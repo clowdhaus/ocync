@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bench::lock::LockedAt;
+
 /// Stored performance baseline for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Baseline {
@@ -20,23 +22,7 @@ pub(crate) struct Baseline {
     /// The corpus lock the run synced against. Absent from baselines saved
     /// before the lock existed, which therefore compare against no run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) corpus_locked_at: Option<String>,
-}
-
-/// Refuse to compare a run against a baseline taken under another corpus lock,
-/// or under none: they synced different content, so a delta is not a regression.
-pub(crate) fn ensure_same_corpus(
-    baseline: &Baseline,
-    corpus_locked_at: &str,
-) -> Result<(), String> {
-    match baseline.corpus_locked_at.as_deref() {
-        Some(locked) if locked == corpus_locked_at => Ok(()),
-        recorded => Err(format!(
-            "baseline was recorded under corpus lock {}, this run under {corpus_locked_at}; \
-             record a new baseline by deleting bench/results/baseline.json and rerunning",
-            recorded.unwrap_or("(none)")
-        )),
-    }
+    pub(crate) corpus_locked_at: Option<LockedAt>,
 }
 
 /// Result of comparing a current run against a stored baseline.
@@ -53,6 +39,10 @@ pub(crate) struct RegressionResult {
 
 /// Compares `current` against `baseline` using `threshold_pct` as the regression limit.
 ///
+/// Refuses when the two were recorded under different corpus locks, or the
+/// baseline under none: they synced different content, so a delta is not a
+/// regression. `baseline_path` names the file to replace.
+///
 /// Returns percentage deltas computed as `(current - baseline) / baseline * 100`.
 /// Zero baselines return a delta of `0.0` to avoid division by zero.
 /// `regressed` is `true` when either `wall_clock_delta_pct` or `requests_delta_pct`
@@ -61,7 +51,20 @@ pub(crate) fn compare(
     current: &Baseline,
     baseline: &Baseline,
     threshold_pct: u32,
-) -> RegressionResult {
+    baseline_path: &Path,
+) -> Result<RegressionResult, String> {
+    if current.corpus_locked_at != baseline.corpus_locked_at {
+        let show =
+            |at: &Option<LockedAt>| at.as_ref().map_or("(none)".to_owned(), ToString::to_string);
+        return Err(format!(
+            "{} was recorded under corpus lock {}, this run under {}; record a new \
+             baseline by deleting {} and rerunning",
+            baseline_path.display(),
+            show(&baseline.corpus_locked_at),
+            show(&current.corpus_locked_at),
+            baseline_path.display()
+        ));
+    }
     let wall_clock_delta_pct = pct_delta(current.wall_clock_secs, baseline.wall_clock_secs);
     let requests_delta_pct = pct_delta(current.requests as f64, baseline.requests as f64);
     let bytes_delta_pct = pct_delta(current.total_bytes as f64, baseline.total_bytes as f64);
@@ -69,12 +72,12 @@ pub(crate) fn compare(
     let threshold = threshold_pct as f64;
     let regressed = wall_clock_delta_pct > threshold || requests_delta_pct > threshold;
 
-    RegressionResult {
+    Ok(RegressionResult {
         wall_clock_delta_pct,
         requests_delta_pct,
         bytes_delta_pct,
         regressed,
-    }
+    })
 }
 
 /// Loads a [`Baseline`] from a JSON file at `path`.
@@ -162,6 +165,7 @@ fn format_metric_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::lock::fixtures::locked_at;
 
     fn baseline(wall_clock_secs: f64, requests: u64, total_bytes: u64) -> Baseline {
         Baseline {
@@ -218,7 +222,7 @@ mod tests {
                 20.0,
             ),
         ] {
-            let result = compare(&current, &stored, 20);
+            let result = compare(&current, &stored, 20, Path::new("baseline.json")).unwrap();
             assert_eq!(result.regressed, regressed, "{name}");
             assert!((result.wall_clock_delta_pct - wall).abs() < 0.01, "{name}");
             assert!(
@@ -266,7 +270,13 @@ mod tests {
 
     #[test]
     fn zero_baseline_returns_zero_delta() {
-        let result = compare(&baseline(50.0, 500, 1_000_000), &baseline(0.0, 0, 0), 20);
+        let result = compare(
+            &baseline(50.0, 500, 1_000_000),
+            &baseline(0.0, 0, 0),
+            20,
+            Path::new("baseline.json"),
+        )
+        .unwrap();
         assert!(!result.regressed);
         assert_eq!(result.wall_clock_delta_pct, 0.0);
         assert_eq!(result.requests_delta_pct, 0.0);
@@ -279,7 +289,7 @@ mod tests {
             wall_clock_secs: 47.5,
             requests: 847,
             total_bytes: 2_100_000_000,
-            corpus_locked_at: Some("2026-10-30-214340".into()),
+            corpus_locked_at: Some(locked_at("2026-10-30-214340")),
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         save_baseline(tmpfile.path(), &baseline).unwrap();
@@ -288,27 +298,35 @@ mod tests {
         assert_eq!(loaded.requests, 847);
         assert_eq!(loaded.total_bytes, 2_100_000_000);
         assert_eq!(
-            loaded.corpus_locked_at.as_deref(),
-            Some("2026-10-30-214340")
+            loaded.corpus_locked_at,
+            Some(locked_at("2026-10-30-214340"))
         );
     }
 
     #[test]
-    fn a_baseline_from_another_lock_or_none_is_refused() {
-        let cases: [(Option<&str>, bool); 3] = [
-            (Some("2026-10-30-214340"), true),
-            (Some("2026-09-01-000000"), false),
+    fn a_baseline_from_another_lock_or_none_is_not_compared() {
+        // Catches: reading a delta between runs that synced different content
+        // as a regression, and a refusal that does not say which file to replace.
+        let this_run = Some(locked_at("2026-10-30-214340"));
+        let cases = [
+            (Some(locked_at("2026-10-30-214340")), true),
+            (Some(locked_at("2026-09-01-000000")), false),
             (None, false),
         ];
-        for (recorded, accepted) in cases {
+        for (recorded, compared) in cases {
             let stored = Baseline {
-                corpus_locked_at: recorded.map(str::to_owned),
+                corpus_locked_at: recorded.clone(),
                 ..baseline(1.0, 1, 1)
             };
-            let got = ensure_same_corpus(&stored, "2026-10-30-214340");
-            assert_eq!(got.is_ok(), accepted, "baseline lock {recorded:?}");
+            let current = Baseline {
+                corpus_locked_at: this_run.clone(),
+                ..baseline(1.0, 1, 1)
+            };
+            let got = compare(&current, &stored, 20, Path::new("results/b.json"));
+            assert_eq!(got.is_ok(), compared, "baseline lock {recorded:?}");
             if let Err(e) = got {
-                assert!(e.contains("record a new baseline"), "{e}");
+                assert!(e.starts_with("results/b.json was recorded"), "{e}");
+                assert!(e.contains("deleting results/b.json"), "{e}");
             }
         }
     }

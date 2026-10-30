@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bench::lock::LockedAt;
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::runner::Tool;
 use crate::bench::{Provider, command_stdout};
@@ -33,7 +34,7 @@ pub(crate) struct RunRecord {
     /// absent from records written before the lock existed and from runs that
     /// sync no locked corpus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) corpus_locked_at: Option<String>,
+    pub(crate) corpus_locked_at: Option<LockedAt>,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
     /// Versions of binaries the benchmarked tools relay their transfers
@@ -1193,17 +1194,14 @@ mod tests {
         let without = serde_json::to_string(&record).unwrap();
         assert!(!without.contains("corpus_locked_at"), "{without}");
 
-        record.corpus_locked_at = Some("2026-10-30-120000".into());
+        record.corpus_locked_at = Some(LockedAt::parse("2026-10-30-120000").unwrap());
         let with = serde_json::to_string(&record).unwrap();
         assert!(
             with.contains(r#""corpus_locked_at":"2026-10-30-120000""#),
             "{with}"
         );
         let reread: RunRecord = serde_json::from_str(&with).unwrap();
-        assert_eq!(
-            reread.corpus_locked_at.as_deref(),
-            Some("2026-10-30-120000")
-        );
+        assert_eq!(reread.corpus_locked_at, record.corpus_locked_at);
     }
 
     #[test]

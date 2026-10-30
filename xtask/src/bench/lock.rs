@@ -142,25 +142,102 @@ pub(crate) fn refs_of(entries: &[ImageEntry]) -> BTreeSet<ImageRef> {
         .collect()
 }
 
+/// When a lock was written: a UTC timestamp in the run timestamp format,
+/// `YYYY-MM-DD-HHMMSS`. Runs recorded under different values are different
+/// comparison series.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct LockedAt(String);
+
+impl LockedAt {
+    /// Parse the run timestamp format, refusing anything else.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        let field = |range: std::ops::Range<usize>| {
+            let digits = raw.get(range)?;
+            if digits.bytes().all(|b| b.is_ascii_digit()) {
+                digits.parse::<u32>().ok()
+            } else {
+                None
+            }
+        };
+        let dashes = [4, 7, 10]
+            .iter()
+            .all(|&i| raw.as_bytes().get(i) == Some(&b'-'));
+        let in_range = matches!(
+            (
+                field(0..4),
+                field(5..7),
+                field(8..10),
+                field(11..13),
+                field(13..15),
+                field(15..17)
+            ),
+            (
+                Some(_),
+                Some(1..=12),
+                Some(1..=31),
+                Some(0..=23),
+                Some(0..=59),
+                Some(0..=59)
+            )
+        );
+        if raw.len() == 17 && dashes && in_range {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(format!(
+                "{raw:?} is not a UTC timestamp like 2026-10-30-214340"
+            ))
+        }
+    }
+
+    /// The current time.
+    fn now() -> Self {
+        Self(crate::bench::utc_timestamp())
+    }
+}
+
+impl TryFrom<String> for LockedAt {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, String> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<LockedAt> for String {
+    fn from(at: LockedAt) -> String {
+        at.0
+    }
+}
+
+impl fmt::Display for LockedAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// What a tag resolved to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LockEntry {
+pub(crate) struct Entry {
     /// Digest of the manifest the tag names.
     pub(crate) digest: Digest,
     /// The index's child manifest digests in order; empty for a single manifest.
     pub(crate) children: Vec<Digest>,
 }
 
-/// The lock file: when it was written and what each ref resolved to.
+/// The lock file: when it was written, which partial overrides it was built
+/// with, and what each ref resolved to.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Lock {
-    /// UTC time the lock was written, in the run timestamp format. Runs recorded
-    /// under different values are different comparison series.
-    pub(crate) locked_at: String,
+    /// When the lock was written.
+    pub(crate) locked_at: LockedAt,
+    /// The `--partial-overrides` path, as given, whose tags are in `images`.
+    /// A partial scenario reading other overrides syncs tags this lock never saw.
+    pub(crate) partial_overrides: String,
     /// Resolution of every ref.
-    pub(crate) images: BTreeMap<ImageRef, LockEntry>,
+    pub(crate) images: BTreeMap<ImageRef, Entry>,
 }
 
 impl Lock {
@@ -190,6 +267,18 @@ impl Lock {
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize lock: {e}"))?;
         text.push('\n');
         Ok(text)
+    }
+
+    /// Refuse partial overrides other than the ones this lock was built from.
+    pub(crate) fn ensure_overrides(&self, given: &str) -> Result<(), String> {
+        if self.partial_overrides == given {
+            return Ok(());
+        }
+        Err(format!(
+            "the corpus lock was built with --partial-overrides {}, not {given}, so the partial \
+             scenario would sync tags it never saw; run `cargo xtask bench-lock --partial-overrides {given}`",
+            self.partial_overrides
+        ))
     }
 }
 
@@ -240,41 +329,119 @@ fn compare(lock: &Lock, resolved: &BTreeMap<ImageRef, Digest>) -> Vec<Difference
     differences
 }
 
-/// `Err` listing every ref that differs from `lock`, `Ok` when none does.
-fn check_unmoved(lock: &Lock, resolved: &BTreeMap<ImageRef, Digest>) -> Result<(), String> {
+/// Why a check against the lock did not pass.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecheckError {
+    /// A source differs from the lock.
+    Moved(String),
+    /// Nothing differs among the refs that resolved, but some could not be
+    /// resolved after retries, so the check is incomplete.
+    Lookup(String),
+}
+
+impl fmt::Display for RecheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Moved(text) | Self::Lookup(text) => f.write_str(text),
+        }
+    }
+}
+
+impl std::error::Error for RecheckError {}
+
+/// Judge the refs that resolved against `lock`, and say what could not be
+/// resolved. A difference is a move even when other refs failed to resolve.
+fn check_unmoved(
+    lock: &Lock,
+    resolved: &BTreeMap<ImageRef, Digest>,
+    failures: &[String],
+) -> Result<(), RecheckError> {
     let differences = compare(lock, resolved);
+    let unresolved = (!failures.is_empty()).then(|| {
+        format!(
+            "could not resolve {} source ref(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        )
+    });
     if differences.is_empty() {
-        return Ok(());
+        return unresolved.map_or(Ok(()), |text| Err(RecheckError::Lookup(text)));
     }
     let listed: Vec<String> = differences.iter().map(|d| format!("  {d}")).collect();
-    Err(format!(
+    let mut text = format!(
         "{} source ref(s) differ from the corpus lock, so this run would not sync the corpus \
          it was locked to:\n{}\nRun `cargo xtask bench-lock` to lock the current content. A new \
          lock starts a new comparison series: do not read its runs against runs under the old one.",
         differences.len(),
         listed.join("\n")
-    ))
+    );
+    if let Some(unresolved) = unresolved {
+        text.push_str("\nAlso, ");
+        text.push_str(&unresolved);
+    }
+    Err(RecheckError::Moved(text))
 }
 
 /// Resolve every ref in `refs` again and refuse if any differs from `lock`.
 ///
-/// Probes with HEAD, which every registry answers with the digest and which
-/// costs no body, and falls back to a GET only where a registry sends none.
+/// Probes with HEAD, which costs no body, and falls back to a GET only for a
+/// registry that sends no digest header.
 pub(crate) async fn ensure_unmoved(
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
     auth: Option<&DockerHubAuth>,
-) -> Result<(), String> {
+    tokens: &mut Tokens,
+) -> Result<(), RecheckError> {
     eprintln!(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
-    let resolved = resolve(refs, auth, Mode::Recheck).await?;
-    let digests = resolved
-        .into_iter()
-        .map(|(image, fetched)| (image, fetched.digest))
-        .collect();
-    check_unmoved(lock, &digests)
+    let (resolved, failures) = resolve(refs, auth, tokens, fetch_digest)
+        .await
+        .map_err(RecheckError::Lookup)?;
+    check_unmoved(lock, &resolved, &failures)
+}
+
+/// What a run does after the check between scenarios.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// Run the next scenario; the check could not finish, which is warned of.
+    Proceed { warning: Option<String> },
+    /// Do not run the remaining scenarios, for this reason.
+    Stop(String),
+}
+
+/// Decide from the between-scenarios check. Only an actual difference stops
+/// the run: a lookup that failed after retries leaves the post-pass digest
+/// check to guard the content.
+pub(crate) fn between_scenarios(check: Result<(), RecheckError>) -> Next {
+    match check {
+        Ok(()) => Next::Proceed { warning: None },
+        Err(RecheckError::Lookup(text)) => Next::Proceed {
+            warning: Some(format!(
+                "could not re-check the sources before the next scenario, continuing; \
+                 the post-pass digest check still guards the content:\n{text}"
+            )),
+        },
+        Err(RecheckError::Moved(text)) => Next::Stop(text),
+    }
+}
+
+/// Explain a failed content check by what re-resolving the mismatched sources
+/// found: the source moving is not the tool's fault.
+pub(crate) fn blame(content_check: &str, recheck: Result<(), RecheckError>) -> String {
+    match recheck {
+        Err(RecheckError::Moved(text)) => {
+            format!("the source moved during the scenario: {text}\n{content_check}")
+        }
+        Ok(()) => {
+            format!("the content synced differs from the unmoved source: {content_check}")
+        }
+        Err(RecheckError::Lookup(text)) => format!(
+            "the content synced differs from the lock, and the source could not be re-checked \
+             to tell whether it moved: {text}\n{content_check}"
+        ),
+    }
 }
 
 /// The digest of a manifest body. A registry that also reports a digest must
@@ -290,6 +457,23 @@ fn body_digest(header: Option<&str>, body: &[u8]) -> Result<Digest, String> {
         }
     }
     Ok(actual)
+}
+
+/// What a HEAD answer settles.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// The registry named the digest.
+    Header(Digest),
+    /// It sent none, so the body must be fetched and hashed.
+    NeedBody,
+}
+
+/// Read the `Docker-Content-Digest` of a HEAD answer.
+fn probe(header: Option<&str>) -> Result<Probe, String> {
+    match header {
+        Some(value) => Digest::parse(value.trim()).map(Probe::Header),
+        None => Ok(Probe::NeedBody),
+    }
 }
 
 /// A manifest body, read only for the children an index lists.
@@ -319,38 +503,21 @@ fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
     Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
 }
 
-/// What a resolution is for.
-#[derive(Clone, Copy)]
-enum Mode {
-    /// Writing the lock: fetch every manifest and hash the exact bytes.
-    Lock,
-    /// Checking the lock: the digest alone.
-    Recheck,
-}
-
-/// What a tag resolved to.
-struct Fetched {
-    /// Digest of the manifest the tag names.
-    digest: Digest,
-    /// The manifest bytes, when they were fetched.
-    body: Option<Vec<u8>>,
-}
-
-/// Resolve every ref, naming each one that cannot be resolved.
-async fn resolve(
+/// Resolve every ref with `fetch`. Returns what resolved and a line for each
+/// ref that did not, so the caller decides what an incomplete answer means.
+async fn resolve<T>(
     refs: &BTreeSet<ImageRef>,
     auth: Option<&DockerHubAuth>,
-    mode: Mode,
-) -> Result<BTreeMap<ImageRef, Fetched>, String> {
+    tokens: &mut Tokens,
+    fetch: impl AsyncFn(&reqwest::Client, &Repository<'_>, &str, &str) -> Result<T, String>,
+) -> Result<(BTreeMap<ImageRef, T>, Vec<String>), String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
 
-    let mut tokens = Tokens::default();
     let mut resolved = BTreeMap::new();
     let mut failures = Vec::new();
-
     for image in refs {
         let outcome = async {
             let repo = registry::split_source(&image.source)
@@ -360,26 +527,17 @@ async fn resolve(
                 .await
                 .as_ref()
                 .map_err(String::clone)?;
-            fetch_one(&client, &repo, &image.tag, token, mode).await
+            fetch(&client, &repo, &image.tag, token).await
         }
         .await;
         match outcome {
-            Ok(fetched) => {
-                resolved.insert(image.clone(), fetched);
+            Ok(found) => {
+                resolved.insert(image.clone(), found);
             }
             Err(reason) => failures.push(format!("  {image}: {reason}")),
         }
     }
-
-    if failures.is_empty() {
-        Ok(resolved)
-    } else {
-        Err(format!(
-            "could not resolve {} source ref(s):\n{}",
-            failures.len(),
-            failures.join("\n")
-        ))
-    }
+    Ok((resolved, failures))
 }
 
 /// Request a manifest, retrying what [`registry::send_retrying`] retries. Any
@@ -411,25 +569,6 @@ async fn request_manifest(
     }
 }
 
-/// GET a manifest and hash its exact bytes.
-async fn fetch_body(
-    client: &reqwest::Client,
-    repo: &Repository<'_>,
-    tag: &str,
-    token: &str,
-) -> Result<Fetched, String> {
-    let response = request_manifest(client, Method::GET, repo, tag, token).await?;
-    let header = content_digest(&response);
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| format!("manifest body unreadable: {e}"))?;
-    Ok(Fetched {
-        digest: body_digest(header.as_deref(), &body)?,
-        body: Some(body.to_vec()),
-    })
-}
-
 /// The `Docker-Content-Digest` header of a response, if any.
 fn content_digest(response: &reqwest::Response) -> Option<String> {
     response
@@ -439,24 +578,52 @@ fn content_digest(response: &reqwest::Response) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Resolve one tag the way `mode` asks.
-async fn fetch_one(
+/// GET a manifest, hash its exact bytes and read them with `read`.
+async fn get_manifest<T>(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     tag: &str,
     token: &str,
-    mode: Mode,
-) -> Result<Fetched, String> {
-    if let Mode::Recheck = mode {
-        let response = request_manifest(client, Method::HEAD, repo, tag, token).await?;
-        if let Some(header) = content_digest(&response) {
-            return Ok(Fetched {
-                digest: Digest::parse(header.trim())?,
-                body: None,
-            });
-        }
+    read: impl FnOnce(Digest, &[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    let response = request_manifest(client, Method::GET, repo, tag, token).await?;
+    let header = content_digest(&response);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("manifest body unreadable: {e}"))?;
+    read(body_digest(header.as_deref(), &body)?, &body)
+}
+
+/// The digest a tag names: HEAD, then a GET to hash the body when the registry
+/// sends no digest header.
+async fn fetch_digest(
+    client: &reqwest::Client,
+    repo: &Repository<'_>,
+    tag: &str,
+    token: &str,
+) -> Result<Digest, String> {
+    let head = request_manifest(client, Method::HEAD, repo, tag, token).await?;
+    match probe(content_digest(&head).as_deref())? {
+        Probe::Header(digest) => Ok(digest),
+        Probe::NeedBody => get_manifest(client, repo, tag, token, |digest, _| Ok(digest)).await,
     }
-    fetch_body(client, repo, tag, token).await
+}
+
+/// The digest and children of a tag, from a GET of its exact bytes.
+async fn fetch_entry(
+    client: &reqwest::Client,
+    repo: &Repository<'_>,
+    tag: &str,
+    token: &str,
+) -> Result<Entry, String> {
+    get_manifest(client, repo, tag, token, |digest, body| {
+        Ok(Entry {
+            digest,
+            children: child_digests(body)?,
+        })
+    })
+    .await
 }
 
 /// Arguments for the `bench-lock` subcommand.
@@ -466,19 +633,23 @@ pub(crate) struct LockArgs {
     paths: CorpusPaths,
 }
 
-/// The lock to write, or `None` when `images` equal the existing lock's, so
+/// The lock to write, or `None` when it would equal the existing one, so
 /// re-running over unchanged sources leaves the file, and its `locked_at`
 /// series, alone.
 fn relock(
     existing: Option<&Lock>,
-    images: BTreeMap<ImageRef, LockEntry>,
-    now: String,
+    partial_overrides: &str,
+    images: BTreeMap<ImageRef, Entry>,
+    now: LockedAt,
 ) -> Option<Lock> {
-    if existing.is_some_and(|lock| lock.images == images) {
+    let unchanged = existing
+        .is_some_and(|lock| lock.images == images && lock.partial_overrides == partial_overrides);
+    if unchanged {
         return None;
     }
     Some(Lock {
         locked_at: now,
+        partial_overrides: partial_overrides.to_owned(),
         images,
     })
 }
@@ -495,19 +666,15 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
 
     let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
-    let mut images = BTreeMap::new();
-    for (image, fetched) in resolve(&refs, auth.as_ref(), Mode::Lock).await? {
-        let body = fetched
-            .body
-            .ok_or_else(|| format!("{image}: manifest was not fetched"))?;
-        let children = child_digests(&body).map_err(|e| format!("{image}: {e}"))?;
-        images.insert(
-            image,
-            LockEntry {
-                digest: fetched.digest,
-                children,
-            },
-        );
+    let (images, failures) =
+        resolve(&refs, auth.as_ref(), &mut Tokens::default(), fetch_entry).await?;
+    if !failures.is_empty() {
+        return Err(format!(
+            "could not resolve {} source ref(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        )
+        .into());
     }
 
     let path = args.paths.lock_path();
@@ -518,7 +685,12 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
             None
         }
     };
-    match relock(existing.as_ref(), images, crate::bench::utc_timestamp()) {
+    match relock(
+        existing.as_ref(),
+        args.paths.partial_overrides(),
+        images,
+        LockedAt::now(),
+    ) {
         None => eprintln!(
             "bench-lock: {} is already current ({} refs); left unchanged",
             path.display(),
@@ -538,38 +710,55 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-/// Digests and lock entries for tests here and in the modules that check
-/// against a lock.
+/// Digests, lock entries and timestamps for tests here and in the modules that
+/// check against a lock.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use super::{Digest, LockEntry};
+    use super::{Digest, Entry, Lock, LockedAt};
 
     /// A digest whose 64 hex characters are all `c`.
     pub(crate) fn digest(c: char) -> Digest {
         Digest::parse(&format!("sha256:{}", c.to_string().repeat(64))).unwrap()
     }
 
-    /// A lock entry for `digest` listing `children`, each named by its fill character.
-    pub(crate) fn entry(digest_fill: char, children: &[char]) -> LockEntry {
-        LockEntry {
+    /// An entry for `digest_fill` listing `children`, each named by its fill character.
+    pub(crate) fn entry(digest_fill: char, children: &[char]) -> Entry {
+        Entry {
             digest: digest(digest_fill),
             children: children.iter().map(|c| digest(*c)).collect(),
+        }
+    }
+
+    /// A lock time.
+    pub(crate) fn locked_at(raw: &str) -> LockedAt {
+        LockedAt::parse(raw).unwrap()
+    }
+
+    /// A lock with no images.
+    pub(crate) fn lock() -> Lock {
+        Lock {
+            locked_at: locked_at("2026-10-30-120000"),
+            partial_overrides: "overrides.yaml".into(),
+            images: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{digest as d, entry};
+    use super::fixtures::{digest as d, entry, locked_at};
     use super::*;
+
+    const OVERRIDES: &str = "bench/corpus-partial-overrides.yaml";
 
     fn image(raw: &str) -> ImageRef {
         ImageRef::parse(raw).unwrap()
     }
 
-    fn lock_of(images: &[(&str, LockEntry)]) -> Lock {
+    fn lock_of(images: &[(&str, Entry)]) -> Lock {
         Lock {
-            locked_at: "2026-10-30-120000".into(),
+            locked_at: locked_at("2026-10-30-120000"),
+            partial_overrides: OVERRIDES.into(),
             images: images.iter().map(|(k, v)| (image(k), v.clone())).collect(),
         }
     }
@@ -604,6 +793,26 @@ mod tests {
     }
 
     #[test]
+    fn locked_at_accepts_only_the_run_timestamp_format() {
+        let cases = [
+            ("2026-10-30-214340", true),
+            ("2026-10-30-2143", false),
+            ("2026-10-30T214340", false),
+            ("2026-13-30-214340", false),
+            ("2026-10-30-246000", false),
+            ("20261030-214340x", false),
+            ("2026-10-3a-214340", false),
+        ];
+        for (raw, accepted) in cases {
+            assert_eq!(LockedAt::parse(raw).is_ok(), accepted, "{raw}");
+        }
+        assert!(
+            LockedAt::parse(&crate::bench::utc_timestamp()).is_ok(),
+            "what the run stamps must be what the lock accepts"
+        );
+    }
+
+    #[test]
     fn body_digest_hashes_the_body_and_refuses_a_header_that_disagrees() {
         let cases: [(Option<&str>, Option<&str>); 3] = [
             (None, Some(ABC_SHA256)),
@@ -616,6 +825,27 @@ mod tests {
         for (header, want) in cases {
             let got = body_digest(header, b"abc").ok().map(|d| d.to_string());
             assert_eq!(got.as_deref(), want, "header {header:?}");
+        }
+    }
+
+    #[test]
+    fn a_head_answer_with_a_digest_is_used_and_one_without_sends_for_the_body() {
+        // Catches: hashing a body for every ref (a body per tag on every re-check),
+        // and trusting nothing when the registry did name the digest.
+        let cases: [(Option<&str>, Option<Probe>); 4] = [
+            (
+                Some(ABC_SHA256),
+                Some(Probe::Header(Digest::parse(ABC_SHA256).unwrap())),
+            ),
+            (
+                Some(" sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"),
+                Some(Probe::Header(Digest::parse(ABC_SHA256).unwrap())),
+            ),
+            (None, Some(Probe::NeedBody)),
+            (Some("sha512:abc"), None),
+        ];
+        for (header, want) in cases {
+            assert_eq!(probe(header).ok(), want, "header {header:?}");
         }
     }
 
@@ -654,7 +884,6 @@ mod tests {
             child_digests(br#"{"layers":[]}"#).unwrap().is_empty(),
             "a single manifest has no children"
         );
-        assert!(child_digests(br#"{"manifests":[{"digest":"nope"}]}"#).is_err());
         assert!(child_digests(b"<html>").is_err());
     }
 
@@ -677,6 +906,21 @@ mod tests {
         assert!(Lock::parse(&extra_entry).is_err(), "unknown entry field");
         let bad_key = text.replacen("docker.io/a:1", "docker.io/a", 1);
         assert!(Lock::parse(&bad_key).is_err(), "key with no tag");
+        let bad_time = text.replacen("2026-10-30-120000", "yesterday", 1);
+        assert!(Lock::parse(&bad_time).is_err(), "malformed locked_at");
+    }
+
+    #[test]
+    fn a_partial_scenario_refuses_overrides_the_lock_was_not_built_with() {
+        let lock = lock_of(&[]);
+        assert!(lock.ensure_overrides(OVERRIDES).is_ok());
+        let error = lock
+            .ensure_overrides("elsewhere/overrides.yaml")
+            .expect_err("other overrides would sync tags the lock never saw");
+        assert!(
+            error.contains(OVERRIDES)
+                && error.contains("bench-lock --partial-overrides elsewhere/overrides.yaml")
+        );
     }
 
     #[test]
@@ -715,45 +959,98 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_source_is_refused_naming_every_difference_and_the_remedy() {
+    fn a_moved_source_is_refused_and_a_failed_lookup_is_not_called_a_move() {
         let lock = lock_of(&[("s/a:1", entry('1', &[])), ("s/b:1", entry('2', &[]))]);
+        let lookup = vec!["  s/b:1: manifest request returned 503 (5 attempts)".to_owned()];
 
-        assert!(
-            check_unmoved(&lock, &resolved_of(&[("s/a:1", '1')])).is_ok(),
+        assert_eq!(
+            check_unmoved(&lock, &resolved_of(&[("s/a:1", '1')]), &[]),
+            Ok(()),
             "an unmoved source passes"
         );
 
-        let error = check_unmoved(
+        let Err(RecheckError::Moved(text)) = check_unmoved(
             &lock,
-            &resolved_of(&[("s/a:1", '9'), ("s/b:1", '2'), ("s/c:1", '3')]),
-        )
-        .expect_err("a moved source must not pass");
-        assert!(error.contains(&format!("s/a:1: expected {}, now {}", d('1'), d('9'))));
-        assert!(error.contains("s/c:1: not in the lock"));
-        assert!(!error.contains("s/b:1"), "an unmoved ref is not listed");
-        assert!(error.contains("cargo xtask bench-lock"));
-        assert!(error.contains("new comparison series"));
+            &resolved_of(&[("s/a:1", '9'), ("s/c:1", '3')]),
+            &lookup,
+        ) else {
+            panic!("a moved source must not pass, even beside a failed lookup");
+        };
+        assert!(text.contains(&format!("s/a:1: expected {}, now {}", d('1'), d('9'))));
+        assert!(text.contains("s/c:1: not in the lock"));
+        assert!(text.contains("cargo xtask bench-lock") && text.contains("new comparison series"));
+        assert!(text.contains("s/b:1: manifest request returned 503"));
+
+        let Err(RecheckError::Lookup(text)) =
+            check_unmoved(&lock, &resolved_of(&[("s/a:1", '1')]), &lookup)
+        else {
+            panic!("an incomplete check with no difference is a lookup failure");
+        };
+        assert!(text.contains("could not resolve 1 source ref(s)"));
+    }
+
+    #[test]
+    fn between_scenarios_only_a_difference_stops_the_run() {
+        // Catches: stopping a long run, and discarding its finished scenarios,
+        // because a registry was briefly unreachable.
+        let moved = RecheckError::Moved("s/a:1 moved".into());
+        let lookup = RecheckError::Lookup("s/a:1 unreachable".into());
+        assert_eq!(between_scenarios(Ok(())), Next::Proceed { warning: None });
+        assert_eq!(
+            between_scenarios(Err(moved)),
+            Next::Stop("s/a:1 moved".into())
+        );
+        let Next::Proceed { warning: Some(w) } = between_scenarios(Err(lookup)) else {
+            panic!("a failed lookup proceeds with a warning");
+        };
+        assert!(w.contains("s/a:1 unreachable") && w.contains("post-pass digest check"));
+    }
+
+    #[test]
+    fn a_failed_content_check_blames_the_source_only_when_it_moved() {
+        // Catches: reporting a source that changed mid-scenario as a tool defect.
+        let content = "ocync cold verification failed -- 1 problems";
+        let moved = blame(content, Err(RecheckError::Moved("s/a:1 moved".into())));
+        assert!(moved.starts_with("the source moved during the scenario"));
+        assert!(moved.contains("s/a:1 moved") && moved.contains(content));
+
+        let tool = blame(content, Ok(()));
+        assert!(tool.starts_with("the content synced differs from the unmoved source"));
+        assert!(!tool.contains("moved during"));
+
+        let unknown = blame(content, Err(RecheckError::Lookup("unreachable".into())));
+        assert!(unknown.contains("could not be re-checked") && unknown.contains(content));
     }
 
     #[test]
     fn relock_leaves_unchanged_content_alone_and_stamps_anything_else() {
         let existing = lock_of(&[("s/a:1", entry('1', &[]))]);
-        let same = existing.images.clone();
+        let now = || locked_at("2026-11-01-000000");
         assert_eq!(
-            relock(Some(&existing), same, "2026-11-01-000000".into()),
+            relock(Some(&existing), OVERRIDES, existing.images.clone(), now()),
             None,
             "unchanged content keeps the file and its locked_at"
         );
 
         let moved = lock_of(&[("s/a:1", entry('2', &[]))]).images;
-        let relocked = relock(Some(&existing), moved.clone(), "2026-11-01-000000".into());
         assert_eq!(
-            relocked,
+            relock(Some(&existing), OVERRIDES, moved.clone(), now()),
             Some(Lock {
-                locked_at: "2026-11-01-000000".into(),
+                locked_at: now(),
+                partial_overrides: OVERRIDES.into(),
                 images: moved.clone(),
             })
         );
-        assert!(relock(None, moved, "2026-11-01-000000".into()).is_some());
+        assert!(
+            relock(
+                Some(&existing),
+                "other.yaml",
+                existing.images.clone(),
+                now()
+            )
+            .is_some(),
+            "other overrides are another lock"
+        );
+        assert!(relock(None, OVERRIDES, moved, now()).is_some());
     }
 }

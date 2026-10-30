@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bench::corpus::DockerHubAuth;
 
@@ -17,10 +17,14 @@ pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+
 /// API host Docker Hub serves its registry from.
 const DOCKER_HUB_API_HOST: &str = "registry-1.docker.io";
 
+/// Every name Docker Hub's registry goes by in an image reference.
+const DOCKER_HUB_NAMES: [&str; 3] = ["docker.io", DOCKER_HUB_API_HOST, "index.docker.io"];
+
 /// The registry a repository lives on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Host<'a> {
-    /// Docker Hub, named `docker.io` in a corpus source and served from its API host.
+    /// Docker Hub, named `docker.io`, `index.docker.io` or its API host in a
+    /// corpus source, and served from its API host.
     DockerHub,
     /// Any other registry, by hostname.
     Other(&'a str),
@@ -57,7 +61,7 @@ impl std::fmt::Display for Repository<'_> {
 /// Returns `None` for a source with no `/`.
 pub(crate) fn split_source(source: &str) -> Option<Repository<'_>> {
     let (host, path) = source.split_once('/')?;
-    let host = if host == "docker.io" {
+    let host = if DOCKER_HUB_NAMES.contains(&host) {
         Host::DockerHub
     } else {
         Host::Other(host)
@@ -81,8 +85,14 @@ fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
     Duration::from_secs(secs).min(MAX_BACKOFF)
 }
 
+/// Whether a response status is worth another attempt: the registry is
+/// throttling (429) or failing (5xx), not refusing the request.
+fn transient(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 /// Send the request `build` makes, waiting out what is transient: a failed
-/// connection, a 429 and a 5xx, up to [`MAX_ATTEMPTS`] times. Any other
+/// connection (always retried), a 429 and a 5xx, up to [`MAX_ATTEMPTS`] times. Any other
 /// response, whatever its status, is returned for the caller to judge. `what`
 /// names the request in the retry notice.
 pub(crate) async fn send_retrying(
@@ -92,10 +102,8 @@ pub(crate) async fn send_retrying(
     let mut attempt = 0;
     loop {
         let (failure, retry_after) = match build().send().await {
-            Ok(response)
-                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || response.status().is_server_error() =>
-            {
+            Ok(response) if !transient(response.status()) => return Ok(response),
+            Ok(response) => {
                 let retry_after = response
                     .headers()
                     .get("retry-after")
@@ -103,7 +111,6 @@ pub(crate) async fn send_retrying(
                     .map(str::to_owned);
                 (format!("returned {}", response.status()), retry_after)
             }
-            Ok(response) => return Ok(response),
             Err(e) => (format!("failed: {e}"), None),
         };
         attempt += 1;
@@ -116,41 +123,88 @@ pub(crate) async fn send_retrying(
     }
 }
 
+/// A repository as a map key: the API host and the path, owned.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RepoKey {
+    /// Hostname requests go to.
+    pub(crate) host: String,
+    /// Path within the registry.
+    pub(crate) path: String,
+}
+
+impl From<&Repository<'_>> for RepoKey {
+    fn from(repo: &Repository<'_>) -> Self {
+        Self {
+            host: repo.host.api_host().to_owned(),
+            path: repo.path.to_owned(),
+        }
+    }
+}
+
+/// How long an exchanged token is reused. Registries expire tokens in minutes
+/// (Docker Hub after five), and a run outlives that many times over.
+const TOKEN_TTL: Duration = Duration::from_secs(120);
+
+/// A token exchange and when it was made.
+struct Exchange {
+    /// The token, or why the exchange failed.
+    outcome: Result<String, String>,
+    /// When the exchange finished.
+    at: Instant,
+}
+
 /// Bearer tokens by repository, so a repository with several tags is
-/// authorized once.
+/// authorized once and a long run does not reuse an expired token.
 #[derive(Default)]
 pub(crate) struct Tokens {
-    /// Outcome of the exchange for each (API host, path); a failure is kept so
-    /// it is reported for every tag and not retried.
-    by_repository: HashMap<(String, String), Result<String, String>>,
+    /// Latest exchange for each repository. A failure is kept as long as a
+    /// token would be, so it is reported for every tag and not retried at once.
+    by_repository: HashMap<RepoKey, Exchange>,
 }
 
 impl Tokens {
-    /// The token for `repo`, exchanging for one the first time it is asked.
+    /// The token for `repo`, exchanging for one when there is none or it is
+    /// older than [`TOKEN_TTL`].
     pub(crate) async fn get(
         &mut self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
         dockerhub_auth: Option<&DockerHubAuth>,
     ) -> &Result<String, String> {
-        match self.by_repository.entry(key(repo)) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(oci_token(client, repo, dockerhub_auth).await),
-        }
+        let exchange = match self.by_repository.entry(RepoKey::from(repo)) {
+            Entry::Occupied(entry) if !expired(entry.get().at.elapsed()) => entry.into_mut(),
+            Entry::Occupied(mut entry) => {
+                entry.insert(Exchange::new(client, repo, dockerhub_auth).await);
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(Exchange::new(client, repo, dockerhub_auth).await),
+        };
+        &exchange.outcome
     }
 
-    /// The token already exchanged for `api_host` and `path`, if it succeeded.
-    pub(crate) fn cached(&self, api_host: &str, path: &str) -> Option<&str> {
-        self.by_repository
-            .get(&(api_host.to_owned(), path.to_owned()))?
-            .as_deref()
-            .ok()
+    /// The token last exchanged for `repo`, if that succeeded, however old.
+    pub(crate) fn cached(&self, repo: &RepoKey) -> Option<&str> {
+        self.by_repository.get(repo)?.outcome.as_deref().ok()
     }
 }
 
-/// The cache key of a repository.
-fn key(repo: &Repository<'_>) -> (String, String) {
-    (repo.host.api_host().to_owned(), repo.path.to_owned())
+impl Exchange {
+    /// Exchange for a token now.
+    async fn new(
+        client: &reqwest::Client,
+        repo: &Repository<'_>,
+        dockerhub_auth: Option<&DockerHubAuth>,
+    ) -> Self {
+        Self {
+            outcome: oci_token(client, repo, dockerhub_auth).await,
+            at: Instant::now(),
+        }
+    }
+}
+
+/// Whether a token of this age is past [`TOKEN_TTL`].
+fn expired(age: Duration) -> bool {
+    age > TOKEN_TTL
 }
 
 /// OCI token exchange for a single repository scope.
@@ -158,7 +212,7 @@ fn key(repo: &Repository<'_>) -> (String, String) {
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
 /// request a bearer token from the auth realm. For Docker Hub, includes
 /// basic auth credentials if given. The error says which step failed.
-pub(crate) async fn oci_token(
+async fn oci_token(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
@@ -250,6 +304,23 @@ mod tests {
                 "quay.io/jupyter/base-notebook",
                 Some((Host::Other("quay.io"), "jupyter/base-notebook")),
             ),
+            // Every spelling of Docker Hub is one host; a lookalike is not.
+            (
+                "registry-1.docker.io/library/alpine",
+                Some((Host::DockerHub, "library/alpine")),
+            ),
+            (
+                "index.docker.io/library/alpine",
+                Some((Host::DockerHub, "library/alpine")),
+            ),
+            (
+                "notdocker.io/library/alpine",
+                Some((Host::Other("notdocker.io"), "library/alpine")),
+            ),
+            (
+                "docker.io.example.com/library/alpine",
+                Some((Host::Other("docker.io.example.com"), "library/alpine")),
+            ),
             ("alpine", None),
         ];
         for (source, want) in cases {
@@ -276,6 +347,33 @@ mod tests {
                 "attempt {attempt}, Retry-After {header:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_throttling_and_server_failures_are_retried() {
+        use reqwest::StatusCode;
+        // A refusal retried would hammer a registry that said no; a throttle
+        // or outage not retried would fail a run that a short wait saves.
+        let cases = [
+            (429, true),
+            (500, true),
+            (503, true),
+            (200, false),
+            (401, false),
+            (404, false),
+        ];
+        for (code, retried) in cases {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert_eq!(transient(status), retried, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_token_is_reused_until_it_is_older_than_the_ttl() {
+        // Reusing an expired token fails a later scenario's re-check with a 401.
+        assert!(!expired(Duration::from_secs(0)));
+        assert!(!expired(TOKEN_TTL));
+        assert!(expired(TOKEN_TTL + Duration::from_secs(1)));
     }
 
     #[test]
