@@ -85,7 +85,7 @@
 
   <rect x="620" y="230" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="275" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
-  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">19%</text>
+  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">22%</text>
   <text x="845" y="315" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">fewer</text>
   <text x="845" y="340" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">requests</text>
 
