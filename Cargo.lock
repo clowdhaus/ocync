@@ -4110,6 +4110,8 @@ dependencies = [
  "aws-sdk-ecr",
  "clap",
  "futures-util",
+ "http",
+ "ocync-distribution",
  "reqwest",
  "serde",
  "serde_json",

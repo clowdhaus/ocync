@@ -21,6 +21,8 @@ enum Cli {
     Bench(bench::BenchArgs),
     /// Run benchmarks on a remote bench instance via SSH.
     BenchRemote(bench::remote::BenchRemoteArgs),
+    /// Resolve the bench corpus to manifest digests and write `bench/corpus.lock.json`.
+    BenchLock(bench::lock::LockArgs),
 }
 
 fn main() -> ExitCode {
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
     let result = match cli {
         Cli::Bench(args) => rt.block_on(bench::run(args)),
         Cli::BenchRemote(args) => bench::remote::run(args),
+        Cli::BenchLock(args) => rt.block_on(bench::lock::run(args)),
     };
 
     match result {

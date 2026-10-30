@@ -13,6 +13,13 @@
 # golang) are pulled from their public ECR mirrors instead to avoid
 # unnecessary rate limit consumption.
 #
+# Content is fixed by bench/corpus.lock.json, which records every tag's manifest
+# digest. A tag that moves is refused at the start of a run; `cargo xtask
+# bench-lock` writes a new lock, which starts a new comparison series. Tags are
+# version or date tags where the source publishes one with the same
+# digest as `latest`. Tags left on `latest` have no such tag served anonymously
+# (Chainguard free tier, SOCI workshop images); the lock is what holds them.
+#
 # Ordering: mount-exercising images first (Jupyter family shares GB-sized base
 # layers across distinct source names and therefore distinct target repos --
 # the canonical cross-repo mount scenario). Use `--limit N` to scope the
@@ -25,22 +32,23 @@ corpus:
 images:
   # ── Jupyter docker-stacks (cross-repo mount exercise) ──────────────────────
   # Canonical source is quay.io (moved from Docker Hub in late 2023).
+  # The date tag is the build `latest` named when the corpus was locked.
   # Multi-stage lineage: base-notebook -> minimal-notebook -> scipy-notebook ->
   # (datascience|pyspark|tensorflow)-notebook. Each image is ~0.3-2.2 GB with
   # large shared base layers. Distinct source names -> distinct target repos ->
   # cross-repo mount candidates for the shared layers.
   - source: "quay.io/jupyter/base-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
   - source: "quay.io/jupyter/minimal-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
   - source: "quay.io/jupyter/scipy-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
   - source: "quay.io/jupyter/datascience-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
   - source: "quay.io/jupyter/pyspark-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
   - source: "quay.io/jupyter/tensorflow-notebook"
-    tags: ["latest"]
+    tags: ["2026-10-28"]
 
   # ── NVIDIA CUDA (chunked-upload stress + intra-repo blob sharing) ─────────
   # NGC's nvcr.io requires auth; the docker.io/nvidia/cuda mirror is
@@ -64,6 +72,8 @@ images:
   # ── Chainguard free tier images (cgr.dev) ──────────────────────────────────
   # Small; useful for cross-repo mount stress when concurrency windows overlap
   # (all share the wolfi-base layer). Retained as historical baseline.
+  # The free tier serves only floating tags (latest, latest-dev, variants);
+  # php also serves 8.5.12, the version `latest` resolved to.
   - source: "cgr.dev/chainguard/static"
     tags: ["latest"]
   - source: "cgr.dev/chainguard/busybox"
@@ -93,7 +103,7 @@ images:
   - source: "cgr.dev/chainguard/jdk"
     tags: ["latest"]
   - source: "cgr.dev/chainguard/php"
-    tags: ["latest"]
+    tags: ["8.5.12"]
 
   # ── AWS Public ECR images ──────────────────────────────────────────────────
   - source: "public.ecr.aws/amazonlinux/amazonlinux"
@@ -101,7 +111,7 @@ images:
   - source: "public.ecr.aws/ubuntu/ubuntu"
     tags: ["22.04", "20.04"]
   - source: "public.ecr.aws/aws-cli/aws-cli"
-    tags: ["latest"]
+    tags: ["2.39.3"]
   - source: "public.ecr.aws/lambda/python"
     tags: ["3.12", "3.11"]
   - source: "public.ecr.aws/lambda/nodejs"
@@ -114,12 +124,12 @@ images:
     tags: ["7", "6"]
   - source: "public.ecr.aws/docker/library/nginx"
     tags: ["1.27", "1.26"]
-  # These four tags must resolve to one multi-arch index, so the run measures
-  # each child manifest being pulled and pushed once rather than once per tag.
-  # Any alpine release splits them: re-point `3.24` and `3.24.3` to the minor
-  # and patch that `latest` resolves to.
+  # Alpine tags usually share one multi-arch index, so the run measures each
+  # child manifest pulled and pushed once rather than once per tag. If a release
+  # splits them, runs refuse until `cargo xtask bench-lock` locks the new
+  # digests; after that the tags are separate images.
   - source: "public.ecr.aws/docker/library/alpine"
-    tags: ["latest", "3", "3.24", "3.24.3"]
+    tags: ["3", "3.24", "3.24.3"]
   - source: "public.ecr.aws/docker/library/golang"
     tags: ["1.22", "1.21"]
 

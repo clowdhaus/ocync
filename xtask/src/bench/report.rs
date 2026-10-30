@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bench::lock::LockedAt;
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::runner::Tool;
 use crate::bench::{Provider, command_stdout};
@@ -28,6 +29,12 @@ pub(crate) struct RunRecord {
     pub(crate) timestamp: String,
     /// Short git commit hash at the time of the run.
     pub(crate) git_ref: String,
+    /// When the corpus lock the run synced against was written. Runs under
+    /// different locks synced different content and are different series;
+    /// absent from records written before the lock existed and from runs that
+    /// sync no locked corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) corpus_locked_at: Option<LockedAt>,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
     /// Versions of binaries the benchmarked tools relay their transfers
@@ -95,7 +102,7 @@ fn imds_or_unknown(path: &str) -> String {
 }
 
 /// Corpus size metadata.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
     /// Number of distinct images.
     pub(crate) images: usize,
@@ -1112,6 +1119,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-021040".into(),
             git_ref: "d121864".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
@@ -1160,11 +1168,50 @@ mod tests {
     }
 
     #[test]
+    fn the_tracked_archive_still_parses() {
+        let archive = include_str!("../../../bench/results/ecr.json");
+        let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
+        assert!(!records.is_empty());
+    }
+
+    #[test]
+    fn corpus_locked_at_is_written_only_when_set_and_old_records_read_as_unset() {
+        let mut record: RunRecord = serde_json::from_str(
+            r#"{
+                "timestamp": "2026-10-30-120000",
+                "git_ref": "abc1234",
+                "machine": {
+                    "instance_type": "c6in.4xlarge", "arch": "x86_64", "vcpus": 16,
+                    "memory_gib": 32.0, "network": "n", "region": "us-east-1",
+                    "image_id": "unknown"
+                },
+                "corpus": { "images": 1, "tags": 1 },
+                "scenarios": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.corpus_locked_at, None, "a record with no field");
+        let without = serde_json::to_string(&record).unwrap();
+        assert!(!without.contains("corpus_locked_at"), "{without}");
+
+        record.corpus_locked_at =
+            Some(crate::bench::lock::fixtures::locked_at("2026-10-30-120000"));
+        let with = serde_json::to_string(&record).unwrap();
+        assert!(
+            with.contains(r#""corpus_locked_at":"2026-10-30-120000""#),
+            "{with}"
+        );
+        let reread: RunRecord = serde_json::from_str(&with).unwrap();
+        assert_eq!(reread.corpus_locked_at, record.corpus_locked_at);
+    }
+
+    #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let record = RunRecord {
             timestamp: "2026-04-18-100000".into(),
             git_ref: "abc1234".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
@@ -1201,6 +1248,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-110000".into(),
             git_ref: "def5678".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "c7g.xlarge".into(),
@@ -1232,6 +1280,7 @@ mod tests {
         let record = RunRecord {
             timestamp: "2026-04-18-120000".into(),
             git_ref: "aaa1111".into(),
+            corpus_locked_at: None,
             machine: MachineInfo {
                 provider: Some(Provider::Aws),
                 instance_type: "unknown".into(),

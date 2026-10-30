@@ -1,0 +1,536 @@
+{
+  "locked_at": "2026-10-30-220156",
+  "images": {
+    "cgr.dev/chainguard/busybox:latest": {
+      "digest": "sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218",
+      "children": [
+        "sha256:cf316806f9d78ab6baca815593a97a870d8e5aa34e76c29691a81ee1195afc11",
+        "sha256:2d0f94620097166ad283e7654e41e0adea49097ff37df8e9f16e70ec083bbb77"
+      ]
+    },
+    "cgr.dev/chainguard/curl:latest": {
+      "digest": "sha256:a64879785161853ebb8841501ab74a1b2cfc766ea706e609b38b50e063eeabab",
+      "children": [
+        "sha256:f9159b36cc1829453d2369930efc8cc5707508057d6cc39553552394f55c14d8",
+        "sha256:6e3646f33e145977e6970e221c58e5775d06aee2f2bda7615b24e8cb91456a58"
+      ]
+    },
+    "cgr.dev/chainguard/git:latest": {
+      "digest": "sha256:9af245693971eacc8414e52060ddaab20387a50908bb72fb3f142ba0bcf5d003",
+      "children": [
+        "sha256:b2cf28a09c75a54eada959623af5aa93a9edf302fd0889ef6fe2f8e4cf7a102e",
+        "sha256:37676ce7e8d228715db7d459b96f64181f10dd06dd36352355ca44c769798c64"
+      ]
+    },
+    "cgr.dev/chainguard/go:latest": {
+      "digest": "sha256:0d2076bcb78a90d3ceb8a56469f1562a1b81f42e3a184767db75556e0cfbea7f",
+      "children": [
+        "sha256:69f95ced617ff9de4283d8d97afd52c909052d496e9f3e15e4af6e4de1c9fd70",
+        "sha256:c7e7bdb55fd0b7a528dcd691fd490c03f5659065e6e46c401463755a023090e5"
+      ]
+    },
+    "cgr.dev/chainguard/jdk:latest": {
+      "digest": "sha256:f099da1fccf7602c8e94c4eddd71b0dc426c2417c8859cca9f6470aeb38b0574",
+      "children": [
+        "sha256:8c784696a163458179ee15623e1d3399c25b3789bad882f77ebe6ca14558edba",
+        "sha256:a0ef6a345467d4e1af81392d955f58962e3b98c0d929274d0f1fbbd512eea4af"
+      ]
+    },
+    "cgr.dev/chainguard/nginx:latest": {
+      "digest": "sha256:16d0e55ffe62f55744d9b903d8eb57e533d0f660332a9fbb967d78b4e77c8bdb",
+      "children": [
+        "sha256:7456497bc9f8c39e7a90fbded69cb9a7f7aaafaa153424c04dac458e87e188da",
+        "sha256:33582fa47e8d26f591e90f87b29f89c65803416c8351685b4feb45d5edab1b46"
+      ]
+    },
+    "cgr.dev/chainguard/node:latest": {
+      "digest": "sha256:6cb70d6b2a324e491263949ea9f58938ed19031ef478e0bdb0b1810f96f8b400",
+      "children": [
+        "sha256:265293da4fbcd0efb830a3753f1ede5f2d128544fad8b71bd4048139e0ba3934",
+        "sha256:cc3facf2bac88b5f4f097342e68965068097f124a1f096d855fead3b130b3870"
+      ]
+    },
+    "cgr.dev/chainguard/php:8.5.12": {
+      "digest": "sha256:1b7e235d49d0b9e3e3114966f040599fa6308f3681d8d1456757bfeb33cd010e",
+      "children": [
+        "sha256:6b52938431afb92e170ed240f3b01c5c497ab4dffc1a814751181f3f8b66ef1d",
+        "sha256:aeaf5f03d81d2849cd16f73f4909035381b8c45f50bcf1c302274c270d0e6e1c"
+      ]
+    },
+    "cgr.dev/chainguard/postgres:latest": {
+      "digest": "sha256:231567af1b5b1a67bc61decb092a622a0d10cd1b8d8ba7b00d6d6a902298a0ee",
+      "children": [
+        "sha256:1664a34f75b0e93989a154d02e93973538e104f726845c3c93da66f472c7e9be",
+        "sha256:a405c61bba021f84cc22fa48e02fbe7a774010a66766eb5032b7463037caf53c"
+      ]
+    },
+    "cgr.dev/chainguard/python:latest": {
+      "digest": "sha256:35d6025b288eb1c40ae631db77ed6cdd26c6f51d898428d8fc9989db7f29e784",
+      "children": [
+        "sha256:a3995e4d233c10dff34ebd5a9f86d60ca041fdc9ca6870482f222baa21e4e4fd",
+        "sha256:f1f5690a523a0920353dfa3f7af3a1ecbb6d2a4e69e2a5066cdd052e908f4697"
+      ]
+    },
+    "cgr.dev/chainguard/redis:latest": {
+      "digest": "sha256:f6b8a1bf51bd2f5c8519130632666b050ab33d4b7c48031c9cda0faf3efa9405",
+      "children": [
+        "sha256:c54c4e89d88eecc02d315161f9a150f0247bcdf18bcdfb886bcacf4632cfa934",
+        "sha256:b021f6cfe380ffb4cc5809aa815941d92f53f1c0a622a8fb82d4f62ba30bae84"
+      ]
+    },
+    "cgr.dev/chainguard/ruby:latest": {
+      "digest": "sha256:c32b83fa991ac6972fb1a67a4f9fb459168106cf332b93482472d24bc9fde979",
+      "children": [
+        "sha256:dbe8fa57ab295ff0454357c826131c703ca30549527e736c6291e02f77bf825f",
+        "sha256:eb335d77a4f07c927ea56a22214f93692e7f3daf223441f9fd671f99e0f305fe"
+      ]
+    },
+    "cgr.dev/chainguard/rust:latest": {
+      "digest": "sha256:185234e494f7b36ae4af0b4f28113064736d70311eef3baa76bcd83bb0143195",
+      "children": [
+        "sha256:3cd509da397deb2c3da46cbe5f9ce9339d01659371dadd6890d1d6c152ec1fed",
+        "sha256:4aac0af29973ad70b2823eb32a3e67dc08ab213fbe2ccf994531cf639333c060"
+      ]
+    },
+    "cgr.dev/chainguard/static:latest": {
+      "digest": "sha256:fc42af33e643f20d08baf03cddcc1c02ba57052dfb02edb0d79f3fc47bcea8d9",
+      "children": [
+        "sha256:939754fefdbdb198356dc3187310417777d4dd8561be000885e224d49a4ce727",
+        "sha256:8f9c7533c7709270342660bca209e5fc593483c27f95283e1082424c1e0da967"
+      ]
+    },
+    "cgr.dev/chainguard/wolfi-base:latest": {
+      "digest": "sha256:88a20e2d017bd20cdc0cb3910de603e7bea9512a6c351a8dd3c9df212ab03d73",
+      "children": [
+        "sha256:73f2cab0f11208427595d4bdd784046bc4116ef7cc52f0c1b48b6b7f820288d5",
+        "sha256:742cb89fddcad855188f892183ded0b4dcb48d83fdb41ed4463bbab2fe3f7801"
+      ]
+    },
+    "docker.io/nvidia/cuda:12.6.2-base-ubuntu22.04": {
+      "digest": "sha256:26c704086505dc1ad1694591566d156296b4cd340a0076396ea8618d4f211bc2",
+      "children": [
+        "sha256:03a4ab81df39a3cff40dce428940e9dd4aee6023530512e6c770c788185ee1c6",
+        "sha256:00dc1cc76046560ff8939b3c22607020b62d17448baf752dda25c95618c66d29"
+      ]
+    },
+    "docker.io/nvidia/cuda:12.6.2-cudnn-devel-ubuntu22.04": {
+      "digest": "sha256:daf1e0c2f307073fa1f0eaa64779fd856155aa10e10e9cf57b355c6a2925b830",
+      "children": [
+        "sha256:060be96315d802382af17de268c0362278cf1bbc19109a5be1896cb5351d0835",
+        "sha256:d8eb69e1f765cd79ba66b7c8b439e0d73624c4a079edb473f9a68170a7933564"
+      ]
+    },
+    "docker.io/nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04": {
+      "digest": "sha256:9e1fce38554b42e9f9520a6a6be5065f05afdbca08eed0bd115c6673e02a1865",
+      "children": [
+        "sha256:219312400e078c7129db2ecc0ea3308406ac38392de92d3dabe22ef4e68a9f70",
+        "sha256:eba211357483ffabeab7c796395a8526d637724aa95b22ceb3100822874e4cbb"
+      ]
+    },
+    "docker.io/pytorch/pytorch:2.10.0-cuda12.6-cudnn9-runtime": {
+      "digest": "sha256:4ec910830ec6c3b837d5621b6f995a31638d3b0824bf0ed4fcaeba7dd4f89b48",
+      "children": []
+    },
+    "docker.io/pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime": {
+      "digest": "sha256:3bb77138e105723dd4ed760b82fb63d8310ae3a1afc58f76e0ecf0f776568d33",
+      "children": []
+    },
+    "public.ecr.aws/amazoncorretto/amazoncorretto:11": {
+      "digest": "sha256:1bcf2a6f574e8d00317a7c4677b00168fc305932b2745057fb30c8070350a39c",
+      "children": [
+        "sha256:37d42c60650cdc4aecf0ef2f68dd0b7e38284a58056dddda86141f735746994b",
+        "sha256:4a95e2dce4dfbde325d9cc2421d9aa6710b87af4eeb9321212caad679da65549"
+      ]
+    },
+    "public.ecr.aws/amazoncorretto/amazoncorretto:17": {
+      "digest": "sha256:9d701e7657a9a7280211f6a6cff5073fedbc13ffb76f49eee3914cc5225b791e",
+      "children": [
+        "sha256:c26455cca9306561fb5307b8f2e750b3f4d5682f5760d8129f320c576fd3d597",
+        "sha256:aa71385b44ddeb7bde9166fb2aaf95258c041568fee2c161a8d553400c6b4c2f"
+      ]
+    },
+    "public.ecr.aws/amazoncorretto/amazoncorretto:21": {
+      "digest": "sha256:b2e7ffbd5e1c6f0391a3b54e7e8eab623de649939adf898e6763b88d2b627781",
+      "children": [
+        "sha256:eeaa6e358876076ce77ea5a35bb0de2938975a1f67fb1e2230370f01130f326b",
+        "sha256:c354a33b2a996b6763100b743b434a5d815c263e9b5cceba5b6f5fb7103f8378"
+      ]
+    },
+    "public.ecr.aws/amazonlinux/amazonlinux:2": {
+      "digest": "sha256:b2817552413197681024bb55621800d1721ad38c22b7866936dd475416f6959b",
+      "children": [
+        "sha256:b0d0fac27471a430d3736a7bc0315c233dc502f9b4f8b21f9af7ba45cd4ddef7",
+        "sha256:a173876315d3ee8b354addd78b76db38669d39452b9c22c8bde92f2f3e6e5f78"
+      ]
+    },
+    "public.ecr.aws/amazonlinux/amazonlinux:2023": {
+      "digest": "sha256:381352c430f36d8aa6b8b670de06e7e4e5642fe0cb9dbd463bb8d1e79aefc0c7",
+      "children": [
+        "sha256:3bbae8a3ad757535c4a031e6dbc67b18e6e6cb120436c3f067841da262993455",
+        "sha256:6b60f399998548f63d564a8591eb9493a1aed0d6ef447db83b9ea884ed82065d"
+      ]
+    },
+    "public.ecr.aws/aws-cli/aws-cli:2.39.3": {
+      "digest": "sha256:d557b3524475d70dd3104cf44d96568ee3188897b73a6ece2b37aa50e1af362f",
+      "children": [
+        "sha256:49609865f0e326f6c22e4e6e4c6b9a3d6638b6faaa1d71bda1ac089aa493ccfb",
+        "sha256:d62ba4682d88d6f53d077c1f9c2845989b4fd6fa067290c8172a827d0a41e883"
+      ]
+    },
+    "public.ecr.aws/docker/library/alpine:3": {
+      "digest": "sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "children": [
+        "sha256:c26612752c78b18faacd63c7d50f4592c2e7b0f25e0e20e82bd74e465c57ab0d",
+        "sha256:964745728d174226819257152a79b34561fe7321472eb9c8e32f461cbc7969c2",
+        "sha256:2b8ed0bd9e82c247a3817b867718404f020ab8f701bda09642ddfaa7b4f1578d",
+        "sha256:a28d9fc2e441f25a4340eaa840511d5ad1e07522bd56b498af238382f40ade35",
+        "sha256:6db0aa37b0f1ba86c31102b0972cb082a1d22ed1390440de84f1076d78d4d399",
+        "sha256:563589a905f92e0add079850ab496c980d78cc70b4b30114d4d9bab1c0aa22d8",
+        "sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42",
+        "sha256:94db52ee2ab0391093b6748b79508ce6f91a046348f67afae380f372633f5c55",
+        "sha256:6708ca119efec5c3fdcad5dc95d8a28a529aad8debc95872b7e12b3941882f55",
+        "sha256:ba50faba2da27dc9cc11c6f496125fea631b0778bcb29aaf59f904bb36ea0a8a",
+        "sha256:8603c585662f0dcd519f4838a40ea3ef98542466848021ffd3c7b7979896362a",
+        "sha256:1aee90cdbda4ad57477d7481c68b64ad16e03f2ed23e200f719a22bfc55407be",
+        "sha256:4451fbe20381b2a23da80f7a6f68f30f3ff0ff2f4a4a074505a52bd46423fb39",
+        "sha256:37480ae6d5242e16a2f59464deed2018531936746a1a3928df39b4ce5dab6b4c",
+        "sha256:e56e90d77a05614cba94ec4c791282e108f3eac66d697781a79f9c0ccf2f6804",
+        "sha256:12fab14f7a43d3fabe0a4047c9b8b2de354608c1421ab7df6e265508f67a7c74"
+      ]
+    },
+    "public.ecr.aws/docker/library/alpine:3.24": {
+      "digest": "sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "children": [
+        "sha256:c26612752c78b18faacd63c7d50f4592c2e7b0f25e0e20e82bd74e465c57ab0d",
+        "sha256:964745728d174226819257152a79b34561fe7321472eb9c8e32f461cbc7969c2",
+        "sha256:2b8ed0bd9e82c247a3817b867718404f020ab8f701bda09642ddfaa7b4f1578d",
+        "sha256:a28d9fc2e441f25a4340eaa840511d5ad1e07522bd56b498af238382f40ade35",
+        "sha256:6db0aa37b0f1ba86c31102b0972cb082a1d22ed1390440de84f1076d78d4d399",
+        "sha256:563589a905f92e0add079850ab496c980d78cc70b4b30114d4d9bab1c0aa22d8",
+        "sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42",
+        "sha256:94db52ee2ab0391093b6748b79508ce6f91a046348f67afae380f372633f5c55",
+        "sha256:6708ca119efec5c3fdcad5dc95d8a28a529aad8debc95872b7e12b3941882f55",
+        "sha256:ba50faba2da27dc9cc11c6f496125fea631b0778bcb29aaf59f904bb36ea0a8a",
+        "sha256:8603c585662f0dcd519f4838a40ea3ef98542466848021ffd3c7b7979896362a",
+        "sha256:1aee90cdbda4ad57477d7481c68b64ad16e03f2ed23e200f719a22bfc55407be",
+        "sha256:4451fbe20381b2a23da80f7a6f68f30f3ff0ff2f4a4a074505a52bd46423fb39",
+        "sha256:37480ae6d5242e16a2f59464deed2018531936746a1a3928df39b4ce5dab6b4c",
+        "sha256:e56e90d77a05614cba94ec4c791282e108f3eac66d697781a79f9c0ccf2f6804",
+        "sha256:12fab14f7a43d3fabe0a4047c9b8b2de354608c1421ab7df6e265508f67a7c74"
+      ]
+    },
+    "public.ecr.aws/docker/library/alpine:3.24.3": {
+      "digest": "sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+      "children": [
+        "sha256:c26612752c78b18faacd63c7d50f4592c2e7b0f25e0e20e82bd74e465c57ab0d",
+        "sha256:964745728d174226819257152a79b34561fe7321472eb9c8e32f461cbc7969c2",
+        "sha256:2b8ed0bd9e82c247a3817b867718404f020ab8f701bda09642ddfaa7b4f1578d",
+        "sha256:a28d9fc2e441f25a4340eaa840511d5ad1e07522bd56b498af238382f40ade35",
+        "sha256:6db0aa37b0f1ba86c31102b0972cb082a1d22ed1390440de84f1076d78d4d399",
+        "sha256:563589a905f92e0add079850ab496c980d78cc70b4b30114d4d9bab1c0aa22d8",
+        "sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42",
+        "sha256:94db52ee2ab0391093b6748b79508ce6f91a046348f67afae380f372633f5c55",
+        "sha256:6708ca119efec5c3fdcad5dc95d8a28a529aad8debc95872b7e12b3941882f55",
+        "sha256:ba50faba2da27dc9cc11c6f496125fea631b0778bcb29aaf59f904bb36ea0a8a",
+        "sha256:8603c585662f0dcd519f4838a40ea3ef98542466848021ffd3c7b7979896362a",
+        "sha256:1aee90cdbda4ad57477d7481c68b64ad16e03f2ed23e200f719a22bfc55407be",
+        "sha256:4451fbe20381b2a23da80f7a6f68f30f3ff0ff2f4a4a074505a52bd46423fb39",
+        "sha256:37480ae6d5242e16a2f59464deed2018531936746a1a3928df39b4ce5dab6b4c",
+        "sha256:e56e90d77a05614cba94ec4c791282e108f3eac66d697781a79f9c0ccf2f6804",
+        "sha256:12fab14f7a43d3fabe0a4047c9b8b2de354608c1421ab7df6e265508f67a7c74"
+      ]
+    },
+    "public.ecr.aws/docker/library/golang:1.21": {
+      "digest": "sha256:4746d26432a9117a5f58e95cb9f954ddf0de128e9d5816886514199316e4a2fb",
+      "children": [
+        "sha256:e6ba96dde4af9f4e06caba475fa65e94e4c54fe4aa3e9f4f504c02178eb8934e",
+        "sha256:3ebdef0bd69a065dd4a0226d05ce5272c952b02e751850b8364fde34f87c962b",
+        "sha256:b9c2e58b44c8d4f15bd048980f6f1631e1618850bf78f3c3ae13e5f07a1bb7a6",
+        "sha256:45c6a5f2638d8d0363ff4d09dde6d4e2b51b4f9ab635a982fddc870c2fe399d8",
+        "sha256:dfceff6afa1332bfb629241677a1272cf914eb51da2e370d47ab9ce8b4d94b0c",
+        "sha256:b560cea10bef45f7ecb86325158fa29b5c467ece9d97008c016829291692f48c",
+        "sha256:0d086625169a25725cd80317e495198f1bf1611fcefc0aa232f67cac89704773",
+        "sha256:1e47321860195cc223c19138889d16c194a29ce7dedc6cbf429c6f1c429944a0",
+        "sha256:e5110e564177ebe3656c2c6270a576e62b6ea0f4a5f1bcefc78851e28ffa6f8b",
+        "sha256:11497d8d604df494cc4b8b3c723095b266ff881c21120a08aaedaf19b5530e1c",
+        "sha256:fdf874af259564360541d6b20348e25a281ad703d9909c356e031b8496b91899",
+        "sha256:b91c73ecd23d1d03d1786a755cacd8b377596f8b689c5a321b515f20fbc713b2",
+        "sha256:661ae48ed637fda3e3a66c908949e86bfa619513959142c0431f50b4afd116dc",
+        "sha256:a9c54efd3c92b871a6d4bd5582ac30204fccb0facce0e8a686956c39c9cbd40e",
+        "sha256:dee280fb84a92b9dce63eafe208e940dd77139f3d653eef00736c67fb05b50b4",
+        "sha256:edeef5552efa53a4a50c4e9aa96f53c6c96804918aa57493b7ed3fecbe11c468"
+      ]
+    },
+    "public.ecr.aws/docker/library/golang:1.22": {
+      "digest": "sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02",
+      "children": [
+        "sha256:1f298b0c9fecdf504389a0329236f948cc04a566a2bb32337207cbaaa2f8177c",
+        "sha256:48e18ce7bba103031fda4c8d78b6c5bdf51ce625e7269a4ffc6062f23001462c",
+        "sha256:d5847dc287a249b3e051cbcf6af2a381d427bceae80fc12c7f6748b283f96fce",
+        "sha256:cb70de408c399074958243be201d1ac3e628434abaa481bd3c757973bc11be87",
+        "sha256:949a23396a9cbb2dedef036fc159d72b58a239ddc0c04fae2df73b8087949938",
+        "sha256:51935668929c2c8ed7473a7db944272862585e6a05f82a2a824ff86794780bfd",
+        "sha256:3df5991252b3900219aaf1c99407df8ff40bd20e379aca4c9535206e4db968b0",
+        "sha256:8dcd517c439ad32bd433c1b351defeee3f4eca1d7593d74195aa937afec1d333",
+        "sha256:a26e1034153e9b498ab47d688797e978a8772ce42edb7beadf392e0345274e69",
+        "sha256:89966e6720c8ffcacfc2346b4ec70e6f72c7f5f246e0eb68fde66e58d4730cc7",
+        "sha256:0bb28367ddd6549327c02efd9f44dbca458673e627b4a3b002841b03edb9ef7f",
+        "sha256:b7b3a2758db9fd1f4888da791e811deb43185f8566d6c6b2cf4d44900116d784",
+        "sha256:c26ce9bcc78f99abee001fb57b79642b21511cd512259c1bf88b5b1364546fac",
+        "sha256:fe970f9c0dc3b38150872dfb682361992acb458f1a3dfc7f496b8e269a276656",
+        "sha256:f4175e5b58414bf3ae407b7a613ad979fca2d529be828955d106e1c6fa3814f7",
+        "sha256:74bd32dd9982d068a1f5503eac7b3d6515b82aa122fb30ea8788d74b1bfe56bc",
+        "sha256:9f14aab78fa7b2f5e05c68d4fc23293b4ee1eff971534e57f54ba8a2eb129b15"
+      ]
+    },
+    "public.ecr.aws/docker/library/nginx:1.26": {
+      "digest": "sha256:41b194461e4bae16f9b25d68b0976ed4735b89ca625c89aad88e1c1c3b7e8860",
+      "children": [
+        "sha256:c8042489f41ddaf05b7dfbe1e32d5227f94f1b002aca8e3b7b9c9d0cee6b0fed",
+        "sha256:c28381c5787d56e9bf825ecd4b8b1f1a64caec040b959a54674ac5a43954cfd3",
+        "sha256:d2b9373476ef804de28b7760b92ae495344d634e10ee48bf0825bf286e6bf6b5",
+        "sha256:9965e178245859b3edf8e5d832977330ea999abca272bb6a694ecd4d5a77774b",
+        "sha256:0e84a30ef40c2bc3f34e94fc390f08793b375021eb2d90caa8e204baba36527b",
+        "sha256:16c2fed925691896475cffd5f93dc29afb43c5bfa95ba42def71e5e00c8e42df",
+        "sha256:b96e0f79978a14f83e3562ccbbcdc4075f131b7b106a8a47cd9f977011afa8f0",
+        "sha256:0d3f1f43700ea24448c01e74ee8e4aa406442ee3fd68b70abedffc017411803f",
+        "sha256:d2377688b5371d621c48a76e1e08bbf3201ba890966ac51ee83ae05965a81854",
+        "sha256:baccc8145e97b50f1b8791bc6767d64cb4f34166d05c8bc58e8a546741fc7ff1",
+        "sha256:326374d852225c4dfdf1e76041ea31934e0ba20568845b48595c376a2e8261c5",
+        "sha256:85dba07c8006a484ee59ea47f248625971dc24ebe3ea4fe6e38ffeb4e117bc10",
+        "sha256:d75181028e5b33c21d5a618a4f2b0ed1d5ebfc197dd23d24db5ec1f519e048a4",
+        "sha256:e3868d8f9b43811970274c95841f3d1719c931e6cebc5f01d9d94b89d30c1fe5",
+        "sha256:79dfa38718756d367a9df4f5bc03015e794de40ee5e3a4136e90f198de6e6c75",
+        "sha256:c9aa31abe377165459d911492be2f4de3347dfe6bfaa8a87a5791f33859c019a"
+      ]
+    },
+    "public.ecr.aws/docker/library/nginx:1.27": {
+      "digest": "sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d",
+      "children": [
+        "sha256:fafd5f55296511cd0f1c991efa0cb85f323449bf643f3b6d760c6542f020d6e5",
+        "sha256:e3cd88cafe07d9dd9ca698e8c6770339833becbce9d7f4e68b78fb41c7290f89",
+        "sha256:6dc08a9d8ed62c0899d1406e851727cad3ce7cf13aa946f6def77730325d273a",
+        "sha256:14d270d21aee97e3437c4a3f8ff8a971b3a0f84f87293e09f9f23d3fa5994895",
+        "sha256:ee5d7cac6f3353e0d19fb011d62d827c982b9a52aefac04976b8cc4ccb879f18",
+        "sha256:dc76e1be1d3f71c6cd1ab71f63f4c2bdcd57a1a3d8766b4305142ef54bdbdf52",
+        "sha256:e6017bb25206300fa159619f19498e0d682d0b48eed71fbdb08064b29888b103",
+        "sha256:d0825145bf4d3eb9d429ca6828b5ed03bddee8e960bb4ff339868a68ed2f5d00",
+        "sha256:2c1ee2371c776670cebad7f4fee298ed8979fdfc18d2c1bc49f17c35754259f2",
+        "sha256:f7f935273ac271a41b14c1a8d1b917cf7274d54b2c3828179a39a37a573f06f1",
+        "sha256:6c8dff1ca002b67bb2392d8bc33e9760f51cc2d3fa63236d1a82208c70e6d96e",
+        "sha256:b7112e1503da38fc6625d14e69fe40ae3c4b96cc048b7f63258109032f1c6b44",
+        "sha256:2b224f2786060b77e5d5cc376b98dbb6cf062353c77828bf426ca1eab526b714",
+        "sha256:c1c20d1dc1645062ceacf7c5ab5a02215f0a60b2c3b555f017b588ee14d6a8dc",
+        "sha256:89525ec29fd002ada8f7981d7a8aad5bed01a651b78b6d1a3b3228616d2d7432",
+        "sha256:6e05297f9f1642d52fe23d86291a17c2ad2f63b5ca0e57c9313244fec9f2d3ab"
+      ]
+    },
+    "public.ecr.aws/docker/library/postgres:15": {
+      "digest": "sha256:64b99032e218b66b1d1a6334995056e1aa57f50a0c522cc856e72dff0e4b0d63",
+      "children": [
+        "sha256:7da5d534f1ffcdb2f69efa6e466a7a29ff89eefd611c7b50c4d69aa77fd4a822",
+        "sha256:0de4d2eb3824fccf14a956edc33f905992216e96df3b19e359ea7fcff92b56f2",
+        "sha256:539b3c30b023011f005ccd0eee443537debb77d5df57d09a82d188c68c696f5f",
+        "sha256:3e418d26507cf190531b134d20fad4558cc9ee6077ecab6c1189eed87cb66828",
+        "sha256:30c8807c3dfe0dc0b36b7b60b894c2396e5f0ea773733dda8cc0abbfd974db71",
+        "sha256:5d9b19cc308fc0806de78934d509abc80f2dfbd5e5f94915ead1a13cbbb27797",
+        "sha256:11467d4eb65f883f7339dd62eadde848e28a586c5a34af5e719763c8072e51da",
+        "sha256:c46d57e2b90889a2198cb95d6b2d41d6fb1a5cbb47d7f8de863b5c207e17d9b1",
+        "sha256:42c2943a72029c9ddd200f2c2d580e2c2a8c66ce01e15409623e607d9b1c78dd",
+        "sha256:ef54040d62285e7e5a5d429bfe921856487a3a7903586552e3475ff7d9fce388",
+        "sha256:9ad272cfdde2288f5bdfaddf1bd9a236ccc8ad15e6028192b0c3d29e25a968fb",
+        "sha256:b858afa833602f01dbfb4184cba5c30424dca57619c0ec0755c43765066c523c",
+        "sha256:f92d43e680655a0f1223d4655bf3a4ea7e081c15d7f9a8f41b7a0e97f278dab6",
+        "sha256:9c663471e5e28b6def31210464f4ecc1a980c70b01835f3cdfbf46db2d36d866",
+        "sha256:52b7fa6b54dcb6d2a1f2c746737d77378996f55e682390290e210f2a89b91c6d",
+        "sha256:e347d1f606afcdea6aaa33cf38f02f4543bb76a31f9ff906b237af82549624f5"
+      ]
+    },
+    "public.ecr.aws/docker/library/postgres:16": {
+      "digest": "sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c",
+      "children": [
+        "sha256:b95b87e93ceb7594715d5c71fb6e09f6fc878851ab537735d617325eb9ba8b1b",
+        "sha256:640cbac6cf10e2babf0cd27b8675e25d35c88471da9d1a21a45e24c5e617fc63",
+        "sha256:6a1d9d7180e1f20084740fbf023e33d3e11f169fb7a4a21d13d12c4da0e88adc",
+        "sha256:c0d8f3674ef80dac5c75c47195413fba09d6d43957b660a5d41481abc4408b1e",
+        "sha256:b692d1b6067dc12f6d912e113fc98c1a7560aaab28d182c911a513eda498904c",
+        "sha256:59d47482cb1a6dfa5b35e7072bdef4e0c70ec8d7bc93426d4d01d8cde228530b",
+        "sha256:624b15a3c9e7b8930c8c1d3ff617a3135f92e06bb47df7a4fea49869ccd3a775",
+        "sha256:38141500cff19c5602e1f38e532a0d30a4390537ca0ba00a9a7069b946414b2c",
+        "sha256:539bc96735cb18026561501f42f8c3eb08d9d20142b7d6027a35533cd5b5fccf",
+        "sha256:8a782328cccb7952de81699026df1bddfb6eb4456b22b5f2b6bdaa47ea90bb0a",
+        "sha256:d6cfa7b9e2b583a778da5b0fde9f31e9c7e7a6f01babc100c3df89c7ad95e008",
+        "sha256:9f98308500caa4836b5863a2bd4d0b7bfa88260332711a97c59c883a2bf306ee",
+        "sha256:2a8be63cd464f571fe3e21edbbdbae18ef42355b2f59de4d9b7e0395a2abe1a9",
+        "sha256:edc5ec2c732cc5abeee0fb6bc10d796e7ad305d71d7231cd3ec0e54874dbf45a",
+        "sha256:12a0cc015d363facf31a9f52f0eb1d71935acc07ba3a1bffbe8916068f3be277",
+        "sha256:bff3bbaaf12111eddd17ed6034004a1370f9b84cf914d144c0ef52f69d876a69"
+      ]
+    },
+    "public.ecr.aws/docker/library/redis:6": {
+      "digest": "sha256:71075871d0c318a0a835648a954e32d2b88d7b2a75c89a034ad0aa404e0319c9",
+      "children": [
+        "sha256:13d6d1e01c742fa698d8de5e8b2b8f9942499da0e222332ae6622704b4e5454c",
+        "sha256:2025674a4f0b129b9da0f5cda9d7d4c7b044fe3592009ab52775c3ce2c52bfd5",
+        "sha256:031c0e29c91b5d18e0058cc949154c7b59fbc5eeedda727027f56c115dc327c1",
+        "sha256:a11848a1b337a3688ef31bb0ecf6d5832403a3f29684ec166ca39053d6530d64",
+        "sha256:365a1a7edff64a223a10d50afb4171dbe4f4f5079767fe43439a8687ca54ce33",
+        "sha256:71f8281821df891b8bdf00af4d85094826aa53de41780b77cd0d71bdca9174ee",
+        "sha256:a42611488fc1ee883500a71f9b82e5d59e6baf1254e580efc8585e683da0658b",
+        "sha256:5514780bb5d440b5bec0e9365a2f2336c4e2fd8f85576d42e6c135d1c35bd97c",
+        "sha256:129f5abd382acdba28540c3a520fe6919513862c65e459195f76682490a40364",
+        "sha256:87a2de2afe1137b556c1afd93e56f617d0e383fd0d313a65b943f9a78db0ad39"
+      ]
+    },
+    "public.ecr.aws/docker/library/redis:7": {
+      "digest": "sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5",
+      "children": [
+        "sha256:a7aad82554197a54c653388bfded882a59d6b4a02468484bc31bae6772dcc42c",
+        "sha256:453c0892de49c03f4b4de89a2a375f5ba04726ec0486cce6b55f7657138ba003",
+        "sha256:a7f3f853144deba30d74f32485c25ca3ec28e11a816621bdf4539fd28166e56e",
+        "sha256:11d16b50a39652ea9402585f4ad1af465f69f3ce21f6c79402e2bb82c3cc7ad6",
+        "sha256:70906c24c6bcde0712573cce29bb3d30331fec36aaefd503bc570c18ba431c26",
+        "sha256:70263f3534d6bb5603d4dccd636ceeacbba27a5c7ca7c628cdb69c6b234b53c4",
+        "sha256:9ae928481cc4844d62337091f77b1844749d36e23794a6ef546c913f00518009",
+        "sha256:70e2f93d7b31c5db05a1b5d305d5904d61990e1f1397428d6259ba2a607678ce",
+        "sha256:44bac9bbc439d91a9e665ad5d03d3cbc616123dc4520752579d9b846b687b462",
+        "sha256:ff2d93e84d9bb2e3d6d7d9ac1d8bdebfb8ab7122c94c26513ae9b255c4e0ce33"
+      ]
+    },
+    "public.ecr.aws/lambda/nodejs:18": {
+      "digest": "sha256:daf6a5c0a2b36153b94c91f3563e8ef89b3b19e4129963c6ccb07b8c5251f7ef",
+      "children": [
+        "sha256:c3fe6ff9c75a5d6b0c8ba4c1224ef0c3a3a869c94487e1c786503d8e872b5e2e",
+        "sha256:f088b3d4f1f6918d591323f76954983c49e18fc1fd1e3e34a92dcdef58171f35"
+      ]
+    },
+    "public.ecr.aws/lambda/nodejs:20": {
+      "digest": "sha256:a4440274d6f0fb4e6cb92cd5f2a97254efe6612f631d9974b197ecbd4a61fcab",
+      "children": [
+        "sha256:2c2357d244ca4b8c599b7fb080bd5fdc2b655a572b344978ce8fde5bd8005d6b",
+        "sha256:7113432fbe93b701792a659c515a9501822b95b0c3070d27565f22b8422aee3d"
+      ]
+    },
+    "public.ecr.aws/lambda/python:3.10": {
+      "digest": "sha256:6e574c3e6a09794c5177f24ecb7a94ba0c7179f3a3669f53d6ac7d25d0eea5ed",
+      "children": [
+        "sha256:75eead7948a02058efd297ca9666efac3f6bf435badd3431c7785b60229d0cb1",
+        "sha256:3032118cf3b1c3e38ef8277eec462632912d45732e4a165370fb6a80b355e054"
+      ]
+    },
+    "public.ecr.aws/lambda/python:3.11": {
+      "digest": "sha256:148e32d687b1492accc8990af5f4b82a89203438fe0ef072dd72628fb1bcc4c9",
+      "children": [
+        "sha256:20efb8868dd579c5f7a8f4acaad952d670a43d469c3351fe71ede38b27c11c2f",
+        "sha256:0568d42610a39f1aa642ad903f4aa1cc1ce58d1e8923faf43ff14e2df4841d83"
+      ]
+    },
+    "public.ecr.aws/lambda/python:3.12": {
+      "digest": "sha256:d82c9eee479c78dd43ce5c4d0c80feedc581b2015bd105e52364b8aca589644d",
+      "children": [
+        "sha256:7372b6c2f91067eb14c245da88f95ccee1a1fa4f7780c44a36ae285f31802d2a",
+        "sha256:2e5f4048d2c1388345767fcc985db6e351050142deaee050a3d17e76157fe9ff"
+      ]
+    },
+    "public.ecr.aws/soci-workshop-examples/ffmpeg:latest": {
+      "digest": "sha256:4bd5d3b7143c5401f3b433bbd708d8a5f3eb72aef65a977a1e52e97c721b7687",
+      "children": []
+    },
+    "public.ecr.aws/soci-workshop-examples/mongo:latest": {
+      "digest": "sha256:dc1a3da50d05abb11a8a69a2cf23fdcabd278fc1ca19474ae94e984b6b357770",
+      "children": []
+    },
+    "public.ecr.aws/soci-workshop-examples/node:latest": {
+      "digest": "sha256:ee4017e6ba10c711402154b82786ef4b8f61b42719f31679d843a434bfdb9b98",
+      "children": []
+    },
+    "public.ecr.aws/soci-workshop-examples/rabbitmq:latest": {
+      "digest": "sha256:7d4d0320157c1493853df75ad68f2abefcc397c38023c499d6fd1d0736a93577",
+      "children": []
+    },
+    "public.ecr.aws/soci-workshop-examples/tensorflow:latest": {
+      "digest": "sha256:2634f2dcadb4031862c7a778f06050bbc971b6ebe3ab083ddefe0b74e2698880",
+      "children": []
+    },
+    "public.ecr.aws/soci-workshop-examples/tensorflow_gpu:latest": {
+      "digest": "sha256:150bdbcfc5b5b008d8df244cbd8f10cf673688c72848992e8f5e145d191fe1bd",
+      "children": []
+    },
+    "public.ecr.aws/ubuntu/ubuntu:20.04": {
+      "digest": "sha256:7e9558e1203a9a2b0967554abf9ebdc5552f29013b01f6e7271bf2d776d51234",
+      "children": [
+        "sha256:b529c231bdcd0da7afcc79d7b2c8ae64545075ac97dc0b99c0840d3b298b76d4",
+        "sha256:b0033f18d85c977efa682513c640f93937c9625b686068ccc214582a8c77fce6",
+        "sha256:35cabe8f93aecc5789377ae75e71674871e1865d493b1e4cf33f3b1bbd843dfa",
+        "sha256:84c54441de948269ee9f9bae3dbe09aa180465bc358737181e0b62bbc50c59c4",
+        "sha256:3079448dcc866025947f1c492f37158f6b40ce80c556bf3621ae017d9da27904",
+        "sha256:2dba0cb7f62dbde6851b2c784d812ba95c475003cc1ebe000bc2189ffbe2fb57"
+      ]
+    },
+    "public.ecr.aws/ubuntu/ubuntu:22.04": {
+      "digest": "sha256:7e421ec89eccbc7b0b38c0e4cea41548b4bd0d4cff63c42355fadd0369f49fa0",
+      "children": [
+        "sha256:8a2321a92b438238f93b4346fff61bc4259c99fdd4d9b52ee86f153fee0c344f",
+        "sha256:a8fb2ba88181746111cbbe2969826d6546b71226785b196c93d2c3445a25000d",
+        "sha256:02a8457887701ff229132ea6fc23b0dcd2442755e73e6799db1204d6910db799",
+        "sha256:a42deba184aca2ee6fa2fa3d066cbe2d2e1997da55b123d49a4837338227b0e8",
+        "sha256:a51be4a3f16d9c14d46cf2c94d397a0242dd6c745a0e9f133cc8d78b7969b00d",
+        "sha256:626774cb2fcfaffb79f782713cbe84f4aa9f5de344f2f5cbf984a31d4830549d"
+      ]
+    },
+    "quay.io/jupyter/base-notebook:2026-10-28": {
+      "digest": "sha256:e7e1d8727cdca641ae97c4aa96afafc21b85eb8908da1a0dafa7ddb00c8e1554",
+      "children": [
+        "sha256:accedcf7236a320ce6b71f581ecdece57a290ba5341720a6e0878cce7162fb4e",
+        "sha256:70b5295015142a652882d9614406ea47c6c2cc0638a4f703fd993f395bb6392a",
+        "sha256:fddc6a64838e4616cef65ea31bcd41e49d9edcbad01d841135b53b3513649b71",
+        "sha256:03ac24ddca53f906f4a71399c635ce31564b58693a6e0e82d7cfc9121d043e55"
+      ]
+    },
+    "quay.io/jupyter/datascience-notebook:2026-10-28": {
+      "digest": "sha256:77160324aa27c9fc775f21679b5360168e311da0736dd268429b5d4dc54dfe98",
+      "children": [
+        "sha256:1023acda509817ba218ecaa69947f7a14d5834a305e4ca3bdb73c7dd0dfd5e19",
+        "sha256:dc74aa2d35952f9817e4d2f3985ab3e2fc880fcdfc8c4e4983138ac5563952cb",
+        "sha256:89905d59a073529435371ccbdfda5dafb44f33ed14e7adbb96be76dd855b582f",
+        "sha256:ce850160618ce04bf11cc0ac9e8622a6d4760dc35eaed71670b698862a183241"
+      ]
+    },
+    "quay.io/jupyter/minimal-notebook:2026-10-28": {
+      "digest": "sha256:2a9656bc0e0525f3c6db713c53ccf3987a60aed19d6fcb535a43dfaf3607ebf6",
+      "children": [
+        "sha256:260370941c9e9f86dd58425f84e4df89075ab0abd525b9c97b0be580b97a651c",
+        "sha256:c903482d2cdb793aca79b01a1e9621fa6e3f238851f52bf0c47df6ddc414ff4f",
+        "sha256:62eabb1d67f90ca4dcffbaec3915603541238ce4a896b0b1fd8a025aa933a387",
+        "sha256:8a2927f745bdc39a60a277c01154972793ca3ddbdb6c4c7b1dcbf88da66ffd03"
+      ]
+    },
+    "quay.io/jupyter/pyspark-notebook:2026-10-28": {
+      "digest": "sha256:0660e7a553729435783e1b87c118028b109e46e881f4e73152c1f1391c9cb204",
+      "children": [
+        "sha256:9cff95d6de770d1f4f33076293711dd33673d05b24b142d9711a73e122ffa906",
+        "sha256:247fce26f457c4b8994c568c39ea84d0102655a7b44c1e8ab4f1bd27ba8ab042",
+        "sha256:2078eac69e22fc23c298aaabcf0e8498d652195d3c9ddf0b7614b61fa23e8d67",
+        "sha256:435b1109b53e04081d3f55f961ed52398913baffbc192ce90e8a6ba2adaa000a"
+      ]
+    },
+    "quay.io/jupyter/scipy-notebook:2026-10-28": {
+      "digest": "sha256:d416eea5c12a44981c2fcb56520649dbd92f7ae5983f4e68e14d1d0ebdf0c2ce",
+      "children": [
+        "sha256:7cac4bac10b798a6b20fc1016a8edddc3d2ac9d2be41567b2651f387b6757f83",
+        "sha256:d2f1be3ca01e888deeca3c12b7a3ff0e1b4db3ea2dfe32e65c14d341ba8009be",
+        "sha256:49ab177ec38bc7f73d181a32d99527072d68d3ce36c174246eb6eaa17ebfc8c4",
+        "sha256:db3d066728cde000b3971d38ccc3ef7844a89fae59496cecf94482345c51d642"
+      ]
+    },
+    "quay.io/jupyter/tensorflow-notebook:2026-10-28": {
+      "digest": "sha256:2bc5f13c253e302f155c34d944e71a44bf8ff9d5f347f5f0b07ffd871f894245",
+      "children": [
+        "sha256:4d1baa754464438785af598135329a6eee7dbbb2a36a6a82ff0f31ecae57343a",
+        "sha256:54b95bfd0fc7967eae63cd12f3c51da64224b9cf175ea8899c2f8a7ff534b392",
+        "sha256:6489d1b01f2bcf2e9dc3234c2e57dee4baeb9bc6d6a7759c4bfa345ade616fd9",
+        "sha256:d2d17927a32d36c5d5332a33c583134cb6c6b5814cffcd414650d2b2a8b6188f"
+      ]
+    }
+  }
+}

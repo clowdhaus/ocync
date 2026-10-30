@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 aws-config.workspace = true
+ocync-distribution = { workspace = true, features = ["non-fips"] }
 futures-util.workspace = true
 aws-sdk-ecr.workspace = true
 clap.workspace = true
@@ -22,3 +23,6 @@ serde_yaml.workspace = true
 tempfile.workspace = true
 reqwest = { workspace = true, features = ["rustls"] }
 tokio = { workspace = true, features = ["rt", "process", "time"] }
+
+[dev-dependencies]
+http.workspace = true

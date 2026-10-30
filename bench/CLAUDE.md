@@ -66,22 +66,34 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 **A run whose instance metadata is unknown does not append to `bench/results/{registry}.json`.** That archive is tracked in git and read as a history of comparable runs; a laptop run landing in it puts uncomparable numbers under the same key. The timestamped summary is still written. This matters here more than elsewhere, because `prepare` is the scenario most likely to be run off the rig.
 
+## The corpus lock
+
+`bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to its manifest digest, so runs on different dates sync the same content. It is tracked in git, sits beside the corpus it locks, and is written only by `cargo xtask bench-lock`. A prepare-only run reads no lock.
+
+- **`cargo xtask bench-lock`** resolves every ref in the corpus and the partial overrides and writes the lock. A ref that cannot be resolved fails the command and is named. Over unchanged sources it leaves the file, and its `locked_at`, untouched. It needs the network and Docker Hub credentials (anonymous works for a small corpus), and writes nothing to a cloud.
+- **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
+- **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and its sources have since moved, the error says so.
+- **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, or under none; delete `bench/results/baseline.json` to record a new one.
+- A floating tag stays in the corpus only where the source publishes no immutable tag for the same content.
+
 ## Benchmark fairness invariants
 
 The harness enforces these automatically -- do not bypass them.
 
+**Before the build, and again before every later scenario except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
+
 **Before any tool runs (once per scenario):**
-0. **CDN pre-warm** -- HEAD every source manifest AND GET every unique blob (following 302 redirects to CloudFront, consuming full body) with OCI token exchange to populate both manifest and blob CDN edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN while the last tool gets near-100% hits -- a massive unfair advantage from execution order.
+0. **CDN pre-warm** -- GET every unique blob (following 302 redirects to CloudFront, consuming full body) with OCI token exchange; the lock check has just requested every source manifest, which warms the manifest edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN while the last tool gets near-100% hits -- a massive unfair advantage from execution order.
 1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
 
 **Before every tool run (including the first):**
 2. **Drop OS page cache** -- `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`. Without this, tool 2 benefits from tool 1's source blobs cached in RAM (55GB corpus = massive unfair advantage).
 3. **Clean staging tmpdir** -- remove all files in `$TMPDIR`. Prevents staged blobs from a previous tool consuming disk.
-4. **Delete + recreate ECR repos** -- not just create-if-not-exists. Repos from aborted runs or previous tools may contain partial data that makes a "cold" sync warm.
+4. **Delete + recreate ECR repos** -- not just create-if-not-exists. Repos from aborted runs or previous tools may contain partial data that makes a "cold" sync warm. A repo that cannot be deleted fails the pass, since its content would satisfy the next tool's digest check.
 5. **10s cooldown** -- allows process cleanup between tool runs. CDN state is handled by pre-warm (invariant 0), not by inter-tool cooldown.
 
 **After every tool run (cold and warm):**
-6. **Verify sync correctness** -- list tags in every target ECR repo (per-repo output), confirm all expected tags are present. An unverified benchmark may report fast times for incomplete syncs.
+6. **Verify synced content by digest** (after the sync, partial and scale passes) -- list every image in each target ECR repo, tagged or not (per-repo output). Each expected tag must name the digest in `bench/corpus.lock.json`, and every child manifest the lock lists for an index must be in the repo. A tool that converted a format, dropped a platform or transferred nothing fails the run instead of being credited with a fast time. This is the only post-sync check; there is no tag-presence fallback.
 
 **Never run benchmarks manually via SSH.** The `bench-remote` xtask handles all of the above. Manual `cargo xtask bench` on the instance skips TMPDIR setup and other safeguards. SSH is for debugging only.
 

@@ -1,6 +1,41 @@
 //! YAML corpus config parsing with environment variable expansion.
 
+use std::path::PathBuf;
+
+use clap::Args;
 use serde::Deserialize;
+
+/// Where the corpus and its partial-sync overrides are read from, shared by
+/// `bench` and `bench-lock`.
+#[derive(Args)]
+pub(crate) struct CorpusPaths {
+    /// Path to corpus YAML file. Its lock is the `.lock.json` beside it.
+    #[arg(long, default_value = "bench/corpus.yaml")]
+    corpus: String,
+
+    /// Path to partial sync overrides YAML, applied on top of the corpus for
+    /// the partial scenario. Its tags are locked too.
+    #[arg(long, default_value = "bench/corpus-partial-overrides.yaml")]
+    partial_overrides: String,
+}
+
+impl CorpusPaths {
+    /// The corpus YAML.
+    pub(crate) fn corpus(&self) -> &str {
+        &self.corpus
+    }
+
+    /// The partial sync overrides YAML.
+    pub(crate) fn partial_overrides(&self) -> &str {
+        &self.partial_overrides
+    }
+
+    /// The lock beside the corpus: `bench/corpus.yaml` is locked by
+    /// `bench/corpus.lock.json`.
+    pub(crate) fn lock_path(&self) -> PathBuf {
+        PathBuf::from(&self.corpus).with_extension("lock.json")
+    }
+}
 
 /// Docker Hub credentials for authenticated pulls (avoids 10 pulls/hr anon limit).
 #[derive(Clone)]
@@ -156,6 +191,26 @@ pub(crate) fn load_overrides(path: &str) -> Result<PartialOverrides, String> {
         .map_err(|e| format!("failed to parse overrides file {path}: {e}"))
 }
 
+/// Load only the image entries of a corpus YAML file.
+///
+/// Skips the corpus settings, whose `${BENCH_TARGET_REGISTRY}` only a run
+/// against a target needs, so a command that only reads sources works anywhere.
+/// Image entries are read as written, with no variable expansion.
+pub(crate) fn load_images(path: &str) -> Result<Vec<ImageEntry>, String> {
+    /// The part of a corpus file that names sources.
+    #[derive(Deserialize)]
+    struct Images {
+        images: Vec<ImageEntry>,
+    }
+
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read corpus file {path}: {e}"))?;
+    let parsed: Images = serde_yaml::from_str(&raw)
+        .map_err(|e| format!("failed to parse corpus file {path}: {e}"))?;
+    validate_images(&parsed.images)?;
+    Ok(parsed.images)
+}
+
 /// Validates corpus invariants.
 fn validate(corpus: &Corpus) -> Result<(), String> {
     if corpus.settings.target_registry.is_empty() {
@@ -164,10 +219,15 @@ fn validate(corpus: &Corpus) -> Result<(), String> {
     if corpus.settings.target_prefix.is_empty() {
         return Err("corpus target_prefix must not be empty".into());
     }
-    if corpus.images.is_empty() {
+    validate_images(&corpus.images)
+}
+
+/// Validates that there are images and that each names a tag.
+fn validate_images(images: &[ImageEntry]) -> Result<(), String> {
+    if images.is_empty() {
         return Err("corpus has no images".into());
     }
-    for (i, img) in corpus.images.iter().enumerate() {
+    for (i, img) in images.iter().enumerate() {
         if img.tags.is_empty() {
             return Err(format!("corpus image {i} ({}) has no tags", img.source));
         }
@@ -234,6 +294,21 @@ images:
   - source: "docker.io/library/alpine"
     tags: ["3.20", "latest"]
 "#
+    }
+
+    #[test]
+    fn the_lock_sits_beside_the_corpus_it_locks() {
+        let cases = [
+            ("bench/corpus.yaml", "bench/corpus.lock.json"),
+            ("elsewhere/small.yml", "elsewhere/small.lock.json"),
+        ];
+        for (corpus, want) in cases {
+            let paths = CorpusPaths {
+                corpus: corpus.into(),
+                partial_overrides: String::new(),
+            };
+            assert_eq!(paths.lock_path(), PathBuf::from(want), "{corpus}");
+        }
     }
 
     #[test]
