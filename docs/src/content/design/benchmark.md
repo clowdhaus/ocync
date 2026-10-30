@@ -8,7 +8,7 @@ order: 4
 
 Every published number says what it measured, what it excludes and how to reproduce it, and a difference between tools is published only when it is larger than the run-to-run noise.
 
-The archive in `bench/results/ecr.json` shows why the noise comes first. regsync's code did not change across six cold syncs of the same corpus, yet its time ranged from 765 s to 1535 s, and dregsy's from 916 s to 1936 s. Most of that spread comes from the environment: public source registries, the time of day and the network. A single run per tool cannot tell a tool difference from that noise.
+The archive in `bench/results/ecr.json` shows why the noise comes first. Over five cold syncs to ECR in us-east-2 between 22 and 26 April 2026, regsync took 765 s to 1509 s and dregsy 916 s to 1273 s, with neither tool changed. Part of that spread is the environment (public source registries, the time of day, the network), and part may be the content itself, since the corpus's floating tags can move between dates. A single run per tool cannot tell a tool difference from either.
 
 ## Two kinds of test
 
@@ -24,17 +24,19 @@ They live with the integration tests in `crates/ocync-distribution/tests/`. The 
 
 **Question:** how does ocync compare with other sync tools on a realistic corpus, in time, bytes, requests and rate-limit responses?
 
-It lives in `xtask/src/bench/` and runs on one instance per cloud through `cargo xtask bench-remote`. All tools run on the same instance, taking turns. One instance per tool would multiply the cost by the number of tools. Taking turns in a fresh random order every round, and comparing tools within the same round, removes the bias of a shared machine.
+It lives in `xtask/src/bench/` and runs on one instance through `cargo xtask bench-remote`. All tools run on the same instance, taking turns. One instance per tool would multiply the cost by the number of tools; taking turns in a fresh random order every round, and comparing tools within the same round, is how the shared machine is kept fair.
+
+> **Status: Planned.** Today each tool runs once per scenario in one shuffled order, and `bench-remote` drives only the AWS instance. The Google Cloud and Azure hosts in `bench/terraform/` are for measuring sign-in by hand until they can be driven (#168).
 
 ## Accuracy rules
 
-The harness enforces each rule. Where a rule is not built yet, the run's output says so.
+The harness is to enforce each rule. A rule marked Planned is not built yet, and a run's summary does not yet flag which rules it was made without.
 
 ### A fixed corpus
 
 > **Status: Planned.**
 
-Every image in the corpus resolves to a manifest digest once and is recorded in a lock file beside the corpus. Before each round, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock. Today 29 of the corpus's 38 entries track `latest`, so two runs on different dates sync different content.
+Every image in the corpus resolves to a manifest digest once and is recorded in a lock file beside the corpus. Before each round, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock. Today 29 of the corpus's 40 entries sync `latest` (28 of them only `latest`), so two runs on different dates can sync different content.
 
 ### Content verified, not only tags
 
@@ -49,14 +51,15 @@ After every tool's pass, every target tag must resolve to the same manifest dige
 A run has at least 3 rounds, 5 by default. Each round runs every tool once, cold then warm, in a fresh random order. The order and seed are recorded.
 
 - Each tool's metric is reported as its median, with the minimum and maximum.
-- A speed comparison is the median of the per-round ratios between two tools, with a 95% bootstrap confidence interval. Pairing within a round cancels drift that affects every tool in that round.
-- A difference whose interval includes 1 is reported as no measured difference.
+- A speed comparison is the median of the per-round ratios between two tools. Pairing within a round cancels drift that affects every tool in that round.
+- The interval reported with it is the lowest to the highest per-round ratio. Without assuming any distribution, that range holds the true median with 93.75% confidence at 5 rounds and 75% at 3, and the confidence is stated with it. A resampling (bootstrap) interval is not used: with this few rounds it reports more confidence than it has.
+- A difference is claimed only when every round's ratio falls on the same side of 1. Otherwise it is reported as no measured difference.
 
 ### Proxy overhead measured before it is trusted
 
 > **Status: Planned.**
 
-Every request goes through `bench-proxy`, which terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: each tool runs several times with and without the proxy, interleaved, and the per-tool overhead is published.
+Every request goes through `bench-proxy` unless the run passes `--no-proxy`, which records times but no traffic counts. The proxy terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: each tool runs several times with and without the proxy, interleaved, and the per-tool overhead is published.
 
 - If every tool's overhead is within the run-to-run noise, wall clock is taken with the proxy in the same pass as the counts.
 - If not, wall clock is taken in a pass without the proxy, and counts in a separate pass with it.
@@ -72,7 +75,7 @@ Each published number names the source kind it came from.
 
 ### Competitors at their best
 
-> **Status: Planned.** Today regsync and dregsy run at their default concurrency.
+> **Status: Planned.** Today regsync and dregsy run at their default concurrency, and the generated regsync configuration sets `repoAuth: true` on every source without the results saying so.
 
 Before a published comparison, each tool's concurrency is swept once over a few values on the controlled source, and its fastest setting is used and recorded. A competitor's failure or quirk is reported in the results, not worked around silently in the generated configuration.
 
@@ -84,11 +87,11 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-These run before every tool pass and stay in place:
-
-- **CDN pre-warm** before the first tool: every source manifest and unique blob is fetched once, so the first tool does not meet a colder CDN than the last.
-- **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
-- **Clean the staging directory** and **delete and recreate the target repositories**, so a cold pass starts empty.
+- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): every source manifest and unique blob is fetched once, so the first tool does not meet a colder CDN than the last.
+- Before each tool's cold pass:
+  - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
+  - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.
+- The warm pass follows its cold pass directly, against the content that pass synced.
 - **A 10 s pause** between tools for process cleanup.
 
 `bench/CLAUDE.md` lists the operational details.
@@ -99,7 +102,7 @@ ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the
 
 ## What a published claim looks like
 
-One sentence that names the comparison, the source kind, the statistic, the round count, the instance, the target and the commit. For example: "ocync finished a cold sync of the locked 55 GB corpus 3.4 times faster than regsync (median of 5 per-round ratios, 95% interval 3.1 to 3.7), controlled source, c6in.4xlarge, ECR us-east-2, commit `<hash>`."
+One sentence that names the comparison, the source kind, the statistic, the round count, the instance, the target and the commit, in this form: "ocync finished a cold sync of the locked corpus `<ratio>` times faster than `<tool>` (median of `<n>` per-round ratios, range `<low>` to `<high>`, `<confidence>`% confidence), `<source kind>` source, `<instance type>`, `<registry and region>`, commit `<hash>`."
 
 ## What we do not do
 
