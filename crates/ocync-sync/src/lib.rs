@@ -61,16 +61,17 @@ pub struct SyncReport {
 impl SyncReport {
     /// Whether any image synced or was skipped.
     ///
-    /// Exposed because a caller that also tracks failures the report cannot
-    /// see, such as a mapping dropped before the engine ran, has to fold them
-    /// into the exit code itself and would otherwise re-derive this predicate.
+    /// Public so a caller that tracks failures the report cannot see (a
+    /// mapping dropped before the engine ran) can fold them into the exit
+    /// code without re-deriving this predicate.
     pub fn has_success(&self) -> bool {
         self.images
             .iter()
             .any(|i| matches!(i.status, ImageStatus::Synced | ImageStatus::Skipped { .. }))
     }
 
-    /// Derive process exit code from results.
+    /// Process exit code: 0 with no failed image, 1 when some failed and some
+    /// synced or were skipped, 2 when every image failed.
     pub fn exit_code(&self) -> i32 {
         let has_success = self.has_success();
         let has_failure = self
@@ -104,10 +105,9 @@ pub struct ImageResult {
     pub duration: Duration,
     /// Whether artifact discovery or transfer was skipped due to a transient error.
     ///
-    /// When `true`, the image itself synced successfully but its referrers
-    /// (signatures, SBOMs, attestations) may be missing at the target. Only
-    /// `true` on the transient-error path -- when discovery confirms zero
-    /// referrers, this remains `false`.
+    /// When `true`, the image synced but its referrers (signatures, SBOMs,
+    /// attestations) may be missing at the target. Stays `false` when
+    /// discovery confirms zero referrers.
     #[serde(default, skip_serializing_if = "is_default")]
     pub artifacts_skipped: bool,
 }
@@ -170,12 +170,9 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Classification of the operation that failed during image transfer.
-///
-/// Classifies *what operation* failed, not *why* it failed. The `error`
-/// string on [`ImageStatus::Failed`] carries the cause. This separation
-/// lets output formatters group by operation type while preserving full
-/// error context.
+/// Which operation failed during image transfer, not why. The `error` string
+/// on [`ImageStatus::Failed`] carries the cause, so output formatters can
+/// group by operation and keep the full context.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -233,7 +230,7 @@ pub struct SyncStats {
     pub discovery_target_stale: u64,
     /// Tags where `head_first` avoided the full source GET by confirming all
     /// targets already match the source HEAD digest on cache miss. Independent
-    /// of `discovery_cache_hits` and `discovery_cache_misses` -- the cache had
+    /// of `discovery_cache_hits` and `discovery_cache_misses`: the cache had
     /// no entry, but no full pull was needed either.
     pub discovery_head_first_skips: u64,
     /// (Tag, target) pairs skipped via immutable-glob match (zero API calls).
@@ -251,83 +248,76 @@ pub struct SyncStats {
 mod tests {
     use super::*;
 
+    fn image_result(status: ImageStatus, artifacts_skipped: bool) -> ImageResult {
+        ImageResult {
+            image_id: Uuid::now_v7(),
+            source: "src".into(),
+            target: "tgt".into(),
+            status,
+            bytes_transferred: 0,
+            blob_stats: BlobTransferStats::default(),
+            duration: Duration::ZERO,
+            artifacts_skipped,
+        }
+    }
+
     fn make_report(statuses: Vec<ImageStatus>) -> SyncReport {
         SyncReport {
             run_id: Uuid::now_v7(),
             images: statuses
                 .into_iter()
-                .map(|status| ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: "src".into(),
-                    target: "tgt".into(),
-                    status,
-                    bytes_transferred: 0,
-                    blob_stats: BlobTransferStats::default(),
-                    duration: Duration::ZERO,
-                    artifacts_skipped: false,
-                })
+                .map(|status| image_result(status, false))
                 .collect(),
             stats: SyncStats::default(),
             duration: Duration::ZERO,
         }
     }
 
-    #[test]
-    fn exit_code_empty_report() {
-        let report = SyncReport {
-            run_id: Uuid::now_v7(),
-            images: vec![],
-            stats: SyncStats::default(),
-            duration: Duration::ZERO,
-        };
-        assert_eq!(report.exit_code(), 0);
+    fn failed(kind: ErrorKind, error: &str, retries: u32, status_code: Option<u16>) -> ImageStatus {
+        ImageStatus::Failed {
+            kind,
+            error: error.into(),
+            retries,
+            status_code,
+        }
     }
 
     #[test]
-    fn exit_code_all_synced() {
-        let report = make_report(vec![ImageStatus::Synced, ImageStatus::Synced]);
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn exit_code_all_skipped() {
-        let report = make_report(vec![ImageStatus::Skipped {
-            reason: SkipReason::DigestMatch,
-        }]);
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn exit_code_mixed_success_and_failure() {
-        let report = make_report(vec![
-            ImageStatus::Synced,
-            ImageStatus::Failed {
-                kind: ErrorKind::BlobTransfer,
-                error: "timeout".into(),
-                retries: 3,
-                status_code: None,
-            },
-        ]);
-        assert_eq!(report.exit_code(), 1);
-    }
-
-    #[test]
-    fn exit_code_all_failed() {
-        let report = make_report(vec![
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPull,
-                error: "a".into(),
-                retries: 1,
-                status_code: None,
-            },
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPush,
-                error: "b".into(),
-                retries: 2,
-                status_code: None,
-            },
-        ]);
-        assert_eq!(report.exit_code(), 2);
+    fn exit_code_by_outcome() {
+        let cases = [
+            ("empty report", vec![], 0),
+            (
+                "all synced",
+                vec![ImageStatus::Synced, ImageStatus::Synced],
+                0,
+            ),
+            (
+                "all skipped",
+                vec![ImageStatus::Skipped {
+                    reason: SkipReason::DigestMatch,
+                }],
+                0,
+            ),
+            (
+                "mixed success and failure",
+                vec![
+                    ImageStatus::Synced,
+                    failed(ErrorKind::BlobTransfer, "timeout", 3, None),
+                ],
+                1,
+            ),
+            (
+                "all failed",
+                vec![
+                    failed(ErrorKind::ManifestPull, "a", 1, None),
+                    failed(ErrorKind::ManifestPush, "b", 2, None),
+                ],
+                2,
+            ),
+        ];
+        for (name, statuses, want) in cases {
+            assert_eq!(make_report(statuses).exit_code(), want, "{name}");
+        }
     }
 
     #[test]
@@ -346,39 +336,31 @@ mod tests {
     #[test]
     fn skip_reason_display() {
         assert_eq!(SkipReason::DigestMatch.to_string(), "digest match");
-    }
-
-    #[test]
-    fn skip_reason_display_immutable_tag() {
         assert_eq!(SkipReason::ImmutableTag.to_string(), "immutable tag");
     }
 
     #[test]
-    fn error_kind_display_manifest_pull() {
-        assert_eq!(ErrorKind::ManifestPull.to_string(), "manifest pull");
-    }
-
-    #[test]
-    fn error_kind_display_manifest_push() {
-        assert_eq!(ErrorKind::ManifestPush.to_string(), "manifest push");
-    }
-
-    #[test]
-    fn error_kind_display_blob_transfer() {
-        assert_eq!(ErrorKind::BlobTransfer.to_string(), "blob transfer");
-    }
-
-    #[test]
-    fn error_kind_display_artifact_sync() {
-        assert_eq!(ErrorKind::ArtifactSync.to_string(), "artifact sync");
-    }
-
-    #[test]
-    fn error_kind_display_required_artifacts_missing() {
-        assert_eq!(
-            ErrorKind::RequiredArtifactsMissing.to_string(),
-            "required artifacts missing"
-        );
+    fn error_kind_display_and_json() {
+        // (kind, Display text, JSON string)
+        let cases = [
+            (ErrorKind::ManifestPull, "manifest pull", "manifest_pull"),
+            (ErrorKind::ManifestPush, "manifest push", "manifest_push"),
+            (ErrorKind::BlobTransfer, "blob transfer", "blob_transfer"),
+            (ErrorKind::ArtifactSync, "artifact sync", "artifact_sync"),
+            (
+                ErrorKind::RequiredArtifactsMissing,
+                "required artifacts missing",
+                "required_artifacts_missing",
+            ),
+        ];
+        for (kind, display, json) in cases {
+            assert_eq!(kind.to_string(), display, "{json} display");
+            assert_eq!(
+                serde_json::to_value(&kind).unwrap(),
+                serde_json::Value::String(json.into()),
+                "{json} json"
+            );
+        }
     }
 
     #[test]
@@ -390,115 +372,54 @@ mod tests {
     }
 
     #[test]
-    fn error_kind_json_serialization() {
-        assert_eq!(
-            serde_json::to_value(ErrorKind::ManifestPull).unwrap(),
-            serde_json::Value::String("manifest_pull".into()),
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorKind::ManifestPush).unwrap(),
-            serde_json::Value::String("manifest_push".into()),
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorKind::BlobTransfer).unwrap(),
-            serde_json::Value::String("blob_transfer".into()),
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorKind::ArtifactSync).unwrap(),
-            serde_json::Value::String("artifact_sync".into()),
-        );
-        assert_eq!(
-            serde_json::to_value(ErrorKind::RequiredArtifactsMissing).unwrap(),
-            serde_json::Value::String("required_artifacts_missing".into()),
-        );
+    fn image_status_failed_json() {
+        // (name, error, retries, status_code)
+        let cases = [
+            ("no status code", "timeout", 3, None),
+            ("with status code", "unauthorized", 1, Some(401)),
+        ];
+        for (name, error, retries, status_code) in cases {
+            let json =
+                serde_json::to_value(failed(ErrorKind::ManifestPull, error, retries, status_code))
+                    .unwrap();
+            assert_eq!(json["status"], "failed", "{name}");
+            assert_eq!(json["kind"], "manifest_pull", "{name}");
+            assert_eq!(json["error"], error, "{name}");
+            assert_eq!(json["retries"], retries, "{name}");
+            match status_code {
+                Some(code) => assert_eq!(json["status_code"], code, "{name}"),
+                None => assert!(json.get("status_code").is_none(), "{name}: None is skipped"),
+            }
+        }
     }
 
     #[test]
-    fn image_status_failed_json_includes_kind() {
-        let status = ImageStatus::Failed {
-            kind: ErrorKind::ManifestPull,
-            error: "timeout".into(),
-            retries: 3,
-            status_code: None,
-        };
-        let json = serde_json::to_value(&status).unwrap();
-        assert_eq!(json["status"], "failed");
-        assert_eq!(json["kind"], "manifest_pull");
-        assert_eq!(json["error"], "timeout");
-        assert_eq!(json["retries"], 3);
-        assert!(json.get("status_code").is_none(), "None should be skipped");
+    fn image_result_json_artifacts_skipped() {
+        // (name, flag, expected JSON value; None means the key is omitted)
+        let cases = [("false", false, None), ("true", true, Some(true))];
+        for (name, flag, want) in cases {
+            let json = serde_json::to_value(image_result(ImageStatus::Synced, flag)).unwrap();
+            match want {
+                Some(v) => assert_eq!(json["artifacts_skipped"], v, "{name}"),
+                None => assert!(json.get("artifacts_skipped").is_none(), "{name}: omitted"),
+            }
+        }
     }
 
     #[test]
-    fn image_status_failed_json_includes_status_code() {
-        let status = ImageStatus::Failed {
-            kind: ErrorKind::ManifestPull,
-            error: "unauthorized".into(),
-            retries: 1,
-            status_code: Some(401),
-        };
-        let json = serde_json::to_value(&status).unwrap();
-        assert_eq!(json["status_code"], 401);
-    }
-
-    #[test]
-    fn image_result_json_omits_artifacts_skipped_when_false() {
-        let result = ImageResult {
-            image_id: Uuid::now_v7(),
-            source: "src".into(),
-            target: "tgt".into(),
-            status: ImageStatus::Synced,
-            bytes_transferred: 0,
-            blob_stats: BlobTransferStats::default(),
-            duration: Duration::ZERO,
-            artifacts_skipped: false,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert!(
-            json.get("artifacts_skipped").is_none(),
-            "artifacts_skipped=false should be omitted from JSON"
-        );
-    }
-
-    #[test]
-    fn image_result_json_includes_artifacts_skipped_when_true() {
-        let result = ImageResult {
-            image_id: Uuid::now_v7(),
-            source: "src".into(),
-            target: "tgt".into(),
-            status: ImageStatus::Synced,
-            bytes_transferred: 0,
-            blob_stats: BlobTransferStats::default(),
-            duration: Duration::ZERO,
-            artifacts_skipped: true,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(
-            json["artifacts_skipped"], true,
-            "artifacts_skipped=true should appear in JSON"
-        );
-    }
-
-    #[test]
-    fn sync_stats_json_omits_artifacts_skipped_when_zero() {
-        let stats = SyncStats::default();
-        let json = serde_json::to_value(&stats).unwrap();
-        assert!(
-            json.get("artifacts_skipped").is_none(),
-            "artifacts_skipped=0 should be omitted from JSON"
-        );
-    }
-
-    #[test]
-    fn sync_stats_json_includes_artifacts_skipped_when_nonzero() {
-        let stats = SyncStats {
-            artifacts_skipped: 3,
-            ..SyncStats::default()
-        };
-        let json = serde_json::to_value(&stats).unwrap();
-        assert_eq!(
-            json["artifacts_skipped"], 3,
-            "artifacts_skipped=3 should appear in JSON"
-        );
+    fn sync_stats_json_artifacts_skipped() {
+        // (name, count, expected JSON value; None means the key is omitted)
+        let cases = [("zero", 0, None), ("nonzero", 3, Some(3))];
+        for (name, count, want) in cases {
+            let stats = SyncStats {
+                artifacts_skipped: count,
+                ..SyncStats::default()
+            };
+            let json = serde_json::to_value(&stats).unwrap();
+            match want {
+                Some(v) => assert_eq!(json["artifacts_skipped"], v, "{name}"),
+                None => assert!(json.get("artifacts_skipped").is_none(), "{name}: omitted"),
+            }
+        }
     }
 }

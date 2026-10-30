@@ -1467,7 +1467,7 @@ async fn sync_leader_commits_before_follower_subscribes() {
 }
 
 /// Leader's manifest push fails (500). Followers waiting on the watch channel
-/// must unblock via `notify_repo_failed`, see `is_repo_committed` = false,
+/// must unblock via `notify_repo_failed`, find the repo not committed,
 /// and fall through to HEAD+push instead of deadlocking.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_leader_manifest_push_fails_follower_falls_through() {

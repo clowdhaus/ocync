@@ -9,9 +9,8 @@
 //!   `DiscoveryOutcome::Skip`; others become `TransferTask` entries for execution.
 //!
 //! - **Execution** futures transfer blobs and push manifests for each active
-//!   (tag, target) pair, bounded by a global `Semaphore`. Blob transfers use
-//!   progressive cache population: HEAD checks happen inline during execution
-//!   instead of in a separate plan phase.
+//!   (tag, target) pair, bounded by a global `Semaphore`. Blob existence is
+//!   checked inline during execution, progressively populating the cache.
 //!
 //! All concurrency is cooperative (single-threaded tokio runtime). Shared mutable
 //! state (`TransferStateCache`) is accessed via `Rc<RefCell<>>` with borrows
@@ -57,15 +56,11 @@ use crate::{
     BlobTransferStats, ErrorKind, ImageResult, ImageStatus, SkipReason, SyncReport, SyncStats,
 };
 
-/// Writes a JSONL timing event to the optional timing file.
+/// Writes a JSONL timing event (`{"phase":"<name>","elapsed_ms":<N>}`) to the
+/// optional `OCYNC_TIMING_FILE` benchmark file. No-ops when `file` is `None`.
 ///
-/// Used for benchmark instrumentation via `OCYNC_TIMING_FILE`. Each line is
-/// `{"phase":"<name>","elapsed_ms":<N>}`. No-ops when `file` is `None`.
-///
-/// `phase` must be an ASCII identifier (no quotes or backslashes).
-/// All call sites pass string literals, so this invariant is enforced at
-/// compile time. We avoid adding a `serde_json` dependency to this crate
-/// for a two-field diagnostic line.
+/// `phase` must be an ASCII identifier: it is written unescaped, which spares
+/// this crate a `serde_json` dependency for a two-field line.
 fn write_timing(file: &mut Option<std::fs::File>, phase: &str, start: &Instant) {
     if let Some(f) = file {
         use std::io::Write;
@@ -83,18 +78,13 @@ fn write_timing(file: &mut Option<std::fs::File>, phase: &str, start: &Instant) 
     }
 }
 
-/// An image reference within a single registry (repository name + tag).
+/// A repository and tag within one registry, displayed as `repo:tag`.
 ///
-/// Bundles the two fields that always travel together in discovery and
-/// transfer operations. The [`Display`] impl formats as `repo:tag`.
-///
-/// This is **not** a full OCI reference (which includes the registry hostname).
-/// The registry is tracked separately via the associated [`RegistryClient`].
+/// Not a full OCI reference: the registry is tracked separately via the
+/// associated [`RegistryClient`].
 #[derive(Debug, Clone)]
 struct ImageRef {
-    /// Repository path (e.g. `library/nginx`).
     repo: RepositoryName,
-    /// Tag name (e.g. `latest`, `1.25`).
     tag: String,
 }
 
@@ -106,9 +96,9 @@ impl fmt::Display for ImageRef {
 
 /// A registry identifier used as the blob deduplication key.
 ///
-/// Wraps the config-defined name (e.g. `us-ecr`) or bare hostname for
-/// ad-hoc commands. Must be unique per mapping - it is used as the outer
-/// key in the blob dedup map.
+/// The config-defined name (e.g. `us-ecr`) or the bare hostname for ad-hoc
+/// commands. Must be unique per mapping: it is the outer key of the blob
+/// dedup map.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegistryAlias(String);
 
@@ -132,18 +122,15 @@ impl fmt::Display for RegistryAlias {
     }
 }
 
-/// Resolved artifact sync configuration.
-///
-/// Controls whether the engine discovers and transfers OCI referrers
-/// (signatures, SBOMs, attestations) after syncing each image manifest.
+/// Resolved artifact sync configuration: whether the engine transfers OCI
+/// referrers (signatures, SBOMs, attestations) after each image manifest.
 #[derive(Debug, Clone)]
 pub struct ResolvedArtifacts {
     /// Whether artifact discovery and transfer is enabled.
     pub enabled: bool,
-    /// Only sync artifacts whose artifact type matches one of these MIME types.
-    /// Empty means all types pass.
+    /// Only artifact types in this list pass; empty means all pass.
     pub include: Vec<String>,
-    /// Exclude artifacts whose artifact type matches one of these MIME types.
+    /// Artifact types in this list never pass, even if also in `include`.
     pub exclude: Vec<String>,
     /// When true, images with no referrers cause a sync failure.
     pub require_artifacts: bool,
@@ -173,11 +160,8 @@ impl ResolvedArtifacts {
     }
 }
 
-/// A fully resolved mapping ready for the sync engine.
-///
-/// All config resolution (registry lookup, tag filtering) is done
-/// before constructing this type. The engine operates purely on
-/// resolved values.
+/// A fully resolved mapping ready for the sync engine: registry lookup and tag
+/// filtering are already done.
 #[derive(Debug)]
 pub struct ResolvedMapping {
     /// Source registry authority for cache key construction (e.g. `cgr.dev:443`).
@@ -194,49 +178,37 @@ pub struct ResolvedMapping {
     pub tags: Vec<TagPair>,
     /// Optional platform filter list (e.g., `["linux/amd64"]`).
     ///
-    /// When `Some`, index manifests are filtered to only include descriptors
-    /// whose platform matches one of the filters (using
-    /// [`Platform::matches()`]). Child manifests and blobs for non-matching
-    /// platforms are never pulled from the source.
+    /// When `Some`, index manifests keep only descriptors whose platform
+    /// matches a filter; child manifests and blobs for other platforms are
+    /// never pulled from the source.
     pub platforms: Option<Vec<PlatformFilter>>,
     /// When true, HEAD-check all targets against the source HEAD digest
-    /// before performing a full source manifest GET on cache miss.
-    ///
-    /// Conserves rate-limit tokens on source registries (e.g., Docker Hub)
-    /// by avoiding the expensive GET when all targets already have the
-    /// correct manifest. On cache hit the discovery optimization already
-    /// skips the GET; `head_first` extends that to the cold-cache path.
-    ///
-    /// The source HEAD from the discovery optimization is reused, so
-    /// enabling both features does not issue a redundant HEAD.
+    /// before the full source manifest GET on a cache miss, so a target that
+    /// is already in sync costs no source GET (saves rate-limit tokens on
+    /// registries such as Docker Hub). Reuses the discovery source HEAD.
     pub head_first: bool,
     /// Compiled glob pattern identifying immutable tags.
     ///
-    /// When a tag matches this pattern AND exists in every target's
-    /// [`existing_tags`](TargetEntry::existing_tags), the tag is skipped with
-    /// zero API calls. See the skip optimization hierarchy in the design docs.
+    /// A tag matching it that exists in every target's
+    /// [`existing_tags`](TargetEntry::existing_tags) is skipped with zero API
+    /// calls.
     pub immutable_glob: Option<globset::GlobSet>,
     /// Artifact sync configuration (shared across all tasks for this mapping).
     pub artifacts_config: Rc<ResolvedArtifacts>,
     /// Number of source tags considered before filtering. `None` on the
-    /// exact-tag fast path where source tags are not enumerated. Populated
-    /// on both real-sync and dry-run paths; `filter_report` is only Some on
-    /// dry-run.
+    /// exact-tag fast path where source tags are not enumerated.
     pub candidate_count: Option<usize>,
     /// Filter pipeline trace. `Some` only when `--dry-run` requested a report.
     pub filter_report: Option<crate::filter::FilterReport>,
 }
 
 impl ResolvedMapping {
-    /// Returns `true` when `tag` should be skipped via the immutable-tag
-    /// optimization: the tag matches the configured glob AND already exists
-    /// at every target.
+    /// Returns `true` when `tag` matches the configured immutable glob AND
+    /// already exists at every target.
     ///
-    /// Returns `false` (no skip) when:
-    /// - No `immutable_glob` is configured.
-    /// - The tag does not match the pattern.
-    /// - `targets` is empty (degenerate case; `.all()` on empty is `true`).
-    /// - Any target's `existing_tags` does not contain the tag.
+    /// Returns `false` when there is no glob, the tag does not match, any
+    /// target lacks the tag, or `targets` is empty (where `.all()` would be
+    /// vacuously `true`).
     pub fn should_skip_immutable(&self, tag: &str) -> bool {
         let Some(ref pattern) = self.immutable_glob else {
             return false;
@@ -249,29 +221,21 @@ impl ResolvedMapping {
 }
 
 /// A single target registry entry.
-///
-/// `name` must be unique across targets within a [`ResolvedMapping`] - it is
-/// used as the key in the blob deduplication map to track which blobs have
-/// already been transferred to each target.
 pub struct TargetEntry {
-    /// Registry identifier used as the blob dedup key.
-    ///
-    /// Must be unique per mapping. Typically the config-defined registry name
-    /// (e.g. `us-ecr`) or the bare hostname for ad-hoc commands.
+    /// Registry identifier and blob dedup key, unique per [`ResolvedMapping`]
+    /// (see [`RegistryAlias`]).
     pub name: RegistryAlias,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
-    /// Optional batch blob checker for this target (ECR batch API).
-    ///
-    /// When present, [`transfer_image_blobs`] pre-populates the cache via
-    /// a single batch call instead of per-blob HEAD checks.
+    /// Optional batch blob checker for this target (ECR batch API). When
+    /// present, one batch call pre-populates the cache instead of per-blob HEADs.
     pub batch_checker: Option<Rc<dyn BatchBlobChecker>>,
-    /// Tags already present at this target registry at resolution time.
+    /// Tags already present at this target at resolution time.
     ///
-    /// Populated when `immutable_glob` is configured on the parent
-    /// [`ResolvedMapping`]. Empty when the pattern is absent OR when
-    /// `list_tags` failed (degraded: the immutable skip is disabled
-    /// for this target, falling through to HEAD-based discovery).
+    /// Populated only when `immutable_glob` is configured on the parent
+    /// [`ResolvedMapping`]. Empty when it is absent or `list_tags` failed
+    /// (degraded: the immutable skip is disabled for this target and
+    /// discovery falls through to HEAD checks).
     pub existing_tags: HashSet<String>,
 }
 
@@ -297,10 +261,7 @@ impl fmt::Debug for TargetEntry {
     }
 }
 
-/// A source/target tag pair for syncing.
-///
-/// For most sync operations the source and target tags are identical.
-/// For `copy` with retagging they may differ.
+/// A source/target tag pair; the tags differ only for `copy` with retagging.
 #[derive(Debug, Clone)]
 pub struct TagPair {
     /// Tag name at the source registry.
@@ -330,7 +291,7 @@ impl TagPair {
 
 impl fmt::Display for TagPair {
     /// Renders as the bare tag when source and target match, otherwise
-    /// `source -> target`. Suitable for human-facing tag lists.
+    /// `source -> target`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.source == self.target {
             f.write_str(&self.source)
@@ -364,16 +325,11 @@ fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -
     }
 }
 
-/// Source manifest data pre-pulled once per tag.
-///
-/// Separating the source pull from the target push ensures manifests
-/// are fetched once regardless of target count (1:N fan-out).
+/// Source manifest data pulled once per tag, however many targets it fans out to.
 struct PulledManifest {
-    /// The top-level manifest (image or index).
     pull: ManifestPull,
-    /// For index manifests: pre-pulled child manifests, shared with every
-    /// other tag whose index lists the same child.
-    /// Empty for single-image manifests (blobs are derived from `pull.manifest`).
+    /// For index manifests: the pulled child manifests, shared with every
+    /// other tag whose index lists the same child. Empty for single images.
     children: Vec<Rc<ManifestPull>>,
 }
 
@@ -451,10 +407,7 @@ enum DiscoveryOutcome {
     Failed(Vec<ImageResult>),
 }
 
-/// Signal from `discover_tag()` indicating which discovery route was taken.
-///
-/// Used by the pipeline loop to accumulate per-route counters for
-/// `SyncStats` observability without polluting `DiscoveryOutcome`.
+/// Which route `discover_tag` took, counted into `SyncStats`.
 enum DiscoveryRoute {
     /// Source HEAD matched cache, no full source pull needed.
     CacheHit,
@@ -471,27 +424,20 @@ enum DiscoveryRoute {
 
 /// Elect leader images for mount optimization via greedy set-cover.
 ///
-/// Groups pending tasks by source image (tasks sharing the same
-/// [`PulledManifest`] via `Rc` target different registries for the same
-/// tag). Repeatedly picks the image that covers the most shared blob
-/// digests not already covered by previously elected leaders. Stops when
-/// no candidate provides marginal coverage.
+/// Tasks sharing a [`PulledManifest`] `Rc` are one source image bound to
+/// different targets. Repeatedly picks the image covering the most shared blob
+/// digests not already covered by earlier leaders, stopping when no candidate
+/// adds coverage. Leader tasks move to the front of the deque; two leaders
+/// sharing a blob are deduplicated by `ClaimAction::Wait` in
+/// `transfer_image_blobs` (the second waits, then mounts).
 ///
-/// All leader tasks are promoted to the front of the deque. The existing
-/// `ClaimAction::Wait` mechanism in [`transfer_image_blobs`] handles
-/// inter-leader blob deduplication: if two leaders share a blob, the
-/// second waits for the first's upload then mounts rather than
-/// re-uploading.
-///
-/// Returns the number of tasks promoted to the front of the deque as leaders
-/// (0 if no election benefit exists).
+/// Returns the number of tasks promoted as leaders (0 if election has no benefit).
 fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
     if pending.len() <= 1 {
         return 0;
     }
 
-    // Group tasks by source image. Tasks sharing an Rc<PulledManifest>
-    // represent the same source image bound to different target registries.
+    // Group tasks by source image (same `Rc<PulledManifest>`).
     let mut group_ptrs: Vec<usize> = Vec::new();
     let mut group_blobs: Vec<HashSet<Digest>> = Vec::new();
     let mut task_group: Vec<usize> = Vec::with_capacity(pending.len());
@@ -519,17 +465,12 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         return 0;
     }
 
-    // Greedy multi-leader election. Each round picks the image that
-    // maximizes marginal shared-blob coverage: for each remaining
-    // (non-leader) image, count blobs shared with the candidate that are
-    // not already in a previous leader's blob set.
-    //
-    // Implementation uses an inverted index `blob_remaining_count` that
-    // maps each blob to the number of remaining groups containing it.
-    // A candidate i's marginal contribution from a blob d (where d is
-    // not in `leader_blob_union`) is `count[d] - 1` -- the count of
-    // other remaining groups that share d with i. Total cost per round
-    // is O(n * b_avg) instead of the O(n^2 * b) of a pairwise scan.
+    // Each round picks the image with the most marginal shared-blob coverage.
+    // The inverted index `blob_remaining_count` maps each blob to the number
+    // of remaining groups containing it, so a candidate's marginal gain from a
+    // blob outside `leader_blob_union` is `count - 1`. That costs O(n * b_avg)
+    // per round instead of O(n^2 * b) for a pairwise scan; a cubic version hung
+    // production runs after discovery.
     let mut leader_set: Vec<usize> = Vec::new();
     let mut leader_blob_union: HashSet<Digest> = HashSet::new();
     let mut remaining: Vec<usize> = (0..num_groups).collect();
@@ -578,7 +519,6 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         return 0;
     }
 
-    // Log each leader's source reference.
     for &leader_idx in &leader_set {
         if let Some((pos, _)) = task_group
             .iter()
@@ -595,7 +535,7 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
         }
     }
 
-    // Stable partition: leader tasks first, then followers.
+    // Stable partition: leaders first, then followers.
     let mut leaders: VecDeque<TransferTask> = VecDeque::new();
     let mut followers: VecDeque<TransferTask> = VecDeque::new();
     for (task, &group) in pending.drain(..).zip(task_group.iter()) {
@@ -612,37 +552,30 @@ fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
     leader_count
 }
 
-/// Blob frequency tracker for ordering blobs by popularity.
-///
-/// Blobs shared across many images should be transferred first so the cache
-/// benefits the most follow-on images.
+/// Blob frequency tracker: blobs shared across many images are transferred
+/// first so the cache benefits the most follow-on images.
 struct BlobFrequencyMap {
     counts: HashMap<Digest, usize>,
 }
 
 impl BlobFrequencyMap {
-    /// Create an empty frequency map.
     fn new() -> Self {
         Self {
             counts: HashMap::new(),
         }
     }
 
-    /// Record a blob digest occurrence.
     fn record(&mut self, digest: &Digest) {
         *self.counts.entry(digest.clone()).or_insert(0) += 1;
     }
 
-    /// Return the frequency count for a digest (0 if unknown).
+    /// Frequency count for a digest (0 if unknown).
     fn count(&self, digest: &Digest) -> usize {
         self.counts.get(digest).copied().unwrap_or(0)
     }
 }
 
 /// Accumulates discovery route counters during the pipeline loop.
-///
-/// Groups the per-route counters that were previously separate `let mut`
-/// locals in `run()`, reducing variable count and centralizing the match.
 #[derive(Default)]
 struct DiscoveryCounters {
     /// Tags where source HEAD matched the tag-digest cache.
@@ -658,11 +591,8 @@ struct DiscoveryCounters {
 }
 
 impl DiscoveryCounters {
-    /// Record a discovery route, incrementing the appropriate counters.
-    ///
-    /// `HeadFailure` and `TargetStale` both increment `cache_misses` in
-    /// addition to their own counter because they represent cache misses
-    /// that were further classified by failure reason.
+    /// `HeadFailure` and `TargetStale` also count as `cache_misses`: they are
+    /// cache misses classified further by cause.
     fn record(&mut self, route: &DiscoveryRoute) {
         match route {
             DiscoveryRoute::CacheHit => self.cache_hits += 1,
@@ -682,35 +612,23 @@ impl DiscoveryCounters {
     }
 }
 
-/// Pipeline phase for leader-follower mount optimization.
+/// Pipeline phase, advancing monotonically `Discovering -> Done`.
 ///
-/// Tracks which group of tasks is currently being promoted into execution
-/// futures. The phase advances monotonically: `Discovering -> Done`.
-///
-/// Leaders are ordered first by `elect_leaders` so they acquire semaphore
-/// permits and claim blob uploads before followers. Two-level Notify
-/// synchronization ensures correctness:
-/// 1. Per-blob `Notify` via `ClaimAction::Wait`: followers wait for a
-///    leader's blob upload to complete before claiming the same blob.
-/// 2. Per-repo committed `Notify`: followers wait for the leader's
-///    manifest commit before attempting cross-repo mounts. ECR requires
-///    the source repo to have a committed manifest for mount to succeed.
+/// Leaders are ordered first by `elect_leaders` so they take semaphore
+/// permits and claim blob uploads before followers. Correctness then rests on
+/// two waits: a follower waits on a leader's per-blob claim
+/// (`ClaimAction::Wait`) before claiming the same blob, and on the leader's
+/// manifest commit before a cross-repo mount (ECR requires a committed
+/// manifest in the source repo for a mount to succeed).
 enum PromotionPhase {
     /// Discovery futures still in flight; tasks accumulate in `pending`.
     Discovering,
-    /// All tasks promoted (leaders and followers together); no further
-    /// phase transitions. Per-blob and per-repo-committed `Notify`
-    /// synchronization in `wait_for_blob_claim` ensures followers wait
-    /// for their specific leader blobs and manifest commits.
+    /// All tasks promoted, leaders and followers together.
     Done,
 }
 
-/// Borrowed references shared by the `promote` closure at each call site.
-///
-/// Groups the invariant engine state that every promoted task needs, keeping
-/// the closure signature to `(TransferTask, &PromoteContext, &[RepositoryName])`.
-///
-/// Created after discovery completes (once `freq_map` is frozen).
+/// Engine state every promoted task needs, borrowed by the `promote` closure.
+/// Created after discovery completes, once `freq_map` is frozen.
 struct PromoteContext<'a> {
     sem: &'a Rc<Semaphore>,
     cache: &'a Rc<RefCell<TransferStateCache>>,
@@ -720,32 +638,19 @@ struct PromoteContext<'a> {
     shared: &'a Rc<PerRun>,
 }
 
-/// Default cap for concurrent image transfers (Level 1: global image semaphore).
+/// Default cap for concurrent image transfers (the global image semaphore).
 ///
-/// Derivation: per-target `RegistryClient::blob_upload_sem` caps long-lived
-/// HTTP/2 blob streams at 64 (the lowest-common-denominator under registry
-/// `SETTINGS_MAX_CONCURRENT_STREAMS` of 100-128 minus metadata headroom).
-/// With [`BLOB_CONCURRENCY`] = 6 per image, an image-level cap of 10 gives
-/// 10 * 6 = 60 streaming attempts at saturation -- fits the 64-stream budget
-/// without thrashing on the semaphore. Higher image counts only help when
-/// most images skip / mount (no streaming), which is a workload-specific
-/// override the user can set in config.
-///
-/// Prior value of 50 was picked before we measured registry stream limits;
-/// at 50 * 6 = 300 streams it deadlocks HTTP/2 against every registry we
-/// probed (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`).
+/// Per-target `RegistryClient::blob_upload_sem` caps long-lived HTTP/2 blob
+/// streams at 64 (registries advertise `SETTINGS_MAX_CONCURRENT_STREAMS` of
+/// 100-128, less metadata headroom). With [`BLOB_CONCURRENCY`] = 6 per image,
+/// 10 images gives 10 * 6 = 60 streams at saturation, inside that budget.
+/// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
+/// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
+/// value only helps workloads that mostly skip or mount, via config.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 10;
 
-/// Maximum concurrent blob transfers within a single image.
-///
-/// Within a single image task, blobs are transferred via `FuturesUnordered`
-/// gated by a local `Semaphore(BLOB_CONCURRENCY)`. This bounds the number of
-/// simultaneous blob uploads/downloads per image while allowing the global
-/// semaphore to independently control total in-flight image tasks.
-///
-/// Matches skopeo's default (6). Across images, each `RegistryClient` caps
-/// uploads (`blob_upload_sem`) and downloads (`blob_download_sem`)
-/// independently.
+/// Maximum concurrent blob transfers within a single image (skopeo's default).
+/// Each `RegistryClient` separately caps uploads and downloads across images.
 const BLOB_CONCURRENCY: usize = 6;
 
 /// Default shutdown drain deadline in seconds.
@@ -754,28 +659,21 @@ const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 /// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
 ///
 /// Discovery and execution can each run for minutes without an image reaching
-/// a terminal state. Without a periodic callback the caller has no way to tell
-/// a slow run from a wedged one. 30 seconds is short enough to notice a stall
-/// and long enough that the callback is not itself the noise.
+/// a terminal state, so without a callback a slow run looks like a wedged one.
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 
-/// Sync engine - orchestrates concurrent image transfers across registries.
+/// Sync engine: orchestrates concurrent image transfers across registries.
 ///
 /// Discovery futures drain first via `tokio::select!`, then leader-follower
 /// election reorders pending tasks so images sharing the most blobs execute
-/// first (enabling cross-repo mounts for followers). The plan phase is
-/// eliminated entirely - progressive cache population replaces upfront
-/// batch HEAD checks.
+/// first (enabling cross-repo mounts for followers).
 #[derive(Debug)]
 pub struct SyncEngine {
     retry: RetryConfig,
     max_concurrent: usize,
     drain_deadline: Duration,
-    /// Timeout for the optimization source HEAD request. Default: 5 seconds.
     source_head_timeout: Duration,
-    /// Deadline for the per-blob mount-source wait. Default: 60 seconds.
     mount_source_wait_deadline: Duration,
-    /// Cadence for in-flight progress callbacks. Default: 30 seconds.
     heartbeat_interval: Duration,
     /// Whether the end-of-run prune may treat absent entries as deleted.
     prune_cache: bool,
@@ -784,8 +682,8 @@ pub struct SyncEngine {
 impl SyncEngine {
     /// Create a new sync engine with the given retry configuration and concurrency cap.
     ///
-    /// `max_concurrent` bounds the number of in-flight image sync futures in the
-    /// execute phase (default recommendation: 50).
+    /// `max_concurrent` bounds the in-flight image sync futures in the execute
+    /// phase (see [`DEFAULT_MAX_CONCURRENT_TRANSFERS`]).
     pub fn new(retry: RetryConfig, max_concurrent: usize) -> Self {
         Self {
             retry,
@@ -805,20 +703,17 @@ impl SyncEngine {
         self
     }
 
-    /// Set the timeout for the optimization source HEAD request.
-    ///
-    /// Default: 5 seconds. If the HEAD doesn't complete within this duration,
-    /// the engine falls through to the full source manifest pull.
+    /// Set the timeout for the optimization source HEAD request (default 5
+    /// seconds); on expiry the engine falls through to the full source pull.
     pub fn with_source_head_timeout(mut self, timeout: Duration) -> Self {
         self.source_head_timeout = timeout;
         self
     }
 
-    /// Configure the per-blob mount-source wait deadline.
+    /// Configure the per-blob mount-source wait deadline (default 60 seconds).
     ///
-    /// When a follower's resolver subscribes to a leader's manifest-commit
-    /// watch, the wait is bounded by this deadline. On expiry, the follower
-    /// falls back to push instead of hanging. Default 60 seconds.
+    /// A follower waiting on a leader's manifest-commit watch falls back to
+    /// push on expiry instead of hanging.
     pub fn with_mount_source_wait_deadline(mut self, deadline: Duration) -> Self {
         self.mount_source_wait_deadline = deadline;
         self
@@ -854,17 +749,16 @@ impl SyncEngine {
 
     /// Run the sync engine across all resolved mappings.
     ///
-    /// Orchestrates the pipelined loop: discovery futures feed active items into
-    /// a pending queue, execution futures drain them bounded by a semaphore.
-    /// Progress reporting happens as results arrive from either phase.
+    /// Discovery futures feed active items into a pending queue; execution
+    /// futures drain it, bounded by a semaphore.
     ///
-    /// `staging` enables disk-based blob reuse for multi-target mappings. Pass
-    /// [`BlobStage::disabled`] for single-target deployments to pay zero overhead.
+    /// `staging` enables disk-based blob reuse for multi-target mappings; pass
+    /// [`BlobStage::disabled`] for single-target runs to pay zero overhead.
     ///
-    /// If `shutdown` is `Some`, the engine will stop accepting new work when the
-    /// signal fires, drain in-flight transfers up to the configured drain deadline
-    /// (default: 25s, configurable via [`with_drain_deadline`](Self::with_drain_deadline)),
-    /// then return. Pass `None` to run to completion without shutdown handling.
+    /// If `shutdown` is `Some`, the engine stops accepting new work when the
+    /// signal fires, drains in-flight transfers up to the drain deadline
+    /// (default 25s, see [`with_drain_deadline`](Self::with_drain_deadline)),
+    /// then returns. `None` runs to completion.
     pub async fn run(
         &self,
         mappings: Vec<ResolvedMapping>,
@@ -897,27 +791,18 @@ impl SyncEngine {
         let mut drain_deadline: Option<tokio::time::Instant> = None;
         let mut discovery_counters = DiscoveryCounters::default();
 
-        // Leader-follower mount optimization state.
-        //
-        // `promotion_phase` tracks which stage of the pipeline we are in.
-        // After discovery completes, all tasks are promoted at once (leaders
-        // ordered first). Per-blob `Notify` handles synchronization.
         let mut promotion_phase = PromotionPhase::Discovering;
 
         // Budget circuit breaker: pause discovery when a source registry's
         // rate-limit remaining drops below 10% of the remaining discovery count.
-        // Execution continues for already-discovered images. Discovery resumes
-        // when a subsequent response shows the budget has refilled.
+        // Execution continues for already-discovered images, and discovery
+        // resumes once a response shows the budget has refilled.
         //
         // Pause is all-or-nothing: ANY source below threshold pauses ALL
-        // discovery (not just that source's mappings). This is a structural
-        // constraint -- `FuturesUnordered` doesn't support selective polling,
-        // so per-source pausing would require a different architecture.
-        // In practice, multi-source syncs with mixed rate-limited / unlimited
-        // registries are uncommon, and the anti-stall path prevents deadlock.
+        // discovery, because `FuturesUnordered` cannot poll selectively. The
+        // anti-stall resume (nothing executing) prevents deadlock.
         let mut discovery_paused = false;
-        // Collect unique source clients for rate-limit checking. Deduped by
-        // Arc pointer identity (same source registry = same client).
+        // Unique source clients, deduped by Arc pointer identity.
         let source_clients: Vec<Arc<RegistryClient>> = {
             let mut seen = HashSet::new();
             let mut clients = Vec::new();
@@ -931,18 +816,17 @@ impl SyncEngine {
 
         let mut immutable_tag_skips: u64 = 0;
 
-        // Liveness heartbeat. `interval` yields its first tick immediately;
-        // `reset` pushes it out a full period so the first callback lands
-        // after the run has actually been quiet for that long.
+        // `interval` yields its first tick immediately; `reset` pushes it out a
+        // full period so the first callback lands after the run has been quiet
+        // that long.
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.reset();
         // The `select!` branch only fires on a poll where no work was ready,
         // so a steady completion stream would starve it. This deadline is
-        // checked from the work arms too, which is what guarantees a cadence.
+        // also checked from the work arms, which guarantees a cadence.
         let mut next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
 
-        // Seed discovery with all (mapping, tag) pairs.
         for mapping in &mappings {
             for tag_pair in &mapping.tags {
                 // Tier 1: immutable tag skip (0 API calls).
@@ -995,7 +879,6 @@ impl SyncEngine {
             }
         }
 
-        // Helper closure: promote a task from `pending` into an execution future.
         let mount_source_wait_deadline = self.mount_source_wait_deadline;
         let promote = |item: TransferTask,
                        ctx: &PromoteContext<'_>|
@@ -1035,11 +918,10 @@ impl SyncEngine {
         };
 
         loop {
-            // Budget circuit breaker: check if discovery should resume.
-            // Resume when (a) budget has refilled above the threshold, or
-            // (b) nothing is executing - pending items cannot be promoted until
-            // all discovery completes, so execution draining means no progress
-            // is possible without resuming discovery.
+            // Resume discovery when (a) the budget has refilled above the
+            // threshold, or (b) nothing is executing: pending items are not
+            // promoted until discovery completes, so no progress is possible
+            // without resuming.
             if discovery_paused && !discovery_futures.is_empty() {
                 let remaining_discovery = discovery_futures.len() as u64;
                 let threshold = (remaining_discovery / 10).max(1);
@@ -1064,19 +946,12 @@ impl SyncEngine {
                 }
             }
 
-            // Promotion: accumulate during discovery, then promote all at once.
-            // Leaders are ordered first by `elect_leaders` so they acquire
-            // semaphore permits and claim blob uploads before followers.
-            // Followers that need a blob still in-flight will wait on the
-            // per-blob `Notify` via `ClaimAction::Wait` in `wait_for_blob_claim`,
-            // providing fine-grained synchronization without a coarse gate.
+            // Promote all pending tasks at once after discovery; `freq_map` is
+            // frozen from here, so `PromoteContext` can borrow it.
             if !shutting_down
                 && matches!(promotion_phase, PromotionPhase::Discovering)
                 && discovery_futures.is_empty()
             {
-                // All discovery complete - elect leaders and promote.
-                // `freq_map` is frozen from this point (no more discovery
-                // mutations), so `PromoteContext` can borrow it.
                 elect_leaders(&mut pending);
                 promotion_phase = PromotionPhase::Done;
                 write_timing(&mut timing_file, "discovery_complete", &run_start);
@@ -1114,12 +989,12 @@ impl SyncEngine {
                     }
                 }
                 _ = async {
-                    // Guard above ensures shutdown.is_some(); unwrap cannot panic.
+                    // The guard ensures shutdown.is_some().
                     shutdown.unwrap().notified().await
                 }, if shutdown.is_some()
                     && !shutting_down
-                    // Disable when all work is done - otherwise this branch
-                    // blocks the `else` exit path indefinitely.
+                    // Disabled when all work is done, or this branch would
+                    // block the `else` exit forever.
                     && !(discovery_futures.is_empty()
                         && execution_futures.is_empty()
                         && pending.is_empty()) =>
@@ -1134,7 +1009,7 @@ impl SyncEngine {
                     );
                 }
                 _ = async {
-                    // Guard above ensures drain_deadline.is_some(); unwrap cannot panic.
+                    // The guard ensures drain_deadline.is_some().
                     tokio::time::sleep_until(drain_deadline.unwrap()).await
                 }, if drain_deadline.is_some() && !execution_futures.is_empty() => {
                     tracing::warn!(
@@ -1155,8 +1030,7 @@ impl SyncEngine {
                             results.extend(skip_results);
                         }
                         DiscoveryOutcome::Active { items, skipped } => {
-                            // Record blob frequencies from the shared source data.
-                            // All items share the same Rc<PulledManifest> (pulled once per tag).
+                            // All items share one `Rc<PulledManifest>`, so the first suffices.
                             if let Some(first) = items.first() {
                                 for blob in blobs_from_manifest(&first.source_data) {
                                     freq_map.record(&blob.digest);
@@ -1176,7 +1050,6 @@ impl SyncEngine {
                         }
                     }
 
-                    // Budget circuit breaker: check if we should pause discovery.
                     if !discovery_paused && !discovery_futures.is_empty() {
                         let remaining_discovery = discovery_futures.len() as u64;
                         let threshold = (remaining_discovery / 10).max(1);
@@ -1201,14 +1074,12 @@ impl SyncEngine {
                         }
                     }
                 }
-                // Last in `biased` order: real work always pre-empts the
-                // heartbeat.
-                //
-                // The guard is the disjunction of the two work branches' own
-                // preconditions, and must stay that way. A looser guard (say,
-                // "discovery futures remain") leaves this branch enabled after
-                // shutdown has frozen discovery, which starves the `else` exit
-                // and hangs the engine for a whole interval.
+                // Last in `biased` order, so real work pre-empts the heartbeat.
+                // The guard must stay the disjunction of the two work branches'
+                // own preconditions: a looser one (say, "discovery futures
+                // remain") stays enabled after shutdown freezes discovery,
+                // starving the `else` exit and hanging the engine for a whole
+                // interval.
                 _ = heartbeat.tick(), if !execution_futures.is_empty()
                     || (!shutting_down && !discovery_paused && !discovery_futures.is_empty()) =>
                 {
@@ -1227,12 +1098,9 @@ impl SyncEngine {
 
         write_timing(&mut timing_file, "execution_complete", &run_start);
 
-        // Prune stale cache entries for tags/targets no longer in the mapping set.
-        // Prevents unbounded cache growth when source tags or targets are deleted.
-        //
-        // Skipped when the caller could not resolve everything: absence would
-        // then mean "failed this run", not "deleted from config", and pruning
-        // on it throws away cache state the next run has to re-earn.
+        // Prune cache entries for tags/targets no longer in the mapping set.
+        // Skipped when the caller could not resolve everything: absence then
+        // means "failed this run", not "deleted from config".
         if self.prune_cache {
             let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
@@ -1272,11 +1140,8 @@ impl SyncEngine {
     }
 }
 
-/// Parameters for [`discover_tag`], bundled to keep the argument count under
-/// clippy's limit while preserving readability.
-///
-/// Owns all data so it can be moved directly into the async discovery future
-/// without intermediate borrows.
+/// Parameters for [`discover_tag`]; owns all data so it moves into the async
+/// discovery future without borrows.
 struct DiscoveryParams {
     source_client: Arc<RegistryClient>,
     source_authority: RegistryAuthority,
@@ -1284,13 +1149,10 @@ struct DiscoveryParams {
     target: ImageRef,
     targets: Vec<TargetEntry>,
     retry: RetryConfig,
-    /// Optional platform filter list (e.g., `["linux/amd64"]`).
     platforms: Option<Vec<PlatformFilter>>,
     cache: Rc<RefCell<TransferStateCache>>,
     source_head_timeout: Duration,
-    /// When true, HEAD-check targets on cache miss before the full source GET.
     head_first: bool,
-    /// Artifact sync configuration (Rc-shared with mapping).
     artifacts_config: Rc<ResolvedArtifacts>,
     /// Work shared between tasks in this run.
     shared: Rc<PerRun>,
@@ -1298,22 +1160,15 @@ struct DiscoveryParams {
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
 ///
-/// Returns `(DiscoveryOutcome, DiscoveryRoute)` - the transfer outcome and a
-/// signal for which discovery path was taken (cache hit, miss, head failure, or
-/// stale).
-///
-/// The optimization flow:
-/// 1. HEAD source manifest with a short timeout
-/// 2. If HEAD succeeds, look up the tag digest cache
-/// 3. If cache hit (same source digest + platform key), HEAD-check all targets
-///    against the cached filtered digest
-/// 4. If all targets match, skip entirely (`CacheHit`)
-/// 5. If any target mismatches, full-pull for mismatched targets only (`TargetStale`)
-/// 6. If cache miss or HEAD failed, full-pull all targets (`CacheMiss` / `HeadFailure`)
-///
-/// When `platforms` is `Some`, index manifests are filtered to only include
-/// descriptors matching the given platform filters before pulling children.
-///
+/// Returns the outcome and which route was taken. The flow:
+/// 1. HEAD the source manifest with a short timeout.
+/// 2. If that succeeds, look up the tag digest cache.
+/// 3. On a hit (same source digest and platform key), HEAD-check all targets
+///    against the cached filtered digest.
+/// 4. All match: skip entirely (`CacheHit`). Some mismatch: full-pull for the
+///    mismatched targets only (`TargetStale`).
+/// 5. Cache miss or failed HEAD: full-pull for all targets (`CacheMiss` /
+///    `HeadFailure`).
 async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRoute) {
     let DiscoveryParams {
         source_client,
@@ -1332,7 +1187,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
     let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
 
-    // --- Step 1: HEAD source manifest with short timeout ---
+    // Step 1: HEAD the source manifest with a short timeout.
     let source_head_digest = match tokio::time::timeout(
         source_head_timeout,
         source_client.manifest_head(&source.repo, &source.tag),
@@ -1363,10 +1218,10 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         }
     };
 
-    // --- Steps 2-5: Cache lookup (only if HEAD succeeded) ---
+    // Steps 2-4: cache lookup, only if the HEAD succeeded.
     let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, &source.tag);
     if let Some(ref head_digest) = source_head_digest {
-        // Scoped borrow - dropped before any .await
+        // Borrow dropped before any .await.
         let cached = {
             let c = cache.borrow();
             c.source_snapshot(&snapshot_key).cloned()
@@ -1376,8 +1231,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             if *head_digest == snapshot.source_digest
                 && platform_key == snapshot.platform_filter_key
             {
-                // Source unchanged, config unchanged. Check targets against
-                // the cached filtered_digest.
                 let check = check_targets_against_digest(TargetCheckParams {
                     targets: &targets,
                     source: &source,
@@ -1394,7 +1247,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                     );
                 }
 
-                // Some targets stale - need full pull for those targets.
                 let outcome = full_pull_and_build_tasks(FullPullParams {
                     source_client: &source_client,
                     shared: &shared,
@@ -1415,25 +1267,15 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                 return (outcome, DiscoveryRoute::TargetStale);
             }
         }
-        // Cache miss or source/config changed - fall through.
     }
 
-    // --- head_first: HEAD targets on cache miss to avoid full source GET ---
+    // head_first: on a cache miss, HEAD-check all targets against the source
+    // HEAD digest (reused from step 1) before the full manifest GET, saving
+    // source rate-limit tokens when targets are already in sync.
     //
-    // When head_first is enabled and the source HEAD succeeded, HEAD-check
-    // all targets against the source HEAD digest before performing the
-    // expensive full manifest GET. This conserves source rate-limit tokens
-    // on cold cache when targets are already in sync.
-    //
-    // The source HEAD digest from the discovery optimization (step 1) is
-    // reused here, avoiding a redundant second HEAD.
-    //
-    // Limitation: platform filtering can change the pushed digest relative
-    // to the source HEAD digest. When platform filtering is active, the
-    // target holds a filtered index whose digest differs from the source
-    // HEAD digest, so the comparison would always miss. We skip the
-    // head_first check in that case (fall through to full pull, which
-    // handles filtered comparisons correctly).
+    // Skipped when platform filtering is active: the target then holds a
+    // filtered index whose digest differs from the source HEAD digest, so the
+    // comparison would always miss. The full pull compares filtered digests.
     if head_first && platforms.is_none() {
         if let Some(ref head_digest) = source_head_digest {
             let check = check_targets_against_digest(TargetCheckParams {
@@ -1446,19 +1288,17 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             .await;
 
             if check.mismatched.is_empty() {
-                // All targets match the source HEAD digest - skip entirely.
-                // No cache entry is written since we never pulled the full
-                // manifest (no filtered_digest available). In watch mode this
-                // means head_first fires every cycle for tags that remain in
-                // sync (1 source HEAD + N target HEADs per tag). The cache
-                // only warms when a manifest change forces a full pull.
+                // No cache entry is written: the full manifest was never pulled,
+                // so there is no filtered_digest. In watch mode head_first
+                // therefore fires every cycle for tags that stay in sync (1
+                // source HEAD + N target HEADs per tag) until a change forces
+                // a full pull.
                 return (
                     DiscoveryOutcome::Skip(check.skipped),
                     DiscoveryRoute::HeadFirstSkip,
                 );
             }
 
-            // Some targets stale - fall through to full pull for those targets.
             let outcome = full_pull_and_build_tasks(FullPullParams {
                 source_client: &source_client,
                 shared: &shared,
@@ -1480,7 +1320,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         }
     }
 
-    // --- Full pull path (cache miss, HEAD failed, or source changed) ---
+    // Full pull path: cache miss, HEAD failed, or source changed.
     let route = if source_head_digest.is_none() {
         DiscoveryRoute::HeadFailure
     } else {
@@ -1507,8 +1347,6 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     (outcome, route)
 }
 
-/// Parameters for [`full_pull_and_build_tasks`], bundled to keep the argument
-/// count under clippy's limit.
 /// Parameters for [`check_targets_against_digest`].
 struct TargetCheckParams<'a> {
     targets: &'a [TargetEntry],
@@ -1521,17 +1359,14 @@ struct TargetCheckParams<'a> {
 
 /// Result of [`check_targets_against_digest`].
 struct TargetCheckResult {
-    /// Targets whose HEAD matched the compare digest (skipped).
+    /// Targets whose HEAD matched the compare digest.
     skipped: Vec<ImageResult>,
     /// Targets whose HEAD did not match or failed (need sync).
     mismatched: Vec<TargetEntry>,
 }
 
-/// HEAD-check all targets concurrently against a known digest, partitioning
-/// them into matched (skipped) and mismatched (need sync).
-///
-/// Used by both the cache-hit path (comparing against the cached filtered
-/// digest) and the `head_first` path (comparing against the source HEAD digest).
+/// HEAD-check all targets concurrently against a known digest: the cached
+/// filtered digest on the cache-hit path, the source HEAD digest on `head_first`.
 async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCheckResult {
     let TargetCheckParams {
         targets,
@@ -1594,6 +1429,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
     }
 }
 
+/// Parameters for [`full_pull_and_build_tasks`].
 struct FullPullParams<'a> {
     source_client: &'a Arc<RegistryClient>,
     shared: &'a PerRun,
@@ -1611,9 +1447,7 @@ struct FullPullParams<'a> {
 }
 
 /// Full discovery: pull source manifest, HEAD-check targets, build transfer tasks.
-///
-/// Updates the tag digest cache on successful pull. Used by both the cache-miss
-/// path and the target-stale path (where only mismatched targets need tasks).
+/// Updates the tag digest cache on a successful pull.
 async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutcome {
     let FullPullParams {
         source_client,
@@ -1630,7 +1464,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         platform_key,
         artifacts_config,
     } = params;
-    // Pull source manifest (shared across all targets for this tag).
     let source_data = match pull_source_manifest(
         source_client,
         &source.repo,
@@ -1669,12 +1502,12 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     artifacts_skipped: false,
                 })
                 .collect();
-            // Do NOT update cache on pull failure.
+            // The cache is not updated on pull failure.
             return DiscoveryOutcome::Failed(fail_results);
         }
     };
 
-    // Update cache with fresh source data (regardless of target outcomes).
+    // Record the fresh source data regardless of target outcomes.
     if let Some(hd) = head_digest {
         let snapshot = SourceSnapshot {
             source_digest: hd.clone(),
@@ -1688,7 +1521,6 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     let source_digest = &source_data.pull.digest;
 
-    // HEAD-check all targets concurrently.
     let mut head_checks = FuturesUnordered::new();
     for entry in targets {
         let client = Arc::clone(&entry.client);
@@ -1780,8 +1612,8 @@ async fn execute_item(
 
     if let Some(err) = outcome.error {
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
-        // Unblock any followers waiting for this repo's manifest commit so
-        // they fall through to HEAD+push.
+        // Unblock followers waiting on this repo's manifest commit; they
+        // fall through to HEAD+push.
         cache
             .borrow_mut()
             .notify_repo_failed(&item.target_name, &item.target.repo);
@@ -1802,20 +1634,17 @@ async fn execute_item(
         };
     }
 
-    // Push manifests (children first, then top-level by tag).
     let outcome = RefCell::new(outcome);
     let pushed = push_manifests(&ctx, &item, &outcome).await;
     let outcome = outcome.into_inner();
     match pushed {
         Ok(()) => {
-            // Mark this repo as having a committed manifest so it becomes
-            // a valid cross-repo mount source. ECR requires a committed
-            // manifest in the source repo for mount to succeed.
+            // The repo now has a committed manifest, so it is a valid
+            // cross-repo mount source.
             cache
                 .borrow_mut()
                 .mark_repo_committed(&item.target_name, &item.target.repo);
 
-            // Discover and sync artifacts (signatures, SBOMs, attestations).
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
                 Err(err) => {
@@ -1876,8 +1705,7 @@ async fn execute_item(
             }
         }
         Err(err) => {
-            // Unblock any followers waiting for this repo's manifest commit
-            // so they fall through to HEAD+push.
+            // Unblock followers waiting on this repo's manifest commit.
             cache
                 .borrow_mut()
                 .notify_repo_failed(&item.target_name, &item.target.repo);
@@ -1928,15 +1756,12 @@ async fn execute_item(
     }
 }
 
-/// Pull all source manifest data for a single tag.
+/// Pull all source manifest data for a single tag: the manifest, plus the
+/// child manifests for an index.
 ///
-/// For image manifests, returns just the manifest. For index manifests,
-/// also pulls all child manifests.
-///
-/// When `platforms` is `Some`, index manifests are filtered to only include
-/// descriptors whose platform matches one of the filter strings. Only
-/// matching child manifests are pulled, and the index's `raw_bytes` are
-/// re-serialized to reflect only the kept descriptors.
+/// When `platforms` is `Some`, only matching children are pulled and the
+/// index's `raw_bytes` and digest are re-serialized to list only the kept
+/// descriptors, so targets receive the filtered index.
 async fn pull_source_manifest(
     client: &RegistryClient,
     repo: &RepositoryName,
@@ -1955,7 +1780,6 @@ async fn pull_source_manifest(
     let children = match &pull.manifest {
         ManifestKind::Image(_) => Vec::new(),
         ManifestKind::Index(index) => {
-            // When platform filters are active, only pull children for matching platforms.
             let descriptors: Vec<&Descriptor> = if let Some(filters) = platforms {
                 let total = index.manifests.len();
                 let kept: Vec<&Descriptor> = index
@@ -2006,10 +1830,9 @@ async fn pull_source_manifest(
                 index.manifests.iter().collect()
             };
 
-            // Pull all child manifests concurrently. On single-threaded
-            // tokio these share the same event loop, so the registry's AIMD
-            // controller naturally limits concurrency. A child shared with
-            // another tag's index is pulled once per run.
+            // Children are pulled concurrently; the registry's AIMD controller
+            // limits the real concurrency. A child shared with another tag's
+            // index is pulled once per run.
             let child_futures: Vec<_> = descriptors
                 .iter()
                 .map(|child_desc| {
@@ -2040,9 +1863,6 @@ async fn pull_source_manifest(
                 .collect();
             let children = futures_util::future::try_join_all(child_futures).await?;
 
-            // When platform filtering is active, rebuild the index manifest with
-            // only the matching descriptors. The raw_bytes and digest must be
-            // recomputed so targets receive the filtered index.
             if platforms.is_some() && descriptors.len() != index.manifests.len() {
                 let filtered_index = ImageIndex {
                     schema_version: index.schema_version,
@@ -2100,14 +1920,17 @@ fn child_blobs(child: &ManifestPull) -> Vec<&Descriptor> {
     }
 }
 
-/// Write-only view of the transfer state cache for use inside the
-/// per-image blob semaphore.
+/// Write-only view of the transfer state cache for use under the per-image
+/// blob semaphore.
 ///
 /// Exposes completion/failure signals and repo management but NOT wait
-/// primitives (`unresolved_watches_for`, `claim_blob_upload`). This boundary
-/// is the structural guarantee against semaphore-exhaustion deadlocks:
-/// code holding a permit literally cannot block on external signals because
-/// the type does not expose the methods needed to do so.
+/// primitives (`unresolved_watches_for`, `claim_blob_upload`). External waits
+/// (`Notify::notified()`, `watch::wait_for()`) must never hold a permit: if all
+/// `BLOB_CONCURRENCY` permits sat in external waits, no other blob could make
+/// progress. Code holding a permit therefore cannot block on external signals,
+/// because the type has no method to do so. All such waits run before the
+/// permit is taken (`wait_for_blob_claim`, `resolve_mount_source`,
+/// `resolve_staging`).
 struct BlobSink<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
     target_name: &'a RegistryAlias,
@@ -2145,12 +1968,8 @@ impl<'a> BlobSink<'a> {
     }
 }
 
-/// I/O context for blob transfer operations under the semaphore.
-///
-/// Provides access to registry clients and the write-only [`BlobSink`]
-/// for cache updates. Does NOT provide access to cache read/wait methods,
-/// making it structurally impossible to block on external signals while
-/// holding a semaphore permit.
+/// I/O context for blob transfers under the semaphore: registry clients plus
+/// the write-only [`BlobSink`], with no cache read/wait access.
 struct BlobIoContext<'a> {
     sink: BlobSink<'a>,
     /// Failed copies in this run, written when this task's copy fails.
@@ -2228,28 +2047,20 @@ impl<'a> BlobIoContext<'a> {
     }
 }
 
-/// Pre-semaphore staging resolution. The staging dedup wait
-/// (`Notify::notified()`) runs outside the semaphore via
-/// [`resolve_staging`], preventing permit exhaustion.
+/// Result of the pre-semaphore staging resolution ([`resolve_staging`]).
 enum StagingClaim<'a> {
-    /// Staging disabled -- use direct source-pull + target-push.
+    /// Staging disabled: direct source pull + target push.
     Disabled,
-    /// Blob already staged by another task -- read from disk.
+    /// Blob already staged by another task: read from disk.
     Staged,
-    /// This task claimed the source pull -- pull and stage, then push.
+    /// This task claimed the source pull: pull and stage, then push.
     /// Dropping the claim on any path wakes tasks waiting on this digest.
     Pull(ClaimGuard<'a, Digest, ()>),
 }
 
-/// Context for transferring blobs from source to a single target.
-///
-/// Bundles the parameters needed by [`transfer_image_blobs`] to keep
-/// the function signature under the clippy argument limit.
-///
-/// Used in the pre-semaphore phase (claim, mount-source resolution,
-/// staging claim) where full cache access is needed. After the semaphore
-/// is acquired, [`BlobIoContext`] provides a restricted view that
-/// prevents external waits.
+/// Context for transferring blobs from source to a single target, with full
+/// cache access for the pre-semaphore phase (claim, mount-source resolution,
+/// staging claim). Under the semaphore, [`BlobIoContext`] replaces it.
 struct TransferContext<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
     /// Work shared between tasks in this run.
@@ -2262,7 +2073,6 @@ struct TransferContext<'a> {
     target_client: &'a RegistryClient,
     target_name: &'a RegistryAlias,
     target_repo: &'a RepositoryName,
-    /// Optional batch blob checker for pre-populating the cache.
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
     /// Per-blob deadline for mount-source resolution.
     mount_source_wait_deadline: Duration,
@@ -2270,33 +2080,25 @@ struct TransferContext<'a> {
 
 /// Transfer all blobs for a single image to one target.
 ///
-/// Uses progressive cache population: checks cache first, then tries cross-repo
-/// mount, then HEAD check at target, and finally falls back to pull+push.
-/// Blobs are sorted by descending frequency so the most-shared blobs populate
-/// the cache first.
+/// Per blob: cache check, then cross-repo mount, then HEAD at the target,
+/// then pull+push. Blobs are sorted by descending frequency so the
+/// most-shared blobs populate the cache first.
 async fn transfer_image_blobs(
     ctx: &TransferContext<'_>,
     mut blobs: Vec<&Descriptor>,
     freq_counts: &HashMap<Digest, usize>,
 ) -> TargetBlobOutcome {
-    // Sort by descending frequency (most-shared first for maximum cache benefit).
-    // Rust's sort_by is stable, so blobs with equal frequency preserve their
-    // original manifest order (config first, then layers).
+    // The sort is stable: equal frequencies keep manifest order (config first).
     blobs.sort_by(|a, b| {
         let fa = freq_counts.get(&a.digest).copied().unwrap_or(0);
         let fb = freq_counts.get(&b.digest).copied().unwrap_or(0);
         fb.cmp(&fa)
     });
 
-    // Batch existence check: when a batch checker is available, check all
-    // blobs upfront in a single API call and pre-populate the cache. The
-    // per-blob loop then hits cache at Step 1 for existing blobs and skips
-    // the per-blob HEAD at Step 3 for absent blobs (both were already
-    // checked by the batch API, so per-blob HEAD is redundant).
-    //
-    // TOCTOU: a blob could appear between the batch-check and the per-blob
-    // push loop. This is harmless - the redundant push succeeds because
-    // the registry deduplicates on content-addressable digest.
+    // With a batch checker, check all blobs in one call and pre-populate the
+    // cache: the per-blob loop then hits cache for existing blobs and skips
+    // the HEAD for absent ones. A blob appearing after the check is harmless:
+    // the redundant push succeeds because the registry deduplicates by digest.
     let batch_checked: HashSet<Digest> = if let Some(checker) = ctx.batch_checker {
         let all_digests: Vec<Digest> = blobs.iter().map(|b| b.digest.clone()).collect();
         match checker
@@ -2304,9 +2106,7 @@ async fn transfer_image_blobs(
             .await
         {
             Ok(existence) => {
-                // Record the known digests so the per-blob loop skips HEAD
-                // for absent blobs too. A digest the check left unknown still
-                // gets its HEAD.
+                // A digest the check left unknown still gets its HEAD.
                 let total = all_digests.len();
                 let checked: HashSet<Digest> = all_digests
                     .iter()
@@ -2323,10 +2123,9 @@ async fn transfer_image_blobs(
                     "batch check pre-populated cache"
                 );
                 let mut c = ctx.cache.borrow_mut();
-                // Only a blob the check confirms present is trusted: an
-                // earlier run's entry for any other is dropped, since the
-                // repository may have lost it. A missing blob is pushed; one
-                // the check left unknown gets its HEAD.
+                // Only a blob the check confirms present is trusted: an earlier
+                // run's entry for any other is dropped, since the repository
+                // may have lost it.
                 c.forget_remembered_blobs(
                     ctx.target_name,
                     ctx.target_repo,
@@ -2343,11 +2142,9 @@ async fn transfer_image_blobs(
                     error = %e,
                     "batch check failed, falling back to per-blob HEAD"
                 );
-                // Graceful degradation: every blob gets a per-blob HEAD, an
-                // earlier run's entries included. A HEAD goes to the
-                // registry, not the API that failed, and trusting those
-                // entries would instead wait out the manifest commit gate
-                // on that API for a blob that may be gone.
+                // Degrade to a HEAD per blob, earlier runs' entries included:
+                // trusting them would wait out the manifest commit gate on the
+                // failed API for a blob that may be gone.
                 ctx.cache.borrow_mut().forget_remembered_blobs(
                     ctx.target_name,
                     ctx.target_repo,
@@ -2360,7 +2157,6 @@ async fn transfer_image_blobs(
         HashSet::new()
     };
 
-    // Transfer blobs concurrently, capped by BLOB_CONCURRENCY.
     let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
     let cancel = Cell::new(false);
     let mut blob_futures = FuturesUnordered::new();
@@ -2373,11 +2169,7 @@ async fn transfer_image_blobs(
         let cancel = &cancel;
         let batch = &batch_checked;
         blob_futures.push(async move {
-            // === PRE-SEMAPHORE PHASE ===
-            //
-            // All external waits (Notify, watch) run here where no
-            // semaphore permit is held. `ctx` (full TransferContext with
-            // cache read/wait access) is only used in this phase.
+            // Pre-semaphore phase: all external waits run here, with no permit held.
             let claim = wait_for_blob_claim(ctx, &digest, cancel).await;
             match claim {
                 BlobClaim::Skipped => return BlobResult::Skipped,
@@ -2388,13 +2180,8 @@ async fn transfer_image_blobs(
             let mount_source = resolve_mount_source(ctx, &digest).await;
             let staging_claim = resolve_staging(ctx.staging, &digest).await;
 
-            // === SEMAPHORE BOUNDARY ===
-            //
-            // `run_under_semaphore` takes `BlobIoContext` (not
-            // `TransferContext`), so `ctx` is unreachable inside the
-            // permit scope. `BlobSink` has no unresolved_watches_for,
-            // no claim_blob_upload -- adding an external wait inside the
-            // semaphore is a compile error.
+            // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
+            // so `ctx` is unreachable inside the permit scope.
             let _permit = sem.acquire().await.unwrap();
             run_under_semaphore(
                 &BlobIoContext::from_ctx(ctx),
@@ -2422,8 +2209,8 @@ async fn transfer_image_blobs(
             BlobResult::Failed(err) => {
                 cancel.set(true);
                 outcome.error = Some(err);
-                // Don't break - drain remaining futures so permits are
-                // released and cancel flag takes effect.
+                // No break: drain the remaining futures so permits are
+                // released and the cancel flag takes effect.
             }
         }
     }
@@ -2433,9 +2220,9 @@ async fn transfer_image_blobs(
 
 /// Result of the pre-semaphore blob claim phase.
 enum BlobClaim {
-    /// Blob already exists at target -- skip.
+    /// Blob already exists at target: skip.
     Skipped,
-    /// Cancel flag was set -- abort.
+    /// Cancel flag was set: abort.
     Cancelled,
     /// Blob claimed for upload by this task.
     Claimed,
@@ -2462,17 +2249,14 @@ fn is_local_io(err: &crate::Error) -> bool {
     false
 }
 
-/// Cache check + atomic claim, run OUTSIDE the per-image blob semaphore.
-///
-/// Step 1: skip if blob is already present at our repo.
-/// Step 2: `claim_or_wait` loop -- atomic check-and-claim against the cache,
-/// with `notify.notified().await` between iterations.
+/// Cache check + atomic claim, run OUTSIDE the per-image blob semaphore:
+/// skip if the blob is already at our repo, else loop on an atomic
+/// check-and-claim, awaiting the holder's notify between iterations.
 async fn wait_for_blob_claim(
     ctx: &TransferContext<'_>,
     digest: &Digest,
     cancel: &Cell<bool>,
 ) -> BlobClaim {
-    // Step 1: blob already at our repo -> skip.
     let skip = {
         let c = ctx.cache.borrow();
         c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
@@ -2481,8 +2265,8 @@ async fn wait_for_blob_claim(
         return BlobClaim::Skipped;
     }
 
-    // Step 2: atomic check-and-claim. A copy that already failed between the
-    // same repos fails this one too, unless a mount can avoid the copy.
+    // A copy that already failed between the same repos fails this one too,
+    // unless a mount can avoid the copy.
     loop {
         if cancel.get() {
             return BlobClaim::Cancelled;
@@ -2511,8 +2295,7 @@ async fn wait_for_blob_claim(
                     "waiting for in-flight upload of this blob to finish",
                 );
                 notify.notified().await;
-                // Re-check skip on wake -- a batch_check could have populated
-                // our repo's state during the wait. Otherwise loop and re-claim.
+                // A batch check may have populated our repo's state during the wait.
                 let skip = {
                     let c = ctx.cache.borrow();
                     c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
@@ -2527,13 +2310,8 @@ async fn wait_for_blob_claim(
     }
 }
 
-/// Resolve staging dedup claim, run OUTSIDE the per-image blob semaphore.
-///
-/// The wait (`Notify::notified()`) blocks until another task finishes
-/// pulling the same blob from source. Running it under the semaphore
-/// would consume a permit for the entire duration of another task's
-/// source pull, contributing to the same semaphore-exhaustion deadlock
-/// class as blob claim waits and repo-committed waits.
+/// Resolve the staging dedup claim, run OUTSIDE the per-image blob semaphore:
+/// the wait lasts as long as another task's source pull (see [`BlobSink`]).
 async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> StagingClaim<'a> {
     if !staging.is_enabled() {
         return StagingClaim::Disabled;
@@ -2552,15 +2330,12 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
 
 /// Cross-repo mount-source resolver with bounded deadline.
 ///
-/// Loops until either (a) a mount source emerges, (b) all candidate
-/// repos resolve without committing, or (c) the deadline expires. Returns
-/// the mount source to attempt, or `None` if the caller should fall back to
-/// push.
+/// Loops until (a) a mount source emerges, (b) all candidate repos resolve
+/// without committing, or (c) the deadline expires. Returns the mount source
+/// to attempt, or `None` if the caller should fall back to push.
 ///
-/// The wait runs OUTSIDE the per-image blob semaphore; see
-/// `wait_for_blob_claim` for the parallel reasoning. `select_all` is
-/// cancel-safe; if the per-blob future is dropped (engine cancellation),
-/// all watches release cleanly.
+/// Runs OUTSIDE the per-image blob semaphore (see [`BlobSink`]). `select_all`
+/// is cancel-safe: dropping the per-blob future releases all watches.
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
@@ -2616,10 +2391,8 @@ async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
 
 /// Entry point for the semaphore-bounded phase of blob transfer.
 ///
-/// Takes [`BlobIoContext`] (not [`TransferContext`]), making it impossible
-/// to call cache wait methods (`unresolved_watches_for`, `claim_blob_upload`)
-/// inside the semaphore scope. This is the compile-time enforcement boundary
-/// against semaphore-exhaustion deadlocks.
+/// Takes [`BlobIoContext`], not [`TransferContext`]: this signature is the
+/// compile-time boundary that keeps cache wait methods out of the semaphore scope.
 async fn run_under_semaphore(
     io: &BlobIoContext<'_>,
     digest: &Digest,
@@ -2643,12 +2416,8 @@ async fn run_under_semaphore(
 
 /// Transfer a claimed blob to one target: mount, HEAD, pull+push.
 ///
-/// The blob MUST already be claimed via [`wait_for_blob_claim`]. This
-/// function runs under the per-image blob semaphore to bound concurrent
-/// I/O. All `RefCell` borrows are dropped before `await` points.
-///
-/// Called via [`run_under_semaphore`], which is the type boundary that
-/// prevents cache wait methods from being accessible inside the semaphore.
+/// The blob MUST already be claimed via [`wait_for_blob_claim`]. Runs under
+/// the per-image blob semaphore, reached through [`run_under_semaphore`].
 async fn transfer_claimed_blob(
     io: &BlobIoContext<'_>,
     digest: &Digest,
@@ -2671,12 +2440,9 @@ async fn transfer_claimed_blob(
             }
             Ok(MountResult::NotMounted) | Err(_) => {
                 debug!(%digest, %from_repo, target = %io.sink.target_name, "mount not fulfilled, falling back to HEAD+push");
-                // Mark the stale mount source as failed for this repo, but
-                // keep the upload claim. This task already owns the claim
-                // and will proceed with HEAD+push. Marking stale prevents
-                // future mount attempts from retrying it, while keeping the
-                // claim prevents concurrent waiters from re-claiming and
-                // starting duplicate pushes.
+                // Mark the source stale so later tasks do not retry it, but
+                // keep the upload claim so concurrent waiters do not re-claim
+                // and start duplicate pushes.
                 io.sink.mark_repo_stale(digest, &from_repo);
             }
         }
@@ -2710,7 +2476,6 @@ async fn transfer_claimed_blob(
 
     let transfer_result: Result<(), crate::Error> = match staging {
         StagingClaim::Pull(guard) => {
-            // This task claimed the source pull. Pull to disk, then push.
             if let Err(e) = with_retry(io.retry, "blob pull (to stage)", || async {
                 let mut writer =
                     io.staging
@@ -2749,25 +2514,19 @@ async fn transfer_claimed_blob(
 
             push_staged_blob(io, digest).await
         }
-        StagingClaim::Staged => {
-            // Another task already staged this blob. Read from disk, push.
-            push_staged_blob(io, digest).await
-        }
-        StagingClaim::Disabled => {
-            // No staging -- direct pull from source + push to target.
-            with_retry(io.retry, "blob transfer", || async {
-                let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
-                io.target_client
-                    .blob_push_stream(io.target_repo, digest, Some(size), stream)
-                    .await
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| crate::Error::BlobTransfer {
-                digest: digest.clone(),
-                source: e,
-            })
-        }
+        StagingClaim::Staged => push_staged_blob(io, digest).await,
+        StagingClaim::Disabled => with_retry(io.retry, "blob transfer", || async {
+            let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
+            io.target_client
+                .blob_push_stream(io.target_repo, digest, Some(size), stream)
+                .await
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::Error::BlobTransfer {
+            digest: digest.clone(),
+            source: e,
+        }),
     };
 
     match transfer_result {
@@ -2820,14 +2579,10 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
 /// When `batch_checker` is `Some` AND `retry.manifest_commit_wait` is
 /// non-zero, calls [`BatchBlobChecker::wait_for_blobs_available`] on every
 /// blob referenced by the manifests this task pushes (the image, or the
-/// children it claimed) BEFORE issuing any manifest `PUT`. This eliminates
-/// the `BLOB_UPLOAD_UNKNOWN` race for targets whose consistency view lags
-/// blob upload (ECR specifically) -- it gates the commit on the
-/// authoritative blob-visibility API rather than relying on retry budget
-/// alone. An index whose children were all pushed by other tasks needs no
-/// wait. Targets without a batch checker (everything except ECR) skip the
-/// wait entirely; setting `manifest_commit_wait` to `Duration::ZERO` also
-/// skips the wait.
+/// children it claimed) BEFORE any manifest `PUT`. That gates the commit on
+/// the authoritative blob-visibility API, closing the `BLOB_UPLOAD_UNKNOWN`
+/// race on targets whose consistency view lags blob upload (ECR). An index
+/// whose children were all pushed by other tasks needs no wait.
 async fn push_manifests(
     ctx: &TransferContext<'_>,
     item: &TransferTask,
@@ -2868,8 +2623,8 @@ async fn push_manifests(
         .collect();
     wait_for_commit(item, retry, &digests).await;
 
-    // Push claimed children concurrently. join_all, not try_join_all: a
-    // transient failure on one child must not cancel the others.
+    // join_all, not try_join_all: a transient failure on one child must not
+    // cancel the others.
     let pushes = claimed.into_iter().map(|(child, guard)| async move {
         let outcome = push_manifest(ctx, &child.digest.to_string(), child, Some(outcome))
             .await
@@ -2898,16 +2653,13 @@ async fn push_manifests(
         result?;
     }
 
-    // Push top-level manifest by tag.
     push_manifest(ctx, &item.target.tag, &source_data.pull, Some(outcome)).await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
 /// has a batch checker (production: ECR) and `manifest_commit_wait` is
 /// non-zero. ECR's manifest validator can lag blob PUT-201s; on timeout the
-/// push goes ahead and `with_retry` catches any residual
-/// `BLOB_UPLOAD_UNKNOWN`, so a stuck consistency view is surfaced through
-/// the same retry accounting as any other transient failure.
+/// push goes ahead and `with_retry` catches any residual `BLOB_UPLOAD_UNKNOWN`.
 async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Digest]) {
     let Some(checker) = item.batch_checker.as_deref() else {
         return;
@@ -3032,26 +2784,11 @@ fn settle_blobs(
 
 /// Discover referrers for a synced manifest and transfer matching artifacts.
 ///
-/// Implements the two-step fallback described in the design doc:
-/// 1. Try the referrers API (`GET /v2/{repo}/referrers/{digest}`)
-/// 2. If 404, try tag fallback (`GET /v2/{repo}/manifests/{algo}-{hex}`)
-/// 3. If neither works, log INFO and continue (no artifacts available)
-///
-/// For each matching artifact: push blobs, then push manifest (preserving
-/// the `subject` reference to the parent).
-///
-/// When `batch_checker` is present (production: ECR targets), each artifact
-/// runs the same two-phase batch-check protocol as `transfer_image_blobs`
-/// and `push_manifests`:
-/// - Pre-blob: `check_blob_existence` over all artifact blob digests to
-///   skip per-blob HEAD round-trips.
-/// - Pre-manifest: `wait_for_blobs_available` to gate the artifact
-///   manifest PUT on the same ECR consistency view that protects the
-///   main image manifest PUT.
-///
-/// Within an artifact, blobs are pulled+pushed concurrently capped at
-/// [`BLOB_CONCURRENCY`] so multi-blob artifacts (config + layers) don't
-/// serialise unnecessarily.
+/// Discovery tries the referrers API, then the tag fallback on 404; if
+/// neither works, no artifacts are available. Each matching artifact's blobs
+/// are pushed, then its manifest (preserving the `subject` reference to the
+/// parent). With a `batch_checker`, an artifact follows the same batch-check
+/// protocol as an image (see `transfer_image_blobs` and `push_manifests`).
 ///
 /// Returns `Ok(true)` when artifact discovery was skipped due to a transient
 /// error (the image synced but artifacts may be missing at the target).
@@ -3077,9 +2814,8 @@ async fn discover_and_sync_artifacts(
     .await?;
     let discovery_succeeded = !matches!(referrers, Referrers::Failed);
 
-    // Filter matching descriptors. When `artifact_type` is None (e.g. for
-    // tag-fallback single-manifest referrers), falls back to media_type per
-    // OCI 1.1 artifact guidance.
+    // A descriptor without `artifact_type` (e.g. a tag-fallback single
+    // manifest) is matched on its media_type, per OCI 1.1 artifact guidance.
     let matching: Vec<&Descriptor> = match referrers {
         Referrers::Found(ref index) => index
             .manifests
@@ -3095,8 +2831,7 @@ async fn discover_and_sync_artifacts(
         Referrers::NotFound | Referrers::Failed => Vec::new(),
     };
 
-    // require_artifacts enforcement: only fire when we successfully confirmed
-    // zero referrers, not when discovery itself failed (transient error).
+    // Fires only on confirmed zero referrers, not on a failed discovery.
     if artifacts_config.require_artifacts && matching.is_empty() && discovery_succeeded {
         return Err(crate::Error::RequiredArtifactsMissing {
             reference: parent_digest.to_string(),
@@ -3104,8 +2839,7 @@ async fn discover_and_sync_artifacts(
     }
 
     if matching.is_empty() {
-        // Transient discovery failure -> artifacts_skipped = true.
-        // Successful discovery with zero referrers -> false.
+        // A failed discovery reports artifacts_skipped; zero referrers does not.
         return Ok(!discovery_succeeded);
     }
 
@@ -3149,7 +2883,7 @@ async fn sync_artifact(
     let source_repo = &item.source.repo;
     let artifact_digest_str = desc.digest.to_string();
 
-    // Pull the artifact manifest from source, once per run across targets.
+    // Pulled once per run across targets.
     let pull_key = source_key(source_client, source_repo, &desc.digest);
     let artifact_pull = run_once(&shared.artifact_pulls, pull_key, || async {
         with_retry(retry, "artifact manifest pull", || {
@@ -3181,8 +2915,7 @@ async fn sync_artifact(
 
     wait_for_commit(item, retry, &blob_digests).await;
 
-    // Push artifact manifest by digest (not by tag). Its blob work stays
-    // out of the image's report, like the copy above.
+    // Pushed by digest, not tag; its blob work stays out of the image's report.
     push_manifest(ctx, &artifact_digest_str, &artifact_pull, None)
         .await
         .map_err(|e| crate::Error::ArtifactSync {
@@ -3199,22 +2932,19 @@ async fn sync_artifact(
     Ok(())
 }
 
-/// Discover referrers for a manifest from the source registry.
-///
-/// Tries the referrers API first, falls back to the tag-based lookup.
+/// Discover referrers for a manifest from the source registry: the referrers
+/// API first, then the tag-based fallback on 404.
 async fn discover_referrers(
     source_client: &RegistryClient,
     source_repo: &RepositoryName,
     parent_digest: &Digest,
 ) -> Referrers {
-    // Step 1: Try referrers API.
     match source_client
         .referrers(source_repo, parent_digest, None)
         .await
     {
         Ok(Some(index)) => Referrers::Found(index),
         Ok(None) => {
-            // 404 - try tag fallback (step 2).
             let fallback_tag = parent_digest.tag_fallback();
             debug!(
                 repo = %source_repo,
@@ -3229,10 +2959,9 @@ async fn discover_referrers(
                 Ok(pull) => match pull.manifest {
                     ManifestKind::Index(index) => Referrers::Found(*index),
                     ManifestKind::Image(_) => {
-                        // A single image manifest at the fallback tag is
-                        // itself an artifact referrer. Wrap in a synthetic
-                        // single-entry index so the filter + transfer loop
-                        // handles it uniformly.
+                        // A single image manifest at the fallback tag is itself
+                        // a referrer; wrap it in a synthetic one-entry index so
+                        // the filter and transfer loop treat it uniformly.
                         let desc = Descriptor {
                             media_type: pull.media_type.clone(),
                             digest: pull.digest.clone(),
@@ -3260,7 +2989,6 @@ async fn discover_referrers(
                     Referrers::NotFound
                 }
                 Err(e) => {
-                    // Non-404 error on fallback is not fatal; log and continue.
                     debug!(
                         repo = %source_repo,
                         digest = %parent_digest,
@@ -3272,8 +3000,7 @@ async fn discover_referrers(
             }
         }
         Err(e) => {
-            // Non-404 error from referrers API. Log and continue rather
-            // than failing the entire image sync for an artifact query.
+            // A failed artifact query must not fail the image sync.
             debug!(
                 repo = %source_repo,
                 digest = %parent_digest,
@@ -3287,17 +3014,13 @@ async fn discover_referrers(
 
 /// Read a file in 256 KB chunks, yielding a stream of `Bytes`.
 ///
-/// Uses synchronous `std::fs::Read` internally. On a single-threaded tokio
-/// runtime, each individual read call blocks for microseconds (local disk),
-/// which is negligible compared to network RTT.
-///
 /// # Assumption: local filesystem
 ///
-/// This function performs blocking I/O on the tokio `current_thread` runtime.
-/// The staging directory MUST reside on local disk (tmpfs, ext4, APFS, etc.).
-/// Network filesystems (NFS, EFS, CIFS) can block for milliseconds to seconds
-/// per read, stalling the entire event loop. See [`BlobStage`] documentation
-/// for staging path requirements.
+/// Reads are blocking `std::fs::Read` calls on the `current_thread` runtime:
+/// microseconds on local disk, negligible next to network RTT. The staging
+/// directory MUST therefore be on local disk (tmpfs, ext4, APFS); a network
+/// filesystem (NFS, EFS, CIFS) can block for milliseconds to seconds per read
+/// and stall the whole event loop. See [`BlobStage`] for staging path requirements.
 fn file_read_stream(
     file: std::fs::File,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> {
@@ -3364,67 +3087,53 @@ mod tests {
     }
 
     #[test]
-    fn collect_blobs_config_and_layers() {
-        let config_digest = test_digest("c0");
-        let layer1_digest = test_digest("a1");
-        let layer2_digest = test_digest("b2");
+    fn collect_image_blobs_orders_config_first_then_layers() {
+        // (name, config (suffix, size), layers, want (suffix, size) in order)
+        type Blob = (&'static str, u64);
+        let cases: [(&str, Blob, Vec<Blob>, Vec<Blob>); 2] = [
+            (
+                "config then two layers keep manifest order",
+                ("c0", 50),
+                vec![("a1", 200), ("b2", 300)],
+                vec![("c0", 50), ("a1", 200), ("b2", 300)],
+            ),
+            (
+                "config alone when there are no layers",
+                ("cc", 42),
+                vec![],
+                vec![("cc", 42)],
+            ),
+        ];
+        for (name, (cfg, cfg_size), layers, want) in cases {
+            let manifest = ImageManifest {
+                schema_version: 2,
+                media_type: None,
+                config: Descriptor {
+                    size: cfg_size,
+                    ..test_descriptor(test_digest(cfg), MediaType::OciConfig)
+                },
+                layers: layers
+                    .iter()
+                    .map(|&(suffix, size)| Descriptor {
+                        size,
+                        ..test_descriptor(test_digest(suffix), MediaType::OciLayerGzip)
+                    })
+                    .collect(),
+                subject: None,
+                artifact_type: None,
+                annotations: None,
+            };
 
-        let config_desc = Descriptor {
-            size: 50,
-            ..test_descriptor(config_digest.clone(), MediaType::OciConfig)
-        };
-        let layer1_desc = Descriptor {
-            size: 200,
-            ..test_descriptor(layer1_digest.clone(), MediaType::OciLayerGzip)
-        };
-        let layer2_desc = Descriptor {
-            size: 300,
-            ..test_descriptor(layer2_digest.clone(), MediaType::OciLayerGzip)
-        };
-
-        let manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: config_desc,
-            layers: vec![layer1_desc, layer2_desc],
-            subject: None,
-            artifact_type: None,
-            annotations: None,
-        };
-
-        let blobs = collect_image_blobs(&manifest);
-        assert_eq!(blobs.len(), 3);
-        assert_eq!(blobs[0].digest, config_digest);
-        assert_eq!(blobs[0].size, 50);
-        assert_eq!(blobs[1].digest, layer1_digest);
-        assert_eq!(blobs[1].size, 200);
-        assert_eq!(blobs[2].digest, layer2_digest);
-        assert_eq!(blobs[2].size, 300);
-    }
-
-    #[test]
-    fn collect_blobs_no_layers() {
-        let config_digest = test_digest("cc");
-
-        let config_desc = Descriptor {
-            size: 42,
-            ..test_descriptor(config_digest.clone(), MediaType::OciConfig)
-        };
-
-        let manifest = ImageManifest {
-            schema_version: 2,
-            media_type: None,
-            config: config_desc,
-            layers: vec![],
-            subject: None,
-            artifact_type: None,
-            annotations: None,
-        };
-
-        let blobs = collect_image_blobs(&manifest);
-        assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].digest, config_digest);
-        assert_eq!(blobs[0].size, 42);
+            let got: Vec<(Digest, u64)> = collect_image_blobs(&manifest)
+                .iter()
+                .map(|d| (d.digest.clone(), d.size))
+                .collect();
+            let want: Vec<(Digest, u64)> = want
+                .iter()
+                .map(|&(suffix, size)| (test_digest(suffix), size))
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
@@ -3441,40 +3150,43 @@ mod tests {
     }
 
     #[test]
-    fn compute_stats_mixed_results() {
-        let images = vec![
-            make_image_result(ImageStatus::Synced, 1024),
-            make_image_result(
-                ImageStatus::Skipped {
-                    reason: SkipReason::DigestMatch,
-                },
-                0,
+    fn compute_stats_counts_each_status_and_sums_synced_bytes() {
+        // want: (synced, skipped, failed, bytes_transferred)
+        let cases = [
+            (
+                "one of each status; only the synced image's bytes count",
+                vec![
+                    make_image_result(ImageStatus::Synced, 1024),
+                    make_image_result(
+                        ImageStatus::Skipped {
+                            reason: SkipReason::DigestMatch,
+                        },
+                        0,
+                    ),
+                    make_image_result(
+                        ImageStatus::Failed {
+                            kind: ErrorKind::BlobTransfer,
+                            error: "timeout".into(),
+                            retries: 3,
+                            status_code: None,
+                        },
+                        0,
+                    ),
+                ],
+                (1, 1, 1, 1024),
             ),
-            make_image_result(
-                ImageStatus::Failed {
-                    kind: ErrorKind::BlobTransfer,
-                    error: "timeout".into(),
-                    retries: 3,
-                    status_code: None,
-                },
-                0,
-            ),
+            ("no images gives all zeros", vec![], (0, 0, 0, 0)),
         ];
-
-        let stats = compute_stats(&images);
-        assert_eq!(stats.images_synced, 1);
-        assert_eq!(stats.images_skipped, 1);
-        assert_eq!(stats.images_failed, 1);
-        assert_eq!(stats.bytes_transferred, 1024);
-    }
-
-    #[test]
-    fn compute_stats_empty() {
-        let stats = compute_stats(&[]);
-        assert_eq!(stats.images_synced, 0);
-        assert_eq!(stats.images_skipped, 0);
-        assert_eq!(stats.images_failed, 0);
-        assert_eq!(stats.bytes_transferred, 0);
+        for (name, images, want) in cases {
+            let stats = compute_stats(&images);
+            let got = (
+                stats.images_synced,
+                stats.images_skipped,
+                stats.images_failed,
+                stats.bytes_transferred,
+            );
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
@@ -3559,7 +3271,7 @@ mod tests {
         assert!(!is_local_io(&registry));
     }
 
-    // --- elect_leaders tests ---
+    // elect_leaders
 
     /// Build a `PulledManifest` with the given blob digests (first = config, rest = layers).
     fn test_pulled_manifest(blob_suffixes: &[&str]) -> PulledManifest {
@@ -3640,32 +3352,34 @@ mod tests {
     }
 
     #[test]
-    fn elect_leaders_empty_deque() {
-        let mut pending = VecDeque::new();
-        let n = elect_leaders(&mut pending);
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn elect_leaders_single_task() {
-        let data = Rc::new(test_pulled_manifest(&["c1", "a1"]));
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(data, "img1"));
-        let n = elect_leaders(&mut pending);
-        assert_eq!(n, 0);
+    fn elect_leaders_returns_zero_without_election_benefit() {
+        let cases: [(&str, Vec<Vec<&str>>); 3] = [
+            ("empty deque", vec![]),
+            ("a single task", vec![vec!["c1", "a1"]]),
+            (
+                "three images with disjoint blob sets",
+                vec![vec!["c1", "aa"], vec!["c2", "bb"], vec!["c3", "cc"]],
+            ),
+        ];
+        for (name, images) in cases {
+            let mut pending: VecDeque<TransferTask> = images
+                .iter()
+                .enumerate()
+                .map(|(i, blobs)| {
+                    test_task(Rc::new(test_pulled_manifest(blobs)), &format!("img{i}"))
+                })
+                .collect();
+            assert_eq!(elect_leaders(&mut pending), 0, "{name}");
+        }
     }
 
     #[test]
     fn elect_leaders_picks_most_shared() {
-        // base:    blobs {c0, a1, a2, a3} - 4 blobs, base layer image
-        // child_a: blobs {c0, a1, a2, d1} - shares 3 with base, 2 with child_b
-        // child_b: blobs {c0, a1, a3, e1} - shares 3 with base, 2 with child_a
+        // base:    {c0, a1, a2, a3}, shares 3 with each child
+        // child_a: {c0, a1, a2, d1}, shares 2 with child_b
+        // child_b: {c0, a1, a3, e1}
         //
-        // Scoring (sum of |intersection| with each other image):
-        //   base:    |base^child_a|=3 + |base^child_b|=3 = 6
-        //   child_a: |child_a^base|=3 + |child_a^child_b|=2 = 5
-        //   child_b: |child_b^base|=3 + |child_b^child_a|=2 = 5
-        // base wins.
+        // Sum of intersections: base 6, children 5 each, so base wins.
         let data_base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
         let data_ca = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
         let data_cb = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
@@ -3677,15 +3391,13 @@ mod tests {
 
         let n = elect_leaders(&mut pending);
 
-        // base is the sole leader (score 6 > 5).
         assert_eq!(n, 1);
         assert_eq!(pending[0].source.tag, "base");
-        // Leader blobs are base's: {c0, a1, a2, a3}.
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4);
         assert!(leader_blobs.contains(&test_digest("c0")));
         assert!(leader_blobs.contains(&test_digest("a3")));
-        // Followers preserve original order.
+        // Followers keep their original order.
         assert_eq!(pending[1].source.tag, "child_a");
         assert_eq!(pending[2].source.tag, "child_b");
     }
@@ -3709,15 +3421,8 @@ mod tests {
 
     #[test]
     fn elect_leaders_multi_target_groups_by_rc() {
-        // "base" image targets 2 registries (2 tasks, same Rc).
-        // "child_a" and "child_b" derive from base.
-        //
-        // base:    blobs {c0, a1, a2, a3} - shares 3 with each child
-        // child_a: blobs {c0, a1, a2, d1} - shares 3 with base, 2 with child_b
-        // child_b: blobs {c0, a1, a3, e1} - shares 3 with base, 2 with child_a
-        //
-        // base scores 6, children score 5 each. base elected.
-        // base has 2 tasks -> n = 2.
+        // Same blob sets as `elect_leaders_picks_most_shared`, but base targets
+        // two registries (two tasks sharing one Rc), so electing it yields n = 2.
         let base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
         let child_a = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
         let child_b = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
@@ -3726,7 +3431,6 @@ mod tests {
         let client_b = test_client();
 
         let mut pending = VecDeque::new();
-        // Two tasks sharing the same Rc (same source image, two targets).
         pending.push_back(TransferTask {
             source_data: Rc::clone(&base),
             source_client: Arc::clone(&client_a),
@@ -3766,7 +3470,6 @@ mod tests {
 
         let n = elect_leaders(&mut pending);
 
-        // base wins (score 6 vs 5). Both base tasks are leaders.
         assert_eq!(n, 2);
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4); // {c0, a1, a2, a3}
@@ -3778,9 +3481,7 @@ mod tests {
 
     #[test]
     fn elect_leaders_two_clusters() {
-        // Cluster 1: images A and B share blobs {c0, f1}
-        // Cluster 2: images C and D share blobs {c9, f2}
-        // No overlap between clusters.
+        // Cluster 1: A and B share {c0, f1}. Cluster 2: C and D share {c9, f2}.
         let data_a = Rc::new(test_pulled_manifest(&["c0", "f1", "a1"]));
         let data_b = Rc::new(test_pulled_manifest(&["c0", "f1", "b1"]));
         let data_c = Rc::new(test_pulled_manifest(&["c9", "f2", "d1"]));
@@ -3794,16 +3495,13 @@ mod tests {
 
         let n = elect_leaders(&mut pending);
 
-        // Two leaders (one per cluster), two followers.
         assert_eq!(n, 2);
-        // Leader blobs span both clusters.
         let leader_blobs = leader_blob_digests(&pending, n);
         assert!(
             leader_blobs.len() >= 4,
             "leader blobs should span both clusters"
         );
 
-        // Leaders are at the front.
         let leader_tags: Vec<&str> = pending
             .iter()
             .take(n)
@@ -3815,12 +3513,10 @@ mod tests {
             .map(|t| t.source.tag.as_str())
             .collect();
 
-        // Each cluster contributes one leader: A or B from cluster 1, C or D from cluster 2.
-        // The follower from each cluster is the other member.
         assert_eq!(leader_tags.len(), 2);
         assert_eq!(follower_tags.len(), 2);
 
-        // Verify leaders come from different clusters.
+        // One leader per cluster.
         let cluster1 = ["imgA", "imgB"];
         let cluster2 = ["imgC", "imgD"];
         assert!(
@@ -3832,21 +3528,11 @@ mod tests {
 
     #[test]
     fn elect_leaders_marginal_coverage_across_rounds() {
-        // A spans both clusters via blob c0. Round 1 elects A. Round 2
-        // must deduct A's blobs from marginal scores: C and D share
-        // {c0, d0}, but c0 is already covered - only d0 is marginal.
+        // A spans both clusters via blob c0, so round 1 elects A (score 4 vs
+        // 2, 3, 3). Round 2 must deduct A's blobs: C and D share {c0, d0}, but
+        // c0 is covered, leaving d0 as their only marginal blob (1 each, B 0).
         //
         // A: {a0, b0, c0}  B: {a0, b0, e0}  C: {c0, d0, f0}  D: {c0, d0, fa}
-        //
-        // Round 1 scores:
-        //   A: |A^B|=2 + |A^C|=1 + |A^D|=1 = 4  (wins)
-        //   B: 2, C: 3, D: 3
-        //
-        // Round 2 (covered = {a0,b0,c0}):
-        //   B: |B^C\covered|=0 + |B^D\covered|=0 = 0
-        //   C: |C^B\covered|=0 + |C^D\covered|=|{d0}|=1 = 1
-        //   D: |D^B\covered|=0 + |D^C\covered|=|{d0}|=1 = 1
-        //   C or D elected (tie on d0). B stays follower.
         let data_a = Rc::new(test_pulled_manifest(&["a0", "b0", "c0"]));
         let data_b = Rc::new(test_pulled_manifest(&["a0", "b0", "e0"]));
         let data_c = Rc::new(test_pulled_manifest(&["c0", "d0", "f0"]));
@@ -3860,9 +3546,8 @@ mod tests {
 
         let n = elect_leaders(&mut pending);
 
-        // Two leaders: A (round 1) + one of C/D (round 2, marginal on d0).
+        // A (round 1) + one of C/D (round 2, marginal on d0).
         assert_eq!(n, 2);
-        // Leader blobs include A's {a0,b0,c0} + winner's {c0,d0,f0 or fa}.
         let leader_blobs = leader_blob_digests(&pending, n);
         assert!(leader_blobs.contains(&test_digest("a0")));
         assert!(leader_blobs.contains(&test_digest("d0")));
@@ -3873,10 +3558,8 @@ mod tests {
             .map(|t| t.source.tag.as_str())
             .collect();
 
-        // A is always first leader.
         assert_eq!(leader_tags[0], "imgA");
-        // Second leader is from cluster 2 (C or D), not B - because B
-        // shares no marginal blobs after A's {a0,b0,c0} are deducted.
+        // Not B: it shares no marginal blobs once A's {a0,b0,c0} are deducted.
         assert!(
             leader_tags[1] == "imgC" || leader_tags[1] == "imgD",
             "second leader should be from cluster 2, got: {leader_tags:?}"
@@ -3885,13 +3568,8 @@ mod tests {
 
     #[test]
     fn elect_leaders_tie_breaks_deterministically() {
-        // A and B have identical sharing with C. max_by_key returns the
-        // last maximum in iteration order, so B (higher index) wins.
-        //
-        // A: {a0, b0}  B: {a0, b0}  C: {a0, c0}
-        // A: |A^B|=2 + |A^C|=1 = 3
-        // B: |B^A|=2 + |B^C|=1 = 3   (tie with A)
-        // C: |C^A|=1 + |C^B|=1 = 2
+        // A: {a0, b0}  B: {a0, b0}  C: {a0, c0}. A and B tie, and
+        // max_by_key returns the last maximum, so B (higher index) wins.
         let data_a = Rc::new(test_pulled_manifest(&["a0", "b0"]));
         let data_b = Rc::new(test_pulled_manifest(&["a0", "b0"]));
         let data_c = Rc::new(test_pulled_manifest(&["a0", "c0"]));
@@ -3904,7 +3582,6 @@ mod tests {
 
             let n = elect_leaders(&mut pending);
             assert_eq!(n, 1);
-            // max_by_key picks last maximum: B (index 1) over A (index 0).
             assert_eq!(
                 pending[0].source.tag, "imgB",
                 "tie should break deterministically in favor of later candidate"
@@ -3914,20 +3591,10 @@ mod tests {
 
     #[test]
     fn elect_leaders_minimal_set_covers_all_follower_shared_blobs() {
-        // Verify the greedy election picks the minimal leader set such that
-        // every shared blob of every follower is present in the leader union.
-        //
-        // Setup: 5 images with overlapping blob sets designed so that 2
-        // leaders suffice to cover all shared blobs.
-        //
-        // img1: {10, a1, a2, a3, f1}  -- shares a1,a2,a3 broadly
-        // img2: {20, a1, a2, f2}       -- shares a1,a2 with img1
-        // img3: {30, a2, a3, f3}       -- shares a2,a3 with img1
-        // img4: {40, b4, b5, f4}       -- disjoint cluster
-        // img5: {50, b4, b5, f5}       -- shares b4,b5 with img4
-        //
-        // Optimal: img1 covers {a1,a2,a3} for cluster 1, img4 or img5 covers
-        // {b4,b5} for cluster 2. Two leaders total.
+        // The greedy election picks the minimal leader set such that every
+        // shared blob of every follower is in the leader union. Two clusters
+        // ({img1, img2, img3} sharing a1..a3, {img4, img5} sharing b4, b5)
+        // need exactly two leaders.
         let data1 = Rc::new(test_pulled_manifest(&["10", "a1", "a2", "a3", "f1"]));
         let data2 = Rc::new(test_pulled_manifest(&["20", "a1", "a2", "f2"]));
         let data3 = Rc::new(test_pulled_manifest(&["30", "a2", "a3", "f3"]));
@@ -3943,17 +3610,13 @@ mod tests {
 
         let n = elect_leaders(&mut pending);
 
-        // Exactly 2 leaders: one per cluster.
         assert_eq!(
             n, 2,
             "should elect exactly 2 leaders for 2 disjoint clusters"
         );
 
-        // Collect the leader blob union.
         let leader_blobs = leader_blob_digests(&pending, n);
 
-        // Verify every shared blob of every follower is in the leader union.
-        // Shared blobs are those appearing in more than one image.
         let all_blob_sets: Vec<HashSet<Digest>> = pending
             .iter()
             .map(|t| {
@@ -3969,7 +3632,7 @@ mod tests {
                 .into_iter()
                 .map(|d| d.digest.clone())
                 .collect();
-            // A blob is "shared" if it appears in at least one other image.
+            // Shared means present in at least one other image.
             for blob in &follower_blobs {
                 let shared_with_others = all_blob_sets
                     .iter()
@@ -3989,12 +3652,9 @@ mod tests {
 
     #[test]
     fn elect_leaders_scales_subcubically() {
-        // Regression test for the cubic blow-up that caused production
-        // sync runs to hang silently at 100% CPU after the discovery
-        // phase. With 75 disjoint pairs (n=150 distinct source manifests)
-        // the greedy loop runs one round per pair; an O(n^3) version
-        // takes hundreds of milliseconds, while a sub-cubic version
-        // finishes in under 50ms.
+        // With 75 disjoint pairs (n=150 distinct source manifests) the greedy
+        // loop runs one round per pair: an O(n^3) version takes hundreds of
+        // milliseconds, a sub-cubic one under 50ms.
         let n_pairs: usize = 75;
         let mut counter: usize = 0;
         let mut next = || {
@@ -4023,8 +3683,7 @@ mod tests {
         let leader_count = elect_leaders(&mut pending);
         let elapsed = start.elapsed();
 
-        // One leader per pair: after the first member of a pair is
-        // elected, the other member's marginal coverage drops to 0.
+        // Electing one member of a pair drops the other's marginal coverage to 0.
         assert_eq!(leader_count, n_pairs, "expected one leader per pair");
         assert!(
             elapsed < Duration::from_millis(500),
@@ -4032,87 +3691,109 @@ mod tests {
         );
     }
 
-    // --- ResolvedArtifacts::type_matches tests ---
-
     #[test]
-    fn type_matches_no_filters_passes_everything() {
-        let config = ResolvedArtifacts::default();
-        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
-        assert!(config.type_matches("application/spdx+json"));
-        assert!(config.type_matches("anything"));
+    fn type_matches_applies_include_then_exclude() {
+        const SPDX: &str = "application/spdx+json";
+        const COSIGN: &str = "application/vnd.dev.cosign.artifact.sig.v1+json";
+        // (name, include, exclude, artifact type, want)
+        let cases = [
+            ("no filters pass cosign", vec![], vec![], COSIGN, true),
+            ("no filters pass spdx", vec![], vec![], SPDX, true),
+            ("no filters pass anything", vec![], vec![], "anything", true),
+            (
+                "include admits a listed type",
+                vec![SPDX],
+                vec![],
+                SPDX,
+                true,
+            ),
+            (
+                "include rejects an unlisted type",
+                vec![SPDX],
+                vec![],
+                COSIGN,
+                false,
+            ),
+            (
+                "exclude rejects a listed type",
+                vec![],
+                vec![SPDX],
+                SPDX,
+                false,
+            ),
+            (
+                "exclude admits other types",
+                vec![],
+                vec![SPDX],
+                COSIGN,
+                true,
+            ),
+            (
+                "exclude beats include",
+                vec![SPDX, COSIGN],
+                vec![SPDX],
+                SPDX,
+                false,
+            ),
+            (
+                "include still admits the non-excluded type",
+                vec![SPDX, COSIGN],
+                vec![SPDX],
+                COSIGN,
+                true,
+            ),
+        ];
+        for (name, include, exclude, artifact_type, want) in cases {
+            let config = ResolvedArtifacts {
+                enabled: true,
+                include: include.into_iter().map(String::from).collect(),
+                exclude: exclude.into_iter().map(String::from).collect(),
+                require_artifacts: false,
+            };
+            assert_eq!(config.type_matches(artifact_type), want, "{name}");
+        }
     }
 
     #[test]
-    fn type_matches_include_filters() {
-        let config = ResolvedArtifacts {
-            enabled: true,
-            include: vec!["application/spdx+json".to_string()],
-            exclude: Vec::new(),
-            require_artifacts: false,
-        };
-        assert!(config.type_matches("application/spdx+json"));
-        assert!(
-            !config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"),
-            "type not in include list should be rejected"
-        );
-    }
-
-    #[test]
-    fn type_matches_exclude_filters() {
-        let config = ResolvedArtifacts {
-            enabled: true,
-            include: Vec::new(),
-            exclude: vec!["application/spdx+json".to_string()],
-            require_artifacts: false,
-        };
-        assert!(
-            !config.type_matches("application/spdx+json"),
-            "excluded type should be rejected"
-        );
-        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
-    }
-
-    #[test]
-    fn type_matches_include_and_exclude() {
-        let config = ResolvedArtifacts {
-            enabled: true,
-            include: vec![
-                "application/spdx+json".to_string(),
-                "application/vnd.dev.cosign.artifact.sig.v1+json".to_string(),
-            ],
-            exclude: vec!["application/spdx+json".to_string()],
-            require_artifacts: false,
-        };
-        // spdx is in both include and exclude - exclude wins.
-        assert!(
-            !config.type_matches("application/spdx+json"),
-            "exclude should take priority over include"
-        );
-        assert!(config.type_matches("application/vnd.dev.cosign.artifact.sig.v1+json"));
-    }
-
-    // -- DiscoveryCounters --
-
-    #[test]
-    fn discovery_counters_head_failure_increments_both_misses_and_failures() {
-        let mut c = DiscoveryCounters::default();
-        c.record(&DiscoveryRoute::HeadFailure);
-        assert_eq!(c.cache_misses, 1, "HeadFailure must count as a cache miss");
-        assert_eq!(c.head_failures, 1);
-        assert_eq!(c.cache_hits, 0);
-        assert_eq!(c.target_stale, 0);
-        assert_eq!(c.head_first_skips, 0);
-    }
-
-    #[test]
-    fn discovery_counters_target_stale_increments_both_misses_and_stale() {
-        let mut c = DiscoveryCounters::default();
-        c.record(&DiscoveryRoute::TargetStale);
-        assert_eq!(c.cache_misses, 1, "TargetStale must count as a cache miss");
-        assert_eq!(c.target_stale, 1);
-        assert_eq!(c.cache_hits, 0);
-        assert_eq!(c.head_failures, 0);
-        assert_eq!(c.head_first_skips, 0);
+    fn discovery_counters_count_each_route() {
+        // want: [cache_hits, cache_misses, head_failures, target_stale, head_first_skips]
+        let cases = [
+            (
+                "HeadFailure counts as a cache miss and a head failure",
+                vec![DiscoveryRoute::HeadFailure],
+                [0, 1, 1, 0, 0],
+            ),
+            (
+                "TargetStale counts as a cache miss and a stale target",
+                vec![DiscoveryRoute::TargetStale],
+                [0, 1, 0, 1, 0],
+            ),
+            (
+                "every route once: CacheMiss, HeadFailure and TargetStale make 3 misses",
+                vec![
+                    DiscoveryRoute::CacheHit,
+                    DiscoveryRoute::CacheMiss,
+                    DiscoveryRoute::HeadFailure,
+                    DiscoveryRoute::TargetStale,
+                    DiscoveryRoute::HeadFirstSkip,
+                ],
+                [1, 3, 1, 1, 1],
+            ),
+        ];
+        for (name, routes, want) in cases {
+            let mut c = DiscoveryCounters::default();
+            for route in &routes {
+                c.record(route);
+            }
+            let got = [
+                c.cache_hits,
+                c.cache_misses,
+                c.head_failures,
+                c.target_stale,
+                c.head_first_skips,
+            ];
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
@@ -4129,7 +3810,6 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
-        // Verify each line is valid JSON with expected fields.
         for (i, phase) in ["discovery_start", "execution_complete"].iter().enumerate() {
             let v: serde_json::Value = serde_json::from_str(lines[i]).unwrap();
             assert_eq!(v["phase"].as_str().unwrap(), *phase);
@@ -4141,23 +3821,6 @@ mod tests {
     fn write_timing_noop_when_none() {
         let mut file: Option<std::fs::File> = None;
         let start = Instant::now();
-        // Should not panic or error.
         write_timing(&mut file, "test_phase", &start);
-    }
-
-    #[test]
-    fn discovery_counters_all_routes() {
-        let mut c = DiscoveryCounters::default();
-        c.record(&DiscoveryRoute::CacheHit);
-        c.record(&DiscoveryRoute::CacheMiss);
-        c.record(&DiscoveryRoute::HeadFailure);
-        c.record(&DiscoveryRoute::TargetStale);
-        c.record(&DiscoveryRoute::HeadFirstSkip);
-        assert_eq!(c.cache_hits, 1);
-        // CacheMiss + HeadFailure + TargetStale = 3 total cache_misses
-        assert_eq!(c.cache_misses, 3);
-        assert_eq!(c.head_failures, 1);
-        assert_eq!(c.target_stale, 1);
-        assert_eq!(c.head_first_skips, 1);
     }
 }
