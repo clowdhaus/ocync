@@ -19,6 +19,12 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use thiserror::Error;
 
+/// CA validity. Long, because benchmark instances are short-lived.
+const CA_VALIDITY_DAYS: i64 = 365 * 10;
+
+/// Leaf certificate validity.
+const LEAF_VALIDITY_DAYS: i64 = 365;
+
 /// Errors from CA/leaf certificate operations.
 #[derive(Debug, Error)]
 pub(crate) enum Error {
@@ -52,9 +58,6 @@ pub(crate) enum Error {
 }
 
 /// A parsed CA keypair ready to sign leaf certificates.
-///
-/// Holds an `rcgen::Issuer` (used to sign leaves) plus a re-derived
-/// rustls `CertifiedKey` for serving the CA cert itself if ever needed.
 pub(crate) struct CaSigner {
     issuer: Issuer<'static, KeyPair>,
     /// Shared leaf cert cache, keyed by SNI hostname.
@@ -116,10 +119,7 @@ pub(crate) fn generate_ca(common_name: &str) -> Result<(String, String), Error> 
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
-    // Long validity - benchmark instances are short-lived.
-    let (not_before, not_after) = validity_one_decade();
-    params.not_before = not_before;
-    params.not_after = not_after;
+    (params.not_before, params.not_after) = validity_window(CA_VALIDITY_DAYS);
 
     let key = KeyPair::generate()?;
     let cert = params.self_signed(&key)?;
@@ -131,14 +131,15 @@ pub(crate) async fn load_ca(cert_path: &Path, key_path: &Path) -> Result<CaSigne
     let cert_pem = tokio::fs::read_to_string(cert_path).await?;
     let key_pem = tokio::fs::read_to_string(key_path).await?;
 
-    let key = KeyPair::from_pem(&key_pem).map_err(|e| Error::Pem {
-        path: key_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key).map_err(|e| Error::Pem {
-        path: cert_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
+    let pem_error = |path: &Path| {
+        let path = path.display().to_string();
+        move |e: rcgen::Error| Error::Pem {
+            path,
+            reason: e.to_string(),
+        }
+    };
+    let key = KeyPair::from_pem(&key_pem).map_err(pem_error(key_path))?;
+    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key).map_err(pem_error(cert_path))?;
 
     Ok(CaSigner {
         issuer,
@@ -164,9 +165,7 @@ fn generate_leaf(issuer: &Issuer<'static, KeyPair>, sni_host: &str) -> Result<Ce
     params.distinguished_name = DistinguishedName::new();
     params.distinguished_name.push(DnType::CommonName, sni_host);
     params.subject_alt_names = vec![san];
-    let (not_before, not_after) = validity_one_year();
-    params.not_before = not_before;
-    params.not_after = not_after;
+    (params.not_before, params.not_after) = validity_window(LEAF_VALIDITY_DAYS);
     params.is_ca = IsCa::NoCa;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -184,21 +183,12 @@ fn generate_leaf(issuer: &Issuer<'static, KeyPair>, sni_host: &str) -> Result<Ce
     Ok(CertifiedKey::new(vec![cert_der], signer))
 }
 
-/// Ten-year validity window starting at ~yesterday UTC.
-fn validity_one_decade() -> (time::OffsetDateTime, time::OffsetDateTime) {
+/// A validity window of `days`, starting at ~yesterday UTC.
+fn validity_window(days: i64) -> (time::OffsetDateTime, time::OffsetDateTime) {
     let now = time::OffsetDateTime::now_utc();
     (
         now - time::Duration::days(1),
-        now + time::Duration::days(365 * 10),
-    )
-}
-
-/// One-year validity window starting at ~yesterday UTC.
-fn validity_one_year() -> (time::OffsetDateTime, time::OffsetDateTime) {
-    let now = time::OffsetDateTime::now_utc();
-    (
-        now - time::Duration::days(1),
-        now + time::Duration::days(365),
+        now + time::Duration::days(days),
     )
 }
 

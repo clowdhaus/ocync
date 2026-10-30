@@ -170,7 +170,7 @@ pub(crate) async fn serve(
                 let log = log.clone();
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, ca, log, upstream).await {
+                    if let Err(e) = handle_connection(stream, ca, log, upstream).await {
                         debug!(%peer, error = %e, "connection closed with error");
                     }
                 });
@@ -204,7 +204,6 @@ async fn shutdown_signal() {
 /// other methods are rejected with 405.
 async fn handle_connection(
     stream: TcpStream,
-    _peer: SocketAddr,
     ca: Arc<CaSigner>,
     log: Arc<LogWriter>,
     upstream: reqwest::Client,
@@ -439,37 +438,33 @@ async fn handle_request(
     });
     // Attach a final future that fires after the stream drains.
     let request_counter_for_log = request_counter.clone();
-    let logging_stream = LogOnDrop {
-        inner: stream,
-        logged: false,
-        on_drop: Some(Box::new(move || {
-            let entry_bytes = byte_counter.load(Ordering::Relaxed);
-            let req_bytes = request_counter_for_log.load(Ordering::Relaxed);
-            let elapsed = start.elapsed();
-            let log = log_for_stream.clone();
-            let method = method_for_log.clone();
-            let host = host_for_log.clone();
-            let url = url_for_log.clone();
-            let status_code = status.as_u16();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let entry = ProxyEntry {
-                        timestamp: now_iso8601(),
-                        method: &method,
-                        host: &host,
-                        url: &url,
-                        request_bytes: req_bytes,
-                        response_bytes: entry_bytes,
-                        status: status_code,
-                        duration_ms: elapsed.as_millis() as u64,
-                        x_cache: x_cache.as_deref(),
-                        age,
-                    };
-                    log.write_entry(&entry).await;
-                });
-            }
-        })),
-    };
+    let logging_stream = LogOnDrop::new(stream, move || {
+        let entry_bytes = byte_counter.load(Ordering::Relaxed);
+        let req_bytes = request_counter_for_log.load(Ordering::Relaxed);
+        let elapsed = start.elapsed();
+        let log = log_for_stream.clone();
+        let method = method_for_log.clone();
+        let host = host_for_log.clone();
+        let url = url_for_log.clone();
+        let status_code = status.as_u16();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let entry = ProxyEntry {
+                    timestamp: now_iso8601(),
+                    method: &method,
+                    host: &host,
+                    url: &url,
+                    request_bytes: req_bytes,
+                    response_bytes: entry_bytes,
+                    status: status_code,
+                    duration_ms: elapsed.as_millis() as u64,
+                    x_cache: x_cache.as_deref(),
+                    age,
+                };
+                log.write_entry(&entry).await;
+            });
+        }
+    });
     let body = StreamBody::new(logging_stream).boxed_unsync();
 
     let mut out = Response::builder().status(status);
@@ -554,23 +549,32 @@ use std::task::{Context, Poll};
 use futures_util::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// A `Stream` wrapper that fires `on_drop` when the inner stream ends
-/// (yields `None`) or the value is dropped - whichever comes first.
-/// Used to log a proxy entry exactly once after the response body has
-/// fully drained.
+/// A `Stream` wrapper that fires `on_drop` once, when the inner stream ends
+/// (yields `None`) or the value is dropped, whichever comes first. Logs a
+/// proxy entry exactly once after the response body has drained.
 struct LogOnDrop<S> {
     inner: S,
-    logged: bool,
     on_drop: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl<S> LogOnDrop<S> {
+    fn new(inner: S, on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    fn fire(&mut self) {
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
 }
 
 impl<S> Drop for LogOnDrop<S> {
     fn drop(&mut self) {
-        if !self.logged {
-            if let Some(f) = self.on_drop.take() {
-                f();
-            }
-        }
+        self.fire();
     }
 }
 
@@ -583,12 +587,7 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(None) = &item {
-            if !self.logged {
-                if let Some(f) = self.on_drop.take() {
-                    self.logged = true;
-                    f();
-                }
-            }
+            self.fire();
         }
         item
     }
@@ -651,7 +650,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use futures_util::StreamExt;
@@ -761,17 +760,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefixed_stream_read_to_end() {
-        let prefix = b"pre-".to_vec();
-        let inner = Cursor::new(b"data");
-        let mut stream = PrefixedStream::new(prefix, inner);
-
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"pre-data");
-    }
-
-    #[tokio::test]
     async fn prefixed_stream_eof_after_drain() {
         let prefix = b"ab".to_vec();
         let inner = Cursor::new(b"cd");
@@ -806,77 +794,50 @@ mod tests {
     // LogOnDrop
     // -----------------------------------------------------------------
 
-    #[tokio::test]
-    async fn log_on_drop_fires_callback_when_stream_ends() {
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_clone = fired.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2)];
-        let inner = stream::iter(items);
-
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                fired_clone.store(true, Ordering::SeqCst);
-            })),
-        };
-
-        assert_eq!(wrapper.next().await, Some(Ok(1)));
-        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
-        assert_eq!(wrapper.next().await, Some(Ok(2)));
-        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
-        assert_eq!(wrapper.next().await, None);
-        assert!(fired.load(Ordering::SeqCst), "should fire when stream ends");
+    /// A stream of `items` wrapped to count how often its callback fires.
+    fn counting_stream(
+        items: i32,
+    ) -> (
+        LogOnDrop<stream::Iter<std::vec::IntoIter<i32>>>,
+        Arc<AtomicU64>,
+    ) {
+        let fired = Arc::new(AtomicU64::new(0));
+        let fired_in_callback = fired.clone();
+        let wrapper = LogOnDrop::new(stream::iter((1..=items).collect::<Vec<_>>()), move || {
+            fired_in_callback.fetch_add(1, Ordering::SeqCst);
+        });
+        (wrapper, fired)
     }
 
     #[tokio::test]
-    async fn log_on_drop_fires_callback_on_early_drop() {
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_clone = fired.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2), Ok(3)];
-        let inner = stream::iter(items);
+    async fn log_on_drop_fires_when_stream_ends_and_not_before() {
+        let (mut wrapper, fired) = counting_stream(2);
 
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                fired_clone.store(true, Ordering::SeqCst);
-            })),
-        };
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(wrapper.next().await, Some(2));
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "fired mid-stream");
+        assert_eq!(wrapper.next().await, None);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "not fired at the end");
+    }
 
-        assert_eq!(wrapper.next().await, Some(Ok(1)));
-        assert!(!fired.load(Ordering::SeqCst));
+    #[tokio::test]
+    async fn log_on_drop_fires_on_early_drop() {
+        let (mut wrapper, fired) = counting_stream(3);
+
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
         drop(wrapper);
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "should fire on drop when stream not drained"
-        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "not fired on drop");
     }
 
     #[tokio::test]
     async fn log_on_drop_does_not_double_fire() {
-        let count = Arc::new(AtomicU64::new(0));
-        let count_clone = count.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
-        let inner = stream::iter(items);
+        let (mut wrapper, fired) = counting_stream(1);
 
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                count_clone.fetch_add(1, Ordering::SeqCst);
-            })),
-        };
-
-        let _ = wrapper.next().await;
-        let _ = wrapper.next().await; // None - fires callback
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(wrapper.next().await, None);
         drop(wrapper);
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "callback must fire exactly once"
-        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "callback must fire once");
     }
 
     /// The production callback calls `Handle::try_current()` + `spawn`
@@ -889,32 +850,13 @@ mod tests {
         let log = Arc::new(LogWriter::create(&path).await.unwrap());
         let log_for_cb = log.clone();
 
-        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
-        let inner = stream::iter(items);
-
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let entry = ProxyEntry {
-                            timestamp: String::new(),
-                            method: "GET",
-                            host: "registry.test",
-                            url: "/v2/",
-                            request_bytes: 0,
-                            response_bytes: 42,
-                            status: 200,
-                            duration_ms: 1,
-                            x_cache: None,
-                            age: None,
-                        };
-                        log_for_cb.write_entry(&entry).await;
-                    });
-                }
-            })),
-        };
+        let mut wrapper = LogOnDrop::new(stream::iter([1]), move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    log_for_cb.write_entry(&test_entry("GET", 200)).await;
+                });
+            }
+        });
 
         let _ = wrapper.next().await;
         let _ = wrapper.next().await; // None - fires callback
@@ -937,36 +879,6 @@ mod tests {
             1,
             "spawned task should write one JSONL entry"
         );
-    }
-
-    // -----------------------------------------------------------------
-    // Streaming body counter
-    // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn streaming_body_counter_accurate() {
-        let chunks: Vec<Result<Bytes, String>> = vec![
-            Ok(Bytes::from_static(b"hello ")),
-            Ok(Bytes::from_static(b"world")),
-            Ok(Bytes::from_static(b"!")),
-        ];
-        let counter = Arc::new(AtomicU64::new(0));
-        let counter_clone = counter.clone();
-
-        let stream = stream::iter(chunks).map(move |chunk| {
-            chunk.inspect(|b| {
-                counter_clone.fetch_add(b.len() as u64, Ordering::Relaxed);
-            })
-        });
-
-        // Drain the stream to trigger counting.
-        let mut total = 0usize;
-        tokio::pin!(stream);
-        while let Some(Ok(chunk)) = stream.next().await {
-            total += chunk.len();
-        }
-        assert_eq!(total, 12);
-        assert_eq!(counter.load(Ordering::Relaxed), 12);
     }
 
     // -----------------------------------------------------------------
