@@ -224,4 +224,29 @@ mod tests {
         let c = signer.leaf_for("other.example").unwrap();
         assert!(!Arc::ptr_eq(&a, &c));
     }
+
+    #[tokio::test]
+    async fn load_ca_names_the_file_that_is_not_pem() {
+        let (cert_pem, key_pem) = generate_ca("test CA").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("ca.pem");
+        let key_path = tmp.path().join("ca-key.pem");
+        tokio::fs::write(&cert_path, &cert_pem).await.unwrap();
+        tokio::fs::write(&key_path, &key_pem).await.unwrap();
+
+        let garbage = tmp.path().join("garbage.pem");
+        tokio::fs::write(&garbage, "not pem").await.unwrap();
+
+        for (name, cert, key, offender) in [
+            ("bad key", &cert_path, &garbage, &garbage),
+            ("bad cert", &garbage, &key_path, &garbage),
+        ] {
+            match load_ca(cert, key).await {
+                Err(Error::Pem { path, .. }) => {
+                    assert_eq!(path, offender.display().to_string(), "{name}");
+                }
+                other => panic!("{name}: expected Error::Pem, got {other:?}"),
+            }
+        }
+    }
 }
