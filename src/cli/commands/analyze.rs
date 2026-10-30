@@ -609,7 +609,7 @@ mod tests {
     }
 
     use crate::cli::commands::test_support::{
-        SlowRegistry, max_in_flight, repo_names, slow_registry, unresolved_mapping,
+        max_in_flight, repo_names, slow_registry, unresolved_mapping,
     };
 
     /// Many mappings with few tags each: a per-mapping walk would stay serial.
@@ -617,17 +617,11 @@ mod tests {
     async fn collect_analysis_overlaps_tag_listings_and_manifest_pulls() {
         let delay = std::time::Duration::from_millis(250);
         let repos = repo_names(8);
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            tag_arrivals,
-            manifest_arrivals,
-        } = slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &ShutdownSignal::new(),
             &PrepareTracker::default(),
@@ -636,12 +630,12 @@ mod tests {
         .await;
 
         assert_eq!(analysis.analyzed, 8, "every image must be analyzed");
-        let observed = max_in_flight(&tag_arrivals, delay);
+        let observed = max_in_flight(&reg.tag_arrivals, delay);
         assert!(
             observed > 1,
             "tag listings must overlap; saw at most {observed} in flight"
         );
-        let observed = max_in_flight(&manifest_arrivals, delay);
+        let observed = max_in_flight(&reg.manifest_arrivals, delay);
         assert!(
             observed > 1,
             "manifest pulls must overlap across mappings; saw at most {observed} in flight"
@@ -654,20 +648,14 @@ mod tests {
     async fn collect_analysis_starts_nothing_once_shutdown_is_triggered() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(8);
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            tag_arrivals,
-            manifest_arrivals,
-        } = slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         shutdown.trigger();
 
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &shutdown,
             &PrepareTracker::default(),
@@ -678,12 +666,15 @@ mod tests {
         assert!(analysis.interrupted, "the report must say it is truncated");
         assert_eq!(analysis.analyzed, 0);
         assert_eq!(
-            tag_arrivals.lock().expect("no panic in a stub").len(),
+            reg.tag_arrivals.lock().expect("no panic in a stub").len(),
             0,
             "no mapping should have been resolved"
         );
         assert_eq!(
-            manifest_arrivals.lock().expect("no panic in a stub").len(),
+            reg.manifest_arrivals
+                .lock()
+                .expect("no panic in a stub")
+                .len(),
             0,
             "and no image should have been pulled"
         );
@@ -696,13 +687,7 @@ mod tests {
         let delay = std::time::Duration::from_millis(1);
         let images = ANALYZE_CONCURRENCY * 3;
         let repos = repo_names(images);
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            manifest_arrivals,
-            ..
-        } = slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         let no_checkers = HashMap::new();
@@ -710,15 +695,16 @@ mod tests {
         let analysis = {
             // Triggered once the image walk is under way.
             let walk = collect_analysis(
-                &config,
-                &clients,
+                &reg.config,
+                &reg.clients,
                 &no_checkers,
                 &shutdown,
                 &tracker,
                 ANALYZE_CONCURRENCY,
             );
             let trip = async {
-                while manifest_arrivals
+                while reg
+                    .manifest_arrivals
                     .lock()
                     .expect("no panic in a stub")
                     .is_empty()
@@ -760,17 +746,12 @@ mod tests {
         let mut baseline: Option<std::time::Duration> = None;
         for concurrency in [1usize, 4, 8, 16, 32] {
             // Fresh server and clients per row: AIMD widens with reuse.
-            let SlowRegistry {
-                _server,
-                config,
-                clients,
-                ..
-            } = slow_registry(&repos, &["v1"], delay).await;
+            let reg = slow_registry(&repos, &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let analysis = collect_analysis(
-                &config,
-                &clients,
+                &reg.config,
+                &reg.clients,
                 &HashMap::new(),
                 &ShutdownSignal::new(),
                 &PrepareTracker::default(),
@@ -799,17 +780,12 @@ mod tests {
     async fn collect_analysis_reports_the_image_walk_as_its_own_step() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(3);
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            ..
-        } = slow_registry(&repos, &["v1", "v2"], delay).await;
+        let reg = slow_registry(&repos, &["v1", "v2"], delay).await;
 
         let tracker = PrepareTracker::default();
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &ShutdownSignal::new(),
             &tracker,

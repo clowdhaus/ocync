@@ -127,8 +127,10 @@ pub(crate) fn unresolved_mapping(
 /// A registry that answers tag listings and manifest pulls after a delay,
 /// with the config and clients pointed at it.
 pub(crate) struct SlowRegistry {
-    /// Keeps the stub server alive for the test.
-    pub(crate) _server: MockServer,
+    /// The stub server; dropping it returns the pooled server and resets its
+    /// mocks, so the struct stays whole for the test's duration.
+    #[expect(dead_code, reason = "held only for its drop")]
+    pub(crate) server: MockServer,
     /// A config with one mapping per repository, all through the server.
     pub(crate) config: crate::cli::config::Config,
     /// Clients for the config's `src` and `dst` registries.
@@ -170,7 +172,7 @@ pub(crate) async fn slow_registry(
         ("dst".to_string(), Ok(test_client(&server.uri()))),
     ]);
     SlowRegistry {
-        _server: server,
+        server,
         config,
         clients,
         tag_arrivals,

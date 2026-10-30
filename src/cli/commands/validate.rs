@@ -61,11 +61,12 @@ mappings:
             ),
             ("nonexistent file", None, "failed to read"),
         ];
+        let dir = tempfile::tempdir().expect("tempdir creates");
         for (name, content, want) in cases {
             let file = content.map(write_temp_config);
             let config = match &file {
                 Some(file) => file.path().to_path_buf(),
-                None => std::path::PathBuf::from("/tmp/ocync_test_does_not_exist.yaml"),
+                None => dir.path().join("missing.yaml"),
             };
             let err = run(&ValidateArgs { config }).unwrap_err().to_string();
             assert!(err.contains(want), "{name}: expected '{want}' in: {err}");

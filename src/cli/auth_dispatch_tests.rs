@@ -33,7 +33,7 @@ impl EnvGuard {
     fn set_docker_config(value: &std::path::Path) -> Self {
         let lock = lock_env();
         let prior = std::env::var_os("DOCKER_CONFIG");
-        // SAFETY: env mutations are serialized by `lock_env`.
+        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
         unsafe {
             std::env::set_var("DOCKER_CONFIG", value);
         }
@@ -43,7 +43,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: env mutations are serialized by `lock_env`.
+        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
         unsafe {
             match &self.prior {
                 Some(v) => std::env::set_var("DOCKER_CONFIG", v),

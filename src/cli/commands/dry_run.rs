@@ -381,7 +381,8 @@ mod tests {
             ),
         ];
         for (name, tags, present) in cases {
-            let out = capture(|w| write_simple_tag_list(w, &tags));
+            let mapping = mapping_with_tags_and_report(tags, None);
+            let out = capture(|w| write_mapping(w, &mapping, false));
             assert_output(name, &out, present, &["filter:", "kept (", "dropped"]);
         }
     }

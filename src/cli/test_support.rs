@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use ocync_distribution::{RegistryClient, RegistryClientBuilder};
 
-/// Serializes every test that reads or writes process environment variables
-/// the code under test also reads. Take it through [`lock_env`].
+/// Serializes the tests that set or remove process environment variables
+/// against each other. A test that only reads a variable takes no lock, so
+/// each variable a writer sets is read only by tests that also hold the lock
+/// or that do not depend on its value. Take it through [`lock_env`].
 static ENV_GUARD: Mutex<()> = Mutex::new(());
 
-/// Hold the returned guard for the whole of a test that mutates the
-/// environment. A panic in an earlier holder does not matter: each test sets
+/// Hold the returned guard for the whole of a test that sets or removes an
+/// environment variable. A panic in an earlier holder does not matter: each test sets
 /// the variables it reads.
 pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
     ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())

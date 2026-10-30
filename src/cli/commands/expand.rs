@@ -43,7 +43,7 @@ mappings:
 "#,
         );
         let _env = lock_env();
-        // SAFETY: `lock_env` serializes every test that touches the environment.
+        // SAFETY: `lock_env` serializes the tests that set or remove variables.
         unsafe {
             std::env::set_var(
                 "OCYNC_TEST_ECR_URL",
@@ -60,7 +60,7 @@ mappings:
     fn show_secrets_flag_controls_secret_variables() {
         let file = write_temp_config("token: \"${OCYNC_EXPAND_FLAG_SECRET}\"\n");
         let _env = lock_env();
-        // SAFETY: `lock_env` serializes every test that touches the environment.
+        // SAFETY: `lock_env` serializes the tests that set or remove variables.
         unsafe { std::env::set_var("OCYNC_EXPAND_FLAG_SECRET", "s3cret") };
         // `Err` carries the blocked variable's name.
         let cases = [
@@ -85,10 +85,8 @@ mappings:
 
     #[test]
     fn expand_nonexistent_file() {
-        let result = expand_config_for_display(
-            std::path::Path::new("/tmp/ocync_test_missing.yaml"),
-            SecretVars::Block,
-        );
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let result = expand_config_for_display(&dir.path().join("missing.yaml"), SecretVars::Block);
         assert!(result.is_err());
     }
 }

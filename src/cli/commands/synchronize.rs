@@ -682,7 +682,7 @@ pub(crate) async fn run(
         state.retain_active(config.mappings.iter().map(|m| m.from.as_str()));
     }
 
-    if min_tags == MinTags::Report {
+    if args.dry_run {
         crate::cli::commands::dry_run::print(&mappings, &unresolved, &dropped_targets, verbose);
         return Ok(dry_run_exit_code(
             mappings.len() + no_match,
@@ -903,7 +903,7 @@ fn emit_mapping_outcomes(
             None => OutcomeChange::Changed,
         };
         let recovered = change == OutcomeChange::Recovered;
-        let line = format_mapping_outcome(d, &outcome, change);
+        let line = format_mapping_outcome(d, &outcome, recovered);
         // `from` / `to` are not structured fields: the message already names
         // them, and the text formatter would repeat them. The counts stay
         // because they carry zero values the terse message elides.
@@ -954,11 +954,7 @@ fn aggregate_mapping_outcome(
     o
 }
 
-fn format_mapping_outcome(
-    d: &MappingDescriptor,
-    o: &MappingOutcome,
-    change: OutcomeChange,
-) -> String {
+fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: bool) -> String {
     let mut parts = Vec::with_capacity(3);
     if o.synced > 0 {
         parts.push(format!("synced {}", o.synced));
@@ -975,11 +971,7 @@ fn format_mapping_outcome(
     } else {
         String::new()
     };
-    let recovered_clause = if change == OutcomeChange::Recovered {
-        " [recovered]"
-    } else {
-        ""
-    };
+    let recovered_clause = if recovered { " [recovered]" } else { "" };
     // Shown whenever more than one registry was configured, including when
     // only one survived: that is when the operator needs to see which.
     let targets_clause = if d.target_names.len() + d.dropped_names.len() > 1 {
@@ -1776,12 +1768,14 @@ type SelectionResult = (
 /// What tag selection does when fewer tags survive than `min_tags` requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MinTags {
-    /// A real sync: [`FilterConfig::apply`] returns `BelowMinTags` when
-    /// `min_tags` is violated, and no filter trace is built.
+    /// A mapping with fewer kept tags than `min_tags` is unresolved:
+    /// [`FilterConfig::apply`] returns `BelowMinTags`. No filter report is
+    /// built.
     Enforce,
-    /// `--dry-run`: [`FilterConfig::apply_with_report`] does NOT enforce
-    /// `min_tags`; the report carries the configured value so the gap can be
-    /// rendered.
+    /// A mapping below `min_tags` is kept, with the filter report built for
+    /// the plan: [`FilterConfig::apply_with_report`] does not enforce
+    /// `min_tags`, and the report carries the configured value so the gap can
+    /// be rendered.
     Report,
 }
 
@@ -2507,14 +2501,14 @@ include: ["1.25.0-rc1"]
 
     #[test]
     fn no_tags_warn_renders() {
-        let truncated = NoTagsInfo {
-            from: "library/alpine".into(),
-            // image_count > samples.len() drives the truncation marker.
-            image_count: 100,
-            artifact_count: 0,
-            filter_desc: Some("semver >=99.0".into()),
-            samples: (0..5).map(|i| format!("v{i}")).collect(),
-        };
+        // image_count > samples.len() drives the truncation marker.
+        let truncated = no_tags_info(
+            "library/alpine",
+            100,
+            0,
+            Some("semver >=99.0"),
+            &["v0", "v1", "v2", "v3", "v4"],
+        );
         assert!(truncated.samples_truncated());
         let cases = [
             (
@@ -2763,7 +2757,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(3, 0, 0, 1024),
-                OutcomeChange::Changed,
+                false,
                 "library/alpine -> mirror/alpine: synced 3 (1.0 KB)",
             ),
             (
@@ -2771,7 +2765,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(0, 5, 0, 0),
-                OutcomeChange::Changed,
+                false,
                 "library/alpine -> mirror/alpine: skipped 5",
             ),
             (
@@ -2779,7 +2773,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(1, 2, 1, 2048),
-                OutcomeChange::Changed,
+                false,
                 "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)",
             ),
             (
@@ -2787,7 +2781,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(3, 0, 0, 1024),
-                OutcomeChange::Recovered,
+                true,
                 "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]",
             ),
             (
@@ -2795,7 +2789,7 @@ include: ["1.25.0-rc1"]
                 vec!["ecr-prod", "ghcr-mirror"],
                 vec![],
                 outcome(1, 0, 0, 1024),
-                OutcomeChange::Changed,
+                false,
                 "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)",
             ),
             (
@@ -2803,18 +2797,18 @@ include: ["1.25.0-rc1"]
                 vec!["good"],
                 vec!["broken"],
                 outcome(4, 0, 0, 0),
-                OutcomeChange::Changed,
+                false,
                 "library/alpine -> mirror/alpine [good, broken unreachable]: synced 4",
             ),
         ];
-        for (name, targets, dropped, o, change, want) in cases {
+        for (name, targets, dropped, o, recovered, want) in cases {
             let d = MappingDescriptor {
                 from: "library/alpine".into(),
                 target_repo: "mirror/alpine".into(),
                 target_names: targets.into_iter().map(String::from).collect(),
                 dropped_names: dropped.into_iter().map(String::from).collect(),
             };
-            assert_eq!(format_mapping_outcome(&d, &o, change), want, "{name}");
+            assert_eq!(format_mapping_outcome(&d, &o, recovered), want, "{name}");
         }
     }
 
@@ -3801,8 +3795,8 @@ mappings:
     }
 
     use crate::cli::commands::test_support::{
-        SlowRecorder, SlowRegistry, arrivals, config_yaml, max_in_flight, repo_names,
-        slow_registry, unresolved_mapping,
+        SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names, slow_registry,
+        unresolved_mapping,
     };
     use crate::cli::test_support::{mapping_with_tags_and_report, test_client};
 
@@ -3810,18 +3804,12 @@ mappings:
     #[tokio::test]
     async fn resolve_all_resolves_mappings_concurrently() {
         let delay = Duration::from_millis(250);
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            tag_arrivals: arrivals,
-            ..
-        } = slow_registry(&repo_names(8), &["v1"], delay).await;
+        let reg = slow_registry(&repo_names(8), &["v1"], delay).await;
 
-        let resolution = resolve(&config, &clients).await;
+        let resolution = resolve(&reg.config, &reg.clients).await;
 
         assert_eq!(resolution.resolved.len(), 8, "every mapping must resolve");
-        let observed = max_in_flight(&arrivals, delay);
+        let observed = max_in_flight(&reg.tag_arrivals, delay);
         assert!(
             observed > 1,
             "tag listings must overlap; saw at most {observed} in flight"
@@ -3834,17 +3822,11 @@ mappings:
     async fn resolve_all_never_exceeds_its_concurrency_limit() {
         let delay = Duration::from_millis(250);
         let limit = 2;
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            tag_arrivals: arrivals,
-            ..
-        } = slow_registry(&repo_names(8), &["v1"], delay).await;
+        let reg = slow_registry(&repo_names(8), &["v1"], delay).await;
 
         resolve_all(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             MinTags::Enforce,
             None,
@@ -3854,7 +3836,7 @@ mappings:
         .await
         .expect("no config-class failure in this fixture");
 
-        let observed = max_in_flight(&arrivals, delay);
+        let observed = max_in_flight(&reg.tag_arrivals, delay);
         assert_eq!(
             observed, limit,
             "resolution must run exactly {limit} mappings at a time"
@@ -3865,16 +3847,11 @@ mappings:
     /// or the run hangs before the engine starts.
     #[tokio::test]
     async fn resolve_all_treats_a_zero_limit_as_one() {
-        let SlowRegistry {
-            _server,
-            config,
-            clients,
-            ..
-        } = slow_registry(&repo_names(2), &["v1"], Duration::from_millis(1)).await;
+        let reg = slow_registry(&repo_names(2), &["v1"], Duration::from_millis(1)).await;
 
         let resolution = resolve_all(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             MinTags::Enforce,
             None,
@@ -4228,18 +4205,12 @@ mappings:
         for concurrency in [1usize, 4, 8, 16, 32] {
             // Fresh server and clients per row: reused AIMD windows would give
             // later rows a head start.
-            let SlowRegistry {
-                _server,
-                config,
-                clients,
-                tag_arrivals: arrivals,
-                ..
-            } = slow_registry(&repo_names(mappings), &["v1"], delay).await;
+            let reg = slow_registry(&repo_names(mappings), &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let resolution = resolve_all(
-                &config,
-                &clients,
+                &reg.config,
+                &reg.clients,
                 &HashMap::new(),
                 MinTags::Enforce,
                 None,
@@ -4251,7 +4222,7 @@ mappings:
             let elapsed = started.elapsed();
             assert_eq!(resolution.resolved.len(), mappings);
 
-            let observed = max_in_flight(&arrivals, delay);
+            let observed = max_in_flight(&reg.tag_arrivals, delay);
             let base = *baseline.get_or_insert(elapsed);
             println!(
                 "{concurrency:>11}  {:>9.2}s  {:>9.1}x  {observed:>12}",
