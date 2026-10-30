@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bench::Provider;
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::runner::Tool;
+use crate::bench::{Provider, command_stdout};
 
 /// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
 fn is_zero(v: &u64) -> bool {
@@ -354,40 +354,28 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
 /// Read a value from the EC2 Instance Metadata Service (`IMDSv2`).
 fn read_imds(path: &str) -> Option<String> {
     // IMDSv2: get a session token first, then use it.
-    let token = std::process::Command::new("curl")
-        .args([
-            "-s",
-            "-f",
-            "--connect-timeout",
-            "1",
-            "-X",
-            "PUT",
-            "http://169.254.169.254/latest/api/token",
-            "-H",
-            "X-aws-ec2-metadata-token-ttl-seconds: 10",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+    let token = command_stdout(std::process::Command::new("curl").args([
+        "-s",
+        "-f",
+        "--connect-timeout",
+        "1",
+        "-X",
+        "PUT",
+        "http://169.254.169.254/latest/api/token",
+        "-H",
+        "X-aws-ec2-metadata-token-ttl-seconds: 10",
+    ]))?;
 
     let url = format!("http://169.254.169.254/latest/meta-data/{path}");
-    std::process::Command::new("curl")
-        .args([
-            "-s",
-            "-f",
-            "--connect-timeout",
-            "1",
-            "-H",
-            &format!("X-aws-ec2-metadata-token: {}", token.trim()),
-            &url,
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    command_stdout(std::process::Command::new("curl").args([
+        "-s",
+        "-f",
+        "--connect-timeout",
+        "1",
+        "-H",
+        &format!("X-aws-ec2-metadata-token: {token}"),
+        &url,
+    ]))
 }
 
 /// Full benchmark report.

@@ -119,31 +119,27 @@ pub(crate) enum Scenario {
     All,
 }
 
+/// The trimmed stdout of `command`, or `None` when it cannot be run, exits
+/// non-zero, prints non-UTF-8, or prints nothing.
+pub(crate) fn command_stdout(command: &mut std::process::Command) -> Option<String> {
+    let output = command.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 /// Read an SSM parameter by name, returning `None` on any failure.
 fn read_ssm_parameter(name: &str) -> Option<String> {
-    std::process::Command::new("aws")
-        .args([
-            "ssm",
-            "get-parameter",
-            "--name",
-            name,
-            "--with-decryption",
-            "--query",
-            "Parameter.Value",
-            "--output",
-            "text",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    command_stdout(std::process::Command::new("aws").args([
+        "ssm",
+        "get-parameter",
+        "--name",
+        name,
+        "--with-decryption",
+        "--query",
+        "Parameter.Value",
+        "--output",
+        "text",
+    ]))
 }
 
 /// Read Docker Hub credentials from environment variables.
@@ -300,21 +296,14 @@ impl RegistryKind {
 /// `unknown`. The run log is streamed to the operator and never persisted, so
 /// this warning is the only chance to notice.
 fn git_ref() -> String {
-    let resolved = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
-    resolved.unwrap_or_else(|| {
-        eprintln!(
-            "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
+    command_stdout(std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
              Recording the git ref as \"unknown\"."
-        );
-        "unknown".into()
-    })
+            );
+            "unknown".into()
+        })
 }
 
 /// Run the benchmark suite.
@@ -1956,6 +1945,17 @@ mod tests {
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[7..8], "-");
         assert_eq!(&ts[10..11], "-");
+    }
+
+    #[test]
+    fn command_stdout_is_trimmed_text_from_a_successful_command() {
+        use std::process::Command;
+        let run = |program: &str, args: &[&str]| command_stdout(Command::new(program).args(args));
+
+        assert_eq!(run("printf", &["  hi\n"]).as_deref(), Some("hi"));
+        assert_eq!(run("printf", &[" \n"]), None, "blank output");
+        assert_eq!(run("false", &[]), None, "non-zero exit");
+        assert_eq!(run("/nonexistent/program", &[]), None, "cannot spawn");
     }
 
     #[test]
