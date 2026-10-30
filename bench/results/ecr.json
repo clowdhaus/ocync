@@ -9,8 +9,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -56,8 +58,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -103,8 +107,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -150,8 +156,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 6
@@ -197,8 +205,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -244,8 +254,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -291,8 +303,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -338,8 +352,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -431,8 +447,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -524,8 +542,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1"
+      "region": "us-east-1",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -617,8 +637,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -784,8 +806,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -951,8 +975,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1118,8 +1144,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1209,8 +1237,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1300,8 +1330,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1394,8 +1426,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1485,8 +1519,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1677,8 +1713,10 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2"
+      "region": "us-east-2",
+      "image_id": "unknown"
     },
+    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1851,6 +1889,200 @@
               "discovery_start": 0,
               "execution_complete": 2099
             }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-10-30-215116",
+    "git_ref": "9c84557",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2",
+      "image_id": "ami-052b3645c2c811821"
+    },
+    "relays": {
+      "docker-credential-ecr-login": "v0.12.0",
+      "skopeo": "v1.24.1"
+    },
+    "corpus": {
+      "images": 40,
+      "tags": 55
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "shuffle_seed": 3496025741446284085,
+        "tool_order": [
+          "ocync",
+          "dregsy",
+          "regsync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 250.939740449,
+            "peak_rss_kb": 52920,
+            "requests": 6995,
+            "rate_limit_429s": 0,
+            "response_bytes": 55045558273,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 356,
+            "mount_successes": 356,
+            "source_blob_gets": 1428,
+            "source_blob_bytes": 55044983212,
+            "cdn_hits": 898,
+            "cdn_misses": 174,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 898,
+            "blob_cdn_misses": 174,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 40,
+            "referrer_calls": 52,
+            "phase_timing_ms": {
+              "discovery_complete": 26542,
+              "discovery_start": 0,
+              "execution_complete": 250792
+            }
+          },
+          {
+            "tool": "dregsy",
+            "version": "v0.0.0-20250317074629-e92e79a50145",
+            "wall_clock_secs": 1085.343294359,
+            "peak_rss_kb": 336144,
+            "requests": 11541,
+            "rate_limit_429s": 0,
+            "response_bytes": 54927990387,
+            "duplicate_blob_gets": 48,
+            "mount_attempts": 341,
+            "mount_successes": 341,
+            "source_blob_gets": 1399,
+            "source_blob_bytes": 54927949987,
+            "cdn_hits": 546,
+            "cdn_misses": 504,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 546,
+            "blob_cdn_misses": 504,
+            "auth_v2_pings": 110,
+            "auth_token_requests": 57,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.7",
+            "wall_clock_secs": 749.845501894,
+            "peak_rss_kb": 26972,
+            "requests": 9588,
+            "rate_limit_429s": 0,
+            "response_bytes": 65085496259,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 1692,
+            "source_blob_bytes": 65085486759,
+            "cdn_hits": 1006,
+            "cdn_misses": 2,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1006,
+            "blob_cdn_misses": 2,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 35,
+            "referrer_calls": 0
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "shuffle_seed": 3496025741446284085,
+        "tool_order": [
+          "ocync",
+          "dregsy",
+          "regsync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.5753332589999998,
+            "peak_rss_kb": 16856,
+            "requests": 156,
+            "rate_limit_429s": 0,
+            "response_bytes": 143098,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 133681,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 4,
+            "auth_token_requests": 40,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2518,
+              "discovery_start": 0,
+              "execution_complete": 2518
+            }
+          },
+          {
+            "tool": "dregsy",
+            "version": "v0.0.0-20250317074629-e92e79a50145",
+            "wall_clock_secs": 106.289032299,
+            "peak_rss_kb": 35920,
+            "requests": 3486,
+            "rate_limit_429s": 0,
+            "response_bytes": 2017636,
+            "duplicate_blob_gets": 48,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 279,
+            "source_blob_bytes": 1982573,
+            "cdn_hits": 225,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 225,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 110,
+            "auth_token_requests": 55,
+            "referrer_calls": 0
+          },
+          {
+            "tool": "regsync",
+            "version": "VCSTag:     v0.11.7",
+            "wall_clock_secs": 11.293697004,
+            "peak_rss_kb": 20220,
+            "requests": 179,
+            "rate_limit_429s": 0,
+            "response_bytes": 128313,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 128313,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 0,
+            "auth_token_requests": 34,
+            "referrer_calls": 0
           }
         ]
       }
