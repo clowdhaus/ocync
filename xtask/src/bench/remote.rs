@@ -15,7 +15,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::runner::{Tool, join_tools};
-use super::{Provider, Scenario};
+use super::{Provider, Scenario, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -189,7 +189,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     if args.no_proxy {
         bench_args.push("--no-proxy".to_string());
     }
-    bench_args.push(args.scenario.to_string());
+    bench_args.push(value_name(&args.scenario));
 
     // Determine the target registry from the provider.
     let registry_env = match config.provider {
@@ -781,6 +781,9 @@ mod tests {
         assert_eq!(config.host, "54.123.45.67");
         assert_eq!(config.user, "ec2-user");
         assert_eq!(config.ssh_key_path, "/tmp/.ssh-key");
+
+        let unknown = json.replace("aws", "digitalocean");
+        assert!(serde_json::from_str::<BenchConfig>(&unknown).is_err());
     }
 
     #[test]

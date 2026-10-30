@@ -372,7 +372,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
-        args.scenario,
+        value_name(&args.scenario),
         runner::join_tools(&tools),
         corpus.images.len(),
         corpus.total_tags(),
@@ -1922,12 +1922,6 @@ fn days_to_civil(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
-impl std::fmt::Display for Scenario {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&value_name(self))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1965,11 +1959,23 @@ mod tests {
     }
 
     #[test]
-    fn scenario_display() {
-        assert_eq!(Scenario::Sync.to_string(), "sync");
-        assert_eq!(Scenario::Partial.to_string(), "partial");
-        assert_eq!(Scenario::Scale.to_string(), "scale");
-        assert_eq!(Scenario::All.to_string(), "all");
+    fn value_name_is_the_spelling_the_command_line_accepts() {
+        for (scenario, expected) in [
+            (Scenario::Sync, "sync"),
+            (Scenario::Partial, "partial"),
+            (Scenario::Scale, "scale"),
+            (Scenario::Prepare, "prepare"),
+            (Scenario::All, "all"),
+        ] {
+            assert_eq!(value_name(&scenario), expected);
+        }
+        for (provider, expected) in [
+            (Provider::Aws, "aws"),
+            (Provider::Gcp, "gcp"),
+            (Provider::Azure, "azure"),
+        ] {
+            assert_eq!(provider.to_string(), expected);
+        }
     }
 
     #[test]
