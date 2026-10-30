@@ -128,6 +128,8 @@ registries:
 
 Auto-detected from hostname. ECR (private and Public), GAR, GCR, and ACR each route to a dedicated native-auth provider. GHCR, Docker Hub, Chainguard, and any unrecognized hostname share the same fallback path: `docker_config` first (using `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`), then anonymous if it holds no credentials for the registry. Set `auth_type` explicitly to override detection.
 
+Before sending credentials to a registry's token endpoint, `ocync` checks that the endpoint belongs to the registry. A registry known by name may use a token host under the same parent domain (`registry-1.docker.io` and `auth.docker.io`). A registry known by IP address must serve tokens from that same address, on any port. A name and an IP address never match, except loopback with loopback, so a registry whose token endpoint is an IP literal must be configured by that IP.
+
 See the [registry guides](/registries/ecr) for provider-specific auth details.
 
 ## Target groups
