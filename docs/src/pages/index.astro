@@ -30,8 +30,8 @@ const jsonLd = {
 };
 
 const stats = [
-  { value: "4x", desc: "faster cold syncs", color: "stat-pink" },
-  { value: "40%", desc: "fewer API requests", color: "stat-purple" },
+  { value: "3x", desc: "faster than regsync", color: "stat-pink" },
+  { value: "19%", desc: "fewer requests than regsync", color: "stat-purple" },
   { value: "AIMD", desc: "adaptive rate control", color: "stat-aqua" },
 ];
 
@@ -66,8 +66,8 @@ const registries = [
       </h1>
       <p class="hero-sub">
         ocync copies OCI images with blob deduplication, cross-repo mounting,
-        and streaming transfers. Faster syncs, fewer requests, fewer
-        bytes transferred, and adaptive rate control.
+        and streaming transfers. Faster syncs, fewer requests, and adaptive rate
+        control.
       </p>
       <div class="hero-actions">
         <a href={`${base}getting-started`} class="btn btn-primary"
@@ -89,7 +89,7 @@ const registries = [
           Global blob deduplication means shared layers transfer exactly once
           from source, then mount across all targets. <a href={`${base}design/overview#adaptive-concurrency-aimd`}>AIMD</a> (additive
           increase, multiplicative decrease) concurrency adapts to each
-          registry independently: no manual tuning, no throttling.
+          registry independently, backing off when one throttles.
         </p>
         <div class="stat-row">
           {stats.map((stat) => (
