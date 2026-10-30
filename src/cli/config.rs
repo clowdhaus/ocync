@@ -139,7 +139,10 @@ pub(crate) struct GlobalConfig {
     /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
     /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
     /// across major container registries).
-    #[serde(default = "default_max_concurrent_transfers")]
+    #[serde(
+        default = "default_max_concurrent_transfers",
+        deserialize_with = "transfers_at_least_one"
+    )]
     pub max_concurrent_transfers: NonZeroUsize,
 
     /// Cache directory for persistent cache and blob staging.
@@ -158,6 +161,33 @@ pub(crate) struct GlobalConfig {
     /// Uses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.
     /// `0` disables disk staging. When absent, no eviction is performed.
     pub staging_size_limit: Option<String>,
+}
+
+/// A count that must be at least 1, so a 0 reads as the rule it broke,
+/// naming `field`, rather than as a type mismatch.
+fn nonzero<E: serde::de::Error>(field: &str, n: usize) -> Result<NonZeroUsize, E> {
+    NonZeroUsize::new(n).ok_or_else(|| E::custom(format!("{field} must be at least 1")))
+}
+
+/// Reads `max_concurrent_transfers` through [`nonzero`].
+fn transfers_at_least_one<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    nonzero(
+        "max_concurrent_transfers",
+        usize::deserialize(deserializer)?,
+    )
+}
+
+/// Reads a registry's optional `max_concurrent` through [`nonzero`].
+fn registry_cap_at_least_one<'de, D>(deserializer: D) -> Result<Option<NonZeroUsize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer)?
+        .map(|n| nonzero("max_concurrent", n))
+        .transpose()
 }
 
 fn default_max_concurrent_transfers() -> NonZeroUsize {
@@ -225,6 +255,7 @@ pub(crate) struct RegistryConfig {
     /// Limits the total number of simultaneous in-flight HTTP requests to this
     /// registry across all action types. This is independent of the global
     /// `max_concurrent_transfers` (which caps image-level parallelism).
+    #[serde(default, deserialize_with = "registry_cap_at_least_one")]
     pub max_concurrent: Option<NonZeroUsize>,
 
     /// Credentials for Basic auth (`auth_type: basic`).
@@ -1624,6 +1655,7 @@ mappings:
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_concurrent_transfers"), "{err}");
+        assert!(err.contains("must be at least 1"), "{err}");
     }
 
     #[test]
@@ -1740,6 +1772,7 @@ mappings:
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_concurrent"), "{err}");
+        assert!(err.contains("must be at least 1"), "{err}");
     }
 
     // - Auth-type validation -------------------------------------------------

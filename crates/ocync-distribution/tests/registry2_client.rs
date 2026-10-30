@@ -340,7 +340,7 @@ async fn blob_push_stream_chunked() {
 
 /// Verify `blob_exists` returns `false` for a nonexistent blob.
 #[tokio::test]
-async fn blob_exists_returns_none_for_missing() {
+async fn blob_exists_returns_false_for_missing() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
     let repo = RepositoryName::new("test/missing").unwrap();

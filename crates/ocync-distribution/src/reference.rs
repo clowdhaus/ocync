@@ -21,7 +21,7 @@ const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
 #[derive(Debug, Clone, Eq)]
 pub struct Reference {
     registry: String,
-    repository: String,
+    repository: RepositoryName,
     tag: Option<String>,
     digest: Option<Digest>,
 }
@@ -30,13 +30,13 @@ impl Reference {
     /// Build a reference from already-validated parts.
     pub fn from_parts(
         registry: impl Into<String>,
-        repository: impl Into<String>,
+        repository: RepositoryName,
         tag: Option<String>,
         digest: Option<Digest>,
     ) -> Self {
         Self {
             registry: registry.into(),
-            repository: repository.into(),
+            repository,
             tag,
             digest,
         }
@@ -48,7 +48,7 @@ impl Reference {
     }
 
     /// The repository path (e.g. `library/nginx`, `clowdhaus/ocync`).
-    pub fn repository(&self) -> &str {
+    pub fn repository(&self) -> &RepositoryName {
         &self.repository
     }
 
@@ -123,15 +123,9 @@ impl FromStr for Reference {
             });
         }
 
-        // The character rule lives in `RepositoryName::new`; only the error's
-        // `input` is widened to the full reference string.
-        RepositoryName::new(&repository).map_err(|e| match e {
-            Error::InvalidReference { reason, .. } => Error::InvalidReference {
-                input: s.into(),
-                reason,
-            },
-            other => other,
-        })?;
+        // The character rule lives in `RepositoryName`; the error names the
+        // whole reference.
+        let repository = RepositoryName::within(repository, s)?;
 
         // Validate tag: must be 1-128 chars and match [a-zA-Z0-9_.-].
         if let Some(ref t) = tag {
@@ -239,7 +233,7 @@ mod tests {
         let input = format!("ghcr.io/clowdhaus/ocync@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
+        assert_eq!(r.repository().as_str(), "clowdhaus/ocync");
         assert!(r.tag().is_none());
         assert_eq!(r.digest().unwrap().to_string(), TEST_DIGEST);
     }
@@ -269,9 +263,14 @@ mod tests {
     #[test]
     fn from_parts() {
         let d: Digest = TEST_DIGEST.parse().unwrap();
-        let r = Reference::from_parts("ghcr.io", "clowdhaus/ocync", Some("v1.0".into()), Some(d));
+        let r = Reference::from_parts(
+            "ghcr.io",
+            RepositoryName::new("clowdhaus/ocync").unwrap(),
+            Some("v1.0".into()),
+            Some(d),
+        );
         assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
+        assert_eq!(r.repository().as_str(), "clowdhaus/ocync");
         assert_eq!(r.tag(), Some("v1.0"));
         assert!(r.digest().is_some());
     }
@@ -358,7 +357,7 @@ mod tests {
         for (input, registry, repository, tag) in cases {
             let r: Reference = input.parse().unwrap();
             assert_eq!(r.registry(), registry, "{input}");
-            assert_eq!(r.repository(), repository, "{input}");
+            assert_eq!(r.repository().as_str(), repository, "{input}");
             assert_eq!(r.tag(), tag, "{input}");
             assert!(r.digest().is_none(), "{input}");
         }

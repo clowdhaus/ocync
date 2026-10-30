@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use super::detect::normalize_host;
+use super::detect::AzureCloud;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
@@ -68,34 +68,7 @@ fn ttl_from_unix_exp(exp: i64) -> Duration {
     }
 }
 
-/// The Azure cloud an ACR host belongs to, which fixes the Entra ID
-/// authority and the container registry resource its tokens are for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AzureCloud {
-    /// Azure public cloud, and the cloud of any host not under a
-    /// sovereign suffix, so an explicit `auth_type: acr` on another host
-    /// still gets a token.
-    Public,
-    /// Azure China (`.azurecr.cn`).
-    China,
-    /// Azure US Government (`.azurecr.us`).
-    UsGov,
-}
-
 impl AzureCloud {
-    /// The cloud of `host`, compared by the same normal form provider
-    /// detection uses.
-    fn of_host(host: &str) -> Self {
-        let host = normalize_host(host);
-        if host.ends_with(".azurecr.cn") {
-            Self::China
-        } else if host.ends_with(".azurecr.us") {
-            Self::UsGov
-        } else {
-            Self::Public
-        }
-    }
-
     /// The Entra ID authority host.
     fn authority(self) -> &'static str {
         match self {
@@ -366,8 +339,7 @@ impl Source {
 /// Azure credential chain that tries four credential sources in order and
 /// keeps using the first that succeeds until reset.
 struct AzureCredentialChain {
-    authority: &'static str,
-    resource: &'static str,
+    cloud: AzureCloud,
     cached_source: AtomicU8,
     http: reqwest::Client,
 }
@@ -375,7 +347,7 @@ struct AzureCredentialChain {
 impl fmt::Debug for AzureCredentialChain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AzureCredentialChain")
-            .field("authority", &self.authority)
+            .field("cloud", &self.cloud)
             .finish_non_exhaustive()
     }
 }
@@ -389,8 +361,7 @@ impl AzureCredentialChain {
             .build()
             .expect("failed to build Azure credential HTTP client");
         Self {
-            authority: cloud.authority(),
-            resource: cloud.resource(),
+            cloud,
             cached_source: AtomicU8::new(Source::NONE),
             http,
         }
@@ -454,8 +425,11 @@ impl AzureCredentialChain {
         let client_secret =
             std::env::var("AZURE_CLIENT_SECRET").map_err(|_| CredentialError::NotConfigured)?;
 
-        let url = format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority);
-        let scope = format!("{resource}/.default", resource = self.resource);
+        let url = format!(
+            "https://{}/{tenant}/oauth2/v2.0/token",
+            self.cloud.authority()
+        );
+        let scope = format!("{resource}/.default", resource = self.cloud.resource());
         let form = [
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
@@ -481,8 +455,11 @@ impl AzureCredentialChain {
             )
         })?;
 
-        let url = format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority);
-        let scope = format!("{resource}/.default", resource = self.resource);
+        let url = format!(
+            "https://{}/{tenant}/oauth2/v2.0/token",
+            self.cloud.authority()
+        );
+        let scope = format!("{resource}/.default", resource = self.cloud.resource());
         let form = [
             ("client_id", client_id.as_str()),
             ("client_assertion", assertion.trim()),
@@ -500,7 +477,7 @@ impl AzureCredentialChain {
     async fn try_managed_identity(&self) -> Result<String, CredentialError> {
         // `resource` is one of `AzureCloud::resource()`'s constants, none holding
         // `&` or `#`, so it needs no encoding.
-        let resource = self.resource;
+        let resource = self.cloud.resource();
         let url = format!(
             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2019-08-01&resource={resource}"
         );
@@ -553,7 +530,7 @@ impl AzureCredentialChain {
                 "account",
                 "get-access-token",
                 "--resource",
-                self.resource,
+                self.cloud.resource(),
                 "-o",
                 "json",
             ])
@@ -957,73 +934,30 @@ mod tests {
         assert!(err.to_string().contains("not valid JSON"));
     }
 
-    /// A host maps to its cloud's authority and resource whatever its case,
-    /// port or trailing dot, and a host under no sovereign suffix (an
-    /// explicit `auth_type: acr`) gets the public cloud. Breaks if the
-    /// match is made on the raw host.
+    /// Each cloud signs in at its own Entra ID authority for its own
+    /// container registry resource. Breaks if two clouds share either.
     #[test]
-    fn azure_cloud_of_host_table() {
+    fn azure_cloud_authority_and_resource_table() {
         let cases = [
             (
-                "myregistry.azurecr.io",
                 AzureCloud::Public,
                 "login.microsoftonline.com",
                 "https://containerregistry.azure.net",
             ),
             (
-                "registry.example.com",
-                AzureCloud::Public,
-                "login.microsoftonline.com",
-                "https://containerregistry.azure.net",
-            ),
-            (
-                "myregistry.azurecr.cn",
                 AzureCloud::China,
                 "login.chinacloudapi.cn",
                 "https://containerregistry.azure.cn",
             ),
             (
-                "MyReg.AzureCR.cn",
-                AzureCloud::China,
-                "login.chinacloudapi.cn",
-                "https://containerregistry.azure.cn",
-            ),
-            (
-                "myreg.azurecr.cn.",
-                AzureCloud::China,
-                "login.chinacloudapi.cn",
-                "https://containerregistry.azure.cn",
-            ),
-            (
-                "myreg.azurecr.cn:443",
-                AzureCloud::China,
-                "login.chinacloudapi.cn",
-                "https://containerregistry.azure.cn",
-            ),
-            (
-                "myregistry.azurecr.us",
-                AzureCloud::UsGov,
-                "login.microsoftonline.us",
-                "https://containerregistry.azure.us",
-            ),
-            (
-                "MyReg.AzureCR.us",
-                AzureCloud::UsGov,
-                "login.microsoftonline.us",
-                "https://containerregistry.azure.us",
-            ),
-            (
-                "myreg.azurecr.us.",
                 AzureCloud::UsGov,
                 "login.microsoftonline.us",
                 "https://containerregistry.azure.us",
             ),
         ];
-        for (host, cloud, authority, resource) in cases {
-            let got = AzureCloud::of_host(host);
-            assert_eq!(got, cloud, "{host}");
-            assert_eq!(got.authority(), authority, "{host}");
-            assert_eq!(got.resource(), resource, "{host}");
+        for (cloud, authority, resource) in cases {
+            assert_eq!(cloud.authority(), authority, "{cloud:?}");
+            assert_eq!(cloud.resource(), resource, "{cloud:?}");
         }
     }
 

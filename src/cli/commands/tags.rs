@@ -1,8 +1,6 @@
 //! The `tags` subcommand - lists and filters tags from a repository.
 
-use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;
-use ocync_sync::version::Range;
 
 use crate::TagsArgs;
 use crate::cli::config::load_config;
@@ -10,8 +8,6 @@ use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_cl
 
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
-    let repository = args.repository.repository();
-
     // Resolve auth settings from config if provided, otherwise auto-detect.
     let registries = match &args.config {
         Some(config_path) => load_config(config_path)?.registries.into_values().collect(),
@@ -23,12 +19,11 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     )
     .await?;
 
-    let repo_path = RepositoryName::new(repository)?;
-    let all_tags = client.list_tags(&repo_path).await?;
+    let all_tags = client.list_tags(args.repository.repository()).await?;
 
     let filter = FilterConfig {
         glob: args.glob.clone(),
-        semver: args.semver.as_deref().map(Range::parse).transpose()?,
+        semver: args.semver.clone(),
         exclude: args.exclude.clone(),
         sort: args.sort.map(|s| s.into()),
         latest: args.latest,

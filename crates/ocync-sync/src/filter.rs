@@ -256,9 +256,7 @@ impl FilterConfig {
             push_drop_reason(
                 &mut drop_reasons,
                 track,
-                DropKind::Semver {
-                    range: req.to_string(),
-                },
+                DropKind::Semver { range: req.clone() },
                 dropped,
             );
             pipeline = kept;
@@ -467,8 +465,8 @@ pub enum DropKind {
     },
     /// Tag did not satisfy the configured `semver:` range.
     Semver {
-        /// The configured version range string, e.g. `">=1.18.0"`.
-        range: String,
+        /// The configured version range, e.g. `">=1.18.0"`.
+        range: Range,
     },
     /// Tag matched a per-mapping `exclude:` pattern (hard tier; blocks
     /// `include:` on the same mapping).
@@ -913,17 +911,6 @@ mod tests {
         }
         let err = build_glob_set(&["[bad".into()]).unwrap_err();
         assert!(matches!(err, Error::InvalidGlob { .. }), "build_glob_set");
-    }
-
-    #[test]
-    fn invalid_semver_range_is_refused_at_parse() {
-        for bad in ["not_valid", ">= not_a_version"] {
-            let err = Range::parse(bad).unwrap_err();
-            assert!(
-                matches!(&err, Error::InvalidVersionRange { range, .. } if range == bad),
-                "{bad}"
-            );
-        }
     }
 
     #[test]

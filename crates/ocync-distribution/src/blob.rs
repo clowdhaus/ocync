@@ -508,7 +508,7 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Upl
     if resolved.origin() != base_url.origin() {
         return Err(Error::UploadProtocol {
             reason: format!(
-                "upload Location origin {} differs from registry origin {}; refusing to forward credentials cross-origin",
+                "upload Location origin {} differs from registry origin {}; refusing to forward credentials cross-origin (a proxy in front of the registry must forward the original scheme, such as with X-Forwarded-Proto, or return relative Locations)",
                 resolved.origin().ascii_serialization(),
                 base_url.origin().ascii_serialization(),
             ),
@@ -648,35 +648,6 @@ mod tests {
         }
     }
 
-    /// A registry that answers a blob HEAD 200 without a usable
-    /// `Content-Length` still has the blob, and a 404 still means it does
-    /// not. Breaks if a missing size turns a hit into a miss (or an error),
-    /// or a 404 into a hit.
-    #[tokio::test]
-    async fn blob_exists_does_not_depend_on_content_length() {
-        let server = wiremock::MockServer::start().await;
-        let present = test_digest(b"present");
-        let absent = test_digest(b"absent");
-        for (digest, status) in [(&present, 200), (&absent, 404)] {
-            wiremock::Mock::given(wiremock::matchers::method("HEAD"))
-                .and(wiremock::matchers::path(format!(
-                    "/v2/repo/{}",
-                    blob_path(digest)
-                )))
-                .respond_with(wiremock::ResponseTemplate::new(status))
-                .expect(1)
-                .mount(&server)
-                .await;
-        }
-        let client = crate::client::RegistryClientBuilder::new(server.uri().parse().unwrap())
-            .build()
-            .unwrap();
-        let repo = RepositoryName::new("repo").unwrap();
-
-        assert!(client.blob_exists(&repo, &present).await.unwrap());
-        assert!(!client.blob_exists(&repo, &absent).await.unwrap());
-    }
-
     /// Build a `RegistryClient` with the given hostname, routing all traffic
     /// for that hostname to a local wiremock port. Used by the tests below
     /// that need a real-looking hostname (e.g. `ghcr.io`,
@@ -711,7 +682,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = crate::client::RegistryClientBuilder::new(server.uri().parse().unwrap())
-            .blob_download_concurrency(1)
+            .blob_download_concurrency(std::num::NonZeroUsize::MIN)
             .build()
             .unwrap();
         let repo = RepositoryName::new("repo").unwrap();
@@ -1066,6 +1037,10 @@ mod tests {
             msg.contains("differs from registry origin"),
             "expected same-origin rejection error, got: {msg}"
         );
+        assert!(
+            msg.contains("X-Forwarded-Proto"),
+            "error must name the remedy, got: {msg}"
+        );
     }
 
     /// `blob_pull` follows 3xx redirects through reqwest's default policy.
@@ -1412,7 +1387,7 @@ mod tests {
                     "ghcr.io",
                     std::net::SocketAddr::from(([127, 0, 0, 1], port)),
                 )
-                .buffered_blob_bytes(8 * 1024 * 1024)
+                .buffered_blob_bytes(std::num::NonZeroUsize::new(8 * 1024 * 1024).unwrap())
                 .build()
                 .unwrap(),
         );

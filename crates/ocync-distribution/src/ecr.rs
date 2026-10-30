@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::digest::Digest;
-use crate::error::{CredentialFailure, Error};
+use crate::error::Error;
 use crate::spec::RepositoryName;
 
 /// Extract the AWS region from an ECR hostname.
@@ -75,9 +75,12 @@ pub(crate) fn api_client(
 }
 
 /// The error for `hostname` when the AWS configuration cannot build a
-/// client: final, since asking again reads the same configuration.
+/// client.
 fn config_failed(hostname: &str, cause: crate::aws::ConfigError) -> Error {
-    Error::cloud_credentials_caused_by(hostname, CredentialFailure::Failed, cause)
+    Error::EcrConfig {
+        registry: hostname.to_owned(),
+        source: std::sync::Arc::new(cause),
+    }
 }
 
 /// ECR's limit on layer digests per `BatchCheckLayerAvailability` call.
@@ -1194,13 +1197,12 @@ mod tests {
             source.to_string(),
             "Invalid Configuration: FIPS and custom endpoint are not supported"
         );
-        assert!(matches!(
-            error,
-            Error::CloudCredentials {
-                failure: CredentialFailure::Failed,
-                ..
-            }
-        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid ECR client configuration for registry '123456789012.dkr.ecr.us-east-1.amazonaws.com': \
+             Invalid Configuration: FIPS and custom endpoint are not supported"
+        );
+        assert!(!error.is_auth_error());
 
         let no_region = BatchChecker::from_hostname(
             "localhost",
@@ -1213,6 +1215,7 @@ mod tests {
             source.to_string(),
             "cannot extract AWS region from ECR hostname 'localhost'"
         );
+        assert!(matches!(no_region, Error::EcrConfig { .. }));
     }
 
     #[test]

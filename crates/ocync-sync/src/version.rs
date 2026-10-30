@@ -174,7 +174,7 @@ fn split_letter_digit(s: &str) -> Vec<&str> {
 /// [`Range::parse`] is the only constructor, so a held `Range` is always
 /// valid. It deserializes from, serializes to, and displays as the original
 /// string, so config round-trips and log lines show what the user wrote.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Range {
     /// The text as written, kept for display; parsing never changes it.
@@ -197,20 +197,15 @@ enum Op {
     Eq,
 }
 
-/// Error returned when a version range string cannot be parsed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RangeParseError {
-    /// Operator-facing explanation of what was rejected.
-    pub(crate) reason: String,
-}
-
-impl std::fmt::Display for RangeParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
+/// Two ranges are equal when they match the same tags as written, so the
+/// text kept for display does not count.
+impl PartialEq for Range {
+    fn eq(&self, other: &Self) -> bool {
+        self.constraints == other.constraints
     }
 }
 
-impl std::error::Error for RangeParseError {}
+impl Eq for Range {}
 
 impl std::fmt::Display for Range {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -248,9 +243,9 @@ impl Range {
                 source: s.to_owned(),
                 constraints,
             })
-            .map_err(|e| Error::InvalidVersionRange {
+            .map_err(|reason| Error::InvalidVersionRange {
                 range: s.to_owned(),
-                reason: e.to_string(),
+                reason,
             })
     }
 
@@ -262,12 +257,10 @@ impl Range {
 }
 
 /// Split a range into its comma-joined constraints.
-fn parse_constraints(s: &str) -> Result<Vec<Constraint>, RangeParseError> {
+fn parse_constraints(s: &str) -> Result<Vec<Constraint>, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Err(RangeParseError {
-            reason: "empty range".into(),
-        });
+        return Err("empty range".into());
     }
     trimmed
         .split(',')
@@ -275,11 +268,9 @@ fn parse_constraints(s: &str) -> Result<Vec<Constraint>, RangeParseError> {
         .collect()
 }
 
-fn parse_constraint(s: &str) -> Result<Constraint, RangeParseError> {
+fn parse_constraint(s: &str) -> Result<Constraint, String> {
     if s.is_empty() {
-        return Err(RangeParseError {
-            reason: "empty constraint".into(),
-        });
+        return Err("empty constraint".into());
     }
     if s.starts_with('^')
         || s.starts_with('~')
@@ -287,12 +278,10 @@ fn parse_constraint(s: &str) -> Result<Constraint, RangeParseError> {
         || s.contains('X')
         || s.contains('*')
     {
-        return Err(RangeParseError {
-            reason: format!(
-                "unsupported range syntax '{}'; use a comma-joined combination of >=, <=, >, <, =",
-                s
-            ),
-        });
+        return Err(format!(
+            "unsupported range syntax '{}'; use a comma-joined combination of >=, <=, >, <, =",
+            s
+        ));
     }
 
     let (op, rest) = if let Some(r) = s.strip_prefix(">=") {
@@ -314,28 +303,25 @@ fn parse_constraint(s: &str) -> Result<Constraint, RangeParseError> {
     Ok(Constraint { op, bound })
 }
 
-fn parse_bound(s: &str) -> Result<Vec<u64>, RangeParseError> {
+fn parse_bound(s: &str) -> Result<Vec<u64>, String> {
     if s.contains('-') {
-        return Err(RangeParseError {
-            reason: format!("prerelease suffix not allowed in range bound: '{}'", s),
-        });
+        return Err(format!(
+            "prerelease suffix not allowed in range bound: '{}'",
+            s
+        ));
     }
     let mut components = Vec::new();
     for part in s.split('.') {
         if part.is_empty() {
-            return Err(RangeParseError {
-                reason: format!("malformed bound '{}'", s),
-            });
+            return Err(format!("malformed bound '{}'", s));
         }
-        let n: u64 = part.parse().map_err(|_| RangeParseError {
-            reason: format!("malformed bound '{}'", s),
-        })?;
+        let n: u64 = part
+            .parse()
+            .map_err(|_| format!("malformed bound '{}'", s))?;
         components.push(n);
     }
     if components.is_empty() {
-        Err(RangeParseError {
-            reason: format!("empty bound '{}'", s),
-        })
+        Err(format!("empty bound '{}'", s))
     } else {
         Ok(components)
     }
@@ -522,6 +508,17 @@ mod range_tests {
         for (name, range) in cases {
             assert!(Range::parse(range).is_err(), "{name}: {range}");
         }
+    }
+
+    /// Ranges are equal by what they match, not by how they were written.
+    /// Breaks if the display text enters the comparison, or if different
+    /// bounds compare equal.
+    #[test]
+    fn equality_ignores_the_text_and_keeps_the_bounds() {
+        let range = |s| Range::parse(s).unwrap();
+        assert_eq!(range(">=1.0,<2.0"), range(" >=1.0 , < 2.0"));
+        assert_ne!(range(">=1.0,<2.0"), range(">=1.0,<3.0"));
+        assert_ne!(range(">=1.0"), range(">1.0"));
     }
 }
 

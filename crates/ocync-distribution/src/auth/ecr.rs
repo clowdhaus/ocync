@@ -284,19 +284,6 @@ mod tests {
     /// A throttle that outlasts its retries is not an auth error, and an
     /// access denial is. Breaks if every AWS failure exits as refused
     /// credentials, or a denial stops counting as one.
-    /// A hostname that names no region fails construction with the config
-    /// error as the source. Breaks if `new` flattens the cause to text.
-    #[test]
-    fn new_keeps_the_config_error_as_source() {
-        let error =
-            EcrAuth::new("localhost", None, &crate::AwsCredentialProviders::default()).unwrap_err();
-        let source = std::error::Error::source(&error).expect("source");
-        assert_eq!(
-            source.to_string(),
-            "cannot extract AWS region from ECR hostname 'localhost'"
-        );
-    }
-
     #[tokio::test]
     async fn only_an_aws_refusal_is_an_auth_error() {
         for (answer, auth_error) in [

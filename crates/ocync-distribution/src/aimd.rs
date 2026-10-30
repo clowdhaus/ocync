@@ -9,6 +9,7 @@
 //! ceilings are also paced by a `TokenBucket`.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -428,7 +429,8 @@ pub struct AimdController {
 
 impl AimdController {
     /// A controller for `host` with `max_concurrent` as the aggregate limit.
-    pub fn new(host: &str, max_concurrent: usize) -> Self {
+    pub fn new(host: &str, max_concurrent: NonZeroUsize) -> Self {
+        let max_concurrent = max_concurrent.get();
         Self {
             host: host.to_owned(),
             provider: detect_provider_kind(host),
@@ -938,7 +940,7 @@ mod tests {
         // Acquire 100 permits in series; total elapsed should be at least
         // (100 - 20) / 80 = 1.0 sec because of bucket pacing past burst.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
         let start = tokio::time::Instant::now();
         for _ in 0..100 {
             let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
@@ -955,7 +957,7 @@ mod tests {
     async fn controller_does_not_pace_unconfigured_window() {
         // ECR_MANIFEST_HEAD has no bucket -- acquires should be near-instant.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
         let start = tokio::time::Instant::now();
         for _ in 0..100 {
             let permit = ctrl.acquire(RegistryAction::ManifestHead).await;
@@ -977,7 +979,7 @@ mod tests {
         // restore burst tokens and re-enable over-cap traffic exactly when the
         // registry has signalled it cannot handle current load.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
 
         // Drain the bucket: 20 burst + a small post-burst sample.
         for _ in 0..21 {
@@ -1002,7 +1004,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn waiters_queued_before_a_halving_are_still_admitted() {
         // ECR manifest HEADs have no token bucket, so only the window gates.
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(100).unwrap(),
+        );
         let op = RegistryAction::ManifestHead;
         let admitted = Duration::from_secs(1);
 
@@ -1050,7 +1055,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_on_a_full_window_holds_no_aggregate_permit() {
         // Aggregate cap of 2; manifest and blob HEADs are separate ECR windows.
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 2);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(2).unwrap(),
+        );
         let holder = ctrl.acquire(RegistryAction::ManifestHead).await;
         let mut waiter = Box::pin(ctrl.acquire(RegistryAction::ManifestHead));
         assert!(
@@ -1068,7 +1076,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn halving_holds_new_requests_until_in_flight_drops_below_limit() {
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(100).unwrap(),
+        );
         let op = RegistryAction::ManifestHead;
         for _ in 0..4 {
             ctrl.acquire(op).await.success();

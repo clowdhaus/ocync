@@ -394,6 +394,7 @@
             "null"
           ],
           "format": "uint",
+          "default": null,
           "minimum": 1
         },
         "token": {
