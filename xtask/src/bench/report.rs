@@ -1167,24 +1167,42 @@ mod tests {
     }
 
     #[test]
-    fn corpus_locked_at_is_written_when_set_and_old_archive_records_still_parse() {
+    fn the_tracked_archive_still_parses() {
         let archive = include_str!("../../../bench/results/ecr.json");
-        let mut records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
+        let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
         assert!(!records.is_empty());
-        assert!(
-            records.iter().all(|r| r.corpus_locked_at.is_none()),
-            "records written before the lock lack the field"
-        );
+    }
 
-        let record = &mut records[0];
-        let without = serde_json::to_string(record).unwrap();
+    #[test]
+    fn corpus_locked_at_is_written_only_when_set_and_old_records_read_as_unset() {
+        let mut record: RunRecord = serde_json::from_str(
+            r#"{
+                "timestamp": "2026-10-30-120000",
+                "git_ref": "abc1234",
+                "machine": {
+                    "instance_type": "c6in.4xlarge", "arch": "x86_64", "vcpus": 16,
+                    "memory_gib": 32.0, "network": "n", "region": "us-east-1",
+                    "image_id": "unknown"
+                },
+                "corpus": { "images": 1, "tags": 1 },
+                "scenarios": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.corpus_locked_at, None, "a record with no field");
+        let without = serde_json::to_string(&record).unwrap();
         assert!(!without.contains("corpus_locked_at"), "{without}");
 
         record.corpus_locked_at = Some("2026-10-30-120000".into());
-        let with = serde_json::to_string(record).unwrap();
+        let with = serde_json::to_string(&record).unwrap();
         assert!(
             with.contains(r#""corpus_locked_at":"2026-10-30-120000""#),
             "{with}"
+        );
+        let reread: RunRecord = serde_json::from_str(&with).unwrap();
+        assert_eq!(
+            reread.corpus_locked_at.as_deref(),
+            Some("2026-10-30-120000")
         );
     }
 

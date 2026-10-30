@@ -17,6 +17,26 @@ pub(crate) struct Baseline {
     pub(crate) requests: u64,
     /// Total bytes transferred.
     pub(crate) total_bytes: u64,
+    /// The corpus lock the run synced against. Absent from baselines saved
+    /// before the lock existed, which therefore compare against no run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) corpus_locked_at: Option<String>,
+}
+
+/// Refuse to compare a run against a baseline taken under another corpus lock,
+/// or under none: they synced different content, so a delta is not a regression.
+pub(crate) fn ensure_same_corpus(
+    baseline: &Baseline,
+    corpus_locked_at: &str,
+) -> Result<(), String> {
+    match baseline.corpus_locked_at.as_deref() {
+        Some(locked) if locked == corpus_locked_at => Ok(()),
+        recorded => Err(format!(
+            "baseline was recorded under corpus lock {}, this run under {corpus_locked_at}; \
+             record a new baseline by deleting bench/results/baseline.json and rerunning",
+            recorded.unwrap_or("(none)")
+        )),
+    }
 }
 
 /// Result of comparing a current run against a stored baseline.
@@ -148,6 +168,7 @@ mod tests {
             wall_clock_secs,
             requests,
             total_bytes,
+            corpus_locked_at: None,
         }
     }
 
@@ -258,6 +279,7 @@ mod tests {
             wall_clock_secs: 47.5,
             requests: 847,
             total_bytes: 2_100_000_000,
+            corpus_locked_at: Some("2026-10-30-214340".into()),
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         save_baseline(tmpfile.path(), &baseline).unwrap();
@@ -265,6 +287,30 @@ mod tests {
         assert_eq!(loaded.wall_clock_secs, 47.5);
         assert_eq!(loaded.requests, 847);
         assert_eq!(loaded.total_bytes, 2_100_000_000);
+        assert_eq!(
+            loaded.corpus_locked_at.as_deref(),
+            Some("2026-10-30-214340")
+        );
+    }
+
+    #[test]
+    fn a_baseline_from_another_lock_or_none_is_refused() {
+        let cases: [(Option<&str>, bool); 3] = [
+            (Some("2026-10-30-214340"), true),
+            (Some("2026-09-01-000000"), false),
+            (None, false),
+        ];
+        for (recorded, accepted) in cases {
+            let stored = Baseline {
+                corpus_locked_at: recorded.map(str::to_owned),
+                ..baseline(1.0, 1, 1)
+            };
+            let got = ensure_same_corpus(&stored, "2026-10-30-214340");
+            assert_eq!(got.is_ok(), accepted, "baseline lock {recorded:?}");
+            if let Err(e) = got {
+                assert!(e.contains("record a new baseline"), "{e}");
+            }
+        }
     }
 
     #[test]

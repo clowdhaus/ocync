@@ -2,18 +2,17 @@
 //! manifest digest it resolved to, so runs on different dates sync the same
 //! content and a moved source is refused rather than benchmarked.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use clap::Args;
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
-use crate::bench::corpus::{self, DockerHubAuth, ImageEntry};
-use crate::bench::registry;
-
-/// Where the lock lives, relative to the repository root.
-pub(crate) const LOCK_PATH: &str = "bench/corpus.lock.json";
+use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
+use crate::bench::registry::{self, Repository, Tokens};
 
 /// The only digest algorithm a corpus manifest is addressed by.
 const DIGEST_PREFIX: &str = "sha256:";
@@ -80,12 +79,48 @@ impl fmt::Display for Digest {
 }
 
 /// A source image and one tag of it, as the corpus names them.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Written in the lock as `source:tag`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub(crate) struct ImageRef {
     /// Source repository, e.g. `quay.io/jupyter/base-notebook`.
     pub(crate) source: String,
     /// Tag of that repository.
     pub(crate) tag: String,
+}
+
+impl ImageRef {
+    /// Parse `source:tag`, splitting at the last `:`. Refuses an empty part,
+    /// and a tag holding `/`, which means the last `:` was a registry port.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let (source, tag) = raw
+            .rsplit_once(':')
+            .ok_or_else(|| format!("image ref {raw:?} has no \":<tag>\""))?;
+        if source.is_empty() || tag.is_empty() || tag.contains('/') {
+            return Err(format!(
+                "image ref {raw:?} is not <source>:<tag> with a non-empty source and a tag holding no \"/\""
+            ));
+        }
+        Ok(Self {
+            source: source.to_owned(),
+            tag: tag.to_owned(),
+        })
+    }
+}
+
+impl TryFrom<String> for ImageRef {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, String> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<ImageRef> for String {
+    fn from(image: ImageRef) -> String {
+        image.to_string()
+    }
 }
 
 impl fmt::Display for ImageRef {
@@ -124,19 +159,20 @@ pub(crate) struct Lock {
     /// UTC time the lock was written, in the run timestamp format. Runs recorded
     /// under different values are different comparison series.
     pub(crate) locked_at: String,
-    /// Resolution of every ref, keyed by `source:tag`.
-    pub(crate) images: BTreeMap<String, LockEntry>,
+    /// Resolution of every ref.
+    pub(crate) images: BTreeMap<ImageRef, LockEntry>,
 }
 
 impl Lock {
     /// Read and parse the lock at `path`.
-    pub(crate) fn load(path: &str) -> Result<Self, String> {
+    pub(crate) fn load(path: &Path) -> Result<Self, String> {
+        let shown = path.display();
         let raw = std::fs::read_to_string(path).map_err(|e| {
             format!(
-                "failed to read corpus lock {path}: {e}; create it with `cargo xtask bench-lock`"
+                "failed to read corpus lock {shown}: {e}; create it with `cargo xtask bench-lock`"
             )
         })?;
-        Self::parse(&raw).map_err(|e| format!("corpus lock {path}: {e}"))
+        Self::parse(&raw).map_err(|e| format!("corpus lock {shown}: {e}"))
     }
 
     /// Parse the text of a lock file.
@@ -161,18 +197,12 @@ impl Lock {
 #[derive(Debug, PartialEq, Eq)]
 enum Difference {
     /// The ref is not in the lock.
-    Missing { image: String },
+    Missing { image: ImageRef },
     /// The tag now names a different manifest.
     Moved {
-        image: String,
+        image: ImageRef,
         expected: Digest,
         actual: Digest,
-    },
-    /// The tag names the same digest but its index lists other children.
-    ChildrenChanged {
-        image: String,
-        expected: Vec<Digest>,
-        actual: Vec<Digest>,
     },
 }
 
@@ -185,67 +215,41 @@ impl fmt::Display for Difference {
                 expected,
                 actual,
             } => write!(f, "{image}: expected {expected}, now {actual}"),
-            Self::ChildrenChanged {
-                image,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "{image}: children expected [{}], now [{}]",
-                join(expected),
-                join(actual)
-            ),
         }
     }
 }
 
-/// `digests` as a comma-separated list.
-fn join(digests: &[Digest]) -> String {
-    digests
-        .iter()
-        .map(Digest::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Every way the freshly resolved refs differ from `lock`. Lock entries the
-/// scenario does not sync are not looked at.
-fn compare(lock: &Lock, resolved: &BTreeMap<String, LockEntry>) -> Vec<Difference> {
+/// Every way the freshly resolved digests differ from `lock`. Equal digests
+/// mean identical manifest bytes, children included. Lock entries the scenario
+/// does not sync are not looked at.
+fn compare(lock: &Lock, resolved: &BTreeMap<ImageRef, Digest>) -> Vec<Difference> {
     let mut differences = Vec::new();
     for (image, actual) in resolved {
-        let Some(expected) = lock.images.get(image) else {
-            differences.push(Difference::Missing {
+        match lock.images.get(image) {
+            None => differences.push(Difference::Missing {
                 image: image.clone(),
-            });
-            continue;
-        };
-        if expected.digest != actual.digest {
-            differences.push(Difference::Moved {
+            }),
+            Some(expected) if expected.digest != *actual => differences.push(Difference::Moved {
                 image: image.clone(),
                 expected: expected.digest.clone(),
-                actual: actual.digest.clone(),
-            });
-        } else if expected.children != actual.children {
-            differences.push(Difference::ChildrenChanged {
-                image: image.clone(),
-                expected: expected.children.clone(),
-                actual: actual.children.clone(),
-            });
+                actual: actual.clone(),
+            }),
+            Some(_) => {}
         }
     }
     differences
 }
 
 /// `Err` listing every ref that differs from `lock`, `Ok` when none does.
-fn check_unmoved(lock: &Lock, resolved: &BTreeMap<String, LockEntry>) -> Result<(), String> {
+fn check_unmoved(lock: &Lock, resolved: &BTreeMap<ImageRef, Digest>) -> Result<(), String> {
     let differences = compare(lock, resolved);
     if differences.is_empty() {
         return Ok(());
     }
     let listed: Vec<String> = differences.iter().map(|d| format!("  {d}")).collect();
     Err(format!(
-        "{} source ref(s) differ from {LOCK_PATH}, so this run would not sync the corpus it \
-         was locked to:\n{}\nRun `cargo xtask bench-lock` to lock the current content. A new \
+        "{} source ref(s) differ from the corpus lock, so this run would not sync the corpus \
+         it was locked to:\n{}\nRun `cargo xtask bench-lock` to lock the current content. A new \
          lock starts a new comparison series: do not read its runs against runs under the old one.",
         differences.len(),
         listed.join("\n")
@@ -253,6 +257,9 @@ fn check_unmoved(lock: &Lock, resolved: &BTreeMap<String, LockEntry>) -> Result<
 }
 
 /// Resolve every ref in `refs` again and refuse if any differs from `lock`.
+///
+/// Probes with HEAD, which every registry answers with the digest and which
+/// costs no body, and falls back to a GET only where a registry sends none.
 pub(crate) async fn ensure_unmoved(
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
@@ -262,17 +269,27 @@ pub(crate) async fn ensure_unmoved(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
-    let resolved = resolve(refs, auth).await?;
-    check_unmoved(lock, &resolved)
+    let resolved = resolve(refs, auth, Mode::Recheck).await?;
+    let digests = resolved
+        .into_iter()
+        .map(|(image, fetched)| (image, fetched.digest))
+        .collect();
+    check_unmoved(lock, &digests)
 }
 
-/// The digest of a manifest: the registry's `Docker-Content-Digest` when it
-/// sent one, else the SHA-256 of the body.
-fn manifest_digest(header: Option<&str>, body: &[u8]) -> Result<Digest, String> {
-    match header {
-        Some(value) => Digest::parse(value.trim()),
-        None => Ok(Digest::of(body)),
+/// The digest of a manifest body. A registry that also reports a digest must
+/// agree with the bytes, or the lock would record something no copy can match.
+fn body_digest(header: Option<&str>, body: &[u8]) -> Result<Digest, String> {
+    let actual = Digest::of(body);
+    if let Some(value) = header {
+        let reported = Digest::parse(value.trim())?;
+        if reported != actual {
+            return Err(format!(
+                "registry reports digest {reported} but the manifest body hashes to {actual}"
+            ));
+        }
     }
+    Ok(actual)
 }
 
 /// A manifest body, read only for the children an index lists.
@@ -287,7 +304,7 @@ struct ManifestBody {
 #[derive(Deserialize)]
 struct Child {
     /// Digest of the child manifest.
-    digest: String,
+    digest: Digest,
 }
 
 /// The child manifest digests of an index body, in order; empty for a single
@@ -298,47 +315,57 @@ fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
         reason = "a public manifest holding no credential"
     )]
     let parsed: ManifestBody =
-        serde_json::from_slice(body).map_err(|e| format!("manifest is not JSON: {e}"))?;
-    parsed
-        .manifests
-        .iter()
-        .map(|child| Digest::parse(&child.digest))
-        .collect()
+        serde_json::from_slice(body).map_err(|e| format!("manifest is not valid: {e}"))?;
+    Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
 }
 
-/// Resolve every ref to its manifest digest and children.
-///
-/// Fetches the manifest rather than probing it, because the children are in the
-/// body. A ref that cannot be resolved fails the whole call, naming each one.
+/// What a resolution is for.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Writing the lock: fetch every manifest and hash the exact bytes.
+    Lock,
+    /// Checking the lock: the digest alone.
+    Recheck,
+}
+
+/// What a tag resolved to.
+struct Fetched {
+    /// Digest of the manifest the tag names.
+    digest: Digest,
+    /// The manifest bytes, when they were fetched.
+    body: Option<Vec<u8>>,
+}
+
+/// Resolve every ref, naming each one that cannot be resolved.
 async fn resolve(
     refs: &BTreeSet<ImageRef>,
     auth: Option<&DockerHubAuth>,
-) -> Result<BTreeMap<String, LockEntry>, String> {
+    mode: Mode,
+) -> Result<BTreeMap<ImageRef, Fetched>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))?;
 
-    let mut tokens: HashMap<(String, String), Result<String, String>> = HashMap::new();
+    let mut tokens = Tokens::default();
     let mut resolved = BTreeMap::new();
     let mut failures = Vec::new();
 
     for image in refs {
         let outcome = async {
-            let (host, repo) = registry::split_source(&image.source)
+            let repo = registry::split_source(&image.source)
                 .ok_or_else(|| "source names no registry".to_owned())?;
-            let key = (host.to_owned(), repo.to_owned());
-            if !tokens.contains_key(&key) {
-                let token = registry::oci_token(&client, host, repo, auth).await;
-                tokens.insert(key.clone(), token);
-            }
-            let token = tokens[&key].as_ref().map_err(String::clone)?;
-            resolve_one(&client, host, repo, &image.tag, token).await
+            let token = tokens
+                .get(&client, &repo, auth)
+                .await
+                .as_ref()
+                .map_err(String::clone)?;
+            fetch_one(&client, &repo, &image.tag, token, mode).await
         }
         .await;
         match outcome {
-            Ok(entry) => {
-                resolved.insert(image.to_string(), entry);
+            Ok(fetched) => {
+                resolved.insert(image.clone(), fetched);
             }
             Err(reason) => failures.push(format!("  {image}: {reason}")),
         }
@@ -355,138 +382,200 @@ async fn resolve(
     }
 }
 
-/// Attempts at one manifest before a 429 is reported.
-const MAX_ATTEMPTS: u32 = 5;
-
-/// Longest a single wait for a 429 may last.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// How long to wait after a 429: the registry's `Retry-After` seconds when it
-/// sent them, else doubling from 2 s, never more than [`MAX_BACKOFF`].
-fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
-    let secs = retry_after
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| 2u64.saturating_pow(attempt.saturating_add(1)));
-    Duration::from_secs(secs).min(MAX_BACKOFF)
-}
-
-/// GET one manifest and read its digest and children, waiting out a 429.
-async fn resolve_one(
+/// Request a manifest, retrying what [`registry::send_retrying`] retries. Any
+/// other failing status is reported at once.
+async fn request_manifest(
     client: &reqwest::Client,
-    host: &str,
-    repo: &str,
+    method: Method,
+    repo: &Repository<'_>,
     tag: &str,
     token: &str,
-) -> Result<LockEntry, String> {
-    let mut attempt = 0;
-    let response = loop {
-        let response = client
-            .get(format!("https://{host}/v2/{repo}/manifests/{tag}"))
+) -> Result<reqwest::Response, String> {
+    let url = format!(
+        "https://{}/v2/{}/manifests/{tag}",
+        repo.host.api_host(),
+        repo.path
+    );
+    let response = registry::send_retrying(&format!("{repo}:{tag}"), || {
+        client
+            .request(method.clone(), &url)
             .bearer_auth(token)
             .header("Accept", registry::MANIFEST_ACCEPT)
-            .send()
-            .await
-            .map_err(|e| format!("manifest request failed: {e}"))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt + 1 < MAX_ATTEMPTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok());
-            let wait = backoff(attempt, retry_after);
-            eprintln!("  {host}/{repo}:{tag}: 429, waiting {}s", wait.as_secs());
-            tokio::time::sleep(wait).await;
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            return Err(format!("manifest request returned {status}"));
-        }
-        break response;
-    };
-    let header = response
-        .headers()
-        .get("docker-content-digest")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    })
+    .await
+    .map_err(|e| format!("manifest request {e}"))?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(format!("manifest request returned {}", response.status()))
+    }
+}
+
+/// GET a manifest and hash its exact bytes.
+async fn fetch_body(
+    client: &reqwest::Client,
+    repo: &Repository<'_>,
+    tag: &str,
+    token: &str,
+) -> Result<Fetched, String> {
+    let response = request_manifest(client, Method::GET, repo, tag, token).await?;
+    let header = content_digest(&response);
     let body = response
         .bytes()
         .await
         .map_err(|e| format!("manifest body unreadable: {e}"))?;
-    Ok(LockEntry {
-        digest: manifest_digest(header.as_deref(), &body)?,
-        children: child_digests(&body)?,
+    Ok(Fetched {
+        digest: body_digest(header.as_deref(), &body)?,
+        body: Some(body.to_vec()),
     })
+}
+
+/// The `Docker-Content-Digest` header of a response, if any.
+fn content_digest(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Resolve one tag the way `mode` asks.
+async fn fetch_one(
+    client: &reqwest::Client,
+    repo: &Repository<'_>,
+    tag: &str,
+    token: &str,
+    mode: Mode,
+) -> Result<Fetched, String> {
+    if let Mode::Recheck = mode {
+        let response = request_manifest(client, Method::HEAD, repo, tag, token).await?;
+        if let Some(header) = content_digest(&response) {
+            return Ok(Fetched {
+                digest: Digest::parse(header.trim())?,
+                body: None,
+            });
+        }
+    }
+    fetch_body(client, repo, tag, token).await
 }
 
 /// Arguments for the `bench-lock` subcommand.
 #[derive(Args)]
 pub(crate) struct LockArgs {
-    /// Path to corpus YAML file.
-    #[arg(long, default_value = "bench/corpus.yaml")]
-    pub(crate) corpus: String,
+    #[command(flatten)]
+    paths: CorpusPaths,
+}
 
-    /// Path to partial sync overrides YAML; its tags are locked too, because
-    /// the partial scenario syncs them.
-    #[arg(long, default_value = "bench/corpus-partial-overrides.yaml")]
-    pub(crate) partial_overrides: String,
+/// The lock to write, or `None` when `images` equal the existing lock's, so
+/// re-running over unchanged sources leaves the file, and its `locked_at`
+/// series, alone.
+fn relock(
+    existing: Option<&Lock>,
+    images: BTreeMap<ImageRef, LockEntry>,
+    now: String,
+) -> Option<Lock> {
+    if existing.is_some_and(|lock| lock.images == images) {
+        return None;
+    }
+    Some(Lock {
+        locked_at: now,
+        images,
+    })
 }
 
 /// Resolve every ref the corpus and the partial overrides sync, and write the
-/// lock. Needs the network and nothing else: no target registry, no cloud write.
+/// lock beside the corpus. Needs the network and nothing else: no target
+/// registry, no cloud write.
 pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = corpus::load_images(&args.corpus)?;
-    let overrides = corpus::load_overrides(&args.partial_overrides)?;
+    let entries = corpus::load_images(args.paths.corpus())?;
+    let overrides = corpus::load_overrides(args.paths.partial_overrides())?;
 
     let mut refs = refs_of(&entries);
     refs.extend(refs_of(&overrides.overrides));
 
-    let auth = crate::bench::dockerhub_auth();
+    let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
-    let images = resolve(&refs, auth.as_ref()).await?;
+    let mut images = BTreeMap::new();
+    for (image, fetched) in resolve(&refs, auth.as_ref(), Mode::Lock).await? {
+        let body = fetched
+            .body
+            .ok_or_else(|| format!("{image}: manifest was not fetched"))?;
+        let children = child_digests(&body).map_err(|e| format!("{image}: {e}"))?;
+        images.insert(
+            image,
+            LockEntry {
+                digest: fetched.digest,
+                children,
+            },
+        );
+    }
 
-    let lock = Lock {
-        locked_at: crate::bench::utc_timestamp(),
-        images,
+    let path = args.paths.lock_path();
+    let existing = match Lock::load(&path) {
+        Ok(lock) => Some(lock),
+        Err(e) => {
+            eprintln!("bench-lock: no usable existing lock ({e})");
+            None
+        }
     };
-    std::fs::write(LOCK_PATH, lock.render()?)
-        .map_err(|e| format!("failed to write {LOCK_PATH}: {e}"))?;
-    eprintln!(
-        "bench-lock: wrote {} refs to {LOCK_PATH} (locked_at {})",
-        lock.images.len(),
-        lock.locked_at
-    );
+    match relock(existing.as_ref(), images, crate::bench::utc_timestamp()) {
+        None => eprintln!(
+            "bench-lock: {} is already current ({} refs); left unchanged",
+            path.display(),
+            existing.map_or(0, |lock| lock.images.len())
+        ),
+        Some(lock) => {
+            std::fs::write(&path, lock.render()?)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            eprintln!(
+                "bench-lock: wrote {} refs to {} (locked_at {})",
+                lock.images.len(),
+                path.display(),
+                lock.locked_at
+            );
+        }
+    }
     Ok(())
+}
+
+/// Digests and lock entries for tests here and in the modules that check
+/// against a lock.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{Digest, LockEntry};
+
+    /// A digest whose 64 hex characters are all `c`.
+    pub(crate) fn digest(c: char) -> Digest {
+        Digest::parse(&format!("sha256:{}", c.to_string().repeat(64))).unwrap()
+    }
+
+    /// A lock entry for `digest` listing `children`, each named by its fill character.
+    pub(crate) fn entry(digest_fill: char, children: &[char]) -> LockEntry {
+        LockEntry {
+            digest: digest(digest_fill),
+            children: children.iter().map(|c| digest(*c)).collect(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{digest as d, entry};
     use super::*;
 
-    /// A digest whose 64 hex characters are all `c`.
-    fn d(c: char) -> Digest {
-        Digest::parse(&format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-    }
-
-    fn entry(digest: char, children: &[char]) -> LockEntry {
-        LockEntry {
-            digest: d(digest),
-            children: children.iter().map(|c| d(*c)).collect(),
-        }
+    fn image(raw: &str) -> ImageRef {
+        ImageRef::parse(raw).unwrap()
     }
 
     fn lock_of(images: &[(&str, LockEntry)]) -> Lock {
         Lock {
             locked_at: "2026-10-30-120000".into(),
-            images: images
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), v.clone()))
-                .collect(),
+            images: images.iter().map(|(k, v)| (image(k), v.clone())).collect(),
         }
     }
 
-    fn resolved_of(images: &[(&str, LockEntry)]) -> BTreeMap<String, LockEntry> {
-        lock_of(images).images
+    fn resolved_of(images: &[(&str, char)]) -> BTreeMap<ImageRef, Digest> {
+        images.iter().map(|(k, c)| (image(k), d(*c))).collect()
     }
 
     #[test]
@@ -506,43 +595,47 @@ mod tests {
         }
     }
 
+    const ABC_SHA256: &str =
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
     #[test]
     fn digest_of_bytes_is_the_known_sha256() {
-        assert_eq!(
-            Digest::of(b"abc").to_string(),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+        assert_eq!(Digest::of(b"abc").to_string(), ABC_SHA256);
     }
 
     #[test]
-    fn manifest_digest_prefers_the_header_and_hashes_the_body_without_one() {
-        let header = format!("sha256:{}", "e".repeat(64));
-        assert_eq!(
-            manifest_digest(Some(&header), b"abc").unwrap().to_string(),
-            header
-        );
-        assert_eq!(
-            manifest_digest(None, b"abc").unwrap().to_string(),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert!(manifest_digest(Some("sha512:abc"), b"abc").is_err());
-    }
-
-    #[test]
-    fn backoff_follows_retry_after_doubles_without_it_and_is_capped() {
-        let cases: [(u32, Option<&str>, u64); 5] = [
-            (0, Some("7"), 7),
-            (0, None, 2),
-            (2, None, 8),
-            (0, Some("3600"), 60),
-            (1, Some("soon"), 4),
+    fn body_digest_hashes_the_body_and_refuses_a_header_that_disagrees() {
+        let cases: [(Option<&str>, Option<&str>); 3] = [
+            (None, Some(ABC_SHA256)),
+            (Some(ABC_SHA256), Some(ABC_SHA256)),
+            (
+                Some("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+                None,
+            ),
         ];
-        for (attempt, header, secs) in cases {
-            assert_eq!(
-                backoff(attempt, header),
-                Duration::from_secs(secs),
-                "attempt {attempt}, Retry-After {header:?}"
-            );
+        for (header, want) in cases {
+            let got = body_digest(header, b"abc").ok().map(|d| d.to_string());
+            assert_eq!(got.as_deref(), want, "header {header:?}");
+        }
+    }
+
+    #[test]
+    fn image_ref_splits_at_the_last_colon_and_refuses_what_is_not_a_tag() {
+        let cases: [(&str, Option<(&str, &str)>); 6] = [
+            (
+                "quay.io/jupyter/base-notebook:2026-10-28",
+                Some(("quay.io/jupyter/base-notebook", "2026-10-28")),
+            ),
+            ("localhost:5000/app:v1", Some(("localhost:5000/app", "v1"))),
+            ("localhost:5000/app", None),
+            ("quay.io/app", None),
+            (":latest", None),
+            ("quay.io/app:", None),
+        ];
+        for (raw, want) in cases {
+            let got = ImageRef::parse(raw).ok().map(|r| (r.source, r.tag));
+            let want = want.map(|(s, t)| (s.to_owned(), t.to_owned()));
+            assert_eq!(got, want, "{raw}");
         }
     }
 
@@ -582,48 +675,38 @@ mod tests {
         assert!(Lock::parse(&extra_top).is_err(), "unknown top-level field");
         let extra_entry = text.replacen("\"children\"", "\"extra\": 1, \"children\"", 1);
         assert!(Lock::parse(&extra_entry).is_err(), "unknown entry field");
-        let bad_digest = text.replacen("sha256:4", "sha256:X", 1);
-        assert!(Lock::parse(&bad_digest).is_err(), "malformed digest");
+        let bad_key = text.replacen("docker.io/a:1", "docker.io/a", 1);
+        assert!(Lock::parse(&bad_key).is_err(), "key with no tag");
     }
 
     #[test]
-    fn compare_reports_each_way_a_ref_differs() {
+    fn compare_reports_a_moved_digest_and_a_missing_ref_and_nothing_else() {
         let lock = lock_of(&[
             ("s/same:1", entry('1', &['2'])),
             ("s/moved:1", entry('3', &[])),
-            ("s/kids:1", entry('4', &['5'])),
         ]);
-        let cases: [(&str, LockEntry, Option<Difference>); 4] = [
-            ("s/same:1", entry('1', &['2']), None),
+        let cases: [(&str, char, Option<Difference>); 3] = [
+            ("s/same:1", '1', None),
             (
                 "s/moved:1",
-                entry('6', &[]),
+                '6',
                 Some(Difference::Moved {
-                    image: "s/moved:1".into(),
+                    image: image("s/moved:1"),
                     expected: d('3'),
                     actual: d('6'),
                 }),
             ),
             (
-                "s/kids:1",
-                entry('4', &['7']),
-                Some(Difference::ChildrenChanged {
-                    image: "s/kids:1".into(),
-                    expected: vec![d('5')],
-                    actual: vec![d('7')],
-                }),
-            ),
-            (
                 "s/new:1",
-                entry('8', &[]),
+                '8',
                 Some(Difference::Missing {
-                    image: "s/new:1".into(),
+                    image: image("s/new:1"),
                 }),
             ),
         ];
-        for (image, actual, want) in cases {
-            let got = compare(&lock, &resolved_of(&[(image, actual)]));
-            assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "{image}");
+        for (name, actual, want) in cases {
+            let got = compare(&lock, &resolved_of(&[(name, actual)]));
+            assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "{name}");
         }
         assert!(
             compare(&lock, &BTreeMap::new()).is_empty(),
@@ -636,17 +719,13 @@ mod tests {
         let lock = lock_of(&[("s/a:1", entry('1', &[])), ("s/b:1", entry('2', &[]))]);
 
         assert!(
-            check_unmoved(&lock, &resolved_of(&[("s/a:1", entry('1', &[]))])).is_ok(),
+            check_unmoved(&lock, &resolved_of(&[("s/a:1", '1')])).is_ok(),
             "an unmoved source passes"
         );
 
         let error = check_unmoved(
             &lock,
-            &resolved_of(&[
-                ("s/a:1", entry('9', &[])),
-                ("s/b:1", entry('2', &[])),
-                ("s/c:1", entry('3', &[])),
-            ]),
+            &resolved_of(&[("s/a:1", '9'), ("s/b:1", '2'), ("s/c:1", '3')]),
         )
         .expect_err("a moved source must not pass");
         assert!(error.contains(&format!("s/a:1: expected {}, now {}", d('1'), d('9'))));
@@ -654,5 +733,27 @@ mod tests {
         assert!(!error.contains("s/b:1"), "an unmoved ref is not listed");
         assert!(error.contains("cargo xtask bench-lock"));
         assert!(error.contains("new comparison series"));
+    }
+
+    #[test]
+    fn relock_leaves_unchanged_content_alone_and_stamps_anything_else() {
+        let existing = lock_of(&[("s/a:1", entry('1', &[]))]);
+        let same = existing.images.clone();
+        assert_eq!(
+            relock(Some(&existing), same, "2026-11-01-000000".into()),
+            None,
+            "unchanged content keeps the file and its locked_at"
+        );
+
+        let moved = lock_of(&[("s/a:1", entry('2', &[]))]).images;
+        let relocked = relock(Some(&existing), moved.clone(), "2026-11-01-000000".into());
+        assert_eq!(
+            relocked,
+            Some(Lock {
+                locked_at: "2026-11-01-000000".into(),
+                images: moved.clone(),
+            })
+        );
+        assert!(relock(None, moved, "2026-11-01-000000".into()).is_some());
     }
 }

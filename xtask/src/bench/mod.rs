@@ -48,13 +48,8 @@ pub(crate) struct BenchArgs {
     #[command(flatten)]
     pub(crate) tool_selection: ToolSelection,
 
-    /// Path to corpus YAML file.
-    #[arg(long, default_value = "bench/corpus.yaml")]
-    pub(crate) corpus: String,
-
-    /// Path to partial sync overrides YAML (applied on top of corpus for the partial scenario).
-    #[arg(long, default_value = "bench/corpus-partial-overrides.yaml")]
-    pub(crate) partial_overrides: String,
+    #[command(flatten)]
+    pub(crate) paths: corpus::CorpusPaths,
 
     /// Path to the prepare-scenario corpus YAML.
     ///
@@ -171,7 +166,7 @@ fn docker_hub_auth_from_env() -> Option<corpus::DockerHubAuth> {
 ///
 /// The SSM fallback needs IAM permissions the bench instance's Terraform does
 /// not grant; it serves local dev with personal credentials.
-fn dockerhub_auth() -> Option<corpus::DockerHubAuth> {
+fn docker_hub_auth() -> Option<corpus::DockerHubAuth> {
     if let Some(auth) = docker_hub_auth_from_env() {
         eprintln!(
             "bench: Docker Hub auth configured (username={})",
@@ -358,7 +353,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         reject_tmpfs_tmpdir()?;
     }
 
-    let loaded = corpus::load(&args.corpus)?;
+    let loaded = corpus::load(args.paths.corpus())?;
     let filtered = if args.skip_registries.is_empty() {
         loaded
     } else {
@@ -376,7 +371,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         None => filtered,
     };
 
-    corpus.dockerhub_auth = dockerhub_auth();
+    corpus.dockerhub_auth = docker_hub_auth();
 
     let scenarios: Vec<Scenario> = match args.scenario {
         Scenario::All => vec![
@@ -388,22 +383,15 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         other => vec![other],
     };
 
+    // The lock is tracked and sits beside the corpus, so it is always read.
     // Prepare reads its own wildcard corpus and transfers nothing, so it is
-    // neither locked nor checked against the lock.
+    // neither checked against the lock nor recorded under it.
+    let lock = lock::Lock::load(&args.paths.lock_path())?;
     let transfers = scenarios.iter().any(|s| !matches!(s, Scenario::Prepare));
-    let lock = if transfers {
-        Some(lock::Lock::load(lock::LOCK_PATH)?)
-    } else {
-        None
-    };
-    if let Some(lock) = &lock {
+    if transfers {
         // Before the build and the CDN pre-warm, so a moved source costs
         // seconds rather than a wasted run.
-        let mut refs = BTreeSet::new();
-        for &scenario in &scenarios {
-            refs.extend(scenario_refs(&args, scenario, &corpus)?);
-        }
-        lock::ensure_unmoved(lock, &refs, corpus.dockerhub_auth.as_ref()).await?;
+        ensure_sources_unmoved(&args, &scenarios, &corpus, &lock).await?;
     }
 
     let tools = &args.tool_selection.tools;
@@ -418,6 +406,10 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     let ecr_client = ecr::client().await;
     ecr::validate_credentials(&ecr_client).await?;
+    let target = ecr::Target {
+        client: &ecr_client,
+        lock: &lock,
+    };
 
     // Build ocync first, so its version probe reads the binary the run will
     // actually execute rather than whatever is on PATH from instance setup.
@@ -485,15 +477,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         cdn_prewarm(&corpus).await;
     }
 
-    for scenario in scenarios {
-        // A source that moved since the last check would put different content
-        // under the numbers this scenario produces.
-        if !matches!(scenario, Scenario::Prepare) {
-            let Some(lock) = &lock else {
-                unreachable!("the lock is loaded whenever a scenario transfers");
-            };
-            let refs = scenario_refs(&args, scenario, &corpus)?;
-            lock::ensure_unmoved(lock, &refs, corpus.dockerhub_auth.as_ref()).await?;
+    // A scenario after the first re-checks the sources, so a move during a long
+    // run cannot put different content under later numbers. The first was
+    // checked before the build. A move stops the scenarios still to run, and
+    // the finished ones are still reported and recorded.
+    let mut stopped: Option<String> = None;
+    for (position, scenario) in scenarios.into_iter().enumerate() {
+        if position > 0 && !matches!(scenario, Scenario::Prepare) {
+            if let Err(reason) = ensure_sources_unmoved(&args, &[scenario], &corpus, &lock).await {
+                stopped = Some(reason);
+                break;
+            }
         }
 
         // Randomize tool execution order to prevent systematic bias from
@@ -508,19 +502,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
         match scenario {
             Scenario::Sync => {
-                let Some(lock) = &lock else {
-                    unreachable!("the lock is loaded whenever a scenario transfers");
-                };
-                let (cold, warm) = run_sync(
-                    &args,
-                    &corpus,
-                    lock,
-                    &shuffled,
-                    &ecr_client,
-                    &output_dir,
-                    seed,
-                )
-                .await?;
+                let (cold, warm) =
+                    run_sync(&args, &corpus, &target, &shuffled, &output_dir, seed).await?;
                 report.scenarios.push(cold);
                 report.scenarios.push(warm);
             }
@@ -530,8 +513,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     &args,
                     &corpus,
                     &partial_corpus,
+                    &target,
                     &shuffled,
-                    &ecr_client,
                     &output_dir,
                     seed,
                 )
@@ -543,7 +526,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 if tools.contains(&Tool::Ocync) {
                     let ocync_only = vec![Tool::Ocync];
                     let scale_results =
-                        run_scale(&args, &corpus, &ocync_only, &ecr_client, &output_dir).await?;
+                        run_scale(&args, &corpus, &target, &ocync_only, &output_dir).await?;
                     report.scenarios.extend(scale_results);
                 } else {
                     eprintln!("bench: scale scenario requires ocync (skipping)");
@@ -574,7 +557,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let record = report::RunRecord {
         timestamp: report.timestamp.clone(),
         git_ref,
-        corpus_locked_at: lock.as_ref().map(|l| l.locked_at.clone()),
+        corpus_locked_at: transfers.then(|| lock.locked_at.clone()),
         machine: report::MachineInfo {
             provider: registry.provider(),
             instance_type: report.instance.instance_type.clone(),
@@ -633,8 +616,15 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: run record appended to bench/results/{reg_key}.json");
     }
 
+    if let Some(reason) = stopped {
+        return Err(format!(
+            "stopped before the remaining scenarios; those that finished are reported and recorded: {reason}"
+        )
+        .into());
+    }
+
     if args.regression {
-        check_regression(&report, args.threshold_pct)?;
+        check_regression(&report, args.threshold_pct, &lock.locked_at)?;
     }
 
     Ok(())
@@ -643,7 +633,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 /// The corpus the partial scenario syncs after its priming pass: the base
 /// corpus with the override tags applied, then cut to `--limit`.
 fn partial_corpus(args: &BenchArgs, base: &Corpus) -> Result<Corpus, String> {
-    let overrides = corpus::load_overrides(&args.partial_overrides)?;
+    let overrides = corpus::load_overrides(args.paths.partial_overrides())?;
     let partial = base.with_overrides(&overrides.overrides);
     Ok(match args.limit {
         Some(n) => partial.limit(n),
@@ -651,8 +641,8 @@ fn partial_corpus(args: &BenchArgs, base: &Corpus) -> Result<Corpus, String> {
     })
 }
 
-/// Every (source, tag) a scenario syncs, none for the scenarios that sync
-/// nothing from the main corpus.
+/// Every (source, tag) a scenario syncs, none for prepare, which syncs nothing
+/// from the main corpus.
 fn scenario_refs(
     args: &BenchArgs,
     scenario: Scenario,
@@ -665,8 +655,24 @@ fn scenario_refs(
             refs.extend(lock::refs_of(&partial_corpus(args, corpus)?.images));
             refs
         }
-        Scenario::Prepare | Scenario::All => BTreeSet::new(),
+        Scenario::Prepare => BTreeSet::new(),
+        Scenario::All => unreachable!("All is expanded before scenarios run"),
     })
+}
+
+/// Refuse unless every source ref the scenarios sync still resolves to its
+/// locked digest.
+async fn ensure_sources_unmoved(
+    args: &BenchArgs,
+    scenarios: &[Scenario],
+    corpus: &Corpus,
+    lock: &lock::Lock,
+) -> Result<(), String> {
+    let mut refs = BTreeSet::new();
+    for &scenario in scenarios {
+        refs.extend(scenario_refs(args, scenario, corpus)?);
+    }
+    lock::ensure_unmoved(lock, &refs, corpus.dockerhub_auth.as_ref()).await
 }
 
 /// The ocync run of the cold sync scenario, the only run a baseline is
@@ -685,6 +691,7 @@ fn cold_ocync_run(scenarios: &[ScenarioResult]) -> Option<&ToolRun> {
 fn check_regression(
     report: &BenchReport,
     threshold: u32,
+    corpus_locked_at: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_path = PathBuf::from("bench/results/baseline.json");
 
@@ -693,10 +700,12 @@ fn check_regression(
             wall_clock_secs: run.wall_clock_secs,
             requests: run.proxy_metrics.as_ref().map_or(0, |m| m.requests),
             total_bytes: run.proxy_metrics.as_ref().map_or(0, |m| m.response_bytes),
+            corpus_locked_at: Some(corpus_locked_at.to_owned()),
         };
 
         if baseline_path.exists() {
             let baseline = regression::load_baseline(&baseline_path)?;
+            regression::ensure_same_corpus(&baseline, corpus_locked_at)?;
             let result = regression::compare(&current, &baseline, threshold);
             eprintln!("bench: regression check:");
             eprintln!("{}", regression::format_result(&result, threshold));
@@ -912,9 +921,8 @@ fn check_source_errors(
 async fn run_sync(
     args: &BenchArgs,
     corpus: &Corpus,
-    lock: &lock::Lock,
+    target: &ecr::Target<'_>,
     tools: &[Tool],
-    ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
     shuffle_seed: u64,
 ) -> Result<(ScenarioResult, ScenarioResult), Box<dyn std::error::Error>> {
@@ -928,8 +936,8 @@ async fn run_sync(
         // Delete repos first to guarantee a truly empty target, then recreate.
         // create_repos alone skips existing repos which may contain partial
         // data from aborted runs.
-        ecr::delete_repos(ecr_client, corpus).await?;
-        ecr::create_repos(ecr_client, corpus).await?;
+        ecr::delete_repos(target.client, corpus).await?;
+        ecr::create_repos(target.client, corpus).await?;
 
         // Single config_dir for cold + warm. The cache file lives
         // under this directory, so reusing it means the warm run
@@ -955,7 +963,7 @@ async fn run_sync(
             cold_runs.push(cold);
 
             let tool_name = tool.to_string();
-            ecr::verify_sync(ecr_client, corpus, lock, &tool_name, "cold").await?;
+            ecr::verify_sync(target, corpus, &tool_name, "cold").await?;
 
             progress(&format!("  warm: {tool}"));
             let warm = run_single_tool(
@@ -974,15 +982,18 @@ async fn run_sync(
             ));
             warm_runs.push(warm);
 
-            ecr::verify_sync(ecr_client, corpus, lock, &tool_name, "warm").await?;
+            ecr::verify_sync(target, corpus, &tool_name, "warm").await?;
 
             Ok(())
         }
         .await;
 
-        // Always clean up ECR repos, even if the tool run failed.
-        ecr::delete_repos(ecr_client, corpus).await?;
+        // Always clean up ECR repos, even if the tool run failed. A repo that
+        // cannot be deleted fails the pass, so its content cannot satisfy the
+        // next tool's digest check.
+        let cleanup = ecr::delete_repos(target.client, corpus).await;
         run_result?;
+        cleanup?;
 
         cooldown().await;
     }
@@ -1008,8 +1019,8 @@ async fn run_partial(
     args: &BenchArgs,
     base_corpus: &Corpus,
     partial_corpus: &Corpus,
+    target: &ecr::Target<'_>,
     tools: &[Tool],
-    ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
     shuffle_seed: u64,
 ) -> Result<ScenarioResult, Box<dyn std::error::Error>> {
@@ -1018,8 +1029,8 @@ async fn run_partial(
 
     for &tool in tools {
         prepare_clean_slate();
-        ecr::delete_repos(ecr_client, base_corpus).await?;
-        ecr::create_repos(ecr_client, base_corpus).await?;
+        ecr::delete_repos(target.client, base_corpus).await?;
+        ecr::create_repos(target.client, base_corpus).await?;
         progress(&format!("  partial: {} (priming)", tool));
 
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
@@ -1053,13 +1064,16 @@ async fn run_partial(
                 tool, run.wall_clock_secs
             ));
             runs.push(run);
+
+            ecr::verify_sync(target, partial_corpus, &tool.to_string(), "partial").await?;
             Ok(())
         }
         .await;
 
         // Always clean up ECR repos, even if the tool run failed.
-        ecr::delete_repos(ecr_client, base_corpus).await?;
+        let cleanup = ecr::delete_repos(target.client, base_corpus).await;
         run_result?;
+        cleanup?;
 
         cooldown().await;
     }
@@ -1077,8 +1091,8 @@ async fn run_partial(
 async fn run_scale(
     args: &BenchArgs,
     corpus: &Corpus,
+    target: &ecr::Target<'_>,
     tools: &[Tool],
-    ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
 ) -> Result<Vec<ScenarioResult>, Box<dyn std::error::Error>> {
     progress("bench: running scale scenario");
@@ -1099,8 +1113,8 @@ async fn run_scale(
 
         for &tool in tools {
             prepare_clean_slate();
-            ecr::delete_repos(ecr_client, &subset).await?;
-            ecr::create_repos(ecr_client, &subset).await?;
+            ecr::delete_repos(target.client, &subset).await?;
+            ecr::create_repos(target.client, &subset).await?;
             progress(&format!("  scale: {} @ {size} images", tool));
 
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
@@ -1116,13 +1130,17 @@ async fn run_scale(
                 )
                 .await?;
                 runs.push(run);
+
+                let phase = format!("scale-{size}");
+                ecr::verify_sync(target, &subset, &tool.to_string(), &phase).await?;
                 Ok(())
             }
             .await;
 
             // Always clean up ECR repos, even if the tool run failed.
-            ecr::delete_repos(ecr_client, &subset).await?;
+            let cleanup = ecr::delete_repos(target.client, &subset).await;
             run_result?;
+            cleanup?;
 
             cooldown().await;
         }
@@ -1287,10 +1305,11 @@ async fn cdn_prewarm(corpus: &Corpus) {
     let mut errors = 0u64;
 
     for image in &corpus.images {
-        let Some((registry, repo)) = registry::split_source(&image.source) else {
+        let Some(source) = registry::split_source(&image.source) else {
             continue;
         };
-        let token = match registry::oci_token(&client, registry, repo, auth).await {
+        let (registry, repo) = (source.host.api_host(), source.path);
+        let token = match registry::oci_token(&client, &source, auth).await {
             Ok(t) => t,
             Err(e) => {
                 errors += image.tags.len() as u64;
@@ -1350,27 +1369,18 @@ async fn cdn_prewarm(corpus: &Corpus) {
     // fetched exactly once.
     let mut unique_blobs: HashSet<(String, String, String)> = HashSet::new();
 
-    // Cache tokens by (registry, repo) so we don't issue O(N_images) /v2/
-    // pings when ~3 registries suffice. Reused for blob pre-warming below.
-    let mut token_cache: HashMap<(String, String), String> = HashMap::new();
+    // One exchange per repository, reused for blob pre-warming below.
+    let mut tokens = registry::Tokens::default();
 
     for image in &corpus.images {
-        let Some((registry, repo)) = registry::split_source(&image.source) else {
+        let Some(source) = registry::split_source(&image.source) else {
             continue;
         };
+        let (registry, repo) = (source.host.api_host(), source.path);
 
-        let cache_key = (registry.to_owned(), repo.to_owned());
-        let token = if let Some(t) = token_cache.get(&cache_key) {
-            t.clone()
-        } else {
-            match registry::oci_token(&client, registry, repo, auth).await {
-                Ok(t) => {
-                    token_cache.insert(cache_key, t.clone());
-                    t
-                }
-                // The manifest pass above already reported this repository.
-                Err(_) => continue,
-            }
+        // The manifest pass above already reported a repository that fails.
+        let Ok(token) = tokens.get(&client, &source, auth).await.clone() else {
+            continue;
         };
 
         // GET one manifest per image to discover blob digests.
@@ -1446,7 +1456,7 @@ async fn cdn_prewarm(corpus: &Corpus) {
             let blob_client = &blob_client;
             let per_registry_stats = &per_registry_stats;
             let rate_controllers = &rate_controllers;
-            let token = token_cache.get(&(registry.clone(), repo.clone()));
+            let token = tokens.cached(registry, repo);
             let registry = registry.clone();
             let repo = repo.clone();
             let digest = digest.clone();
@@ -1617,7 +1627,7 @@ async fn cdn_prewarm(corpus: &Corpus) {
     let mut cdn_check = 0u64;
     for &idx in &sample_indices {
         let (registry, repo, digest) = &blobs_vec[idx];
-        let token = token_cache.get(&(registry.clone(), repo.clone()));
+        let token = tokens.cached(registry, repo);
         if let Some(token) = token {
             let url = format!("https://{registry}/v2/{repo}/blobs/{digest}");
             let resp = client
@@ -2024,6 +2034,65 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{name}: accepted"));
             assert_eq!(err.kind(), kind, "{name}");
+        }
+    }
+
+    #[test]
+    fn scenarios_name_the_refs_they_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = dir.path().join("overrides.yaml");
+        std::fs::write(
+            &overrides,
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.10\"]\n  \
+             - source: \"public.ecr.aws/amazoncorretto/amazoncorretto\"\n    tags: [\"11\"]\n",
+        )
+        .unwrap();
+        let args =
+            parse_bench(&["--partial-overrides", overrides.to_str().unwrap(), "sync"]).unwrap();
+        let corpus: Corpus = serde_yaml::from_str(
+            r#"
+corpus: { target_registry: "r.example", target_prefix: "bench" }
+images:
+  - source: "public.ecr.aws/lambda/python"
+    tags: ["3.12"]
+  - source: "public.ecr.aws/amazoncorretto/amazoncorretto"
+    tags: ["21"]
+"#,
+        )
+        .unwrap();
+
+        // (scenario, ref, in the scenario's refs)
+        let cases = [
+            (Scenario::Sync, "public.ecr.aws/lambda/python:3.12", true),
+            (Scenario::Sync, "public.ecr.aws/lambda/python:3.10", false),
+            (
+                Scenario::Sync,
+                "public.ecr.aws/amazoncorretto/amazoncorretto:11",
+                false,
+            ),
+            (Scenario::Scale, "public.ecr.aws/lambda/python:3.10", false),
+            (Scenario::Partial, "public.ecr.aws/lambda/python:3.12", true),
+            (Scenario::Partial, "public.ecr.aws/lambda/python:3.10", true),
+            (
+                Scenario::Partial,
+                "public.ecr.aws/amazoncorretto/amazoncorretto:21",
+                true,
+            ),
+            (
+                Scenario::Partial,
+                "public.ecr.aws/amazoncorretto/amazoncorretto:11",
+                true,
+            ),
+            (
+                Scenario::Prepare,
+                "public.ecr.aws/lambda/python:3.12",
+                false,
+            ),
+        ];
+        for (scenario, image, expected) in cases {
+            let refs = scenario_refs(&args, scenario, &corpus).unwrap();
+            let present = refs.iter().any(|r| r.to_string() == image);
+            assert_eq!(present, expected, "{scenario:?} {image}");
         }
     }
 

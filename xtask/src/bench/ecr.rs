@@ -146,29 +146,30 @@ fn check_repo(repo: &str, expected: &[(&str, &LockEntry)], listing: &RepoListing
 /// List every image in a target repo, tagged or not, across pages.
 async fn list_repo(client: &Client, repo: &str) -> Result<RepoListing, String> {
     let mut listing = RepoListing::default();
-    let mut next_token: Option<String> = None;
-    loop {
-        let mut req = client.list_images().repository_name(repo);
-        if let Some(token) = &next_token {
-            req = req.next_token(token);
-        }
-        let output = req
-            .send()
-            .await
-            .map_err(|e| format!("{repo}: list failed ({e})"))?;
-        for id in output.image_ids() {
-            let digest = id
-                .image_digest()
-                .ok_or_else(|| format!("{repo}: list returned an image with no digest"))?;
-            listing
-                .insert(id.image_tag(), digest)
-                .map_err(|e| format!("{repo}: {e}"))?;
-        }
-        next_token = output.next_token().map(str::to_owned);
-        if next_token.is_none() {
-            return Ok(listing);
-        }
+    let mut ids = client
+        .list_images()
+        .repository_name(repo)
+        .into_paginator()
+        .items()
+        .send();
+    while let Some(id) = ids.next().await {
+        let id = id.map_err(|e| format!("{repo}: list failed ({e})"))?;
+        let digest = id
+            .image_digest()
+            .ok_or_else(|| format!("{repo}: list returned an image with no digest"))?;
+        listing
+            .insert(id.image_tag(), digest)
+            .map_err(|e| format!("{repo}: {e}"))?;
     }
+    Ok(listing)
+}
+
+/// The target registry and the lock its content is checked against.
+pub(crate) struct Target<'a> {
+    /// ECR client for the target registry.
+    pub(crate) client: &'a Client,
+    /// Digests every synced tag must have.
+    pub(crate) lock: &'a Lock,
 }
 
 /// Verify that every (image, tag) in the corpus is at the target with the
@@ -178,9 +179,8 @@ async fn list_repo(client: &Client, repo: &str) -> Result<RepoListing, String> {
 /// dropped a platform or transferred nothing fails the run instead of being
 /// credited with a fast time.
 pub(crate) async fn verify_sync(
-    client: &Client,
+    target: &Target<'_>,
     corpus: &Corpus,
-    lock: &Lock,
     tool: &str,
     phase: &str,
 ) -> Result<(), String> {
@@ -196,15 +196,14 @@ pub(crate) async fn verify_sync(
             let key = ImageRef {
                 source: img.source.clone(),
                 tag: tag.clone(),
-            }
-            .to_string();
-            match lock.images.get(&key) {
+            };
+            match target.lock.images.get(&key) {
                 Some(entry) => expected.push((tag, entry)),
                 None => problems.push(format!("{key}: not in the lock")),
             }
         }
 
-        let listing = match list_repo(client, &repo_name).await {
+        let listing = match list_repo(target.client, &repo_name).await {
             Ok(listing) => listing,
             Err(e) => {
                 problems.push(e);
@@ -238,9 +237,14 @@ pub(crate) async fn verify_sync(
 }
 
 /// Delete all target repositories for the corpus (force delete with images).
+///
+/// Tries every repo, then fails if any could not be deleted for a reason other
+/// than not existing: content left behind would let the next tool's digest check
+/// pass on what this tool synced.
 pub(crate) async fn delete_repos(client: &Client, corpus: &Corpus) -> Result<(), String> {
     use aws_sdk_ecr::operation::delete_repository::DeleteRepositoryError;
 
+    let mut failures = Vec::new();
     for img in &corpus.images {
         let repo_name = corpus.target_repo(&img.source);
         match client
@@ -257,30 +261,27 @@ pub(crate) async fn delete_repos(client: &Client, corpus: &Corpus) -> Result<(),
                 {
                     // Already gone -- fine.
                 } else {
-                    eprintln!("  warning: failed to delete repo {repo_name}: {e}");
-                    // Log and continue -- don't abort cleanup for one failure.
+                    failures.push(format!("{repo_name}: {e}"));
                 }
             }
         }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to delete {} repo(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn d(c: char) -> Digest {
-        Digest::parse(&format!("sha256:{}", c.to_string().repeat(64))).unwrap()
-    }
-
-    fn locked(digest: char, children: &[char]) -> LockEntry {
-        LockEntry {
-            digest: d(digest),
-            children: children.iter().map(|c| d(*c)).collect(),
-        }
-    }
+    use crate::bench::lock::fixtures::{digest as d, entry as locked};
 
     fn listing(entries: &[(Option<&str>, char)]) -> RepoListing {
         let mut listing = RepoListing::default();
@@ -365,15 +366,6 @@ mod tests {
         assert_eq!(
             text,
             format!("bench/r:v1: expected {}, found {}", d('4'), d('9'))
-        );
-    }
-
-    #[test]
-    fn listing_refuses_a_malformed_digest() {
-        assert!(
-            RepoListing::default()
-                .insert(Some("t"), "sha256:abc")
-                .is_err()
         );
     }
 }

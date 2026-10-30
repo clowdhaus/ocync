@@ -44,7 +44,7 @@ A run already in progress on the instance, including one still checking out or b
 
 ### `cargo xtask bench-lock`
 
-Resolves every source tag in the corpus and the partial overrides to its manifest digest and writes `bench/corpus.lock.json`. `bench` refuses to run when a source no longer matches the lock, and checks synced content against it by digest. Needs the network (and optionally Docker Hub credentials); no cloud write.
+Resolves every source tag in the corpus and the partial overrides to its manifest digest and writes the lock beside the corpus, `bench/corpus.lock.json` by default. `bench` refuses to run when a source no longer matches the lock, and checks synced content against it by digest. Needs the network (and optionally Docker Hub credentials); no cloud write.
 
 ```bash
 cargo xtask bench-lock
@@ -55,7 +55,7 @@ cargo xtask bench-lock
 | `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML |
 | `--partial-overrides` | path | `bench/corpus-partial-overrides.yaml` | Partial sync tag overrides, locked too |
 
-A new lock starts a new comparison series: run records carry its `locked_at` as `corpus_locked_at`.
+Re-running over unchanged sources leaves the file as it is. A new lock starts a new comparison series: run records carry its `locked_at` as `corpus_locked_at`.
 
 ### `cargo xtask bench`
 

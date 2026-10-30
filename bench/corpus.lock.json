@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-10-30-214340",
+  "locked_at": "2026-10-30-220156",
   "images": {
     "cgr.dev/chainguard/busybox:latest": {
       "digest": "sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218",
@@ -23,10 +23,10 @@
       ]
     },
     "cgr.dev/chainguard/go:latest": {
-      "digest": "sha256:0d2e83bf723e1edef67732d22b9272dd1311c7a19dff695bd6928a7831c31a9f",
+      "digest": "sha256:0d2076bcb78a90d3ceb8a56469f1562a1b81f42e3a184767db75556e0cfbea7f",
       "children": [
-        "sha256:3d1abfe1abdafccee11f46f2c8347d89b9d3db6e1b8a34c7a05d7f9b306923c5",
-        "sha256:8932dcc9c88dccf6623ed118d2b466193f9199c272c1b06dec52799f46335429"
+        "sha256:69f95ced617ff9de4283d8d97afd52c909052d496e9f3e15e4af6e4de1c9fd70",
+        "sha256:c7e7bdb55fd0b7a528dcd691fd490c03f5659065e6e46c401463755a023090e5"
       ]
     },
     "cgr.dev/chainguard/jdk:latest": {

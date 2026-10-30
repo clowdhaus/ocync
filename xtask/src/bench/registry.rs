@@ -1,6 +1,10 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
 //! normalization, the manifest `Accept` list and the OCI bearer-token flow.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::time::Duration;
+
 use crate::bench::corpus::DockerHubAuth;
 
 /// The manifest media types a source image can be stored as: OCI image,
@@ -10,22 +14,143 @@ pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+
      application/vnd.oci.image.index.v1+json,\
      application/vnd.docker.distribution.manifest.list.v2+json";
 
-/// Normalize Docker Hub's registry hostname to its API endpoint.
-fn normalize_registry(raw: &str) -> &str {
-    if raw == "docker.io" {
-        "registry-1.docker.io"
-    } else {
-        raw
+/// API host Docker Hub serves its registry from.
+const DOCKER_HUB_API_HOST: &str = "registry-1.docker.io";
+
+/// The registry a repository lives on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Host<'a> {
+    /// Docker Hub, named `docker.io` in a corpus source and served from its API host.
+    DockerHub,
+    /// Any other registry, by hostname.
+    Other(&'a str),
+}
+
+impl Host<'_> {
+    /// The hostname requests go to.
+    pub(crate) fn api_host(&self) -> &str {
+        match self {
+            Self::DockerHub => DOCKER_HUB_API_HOST,
+            Self::Other(host) => host,
+        }
     }
 }
 
-/// Split a corpus source into the registry's API host and the repository.
+/// A repository on a registry, as a corpus source names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Repository<'a> {
+    /// The registry holding the repository.
+    pub(crate) host: Host<'a>,
+    /// Path within the registry, e.g. `library/alpine`.
+    pub(crate) path: &'a str,
+}
+
+impl std::fmt::Display for Repository<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.host.api_host(), self.path)
+    }
+}
+
+/// Split a corpus source into its registry and repository path.
 ///
-/// `docker.io/library/alpine` becomes `("registry-1.docker.io", "library/alpine")`.
+/// `docker.io/library/alpine` becomes Docker Hub and `library/alpine`.
 /// Returns `None` for a source with no `/`.
-pub(crate) fn split_source(source: &str) -> Option<(&str, &str)> {
-    let (registry, repo) = source.split_once('/')?;
-    Some((normalize_registry(registry), repo))
+pub(crate) fn split_source(source: &str) -> Option<Repository<'_>> {
+    let (host, path) = source.split_once('/')?;
+    let host = if host == "docker.io" {
+        Host::DockerHub
+    } else {
+        Host::Other(host)
+    };
+    Some(Repository { host, path })
+}
+
+/// Attempts at one request before a transient failure is reported.
+const MAX_ATTEMPTS: u32 = 5;
+
+/// Longest a single wait before a retry may last.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// How long to wait before retry number `attempt` (from 0): the registry's
+/// `Retry-After` seconds when it sent them, else doubling from 2 s, never more
+/// than [`MAX_BACKOFF`].
+fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
+    let secs = retry_after
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| 2u64.saturating_pow(attempt.saturating_add(1)));
+    Duration::from_secs(secs).min(MAX_BACKOFF)
+}
+
+/// Send the request `build` makes, waiting out what is transient: a failed
+/// connection, a 429 and a 5xx, up to [`MAX_ATTEMPTS`] times. Any other
+/// response, whatever its status, is returned for the caller to judge. `what`
+/// names the request in the retry notice.
+pub(crate) async fn send_retrying(
+    what: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let mut attempt = 0;
+    loop {
+        let (failure, retry_after) = match build().send().await {
+            Ok(response)
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error() =>
+            {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                (format!("returned {}", response.status()), retry_after)
+            }
+            Ok(response) => return Ok(response),
+            Err(e) => (format!("failed: {e}"), None),
+        };
+        attempt += 1;
+        if attempt >= MAX_ATTEMPTS {
+            return Err(format!("{failure} ({attempt} attempts)"));
+        }
+        let wait = backoff(attempt - 1, retry_after.as_deref());
+        eprintln!("  {what}: {failure}, retrying in {}s", wait.as_secs());
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Bearer tokens by repository, so a repository with several tags is
+/// authorized once.
+#[derive(Default)]
+pub(crate) struct Tokens {
+    /// Outcome of the exchange for each (API host, path); a failure is kept so
+    /// it is reported for every tag and not retried.
+    by_repository: HashMap<(String, String), Result<String, String>>,
+}
+
+impl Tokens {
+    /// The token for `repo`, exchanging for one the first time it is asked.
+    pub(crate) async fn get(
+        &mut self,
+        client: &reqwest::Client,
+        repo: &Repository<'_>,
+        dockerhub_auth: Option<&DockerHubAuth>,
+    ) -> &Result<String, String> {
+        match self.by_repository.entry(key(repo)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(oci_token(client, repo, dockerhub_auth).await),
+        }
+    }
+
+    /// The token already exchanged for `api_host` and `path`, if it succeeded.
+    pub(crate) fn cached(&self, api_host: &str, path: &str) -> Option<&str> {
+        self.by_repository
+            .get(&(api_host.to_owned(), path.to_owned()))?
+            .as_deref()
+            .ok()
+    }
+}
+
+/// The cache key of a repository.
+fn key(repo: &Repository<'_>) -> (String, String) {
+    (repo.host.api_host().to_owned(), repo.path.to_owned())
 }
 
 /// OCI token exchange for a single repository scope.
@@ -35,16 +160,18 @@ pub(crate) fn split_source(source: &str) -> Option<(&str, &str)> {
 /// basic auth credentials if given. The error says which step failed.
 pub(crate) async fn oci_token(
     client: &reqwest::Client,
-    registry: &str,
-    repo: &str,
+    repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
 ) -> Result<String, String> {
+    let registry = repo.host.api_host();
+
     // Step 1: challenge the registry to get the auth parameters.
-    let challenge = client
-        .get(format!("https://{registry}/v2/"))
-        .send()
-        .await
-        .map_err(|e| format!("challenge to {registry} failed: {e}"))?;
+    let challenge_url = format!("https://{registry}/v2/");
+    let challenge = send_retrying(&format!("{registry} challenge"), || {
+        client.get(&challenge_url)
+    })
+    .await
+    .map_err(|e| format!("challenge to {registry} {e}"))?;
 
     let www_auth = challenge
         .headers()
@@ -63,25 +190,22 @@ pub(crate) async fn oci_token(
     let service = parse_auth_param(www_auth, "service").unwrap_or_default();
 
     // Step 2: exchange for a bearer token.
-    let scope = format!("repository:{repo}:pull");
-    let mut token_req = client
-        .get(&realm)
-        .query(&[("service", &service), ("scope", &scope)]);
-
-    // Docker Hub: include basic auth for authenticated pull rates.
-    if registry.contains("docker.io") {
-        if let Some(auth) = dockerhub_auth {
-            token_req = token_req.basic_auth(&auth.username, Some(&auth.token));
+    let scope = format!("repository:{}:pull", repo.path);
+    let token_resp = send_retrying(&format!("{repo} token"), || {
+        let request = client
+            .get(&realm)
+            .query(&[("service", &service), ("scope", &scope)]);
+        // Docker Hub: include basic auth for authenticated pull rates.
+        match (repo.host, dockerhub_auth) {
+            (Host::DockerHub, Some(auth)) => request.basic_auth(&auth.username, Some(&auth.token)),
+            _ => request,
         }
-    }
-
-    let token_resp = token_req
-        .send()
-        .await
-        .map_err(|e| format!("token request for {registry}/{repo} failed: {e}"))?;
+    })
+    .await
+    .map_err(|e| format!("token request for {repo} {e}"))?;
     if !token_resp.status().is_success() {
         return Err(format!(
-            "token request for {registry}/{repo} returned {}",
+            "token request for {repo} returned {}",
             token_resp.status()
         ));
     }
@@ -89,18 +213,18 @@ pub(crate) async fn oci_token(
     let text = token_resp
         .text()
         .await
-        .map_err(|e| format!("token response for {registry}/{repo} unreadable: {e}"))?;
+        .map_err(|e| format!("token response for {repo} unreadable: {e}"))?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the error names the registry and repository, never the response body"
     )]
     let body: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|_| format!("token response for {registry}/{repo} is not JSON"))?;
+        .map_err(|_| format!("token response for {repo} is not JSON"))?;
     body.get("token")
         .or_else(|| body.get("access_token"))
         .and_then(|v| v.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| format!("token response for {registry}/{repo} holds no token"))
+        .ok_or_else(|| format!("token response for {repo} holds no token"))
 }
 
 /// Extract a parameter value from a `WWW-Authenticate: Bearer ...` header.
@@ -120,16 +244,37 @@ mod tests {
         let cases = [
             (
                 "docker.io/library/alpine",
-                Some(("registry-1.docker.io", "library/alpine")),
+                Some((Host::DockerHub, "library/alpine")),
             ),
             (
                 "quay.io/jupyter/base-notebook",
-                Some(("quay.io", "jupyter/base-notebook")),
+                Some((Host::Other("quay.io"), "jupyter/base-notebook")),
             ),
             ("alpine", None),
         ];
         for (source, want) in cases {
-            assert_eq!(split_source(source), want, "{source}");
+            let got = split_source(source).map(|r| (r.host, r.path));
+            assert_eq!(got, want, "{source}");
+        }
+        assert_eq!(Host::DockerHub.api_host(), "registry-1.docker.io");
+        assert_eq!(Host::Other("quay.io").api_host(), "quay.io");
+    }
+
+    #[test]
+    fn backoff_follows_retry_after_doubles_without_it_and_is_capped() {
+        let cases: [(u32, Option<&str>, u64); 5] = [
+            (0, Some("7"), 7),
+            (0, None, 2),
+            (2, None, 8),
+            (0, Some("3600"), 60),
+            (1, Some("soon"), 4),
+        ];
+        for (attempt, header, secs) in cases {
+            assert_eq!(
+                backoff(attempt, header),
+                Duration::from_secs(secs),
+                "attempt {attempt}, Retry-After {header:?}"
+            );
         }
     }
 

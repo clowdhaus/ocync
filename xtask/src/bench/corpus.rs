@@ -1,6 +1,41 @@
 //! YAML corpus config parsing with environment variable expansion.
 
+use std::path::PathBuf;
+
+use clap::Args;
 use serde::Deserialize;
+
+/// Where the corpus and its partial-sync overrides are read from, shared by
+/// `bench` and `bench-lock`.
+#[derive(Args)]
+pub(crate) struct CorpusPaths {
+    /// Path to corpus YAML file. Its lock is the `.lock.json` beside it.
+    #[arg(long, default_value = "bench/corpus.yaml")]
+    corpus: String,
+
+    /// Path to partial sync overrides YAML, applied on top of the corpus for
+    /// the partial scenario. Its tags are locked too.
+    #[arg(long, default_value = "bench/corpus-partial-overrides.yaml")]
+    partial_overrides: String,
+}
+
+impl CorpusPaths {
+    /// The corpus YAML.
+    pub(crate) fn corpus(&self) -> &str {
+        &self.corpus
+    }
+
+    /// The partial sync overrides YAML.
+    pub(crate) fn partial_overrides(&self) -> &str {
+        &self.partial_overrides
+    }
+
+    /// The lock beside the corpus: `bench/corpus.yaml` is locked by
+    /// `bench/corpus.lock.json`.
+    pub(crate) fn lock_path(&self) -> PathBuf {
+        PathBuf::from(&self.corpus).with_extension("lock.json")
+    }
+}
 
 /// Docker Hub credentials for authenticated pulls (avoids 10 pulls/hr anon limit).
 #[derive(Clone)]
@@ -259,6 +294,21 @@ images:
   - source: "docker.io/library/alpine"
     tags: ["3.20", "latest"]
 "#
+    }
+
+    #[test]
+    fn the_lock_sits_beside_the_corpus_it_locks() {
+        let cases = [
+            ("bench/corpus.yaml", "bench/corpus.lock.json"),
+            ("elsewhere/small.yml", "elsewhere/small.lock.json"),
+        ];
+        for (corpus, want) in cases {
+            let paths = CorpusPaths {
+                corpus: corpus.into(),
+                partial_overrides: String::new(),
+            };
+            assert_eq!(paths.lock_path(), PathBuf::from(want), "{corpus}");
+        }
     }
 
     #[test]
