@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -50,8 +50,8 @@ pub(crate) fn join_tools(tools: &[Tool]) -> String {
 pub(crate) struct RunResult {
     /// Wall-clock time from process spawn to exit.
     pub(crate) wall_clock: Duration,
-    /// Exit code, or `None` if the process was killed by a signal.
-    pub(crate) exit_code: Option<i32>,
+    /// How the process ended, including a kill by signal.
+    pub(crate) exit_status: ExitStatus,
     /// Peak resident set size in KB (from `/usr/bin/time -v`), if available.
     pub(crate) peak_rss_kb: Option<u64>,
     /// Path to ocync's timing JSONL file (only set for ocync runs).
@@ -409,12 +409,7 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "cargo build --release exited with status {}",
-            status
-                .code()
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-        ))
+        Err(format!("cargo build --release failed ({status})"))
     }
 }
 
@@ -585,7 +580,7 @@ pub(crate) async fn run_tool(
 
     Ok(RunResult {
         wall_clock,
-        exit_code: status.code(),
+        exit_status: status,
         peak_rss_kb,
         timing_path,
     })
@@ -643,19 +638,11 @@ mod tests {
 
     #[test]
     fn join_tools_is_the_form_tools_flag_parses() {
-        use clap::Parser;
-
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            args: crate::bench::BenchArgs,
-        }
-
         let tools = [Tool::Regsync, Tool::Ocync, Tool::Dregsy];
         let joined = join_tools(&tools);
         assert_eq!(joined, "regsync,ocync,dregsy");
-        let parsed = Cli::try_parse_from(["xtask", "--tools", &joined, "prepare"]).unwrap();
-        assert_eq!(parsed.args.tools, tools);
+        let parsed = crate::bench::parse_bench(&["--tools", &joined, "prepare"]).unwrap();
+        assert_eq!(parsed.tool_selection.tools, tools);
     }
 
     #[test]

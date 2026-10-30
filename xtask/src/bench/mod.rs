@@ -13,6 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -23,12 +24,9 @@ use regression::Baseline;
 use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
 use runner::Tool;
 
-/// Arguments for the bench subcommand.
+/// Which tools a benchmark runs, shared by `bench` and `bench-remote`.
 #[derive(Args)]
-pub(crate) struct BenchArgs {
-    #[command(subcommand)]
-    pub(crate) scenario: Scenario,
-
+pub(crate) struct ToolSelection {
     /// Comma-separated list of tools to benchmark.
     #[arg(
         long,
@@ -37,6 +35,16 @@ pub(crate) struct BenchArgs {
         default_value = "ocync"
     )]
     pub(crate) tools: Vec<Tool>,
+}
+
+/// Arguments for the bench subcommand.
+#[derive(Args)]
+pub(crate) struct BenchArgs {
+    #[command(subcommand)]
+    pub(crate) scenario: Scenario,
+
+    #[command(flatten)]
+    pub(crate) tool_selection: ToolSelection,
 
     /// Path to corpus YAML file.
     #[arg(long, default_value = "bench/corpus.yaml")]
@@ -104,7 +112,7 @@ pub(crate) struct BenchArgs {
     pub(crate) no_proxy: bool,
 }
 
-/// Benchmark scenario to run (CLI subcommand).
+/// Benchmark scenario to run.
 #[derive(Subcommand, ValueEnum, Debug, Clone, Copy)]
 pub(crate) enum Scenario {
     /// Full sync (cold) then immediate re-sync (warm).
@@ -233,20 +241,9 @@ pub(crate) enum Provider {
     Azure,
 }
 
-impl Provider {
-    /// The spelling on the command line, in serialized records and in paths.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Aws => "aws",
-            Self::Gcp => "gcp",
-            Self::Azure => "azure",
-        }
-    }
-}
-
 impl std::fmt::Display for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&value_name(self))
     }
 }
 
@@ -266,14 +263,22 @@ enum RegistryKind {
 impl RegistryKind {
     /// Classifies a target registry hostname.
     fn of(target_registry: &str) -> Self {
-        if target_registry.contains(".ecr.") && target_registry.contains(".amazonaws.com") {
+        let host = target_registry.to_ascii_lowercase();
+        let is_ecr = [".dkr.ecr.", ".dkr.ecr-fips."]
+            .iter()
+            .any(|infix| host.contains(infix))
+            && [".amazonaws.com", ".amazonaws.com.cn"]
+                .iter()
+                .any(|suffix| host.ends_with(suffix));
+        if is_ecr {
             Self::Ecr
-        } else if target_registry == "gcr.io"
-            || target_registry.ends_with(".gcr.io")
-            || target_registry.ends_with("-docker.pkg.dev")
+        } else if host == "gcr.io" || host.ends_with(".gcr.io") || host.ends_with("-docker.pkg.dev")
         {
             Self::Gcr
-        } else if target_registry.ends_with(".azurecr.io") {
+        } else if [".azurecr.io", ".azurecr.us", ".azurecr.cn"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        {
             Self::Acr
         } else {
             Self::Other
@@ -364,7 +369,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
     };
 
-    let tools = &args.tools;
+    let tools = &args.tool_selection.tools;
 
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
@@ -733,10 +738,10 @@ async fn run_single_tool(
         .unwrap_or_else(|| "n/a".into());
     if let Some(ref metrics) = proxy_metrics {
         eprintln!(
-            "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
+            "  {}: wall_clock={:.1}s status={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
             tool,
             result.wall_clock.as_secs_f64(),
-            exit_display(result.exit_code),
+            result.exit_status,
             rss_display,
             metrics.requests,
             report::format_bytes(metrics.response_bytes),
@@ -747,12 +752,10 @@ async fn run_single_tool(
         );
     } else {
         eprintln!(
-            "  {}: wall_clock={:.1}s exit={} rss={}",
+            "  {}: wall_clock={:.1}s status={} rss={}",
             tool,
             result.wall_clock.as_secs_f64(),
-            result
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            result.exit_status,
             rss_display,
         );
     }
@@ -766,7 +769,7 @@ async fn run_single_tool(
 
     // Checked last so a source-registry error, which names the cause, is
     // reported first.
-    ensure_exited_zero(tool, pass, result.exit_code)?;
+    ensure_exited_zero(tool, pass, result.exit_status)?;
 
     Ok(ToolRun {
         tool,
@@ -780,19 +783,13 @@ async fn run_single_tool(
 /// Fails unless a tool pass exited 0. A pass that failed did less work, so its
 /// numbers cannot be compared; for `--dry-run` that includes a mapping that
 /// could not be resolved.
-fn ensure_exited_zero(tool: Tool, pass: Pass, exit_code: Option<i32>) -> Result<(), String> {
-    if exit_code == Some(0) {
+fn ensure_exited_zero(tool: Tool, pass: Pass, status: ExitStatus) -> Result<(), String> {
+    if status.success() {
         return Ok(());
     }
     Err(format!(
-        "{tool} {pass} failed (exit {}); aborting, a failed run cannot be compared",
-        exit_display(exit_code)
+        "{tool} {pass} failed ({status}); aborting, a failed run cannot be compared"
     ))
-}
-
-/// An exit code for a log line; `signal` when the process had none.
-fn exit_display(exit_code: Option<i32>) -> String {
-    exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string())
 }
 
 /// Abort on source registry errors (status >= 400) that indicate tainted
@@ -1858,6 +1855,21 @@ fn days_to_civil(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
+/// Parses `argv` (without the program name) as the `bench` subcommand's
+/// arguments, the way the command line does.
+#[cfg(test)]
+pub(crate) fn parse_bench(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: BenchArgs,
+    }
+
+    Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied())).map(|cli| cli.args)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1895,23 +1907,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_pass_that_does_not_exit_zero_aborts_the_run() {
+        use std::os::unix::process::ExitStatusExt;
+
         let pass = Pass::Measured(ScenarioKind::Scale { images: 10 });
-        assert_eq!(ensure_exited_zero(Tool::Ocync, pass, Some(0)), Ok(()));
-        for (name, exit_code, expected) in [
+        assert_eq!(
+            ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(0)),
+            Ok(())
+        );
+        for (name, raw_status, expected) in [
             (
                 "non-zero",
-                Some(1),
-                "ocync scale-10 failed (exit 1); aborting, a failed run cannot be compared",
+                1 << 8,
+                "ocync scale-10 failed (exit status: 1); aborting, a failed run cannot be compared",
             ),
             (
                 "killed by a signal",
-                None,
-                "ocync scale-10 failed (exit signal); aborting, a failed run cannot be compared",
+                9,
+                "ocync scale-10 failed (signal: 9 (SIGKILL)); aborting, a failed run cannot be compared",
             ),
         ] {
             assert_eq!(
-                ensure_exited_zero(Tool::Ocync, pass, exit_code),
+                ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(raw_status)),
                 Err(expected.to_string()),
                 "{name}"
             );
@@ -1940,21 +1958,6 @@ mod tests {
         ] {
             assert_eq!(value_name(&scenario), expected);
         }
-        for (provider, expected) in [
-            (Provider::Aws, "aws"),
-            (Provider::Gcp, "gcp"),
-            (Provider::Azure, "azure"),
-        ] {
-            assert_eq!(provider.to_string(), expected);
-        }
-        for provider in Provider::value_variants() {
-            assert_eq!(provider.as_str(), value_name(provider), "clap spelling");
-            assert_eq!(
-                serde_json::to_string(provider).unwrap(),
-                format!("\"{}\"", provider.as_str()),
-                "serde spelling"
-            );
-        }
     }
 
     #[test]
@@ -1974,6 +1977,26 @@ mod tests {
             ("us-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
             ("europe-west1-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
             ("myregistry.azurecr.io", "acr", Some(Provider::Azure)),
+            (
+                "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "123456789012.DKR.ECR.US-EAST-1.AMAZONAWS.COM",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            ("myreg.azurecr.us", "acr", Some(Provider::Azure)),
+            ("myreg.azurecr.cn", "acr", Some(Provider::Azure)),
+            ("MyReg.AzureCR.io", "acr", Some(Provider::Azure)),
+            ("ecr.example.com", "other", None),
+            ("public.ecr.aws", "other", None),
             ("ghcr.io", "other", None),
             ("docker.io", "other", None),
             ("quay.io", "other", None),
@@ -1986,19 +2009,13 @@ mod tests {
 
     #[test]
     fn bench_args_parse_closed_sets_and_refuse_anything_else() {
-        use clap::Parser;
         use clap::error::ErrorKind;
 
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            args: BenchArgs,
-        }
-
-        let ok = Cli::try_parse_from(["xtask", "--tools", "Ocync,DREGSY,regsync", "prepare"])
-            .unwrap()
-            .args;
-        assert_eq!(ok.tools, [Tool::Ocync, Tool::Dregsy, Tool::Regsync]);
+        let ok = parse_bench(&["--tools", "Ocync,DREGSY,regsync", "prepare"]).unwrap();
+        assert_eq!(
+            ok.tool_selection.tools,
+            [Tool::Ocync, Tool::Dregsy, Tool::Regsync]
+        );
         assert!(matches!(ok.scenario, Scenario::Prepare));
 
         for (name, argv, kind) in [
@@ -2009,7 +2026,7 @@ mod tests {
             ),
             ("scenario", &["cold"][..], ErrorKind::InvalidSubcommand),
         ] {
-            let err = Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied()))
+            let err = parse_bench(argv)
                 .err()
                 .unwrap_or_else(|| panic!("{name}: accepted"));
             assert_eq!(err.kind(), kind, "{name}");

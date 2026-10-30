@@ -14,8 +14,8 @@ use std::process::{Command, Stdio};
 use clap::Args;
 use serde::Deserialize;
 
-use super::runner::{Tool, join_tools};
-use super::{Provider, Scenario, value_name};
+use super::runner::join_tools;
+use super::{Provider, Scenario, ToolSelection, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -78,15 +78,8 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
-    /// Comma-separated list of tools to benchmark (passed through to
-    /// `cargo xtask bench`).
-    #[arg(
-        long,
-        value_delimiter = ',',
-        ignore_case = true,
-        default_value = "ocync"
-    )]
-    pub(crate) tools: Vec<Tool>,
+    #[command(flatten)]
+    pub(crate) tool_selection: ToolSelection,
 
     /// Scenario to run (passed through to `cargo xtask bench`).
     #[arg(long, value_enum, default_value = "all")]
@@ -117,7 +110,6 @@ pub(crate) struct BenchRemoteArgs {
 /// Connection details written by Terraform.
 #[derive(Debug, Deserialize)]
 struct BenchConfig {
-    provider: Provider,
     host: String,
     user: String,
     /// Absolute path to the Terraform-generated SSH private key for this
@@ -154,6 +146,10 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         return fetch_results(&config, &args.output);
     }
 
+    // Decided before the push, so a provider with no setup is refused before
+    // anything leaves this machine.
+    let registry_env = registry_env(args.provider)?;
+
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
         None => current_branch()?,
@@ -174,7 +170,10 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // The benchmark's arguments, unquoted: `remote_script` quotes each one.
-    let mut bench_args = vec!["--tools".to_string(), join_tools(&args.tools)];
+    let mut bench_args = vec![
+        "--tools".to_string(),
+        join_tools(&args.tool_selection.tools),
+    ];
     if let Some(limit) = args.limit {
         bench_args.extend(["--limit".to_string(), limit.to_string()]);
     }
@@ -189,24 +188,11 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     bench_args.push(value_name(&args.scenario));
 
-    let registry_env = match config.provider {
-        Provider::Aws => {
-            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com".to_string()
-        }
-        Provider::Gcp | Provider::Azure => {
-            return Err(format!(
-                "provider '{}' not yet supported. Add registry env setup for this provider.",
-                config.provider
-            )
-            .into());
-        }
-    };
-
     let script = remote_script(
         &git_ref,
         &git_sha,
         &bench_args,
-        &registry_env,
+        registry_env,
         ExistingRun::from_force(args.force),
     );
 
@@ -243,6 +229,19 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     fetch_results(&config, &args.output)?;
     Ok(())
+}
+
+/// The shell that points the benchmark at `provider`'s registry on the
+/// instance, or the reason there is none yet.
+fn registry_env(provider: Provider) -> Result<&'static str, String> {
+    match provider {
+        Provider::Aws => Ok(
+            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com",
+        ),
+        Provider::Gcp | Provider::Azure => Err(format!(
+            "provider '{provider}' not yet supported. Add registry env setup for this provider."
+        )),
+    }
 }
 
 /// A line the remote script prints that says how far it got.
@@ -315,6 +314,8 @@ fn ssh_stream(
         .stderr(Stdio::inherit())
         .spawn()?;
 
+    // `stdin` drops at the end of this block, which closes it so the remote
+    // `bash -s` sees end of input; hoisting it out would hang the run.
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes())?;
     }
@@ -768,13 +769,9 @@ mod tests {
     fn parse_bench_config() {
         let json = r#"{"provider":"aws","host":"54.123.45.67","user":"ec2-user","ssh_key_path":"/tmp/.ssh-key"}"#;
         let config: BenchConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.provider, Provider::Aws);
         assert_eq!(config.host, "54.123.45.67");
         assert_eq!(config.user, "ec2-user");
         assert_eq!(config.ssh_key_path, "/tmp/.ssh-key");
-
-        let unknown = json.replace("aws", "digitalocean");
-        assert!(serde_json::from_str::<BenchConfig>(&unknown).is_err());
     }
 
     #[test]
@@ -901,33 +898,41 @@ mod tests {
     #[test]
     fn closed_set_options_parse_to_types_and_refuse_anything_else() {
         use clap::Parser;
-        let run = Cli::try_parse_from([
-            "xtask",
-            "--provider",
-            "gcp",
-            "--tools",
-            "OCYNC,regsync",
-            "--scenario",
-            "prepare",
-        ])
-        .unwrap()
-        .args;
+        let run = Cli::try_parse_from(["xtask", "--provider", "gcp", "--scenario", "prepare"])
+            .unwrap()
+            .args;
         assert_eq!(run.provider, Provider::Gcp);
-        assert_eq!(run.tools, [Tool::Ocync, Tool::Regsync]);
         assert!(matches!(run.scenario, Scenario::Prepare));
 
         for (name, argv) in [
             ("provider", &["--provider", "digitalocean"][..]),
-            (
-                "tool",
-                &["--provider", "aws", "--tools", "ocync,skopeo"][..],
-            ),
             ("scenario", &["--provider", "aws", "--scenario", "cold"][..]),
         ] {
             let err = Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied()))
                 .err()
                 .unwrap_or_else(|| panic!("{name}: accepted"));
             assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_provider_without_registry_setup_is_refused_by_name() {
+        assert!(
+            registry_env(Provider::Aws)
+                .unwrap()
+                .contains("BENCH_TARGET_REGISTRY")
+        );
+        for (provider, expected) in [
+            (
+                Provider::Gcp,
+                "provider 'gcp' not yet supported. Add registry env setup for this provider.",
+            ),
+            (
+                Provider::Azure,
+                "provider 'azure' not yet supported. Add registry env setup for this provider.",
+            ),
+        ] {
+            assert_eq!(registry_env(provider), Err(expected.to_string()));
         }
     }
 

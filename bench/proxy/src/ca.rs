@@ -129,7 +129,13 @@ pub(crate) fn generate_ca(common_name: &str) -> Result<(String, String), Error> 
 pub(crate) async fn write_private_key(path: &Path, key_pem: &str) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
 
-    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    let Some(file_name) = path.file_name() else {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} does not name a file", path.display()),
+        )));
+    };
+    let mut temp_name = file_name.to_os_string();
     temp_name.push(".tmp");
     let temp = path.with_file_name(temp_name);
 
@@ -282,6 +288,12 @@ mod tests {
                 .collect();
             assert_eq!(entries, ["ca.key"], "{name}: no temp file left behind");
         }
+    }
+
+    #[tokio::test]
+    async fn private_key_path_without_a_file_name_is_refused_naming_the_path() {
+        let err = write_private_key(Path::new("/"), "key").await.unwrap_err();
+        assert!(err.to_string().contains("/ does not name a file"), "{err}");
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
@@ -62,7 +63,7 @@ fn source_path(source: &str) -> &str {
 /// `cgr.dev` → `cgr-dev`
 /// `123456.dkr.ecr.us-east-1.amazonaws.com` → `ecr`
 fn registry_key(hostname: &str) -> String {
-    if hostname.contains(".dkr.ecr.") {
+    if RegistryKind::of(hostname) == RegistryKind::Ecr {
         "ecr".to_string()
     } else {
         hostname.replace('.', "-")

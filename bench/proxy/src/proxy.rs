@@ -285,6 +285,8 @@ async fn handle_connection(
 /// bytes had been consumed into the internal buffer but not yet returned
 /// through `AsyncRead`.
 fn into_parts(reader: BufReader<TcpStream>) -> (TcpStream, Vec<u8>) {
+    // The buffered bytes are the client's ClientHello; they must be replayed
+    // to the TLS acceptor or the handshake breaks.
     let buffered = reader.buffer().to_vec();
     let inner = reader.into_inner();
     (inner, buffered)
@@ -436,31 +438,18 @@ async fn handle_request(
     });
     let request_counter_for_log = request_counter.clone();
     let logging_stream = LogOnDrop::new(stream, move || {
-        let entry_bytes = byte_counter.load(Ordering::Relaxed);
-        let req_bytes = request_counter_for_log.load(Ordering::Relaxed);
-        let elapsed = start.elapsed();
-        let log = log_for_stream.clone();
-        let method = method_for_log.clone();
-        let host = host_for_log.clone();
-        let url = url_for_log.clone();
-        let status_code = status.as_u16();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let entry = ProxyEntry {
-                    timestamp: now_iso8601(),
-                    method: &method,
-                    host: &host,
-                    url: &url,
-                    request_bytes: req_bytes,
-                    response_bytes: entry_bytes,
-                    status: status_code,
-                    duration_ms: elapsed.as_millis() as u64,
-                    x_cache: x_cache.as_deref(),
-                    age,
-                };
-                log.write_entry(&entry).await;
-            });
+        FinishedResponse {
+            method: method_for_log,
+            host: host_for_log,
+            url: url_for_log,
+            request_bytes: request_counter_for_log.load(Ordering::Relaxed),
+            response_bytes: byte_counter.load(Ordering::Relaxed),
+            status: status.as_u16(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            x_cache,
+            age,
         }
+        .spawn_log(log_for_stream);
     });
     let body = StreamBody::new(logging_stream).boxed_unsync();
 
@@ -533,6 +522,45 @@ fn now_iso8601() -> String {
     let now = time::OffsetDateTime::now_utc();
     now.format(&time::format_description::well_known::Iso8601::DEFAULT)
         .unwrap_or_else(|_| String::new())
+}
+
+/// A response whose body has finished streaming, owned so it can move to the
+/// task that logs it.
+struct FinishedResponse {
+    method: String,
+    host: String,
+    url: String,
+    request_bytes: u64,
+    response_bytes: u64,
+    status: u16,
+    duration_ms: u64,
+    x_cache: Option<String>,
+    age: Option<u64>,
+}
+
+impl FinishedResponse {
+    /// Writes this response's entry on a spawned task, so the stream's drop
+    /// path never blocks. Nothing is written outside a runtime.
+    fn spawn_log(self, log: Arc<LogWriter>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let entry = ProxyEntry {
+                timestamp: now_iso8601(),
+                method: &self.method,
+                host: &self.host,
+                url: &self.url,
+                request_bytes: self.request_bytes,
+                response_bytes: self.response_bytes,
+                status: self.status,
+                duration_ms: self.duration_ms,
+                x_cache: self.x_cache.as_deref(),
+                age: self.age,
+            };
+            log.write_entry(&entry).await;
+        });
+    }
 }
 
 /// A `Stream` wrapper that fires `on_drop` once, when the inner stream ends
@@ -814,22 +842,27 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 1, "callback must fire once");
     }
 
-    /// The production callback calls `Handle::try_current()` + `spawn`
-    /// to write a log entry asynchronously. This test exercises that
-    /// exact pattern to verify the spawned task actually completes.
+    /// A finished response written through the production path lands in the
+    /// log as one JSONL entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn log_on_drop_spawns_async_log_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spawn.jsonl");
         let log = Arc::new(LogWriter::create(&path).await.unwrap());
-        let log_for_cb = log.clone();
 
         let mut wrapper = LogOnDrop::new(stream::iter([1]), move || {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    log_for_cb.write_entry(&test_entry("GET", 200)).await;
-                });
+            FinishedResponse {
+                method: "GET".to_owned(),
+                host: "registry.test".to_owned(),
+                url: "/v2/".to_owned(),
+                request_bytes: 0,
+                response_bytes: 7,
+                status: 200,
+                duration_ms: 1,
+                x_cache: None,
+                age: None,
             }
+            .spawn_log(log);
         });
 
         let _ = wrapper.next().await;
@@ -848,11 +881,10 @@ mod tests {
         })
         .await
         .expect("spawned task never wrote its entry");
-        assert_eq!(
-            content.lines().count(),
-            1,
-            "spawned task should write one JSONL entry"
-        );
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "spawned task should write one JSONL entry");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["response_bytes"], 7);
     }
 
     /// Build a [`ProxyEntry`] with sensible defaults for tests.
