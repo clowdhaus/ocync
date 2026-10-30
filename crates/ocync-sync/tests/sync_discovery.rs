@@ -24,39 +24,38 @@ use helpers::*;
 /// Discovery HEAD timeout for tests whose source HEAD can hang.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(1);
 
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
+/// Discovery counters of a run.
+#[derive(Debug, Default, PartialEq)]
+struct Discovery {
+    cache_hits: u64,
+    cache_misses: u64,
+    head_failures: u64,
+    target_stale: u64,
+    head_first_skips: u64,
+}
 
-/// Discovery counters as `[cache_hits, cache_misses, head_failures, target_stale,
-/// head_first_skips]`.
-fn discovery(report: &SyncReport) -> [u64; 5] {
+/// One cache miss and nothing else: the cold-cache route.
+const MISS: Discovery = Discovery {
+    cache_hits: 0,
+    cache_misses: 1,
+    head_failures: 0,
+    target_stale: 0,
+    head_first_skips: 0,
+};
+
+fn discovery(report: &SyncReport) -> Discovery {
     let s = &report.stats;
-    [
-        s.discovery_cache_hits,
-        s.discovery_cache_misses,
-        s.discovery_head_failures,
-        s.discovery_target_stale,
-        s.discovery_head_first_skips,
-    ]
+    Discovery {
+        cache_hits: s.discovery_cache_hits,
+        cache_misses: s.discovery_cache_misses,
+        head_failures: s.discovery_head_failures,
+        target_stale: s.discovery_target_stale,
+        head_first_skips: s.discovery_head_first_skips,
+    }
 }
 
 fn manifest_path(repo: &str, reference: &str) -> String {
     format!("/v2/{repo}/manifests/{reference}")
-}
-
-/// A manifest HEAD or GET response that names `digest`.
-fn digest_response(digest: &Digest, media_type: MediaType) -> ResponseTemplate {
-    ResponseTemplate::new(200)
-        .insert_header("docker-content-digest", digest.to_string())
-        .insert_header("content-type", media_type.as_str())
-        .insert_header("content-length", "100")
-}
-
-fn head_mock(repo: &str, reference: &str, response: ResponseTemplate) -> Mock {
-    Mock::given(method("HEAD"))
-        .and(path(manifest_path(repo, reference)))
-        .respond_with(response)
 }
 
 fn get_mock(repo: &str, reference: &str, response: ResponseTemplate) -> Mock {
@@ -65,10 +64,11 @@ fn get_mock(repo: &str, reference: &str, response: ResponseTemplate) -> Mock {
         .respond_with(response)
 }
 
-/// A manifest GET the engine must never issue.
-async fn forbid_get(server: &MockServer, repo: &str, reference: &str) {
+/// A manifest GET the engine must never issue; `row` names the table row in a failure.
+async fn forbid_get(server: &MockServer, repo: &str, reference: &str, row: &str) {
     get_mock(repo, reference, ResponseTemplate::new(200))
         .expect(0)
+        .named(format!("{row}: no GET {reference}"))
         .mount(server)
         .await;
 }
@@ -89,7 +89,7 @@ fn source_head(kind: &SourceHead, digest: &Digest) -> Mock {
             digest_response(digest, MediaType::OciManifest).set_delay(Duration::from_secs(3))
         }
     };
-    head_mock("src/repo", "v1", response)
+    manifest_head_mock("src/repo", "v1", response)
 }
 
 fn image(name: &str) -> ManifestParts {
@@ -106,19 +106,40 @@ async fn mount_target_blobs(server: &MockServer, repo: &str, parts: &ManifestPar
 
 /// Everything a full pull of `parts` under `tag` needs except the manifest HEADs:
 /// one source manifest GET, the blobs, and a target that accepts the pushes.
+/// `row` names the table row or scenario in a failed expectation.
 async fn mount_full_pull(
     source: &MockServer,
     target: &MockServer,
     parts: &ManifestParts,
     tag: &str,
+    row: &str,
 ) {
     source_manifest_mock("src/repo", tag, &parts.bytes, MediaType::OciManifest)
         .expect(1)
+        .named(format!("{row}: source GET {tag}"))
         .mount(source)
         .await;
     parts.mount_blob_pulls(source, "src/repo").await;
     mount_target_blobs(target, "tgt/repo", parts).await;
     mount_manifest_push(target, "tgt/repo", tag).await;
+}
+
+/// What the cache holds for the tag when the run starts.
+enum Seed {
+    Cold,
+    /// A snapshot of a source digest that has since changed.
+    OldDigest,
+    /// A snapshot of the digest the source serves now.
+    Current,
+}
+
+/// Seed `cache` for `tag` as `seed` says, against a source serving `current`.
+fn seed_cache(cache: &Rc<RefCell<TransferStateCache>>, seed: &Seed, tag: &str, current: &Digest) {
+    match seed {
+        Seed::Cold => {}
+        Seed::OldDigest => seed_snapshot(cache, tag, &make_digest("dead"), &make_digest("beef")),
+        Seed::Current => seed_snapshot(cache, tag, current, current),
+    }
 }
 
 fn seed_snapshot(
@@ -137,10 +158,6 @@ fn seed_snapshot(
     );
 }
 
-fn same_tags(tags: &[&str]) -> Vec<TagPair> {
-    tags.iter().map(|t| TagPair::same(*t)).collect()
-}
-
 fn mapping(source: &MockServer, target: &MockServer, tags: Vec<TagPair>) -> ResolvedMapping {
     mapping_with_distinct_repos(source, target, "src/repo", "tgt/repo", tags)
 }
@@ -153,10 +170,6 @@ async fn end_cycle(source: &MockServer, target: &MockServer) {
     target.reset().await;
 }
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
-
 /// A matching snapshot (or a `head_first` match) skips with one source HEAD, one
 /// target HEAD and no source manifest GET.
 #[tokio::test]
@@ -166,8 +179,8 @@ async fn discovery_skips_without_source_get() {
         source_tag: &'static str,
         target_tag: &'static str,
         head_first: bool,
-        seeded: bool,
-        want: [u64; 5],
+        seed: Seed,
+        want: Discovery,
     }
     let cases = [
         Case {
@@ -175,32 +188,44 @@ async fn discovery_skips_without_source_get() {
             source_tag: "v1",
             target_tag: "v1",
             head_first: false,
-            seeded: true,
-            want: [1, 0, 0, 0, 0],
+            seed: Seed::Current,
+            want: Discovery {
+                cache_hits: 1,
+                ..Discovery::default()
+            },
         },
         Case {
             name: "retag: snapshot keyed on the source tag, target HEAD on the target tag",
             source_tag: "v1.0",
             target_tag: "latest",
             head_first: false,
-            seeded: true,
-            want: [1, 0, 0, 0, 0],
+            seed: Seed::Current,
+            want: Discovery {
+                cache_hits: 1,
+                ..Discovery::default()
+            },
         },
         Case {
             name: "head_first with a warm snapshot takes the snapshot path",
             source_tag: "v1",
             target_tag: "v1",
             head_first: true,
-            seeded: true,
-            want: [1, 0, 0, 0, 0],
+            seed: Seed::Current,
+            want: Discovery {
+                cache_hits: 1,
+                ..Discovery::default()
+            },
         },
         Case {
             name: "head_first on a cold cache skips on the target HEAD match",
             source_tag: "v1",
             target_tag: "v1",
             head_first: true,
-            seeded: false,
-            want: [0, 0, 0, 0, 1],
+            seed: Seed::Cold,
+            want: Discovery {
+                head_first_skips: 1,
+                ..Discovery::default()
+            },
         },
     ];
 
@@ -209,21 +234,23 @@ async fn discovery_skips_without_source_get() {
         let target = MockServer::start().await;
         let digest = make_digest("aabb");
 
-        head_mock(
+        manifest_head_mock(
             "src/repo",
             c.source_tag,
             digest_response(&digest, MediaType::OciManifest),
         )
         .expect(1)
+        .named(format!("{}: source HEAD", c.name))
         .mount(&source)
         .await;
-        forbid_get(&source, "src/repo", c.source_tag).await;
-        head_mock(
+        forbid_get(&source, "src/repo", c.source_tag, c.name).await;
+        manifest_head_mock(
             "tgt/repo",
             c.target_tag,
             digest_response(&digest, MediaType::OciManifest),
         )
         .expect(1)
+        .named(format!("{}: target HEAD", c.name))
         .mount(&target)
         .await;
 
@@ -234,9 +261,7 @@ async fn discovery_skips_without_source_get() {
         );
         m.head_first = c.head_first;
         let cache = empty_cache();
-        if c.seeded {
-            seed_snapshot(&cache, c.source_tag, &digest, &digest);
-        }
+        seed_cache(&cache, &c.seed, c.source_tag, &digest);
 
         let report = run_sync_with_cache(vec![m], cache).await;
 
@@ -262,17 +287,12 @@ async fn discovery_skips_without_source_get() {
 /// GET and a full push.
 #[tokio::test]
 async fn discovery_falls_through_to_full_pull() {
-    enum Seed {
-        Cold,
-        OldDigest,
-        Current,
-    }
     struct Case {
         name: &'static str,
         source_head: SourceHead,
         seed: Seed,
         target_heads: u64,
-        want: [u64; 5],
+        want: Discovery,
         /// Whether the snapshot holds the pulled digest afterwards (a failed
         /// source HEAD must not invent one).
         snapshot: bool,
@@ -283,7 +303,7 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Digest,
             seed: Seed::Cold,
             target_heads: 1,
-            want: [0, 1, 0, 0, 0],
+            want: MISS,
             snapshot: true,
         },
         Case {
@@ -291,7 +311,7 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Digest,
             seed: Seed::OldDigest,
             target_heads: 1,
-            want: [0, 1, 0, 0, 0],
+            want: MISS,
             snapshot: true,
         },
         Case {
@@ -299,7 +319,10 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Digest,
             seed: Seed::Current,
             target_heads: 2,
-            want: [0, 1, 0, 1, 0],
+            want: Discovery {
+                target_stale: 1,
+                ..MISS
+            },
             snapshot: true,
         },
         Case {
@@ -307,7 +330,10 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Status(500),
             seed: Seed::Cold,
             target_heads: 1,
-            want: [0, 1, 1, 0, 0],
+            want: Discovery {
+                head_failures: 1,
+                ..MISS
+            },
             snapshot: false,
         },
         Case {
@@ -315,7 +341,10 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Status(404),
             seed: Seed::Cold,
             target_heads: 1,
-            want: [0, 1, 1, 0, 0],
+            want: Discovery {
+                head_failures: 1,
+                ..MISS
+            },
             snapshot: false,
         },
         Case {
@@ -323,7 +352,10 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::TimesOut,
             seed: Seed::Cold,
             target_heads: 1,
-            want: [0, 1, 1, 0, 0],
+            want: Discovery {
+                head_failures: 1,
+                ..MISS
+            },
             snapshot: false,
         },
         Case {
@@ -331,7 +363,10 @@ async fn discovery_falls_through_to_full_pull() {
             source_head: SourceHead::Status(500),
             seed: Seed::Current,
             target_heads: 1,
-            want: [0, 1, 1, 0, 0],
+            want: Discovery {
+                head_failures: 1,
+                ..MISS
+            },
             snapshot: true,
         },
     ];
@@ -343,22 +378,18 @@ async fn discovery_falls_through_to_full_pull() {
 
         source_head(&c.source_head, &parts.digest)
             .expect(1)
+            .named(format!("{}: source HEAD", c.name))
             .mount(&source)
             .await;
-        mount_full_pull(&source, &target, &parts, "v1").await;
-        head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
+        mount_full_pull(&source, &target, &parts, "v1", c.name).await;
+        manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
             .expect(c.target_heads)
+            .named(format!("{}: target HEAD", c.name))
             .mount(&target)
             .await;
 
         let cache = empty_cache();
-        match c.seed {
-            Seed::Cold => {}
-            Seed::OldDigest => {
-                seed_snapshot(&cache, "v1", &make_digest("dead"), &make_digest("beef"));
-            }
-            Seed::Current => seed_snapshot(&cache, "v1", &parts.digest, &parts.digest),
-        }
+        seed_cache(&cache, &c.seed, "v1", &parts.digest);
 
         let report = SyncEngine::new(fast_retry(), concurrency(10))
             .with_source_head_timeout(HEAD_TIMEOUT)
@@ -392,7 +423,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
 
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&make_digest("aabb"), MediaType::OciManifest),
@@ -424,7 +455,7 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     );
     // The label names the target registry alias.
     assert_eq!(report.images[0].target, "tgt/repo (target):v1");
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
     assert!(
         cache
             .borrow()
@@ -444,7 +475,7 @@ async fn discovery_zero_platform_match_returns_error() {
     let index = IndexBuilder::new()
         .manifest(&image("s390x"), Some(linux("s390x")))
         .build();
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&index.digest, MediaType::OciIndex),
@@ -483,7 +514,7 @@ async fn discovery_zero_platform_match_returns_error() {
         error.contains("linux/s390x"),
         "error should mention the available platform: {error}"
     );
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
 }
 
 /// Two targets, one in sync and one stale: only the stale one is pushed, with a
@@ -495,7 +526,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     let target_b = MockServer::start().await;
     let parts = image("fanout");
 
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -503,8 +534,8 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     .expect(1)
     .mount(&source)
     .await;
-    mount_full_pull(&source, &target_b, &parts, "v1").await;
-    head_mock(
+    mount_full_pull(&source, &target_b, &parts, "v1", "fanout").await;
+    manifest_head_mock(
         "tgt/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -513,7 +544,7 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     .mount(&target_a)
     .await;
     // Discovery's cache validation and the pre-push check both HEAD target B.
-    head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
+    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .expect(2)
         .mount(&target_b)
         .await;
@@ -560,7 +591,13 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
         synced.bytes_transferred,
         (parts.config_data.len() + parts.layers_data[0].len()) as u64
     );
-    assert_eq!(discovery(&report), [0, 1, 0, 1, 0]);
+    assert_eq!(
+        discovery(&report),
+        Discovery {
+            target_stale: 1,
+            ..MISS
+        }
+    );
 }
 
 /// Three tags discovered concurrently: a snapshot hit, a cold miss and a source
@@ -572,7 +609,7 @@ async fn discovery_concurrent_mixed_outcomes() {
     let (a, b, c) = (image("a"), image("b"), image("c"));
 
     // tag-a: snapshot hit.
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "tag-a",
         digest_response(&a.digest, MediaType::OciManifest),
@@ -580,8 +617,8 @@ async fn discovery_concurrent_mixed_outcomes() {
     .expect(1)
     .mount(&source)
     .await;
-    forbid_get(&source, "src/repo", "tag-a").await;
-    head_mock(
+    forbid_get(&source, "src/repo", "tag-a", "tag-a").await;
+    manifest_head_mock(
         "tgt/repo",
         "tag-a",
         digest_response(&a.digest, MediaType::OciManifest),
@@ -591,7 +628,7 @@ async fn discovery_concurrent_mixed_outcomes() {
     .await;
 
     // tag-b: cold miss.
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "tag-b",
         digest_response(&b.digest, MediaType::OciManifest),
@@ -599,19 +636,19 @@ async fn discovery_concurrent_mixed_outcomes() {
     .expect(1)
     .mount(&source)
     .await;
-    mount_full_pull(&source, &target, &b, "tag-b").await;
-    head_mock("tgt/repo", "tag-b", ResponseTemplate::new(404))
+    mount_full_pull(&source, &target, &b, "tag-b", "tag-b").await;
+    manifest_head_mock("tgt/repo", "tag-b", ResponseTemplate::new(404))
         .expect(1)
         .mount(&target)
         .await;
 
     // tag-c: source HEAD 500.
-    head_mock("src/repo", "tag-c", ResponseTemplate::new(500))
+    manifest_head_mock("src/repo", "tag-c", ResponseTemplate::new(500))
         .expect(1)
         .mount(&source)
         .await;
-    mount_full_pull(&source, &target, &c, "tag-c").await;
-    head_mock("tgt/repo", "tag-c", ResponseTemplate::new(404))
+    mount_full_pull(&source, &target, &c, "tag-c", "tag-c").await;
+    manifest_head_mock("tgt/repo", "tag-c", ResponseTemplate::new(404))
         .expect(1)
         .mount(&target)
         .await;
@@ -631,7 +668,15 @@ async fn discovery_concurrent_mixed_outcomes() {
 
     assert_eq!(report.stats.images_skipped, 1, "tag-a should be skipped");
     assert_eq!(report.stats.images_synced, 2, "tag-b and tag-c should sync");
-    assert_eq!(discovery(&report), [1, 2, 1, 0, 0]);
+    assert_eq!(
+        discovery(&report),
+        Discovery {
+            cache_hits: 1,
+            cache_misses: 2,
+            head_failures: 1,
+            ..Discovery::default()
+        }
+    );
 }
 
 /// The snapshot written by one run is invalidated when the source digest changes
@@ -643,7 +688,7 @@ async fn discovery_source_change_across_cycles() {
     let cache = empty_cache();
     let (d1, d2) = (image("cycle-1"), image("cycle-2"));
 
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&d1.digest, MediaType::OciManifest),
@@ -651,8 +696,8 @@ async fn discovery_source_change_across_cycles() {
     .expect(1)
     .mount(&source)
     .await;
-    mount_full_pull(&source, &target, &d1, "v1").await;
-    head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
+    mount_full_pull(&source, &target, &d1, "v1", "cycle 1").await;
+    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .expect(1)
         .mount(&target)
         .await;
@@ -664,7 +709,7 @@ async fn discovery_source_change_across_cycles() {
     .await;
 
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
     assert_eq!(
         cache
             .borrow()
@@ -676,7 +721,7 @@ async fn discovery_source_change_across_cycles() {
     end_cycle(&source, &target).await;
 
     // The source moves to D2 while the target still holds D1.
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&d2.digest, MediaType::OciManifest),
@@ -684,8 +729,8 @@ async fn discovery_source_change_across_cycles() {
     .expect(1)
     .mount(&source)
     .await;
-    mount_full_pull(&source, &target, &d2, "v1").await;
-    head_mock(
+    mount_full_pull(&source, &target, &d2, "v1", "cycle 2").await;
+    manifest_head_mock(
         "tgt/repo",
         "v1",
         digest_response(&d1.digest, MediaType::OciManifest),
@@ -701,7 +746,7 @@ async fn discovery_source_change_across_cycles() {
     .await;
 
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
     assert_eq!(
         cache
             .borrow()
@@ -720,7 +765,7 @@ async fn mount_filtered_cycle(
     index: &IndexParts,
     child: &ManifestParts,
 ) {
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&index.digest, MediaType::OciIndex),
@@ -743,7 +788,7 @@ async fn mount_filtered_cycle(
     .await;
     child.mount_blob_pulls(source, "src/repo").await;
 
-    head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
+    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .expect(1)
         .mount(target)
         .await;
@@ -773,7 +818,7 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
     let report = run_sync_with_cache(vec![m], cache.clone()).await;
 
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
     {
         let c = cache.borrow();
         let snap = c
@@ -794,7 +839,7 @@ async fn discovery_platform_filter_change_triggers_cache_miss() {
     let report = run_sync_with_cache(vec![m], cache.clone()).await;
 
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
     assert_eq!(
         cache
             .borrow()
@@ -815,7 +860,7 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
     let parts = image("prune");
 
     for tag in ["v1", "v2"] {
-        head_mock(
+        manifest_head_mock(
             "src/repo",
             tag,
             digest_response(&parts.digest, MediaType::OciManifest),
@@ -823,8 +868,8 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
         .expect(1)
         .mount(&source)
         .await;
-        mount_full_pull(&source, &target, &parts, tag).await;
-        head_mock("tgt/repo", tag, ResponseTemplate::new(404))
+        mount_full_pull(&source, &target, &parts, tag, "cycle 1").await;
+        manifest_head_mock("tgt/repo", tag, ResponseTemplate::new(404))
             .expect(1)
             .mount(&target)
             .await;
@@ -845,7 +890,7 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
     end_cycle(&source, &target).await;
 
     // v2 is gone from the mapping.
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -853,8 +898,8 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
     .expect(1)
     .mount(&source)
     .await;
-    forbid_get(&source, "src/repo", "v1").await;
-    head_mock(
+    forbid_get(&source, "src/repo", "v1", "cycle 2").await;
+    manifest_head_mock(
         "tgt/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -871,7 +916,13 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
 
     assert_eq!(report.stats.images_skipped, 1);
     assert_eq!(report.stats.images_synced, 0);
-    assert_eq!(discovery(&report), [1, 0, 0, 0, 0]);
+    assert_eq!(
+        discovery(&report),
+        Discovery {
+            cache_hits: 1,
+            ..Discovery::default()
+        }
+    );
     let c = cache.borrow();
     assert!(
         c.source_snapshot(&snap_key("src/repo", "v1")).is_some(),
@@ -882,10 +933,6 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
         "v2 should have been pruned from the snapshot cache"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Budget circuit breaker
-// ---------------------------------------------------------------------------
 
 /// GET for every `v<N>` tag of `repo`, reporting a Docker Hub style
 /// `ratelimit-remaining` when `remaining` is set.
@@ -958,6 +1005,7 @@ async fn budget_circuit_breaker_syncs_every_image() {
 
         manifest_gets("library/app", &parts.bytes, c.remaining)
             .expect(c.tags as u64)
+            .named(format!("{}: manifest GETs", c.name))
             .mount(&source)
             .await;
         mount_unsynced_target(&source, &target, "library/app", "mirror/app", &parts, &tags).await;
@@ -1090,10 +1138,6 @@ async fn budget_circuit_breaker_multi_source_all_or_nothing() {
     assert_eq!(client_b.rate_limit_remaining(), None);
 }
 
-// ---------------------------------------------------------------------------
-// head_first
-// ---------------------------------------------------------------------------
-
 /// A `head_first` mapping that cannot confirm the target from HEADs alone makes
 /// one source GET, syncs, and counts a cache miss (plus a head failure when the
 /// source HEAD itself failed). The target sees a manifest HEAD from `head_first`
@@ -1104,26 +1148,29 @@ async fn head_first_falls_through_to_full_pull() {
         name: &'static str,
         source_head: SourceHead,
         target_head_status: u16,
-        want: [u64; 5],
+        want: Discovery,
     }
     let cases = [
         Case {
             name: "target HEAD 404 is a mismatch",
             source_head: SourceHead::Digest,
             target_head_status: 404,
-            want: [0, 1, 0, 0, 0],
+            want: MISS,
         },
         Case {
             name: "target HEAD 500 degrades to a mismatch instead of failing discovery",
             source_head: SourceHead::Digest,
             target_head_status: 500,
-            want: [0, 1, 0, 0, 0],
+            want: MISS,
         },
         Case {
             name: "source HEAD 500 is a head failure",
             source_head: SourceHead::Status(500),
             target_head_status: 404,
-            want: [0, 1, 1, 0, 0],
+            want: Discovery {
+                head_failures: 1,
+                ..MISS
+            },
         },
     ];
 
@@ -1134,10 +1181,11 @@ async fn head_first_falls_through_to_full_pull() {
 
         source_head(&c.source_head, &parts.digest)
             .expect(1)
+            .named(format!("{}: source HEAD", c.name))
             .mount(&source)
             .await;
-        mount_full_pull(&source, &target, &parts, "v1").await;
-        head_mock(
+        mount_full_pull(&source, &target, &parts, "v1", c.name).await;
+        manifest_head_mock(
             "tgt/repo",
             "v1",
             ResponseTemplate::new(c.target_head_status),
@@ -1167,7 +1215,7 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
     let target_b = MockServer::start().await;
     let parts = image("hf-partial");
 
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -1175,11 +1223,11 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
     .expect(1)
     .mount(&source)
     .await;
-    mount_full_pull(&source, &target_b, &parts, "v1").await;
-    head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
+    mount_full_pull(&source, &target_b, &parts, "v1", "partial match").await;
+    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .mount(&target_b)
         .await;
-    head_mock(
+    manifest_head_mock(
         "tgt/repo",
         "v1",
         digest_response(&parts.digest, MediaType::OciManifest),
@@ -1209,7 +1257,7 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
     let report = run_sync(vec![m]).await;
 
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
 }
 
 /// A platform filter bypasses `head_first`: the target holds the filtered index
@@ -1223,7 +1271,7 @@ async fn head_first_bypassed_with_platform_filter() {
         .manifest(&child, Some(linux("amd64")))
         .build();
 
-    head_mock(
+    manifest_head_mock(
         "src/repo",
         "v1",
         digest_response(&index.digest, MediaType::OciIndex),
@@ -1248,5 +1296,5 @@ async fn head_first_bypassed_with_platform_filter() {
 
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.images_skipped, 0);
-    assert_eq!(discovery(&report), [0, 1, 0, 0, 0]);
+    assert_eq!(discovery(&report), MISS);
 }

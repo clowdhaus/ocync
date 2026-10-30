@@ -14,22 +14,24 @@ use std::time::Duration;
 use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::cache::TransferStateCache;
-use ocync_sync::engine::{RegistryAlias, SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::staging::BlobStage;
 use ocync_sync::{ErrorKind, ImageStatus};
+use wiremock::http::Method;
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
 
-/// How many times a [`MockChecker`] was asked, shared with the test.
+/// How many times a checker was asked, shared with the test.
 #[derive(Clone, Default)]
 struct Calls {
     /// Calls to `check_blob_existence`.
     checks: Rc<Cell<usize>>,
-    /// Calls to `wait_for_blobs_available`, made only by the manifest-commit gate.
+    /// Calls to `wait_for_blobs_available`, made only by the manifest-commit
+    /// gate and counted only by a [`WaitTrackingChecker`].
     waits: Rc<Cell<usize>>,
 }
 
@@ -99,6 +101,28 @@ impl BatchBlobChecker for MockChecker {
             Ok(BlobExistence::new(&checked, &self.existing))
         })
     }
+}
+
+/// A [`MockChecker`] that also overrides `wait_for_blobs_available` to count
+/// the manifest-commit gate's calls apart from the pre-discovery
+/// `check_blob_existence` calls. Every other checker keeps the trait default.
+struct WaitTrackingChecker(MockChecker);
+
+impl WaitTrackingChecker {
+    fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
+        let (checker, calls) = MockChecker::new(expected_repo, existing);
+        (Self(checker), calls)
+    }
+}
+
+impl BatchBlobChecker for WaitTrackingChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
+        self.0.check_blob_existence(repo, digests)
+    }
 
     fn wait_for_blobs_available<'a>(
         &'a self,
@@ -106,10 +130,10 @@ impl BatchBlobChecker for MockChecker {
         digests: &'a [Digest],
         _deadline: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
-        assert_eq!(repo.as_str(), self.expected_repo);
-        let all_known = digests.iter().all(|d| self.existing.contains(d));
+        assert_eq!(repo.as_str(), self.0.expected_repo);
+        let all_known = digests.iter().all(|d| self.0.existing.contains(d));
         Box::pin(async move {
-            self.calls.waits.set(self.calls.waits.get() + 1);
+            self.0.calls.waits.set(self.0.calls.waits.get() + 1);
             if all_known {
                 Ok(())
             } else {
@@ -122,12 +146,14 @@ impl BatchBlobChecker for MockChecker {
 }
 
 /// A target entry whose existence checks go through `checker`.
-fn batch_target(name: &str, server: &MockServer, checker: MockChecker) -> TargetEntry {
+fn batch_target(
+    name: &str,
+    server: &MockServer,
+    checker: impl BatchBlobChecker + 'static,
+) -> TargetEntry {
     TargetEntry {
-        name: RegistryAlias::new(name),
-        client: mock_client(server),
         batch_checker: Some(Rc::new(checker)),
-        existing_tags: HashSet::new(),
+        ..target_entry(name, mock_client(server))
     }
 }
 
@@ -251,6 +277,7 @@ async fn sync_warm_cache_mounts_from_a_cached_repo() {
             .and(query_param("from", "repo-a"))
             .respond_with(ResponseTemplate::new(201))
             .expect(2)
+            .named(format!("{repo_a:?}: mount POST from repo-a"))
             .mount(&target_server)
             .await;
         mount_manifest_push(&target_server, "repo-b", "v1").await;
@@ -283,7 +310,7 @@ async fn sync_warm_cache_mounts_from_a_cached_repo() {
         .unwrap_or_else(|_| panic!("{repo_a:?}: mount waited for a commit that never comes"));
 
         assert_eq!(report.images.len(), 1, "{repo_a:?}");
-        assert_status!(report, 0, ImageStatus::Synced);
+        assert_status!(report, 0, ImageStatus::Synced, "{repo_a:?}");
         assert_eq!(report.images[0].blob_stats.mounted, 2, "{repo_a:?}");
         assert_eq!(report.images[0].blob_stats.transferred, 0, "{repo_a:?}");
         assert_eq!(report.images[0].blob_stats.skipped, 0, "{repo_a:?}");
@@ -412,8 +439,56 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     assert_eq!(report.stats.blobs_transferred, 2);
 }
 
-/// Run a sync, persist the resulting cache to disk, reload it, and verify
-/// the blob entries recorded during the sync are present in the loaded cache.
+/// Every blob uploads as one POST and one PUT with no PATCH, whatever its size.
+#[tokio::test]
+async fn sync_small_blob_uses_monolithic_upload() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"small-config")
+        .layer(b"small-layer")
+        .build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    parts.mount_target_blob_misses(&target_server, "repo").await;
+    let session = "/v2/repo/blobs/uploads/mono-id";
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(202).insert_header("location", session))
+        .expect(2)
+        .named("one upload POST per blob")
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(session))
+        .respond_with(ResponseTemplate::new(201))
+        .expect(2)
+        .named("one upload PUT per blob")
+        .mount(&target_server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(session))
+        .respond_with(ResponseTemplate::new(202).insert_header("location", session))
+        .expect(0)
+        .named("no chunked PATCH")
+        .mount(&target_server)
+        .await;
+    mount_manifest_push(&target_server, "repo", "v1").await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.images[0].blob_stats.transferred, 2);
+}
+
+/// Blobs a sync records survive persist and load at their own repo only.
 #[tokio::test]
 async fn sync_cache_persist_and_load_round_trip() {
     let source_server = MockServer::start().await;
@@ -426,11 +501,10 @@ async fn sync_cache_persist_and_load_round_trip() {
     parts.mount_source(&source_server, "repo", "v1").await;
     parts.mount_target(&target_server, "repo", "v1").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_to_targets(
+        &source_server,
+        &[("target-reg", &target_server)],
         "repo",
-        "repo",
-        vec![target_entry("target-reg", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
 
@@ -611,6 +685,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         cache: Cache,
         tags: &'static [&'static str],
         batch_calls: usize,
+        /// Blob counts and bytes of each tag's image.
         skipped: u64,
         transferred: u64,
         bytes: u64,
@@ -635,7 +710,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             name: "two tags share the checker, one call per tag",
             tags: &["v1", "v2"],
             batch_calls: 2,
-            skipped: 6,
             ..single
         },
         Case {
@@ -702,10 +776,15 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         for tag in case.tags {
             source_manifest_mock(src, tag, &parts.bytes, MediaType::OciManifest)
                 .expect(1)
+                .named(format!("{name}: source manifest GET {tag}"))
                 .mount(&source_server)
                 .await;
             mount_manifest_head_not_found(&target_server, tgt, tag).await;
-            mount_manifest_push(&target_server, tgt, tag).await;
+            manifest_push_mock(tgt, tag)
+                .expect(1)
+                .named(format!("{name}: manifest PUT {tag}"))
+                .mount(&target_server)
+                .await;
         }
         for ((digest, data), answer) in digests.into_iter().zip(BATCH_BLOBS).zip(answers) {
             let (pulls, heads) = match answer {
@@ -715,14 +794,16 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             };
             blob_pull_mock(src, digest, data)
                 .expect(pulls)
+                .named(format!("{name}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
             blob_head_mock(tgt, digest, 200)
                 .expect(heads)
+                .named(format!("{name}: blob HEAD {digest}"))
                 .mount(&target_server)
                 .await;
         }
-        mount_blob_push_expecting(&target_server, tgt, case.transferred).await;
+        mount_blob_push_expecting(&target_server, tgt, case.transferred, name).await;
 
         let (target, calls) = match case.check {
             Check::Absent => (
@@ -763,33 +844,51 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             src,
             tgt,
             vec![target],
-            case.tags.iter().map(|t| TagPair::same(*t)).collect(),
+            same_tags(case.tags),
         );
 
         let report = run_sync_with_cache(vec![mapping], cache).await;
 
+        let images = case.tags.len() as u64;
         assert_eq!(calls.checks.get(), case.batch_calls, "{name}: batch calls");
         assert_eq!(report.images.len(), case.tags.len(), "{name}");
+        for (i, image) in report.images.iter().enumerate() {
+            assert_status!(report, i, ImageStatus::Synced, "{name}");
+            assert_eq!(
+                image.blob_stats.skipped, case.skipped,
+                "{name}: image {i} skipped"
+            );
+            assert_eq!(
+                image.blob_stats.transferred, case.transferred,
+                "{name}: image {i} transferred"
+            );
+            assert_eq!(
+                image.bytes_transferred, case.bytes,
+                "{name}: image {i} bytes"
+            );
+        }
+        assert_eq!(report.stats.images_synced, images, "{name}");
         assert_eq!(
-            report.stats.images_synced,
-            case.tags.len() as u64,
-            "{name}: {:?}",
-            report.images
+            report.stats.blobs_skipped,
+            case.skipped * images,
+            "{name}: skipped"
         );
-        assert_eq!(report.stats.blobs_skipped, case.skipped, "{name}: skipped");
         assert_eq!(
-            report.stats.blobs_transferred, case.transferred,
+            report.stats.blobs_transferred,
+            case.transferred * images,
             "{name}: transferred"
         );
-        assert_eq!(report.stats.bytes_transferred, case.bytes, "{name}: bytes");
+        assert_eq!(
+            report.stats.bytes_transferred,
+            case.bytes * images,
+            "{name}: bytes"
+        );
     }
 }
 
-/// Two targets with independent batch checkers.
-///
-/// Target A: batch reports every blob present (both skipped). Target B:
-/// batch reports the config present and the layer missing (1 transferred).
-/// Stats are tracked per target, and the source manifest is pulled once.
+/// Each target's batch checker decides only that target's blobs: A skips both,
+/// B copies the layer the checker did not report, and the source manifest is
+/// pulled once.
 #[tokio::test]
 async fn sync_batch_checker_multi_target_independent_checkers() {
     let source_server = MockServer::start().await;
@@ -816,7 +915,7 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     mount_manifest_push(&target_a_server, "repo", "v1").await;
 
     mount_manifest_head_not_found(&target_b_server, "repo", "v1").await;
-    mount_blob_push_expecting(&target_b_server, "repo", 1).await;
+    mount_blob_push_expecting(&target_b_server, "repo", 1, "target-b").await;
     mount_manifest_push(&target_b_server, "repo", "v1").await;
 
     let (checker_a, calls_a) =
@@ -916,6 +1015,7 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         for (digest, data) in digests.into_iter().zip([&config_data[..], &layer_data[..]]) {
             blob_pull_mock("repo", digest, data)
                 .expect(1)
+                .named(format!("{answer:?}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
             let heads = match answer {
@@ -924,6 +1024,7 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
             };
             blob_head_mock("repo", digest, 404)
                 .expect(heads)
+                .named(format!("{answer:?}: blob HEAD {digest}"))
                 .mount(&target_server)
                 .await;
         }
@@ -947,7 +1048,7 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         let report = run_sync_with_cache(vec![mapping], earlier_run_cache(&digests)).await;
 
         assert_eq!(calls.checks.get(), 1, "{answer:?}");
-        assert_status!(report, 0, ImageStatus::Synced);
+        assert_status!(report, 0, ImageStatus::Synced, "{answer:?}");
         assert_eq!(
             report.stats.blobs_skipped, 0,
             "{answer:?}: the stale cache must not skip"
@@ -1060,6 +1161,7 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
             .and(path_regex("^/v2/repo/blobs/"))
             .respond_with(ResponseTemplate::new(404))
             .expect(heads)
+            .named(format!("{case}: blob HEAD"))
             .mount(&target_server)
             .await;
         mount_blob_push(&target_server, "repo").await;
@@ -1074,11 +1176,10 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
         .await;
         mount_manifest_push(&target_server, "repo", "v1").await;
 
-        let mapping = resolved_mapping(
-            mock_client(&source_server),
+        let mapping = mapping_from_servers(
+            &source_server,
+            &target_server,
             "repo",
-            "repo",
-            vec![target_entry("target", mock_client(&target_server))],
             vec![TagPair::same("v1")],
         );
         let cache = match cache_at_start {
@@ -1094,8 +1195,12 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
             "{case}: {:?}",
             report.images[0].status
         );
-        let manifest_puts =
-            count_requests(&target_server, "PUT", Some("/v2/repo/manifests/v1")).await;
+        let manifest_puts = count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Exact("/v2/repo/manifests/v1"),
+        )
+        .await;
         assert_eq!(manifest_puts, puts, "{case}");
         assert_eq!(report.stats.blobs_transferred, sent, "{case}");
         assert_eq!(report.stats.blobs_skipped, 2 - sent, "{case}");
@@ -1199,7 +1304,7 @@ async fn sync_refused_sibling_is_repaired_after_another_tasks_drop() {
 
     assert_eq!(report.stats.images_synced, 2, "{:?}", report.images);
     assert_eq!(report.stats.blobs_transferred, 2, "each blob is sent once");
-    let blob_uploads = count_requests(&target_server, "POST", None).await;
+    let blob_uploads = count_requests(&target_server, Some(&Method::POST), PathMatch::Any).await;
     assert_eq!(blob_uploads, 2);
 }
 
@@ -1234,7 +1339,12 @@ async fn sync_refused_index_child_is_repaired_in_the_same_run() {
     let report = run_sync_with_cache(vec![mapping], cache).await;
 
     assert_status!(report, 0, ImageStatus::Synced);
-    let child_pushes = count_requests(&target_server, "PUT", Some(&child_manifest)).await;
+    let child_pushes = count_requests(
+        &target_server,
+        Some(&Method::PUT),
+        PathMatch::Exact(&child_manifest),
+    )
+    .await;
     assert_eq!(child_pushes, 2, "refused once, then pushed again");
     assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.blobs_skipped, 0);
@@ -1289,11 +1399,10 @@ async fn sync_committed_manifest_confirms_its_blobs() {
     }
     mount_blob_push(&target_server, "repo").await;
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "repo",
-        "repo",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("refused"), TagPair::same("committed")],
     );
     let cache = earlier_run_cache(&[
@@ -1488,7 +1597,7 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
         // All blobs exist, so no upload happens; the manifest PUT still fires
         // and is what triggers the wait.
         let (checker, calls) =
-            MockChecker::new("tgt/repo", parts.blob_digests().collect::<HashSet<_>>());
+            WaitTrackingChecker::new("tgt/repo", parts.blob_digests().collect::<HashSet<_>>());
 
         let mapping = resolved_mapping(
             mock_client(&source_server),
@@ -1507,7 +1616,12 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
             None,
         )
         .await;
-        assert_status!(report, 0, ImageStatus::Synced);
+        assert_status!(
+            report,
+            0,
+            ImageStatus::Synced,
+            "commit wait {commit_wait:?}"
+        );
         calls
     }
 
@@ -1539,14 +1653,14 @@ async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
         .iter()
         .flat_map(|m| m.blob_digests())
         .collect();
-    let (checker, calls) = MockChecker::new("repo", existing);
+    let (checker, calls) = WaitTrackingChecker::new("repo", existing);
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
         "repo",
         "repo",
         vec![batch_target("target", &target_server, checker)],
-        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
+        same_tags(&SHARED_TAGS),
     );
     let report = run_engine(
         vec![mapping],
@@ -1598,7 +1712,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
         .iter()
         .flat_map(|m| m.blob_digests())
         .collect();
-    let (checker, calls) = MockChecker::new("repo", existing);
+    let (checker, calls) = WaitTrackingChecker::new("repo", existing);
 
     let mapping = resolved_mapping(
         mock_client(&source_server),

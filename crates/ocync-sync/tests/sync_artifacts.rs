@@ -9,6 +9,7 @@ use ocync_distribution::Digest;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
 use ocync_sync::{ErrorKind, ImageStatus};
+use wiremock::http::Method;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -35,14 +36,6 @@ async fn mount_referrers_error(server: &MockServer, parent_digest: &Digest) {
         .respond_with(ResponseTemplate::new(500))
         .mount(server)
         .await;
-}
-
-/// Requests of method `verb` whose path contains `needle`.
-fn count_requests_containing(requests: &[wiremock::Request], verb: &str, needle: &str) -> usize {
-    requests
-        .iter()
-        .filter(|r| r.method.as_str() == verb && r.url.path().contains(needle))
-        .count()
 }
 
 /// When `artifacts.enabled = false`, no referrers API requests are made.
@@ -73,9 +66,8 @@ async fn artifact_sync_disabled_issues_no_referrers_requests() {
         "artifacts_skipped must be false when artifacts are disabled (not a transient skip)"
     );
 
-    let source_requests = source_server.received_requests().await.unwrap();
     assert_eq!(
-        count_requests_containing(&source_requests, "GET", "/referrers/"),
+        count_requests(&source_server, None, PathMatch::Contains("/referrers/")).await,
         0,
         "artifacts disabled must issue zero referrers requests"
     );
@@ -105,9 +97,13 @@ async fn artifact_sync_transfers_referrer() {
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
-    let target_requests = target_server.received_requests().await.unwrap();
     assert_eq!(
-        count_requests_containing(&target_requests, "PUT", &sig.digest.to_string()),
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains(&sig.digest.to_string()),
+        )
+        .await,
         1,
         "artifact manifest must be pushed to target"
     );
@@ -188,9 +184,13 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
-    let target_requests = target_server.received_requests().await.unwrap();
     assert_eq!(
-        count_requests_containing(&target_requests, "PUT", &sig_digest_str),
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains(&sig_digest_str),
+        )
+        .await,
         1,
         "artifact manifest must be pushed via tag fallback path"
     );
@@ -237,14 +237,23 @@ async fn artifact_sync_include_filter_skips_non_matching() {
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
-    let target_requests = target_server.received_requests().await.unwrap();
     assert_eq!(
-        count_requests_containing(&target_requests, "PUT", &sig.digest.to_string()),
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains(&sig.digest.to_string()),
+        )
+        .await,
         1,
         "cosign signature must be pushed"
     );
     assert_eq!(
-        count_requests_containing(&target_requests, "PUT", &sbom.digest.to_string()),
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains(&sbom.digest.to_string()),
+        )
+        .await,
         0,
         "SBOM must NOT be pushed when include filter excludes it"
     );
@@ -325,14 +334,19 @@ async fn artifact_blob_dedup_skips_existing() {
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
-    let source_requests = source_server.received_requests().await.unwrap();
     assert_eq!(
-        count_requests_containing(&source_requests, "GET", &sig.config_desc.digest.to_string())
-            + count_requests_containing(
-                &source_requests,
-                "GET",
-                &sig.layer_desc.digest.to_string()
-            ),
+        count_requests(
+            &source_server,
+            Some(&Method::GET),
+            PathMatch::Contains(&sig.config_desc.digest.to_string())
+        )
+        .await
+            + count_requests(
+                &source_server,
+                Some(&Method::GET),
+                PathMatch::Contains(&sig.layer_desc.digest.to_string())
+            )
+            .await,
         0,
         "artifact blobs already at target must not be pulled from source"
     );
@@ -366,7 +380,7 @@ async fn artifact_transient_error_sets_artifacts_skipped() {
         let report = run_sync(vec![mapping]).await;
 
         assert_eq!(report.images.len(), 1, "{name}");
-        assert_status!(report, 0, ImageStatus::Synced);
+        assert_status!(report, 0, ImageStatus::Synced, "{name}");
         assert!(report.images[0].artifacts_skipped, "{name}");
         assert_eq!(report.stats.artifacts_skipped, 1, "{name}");
     }
@@ -377,12 +391,9 @@ async fn artifact_transient_error_sets_artifacts_skipped() {
 /// neither case is `artifacts_skipped` set (only a transient error sets it).
 #[tokio::test]
 async fn artifact_empty_referrers_index_is_confirmed_absence() {
-    // (row, require_artifacts, image must fail)
-    let cases = [
-        ("require_artifacts", true, true),
-        ("artifacts optional", false, false),
-    ];
-    for (name, require_artifacts, fails) in cases {
+    // (row, require_artifacts): the image fails exactly when artifacts are required.
+    let cases = [("require_artifacts", true), ("artifacts optional", false)];
+    for (name, require_artifacts) in cases {
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
 
@@ -404,20 +415,18 @@ async fn artifact_empty_referrers_index_is_confirmed_absence() {
         let report = run_sync(vec![mapping]).await;
 
         assert_eq!(report.images.len(), 1, "{name}");
-        if fails {
-            assert!(
-                matches!(
-                    report.images[0].status,
-                    ImageStatus::Failed {
-                        kind: ErrorKind::RequiredArtifactsMissing,
-                        ..
-                    }
-                ),
-                "{name}: got {:?}",
-                report.images[0].status
+        if require_artifacts {
+            assert_status!(
+                report,
+                0,
+                ImageStatus::Failed {
+                    kind: ErrorKind::RequiredArtifactsMissing,
+                    ..
+                },
+                "{name}"
             );
         } else {
-            assert_status!(report, 0, ImageStatus::Synced);
+            assert_status!(report, 0, ImageStatus::Synced, "{name}");
         }
         assert!(!report.images[0].artifacts_skipped, "{name}");
         assert_eq!(report.stats.artifacts_skipped, 0, "{name}");
@@ -514,7 +523,7 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     let pushes_of = |p: &str| {
         requests
             .iter()
-            .filter(|r| r.method == wiremock::http::Method::PUT && r.url.path() == p)
+            .filter(|r| r.method == Method::PUT && r.url.path() == p)
             .count()
     };
     assert_eq!(
@@ -525,7 +534,7 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     let sig_heads = requests
         .iter()
         .filter(|r| {
-            r.method == wiremock::http::Method::HEAD
+            r.method == Method::HEAD
                 && sig_blobs
                     .iter()
                     .any(|d| r.url.path() == format!("/v2/repo/blobs/{d}"))
@@ -597,28 +606,33 @@ async fn artifact_shared_by_tags_syncs_once() {
     sig.mount_source(&source_server, "repo").await;
     sig.mount_target(&target_server, "repo").await;
 
-    let mapping = ResolvedMapping {
-        artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..mapping_from_servers(
-            &source_server,
-            &target_server,
-            "repo",
-            SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
-        )
-    };
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        same_tags(&SHARED_TAGS),
+    );
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.stats.images_synced, 4);
-    let sig_digest = sig.digest.to_string();
-    let source_requests = source_server.received_requests().await.unwrap();
-    let target_requests = target_server.received_requests().await.unwrap();
+    let sig_path = format!("/v2/repo/manifests/{}", sig.digest);
     assert_eq!(
-        count_requests_containing(&source_requests, "GET", &sig_digest),
+        count_requests(
+            &source_server,
+            Some(&Method::GET),
+            PathMatch::Exact(&sig_path)
+        )
+        .await,
         1,
         "signature pulled per tag"
     );
     assert_eq!(
-        count_requests_containing(&target_requests, "PUT", &sig_digest),
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Exact(&sig_path)
+        )
+        .await,
         1,
         "signature pushed per tag"
     );
@@ -647,13 +661,12 @@ async fn artifact_failure_from_one_source_does_not_fail_another() {
     sig.mount_source(&good_source, "repo").await;
     sig.mount_target(&target_server, "repo").await;
 
-    let with_artifacts = |source: &MockServer, tag: &str| ResolvedMapping {
-        artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..mapping_from_servers(source, &target_server, "repo", vec![TagPair::same(tag)])
+    let mapping = |source: &MockServer, tag: &str| {
+        mapping_from_servers(source, &target_server, "repo", same_tags(&[tag]))
     };
     let report = run_sync(vec![
-        with_artifacts(&broken_source, "broken"),
-        with_artifacts(&good_source, "good"),
+        mapping(&broken_source, "broken"),
+        mapping(&good_source, "good"),
     ])
     .await;
 
@@ -702,31 +715,21 @@ async fn artifacts_sharing_a_blob_upload_it_once() {
         artifact.mount_target(&target_server, "repo").await;
     }
 
-    let mapping = ResolvedMapping {
-        artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        ..mapping_from_servers(
-            &source_server,
-            &target_server,
-            "repo",
-            vec![TagPair::same("v1")],
-        )
-    };
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
     let report = run_sync(vec![mapping]).await;
 
     assert_status!(report, 0, ImageStatus::Synced);
-    // The query string carries the digest URL-encoded; match on its hex.
-    let config = first.config_desc.digest.hex().to_owned();
-    let uploads = target_server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r.method.as_str() == "PUT"
-                && r.url.path().contains("/blobs/uploads/")
-                && r.url.query().is_some_and(|q| q.contains(&config))
-        })
-        .count();
+    let uploads = count_blob_uploads(
+        &target_server,
+        PathMatch::Contains("/blobs/uploads/"),
+        &first.config_desc.digest,
+    )
+    .await;
     assert_eq!(
         uploads, 1,
         "a blob shared by two artifacts is uploaded per artifact"

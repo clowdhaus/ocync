@@ -13,41 +13,11 @@ use ocync_sync::progress::NullProgress;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageStatus, RunOutcome, SyncReport};
+use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use helpers::*;
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-/// One `v1` mapping per `(source_repo, target_repo)` pair, all sharing one
-/// source client and one target client (alias `target`).
-fn v1_mappings(
-    source: &MockServer,
-    target: &MockServer,
-    repos: &[(&str, &str)],
-) -> Vec<ResolvedMapping> {
-    let source_client = mock_client(source);
-    let target_client = mock_client(target);
-    repos
-        .iter()
-        .map(|(src, tgt)| {
-            resolved_mapping(
-                Arc::clone(&source_client),
-                src,
-                tgt,
-                vec![target_entry("target", Arc::clone(&target_client))],
-                vec![TagPair::same("v1")],
-            )
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Tests: index manifest child failure, partial blob failure, concurrent dedup
-// ---------------------------------------------------------------------------
 
 /// An index whose second child manifest pull returns 500 fails the whole image.
 #[tokio::test]
@@ -245,7 +215,12 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
     assert_eq!(report.stats.blobs_transferred, 2, "no blob uploaded twice");
     assert_eq!(total_skipped, 2);
     assert_eq!(
-        count_requests(&target_server, "POST", Some("/v2/repo/blobs/uploads/")).await,
+        count_requests(
+            &target_server,
+            Some(&Method::POST),
+            PathMatch::Exact("/v2/repo/blobs/uploads/"),
+        )
+        .await,
         2,
         "one upload session per distinct blob"
     );
@@ -253,12 +228,7 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
 
 /// Run [`SHARED_TAGS`] concurrently from `source` into `target`.
 async fn sync_shared_index_tags(source: &MockServer, target: &MockServer) -> SyncReport {
-    let mapping = mapping_from_servers(
-        source,
-        target,
-        "repo",
-        SHARED_TAGS.iter().map(|t| TagPair::same(*t)).collect(),
-    );
+    let mapping = mapping_from_servers(source, target, "repo", same_tags(&SHARED_TAGS));
     run_sync(vec![mapping]).await
 }
 
@@ -277,13 +247,23 @@ async fn sync_tags_sharing_an_index_copy_each_child_once() {
     for child in [&amd64, &arm64] {
         let child_path = format!("/v2/repo/manifests/{}", child.digest);
         assert_eq!(
-            count_requests(&source_server, "GET", Some(&child_path)).await,
+            count_requests(
+                &source_server,
+                Some(&Method::GET),
+                PathMatch::Exact(&child_path),
+            )
+            .await,
             1,
             "child {} pulled once per tag",
             child.digest
         );
         assert_eq!(
-            count_requests(&target_server, "PUT", Some(&child_path)).await,
+            count_requests(
+                &target_server,
+                Some(&Method::PUT),
+                PathMatch::Exact(&child_path),
+            )
+            .await,
             1,
             "child {} PUT once per tag",
             child.digest
@@ -293,8 +273,8 @@ async fn sync_tags_sharing_an_index_copy_each_child_once() {
         assert_eq!(
             count_requests(
                 &target_server,
-                "PUT",
-                Some(&format!("/v2/repo/manifests/{tag}"))
+                Some(&Method::PUT),
+                PathMatch::Exact(&format!("/v2/repo/manifests/{tag}")),
             )
             .await,
             1,
@@ -343,7 +323,12 @@ async fn sync_tags_sharing_an_index_push_a_failing_child_once() {
         }
     }
     assert_eq!(
-        count_requests(&target_server, "PUT", Some(&failing_path)).await,
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Exact(&failing_path),
+        )
+        .await,
         1,
         "a failed child must not be pushed again by each waiting tag"
     );
@@ -351,8 +336,8 @@ async fn sync_tags_sharing_an_index_push_a_failing_child_once() {
         assert_eq!(
             count_requests(
                 &target_server,
-                "PUT",
-                Some(&format!("/v2/repo/manifests/{tag}"))
+                Some(&Method::PUT),
+                PathMatch::Exact(&format!("/v2/repo/manifests/{tag}")),
             )
             .await,
             0,
@@ -386,7 +371,12 @@ async fn sync_tags_sharing_a_blob_attempt_a_failing_copy_once() {
 
     assert_eq!(report.stats.images_failed, 4);
     assert_eq!(
-        count_requests(&source_server, "GET", Some(&layer_path)).await,
+        count_requests(
+            &source_server,
+            Some(&Method::GET),
+            PathMatch::Exact(&layer_path),
+        )
+        .await,
         1,
         "a failed blob copy must not be repeated per tag"
     );
@@ -499,7 +489,12 @@ async fn sync_unfulfilled_mount_does_not_repeat_a_failed_copy() {
     );
     assert_eq!(report.stats.images_failed, 2);
     assert_eq!(
-        count_requests(&source_server, "GET", Some(&d_path)).await,
+        count_requests(
+            &source_server,
+            Some(&Method::GET),
+            PathMatch::Exact(&d_path),
+        )
+        .await,
         1,
         "the failed copy of `d` into `r` must not be repeated"
     );
@@ -576,10 +571,6 @@ async fn sync_failed_own_child_does_not_wait_on_shared_children() {
         y_result.duration
     );
 }
-
-// ---------------------------------------------------------------------------
-// Tests: concurrent transfers wait on in-progress uploads to enable cross-repo mount
-// ---------------------------------------------------------------------------
 
 /// Two concurrent transfers to different repos at one registry share a blob.
 /// The second must wait for the first's upload to finish, then mount from the
@@ -783,7 +774,10 @@ async fn sync_blob_failure_cancels_remaining_blobs() {
         .mount(&source_server)
         .await;
 
-    parts.mount_target(&target_server, "repo", "v1").await;
+    // No manifest PUT mock: a manifest push would 404 and fail the status check.
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    parts.mount_target_blob_misses(&target_server, "repo").await;
+    mount_blob_push(&target_server, "repo").await;
 
     let mapping = mapping_from_servers(
         &source_server,
@@ -922,11 +916,20 @@ async fn sync_source_pull_dedup_with_staging() {
     let staging_dir = tempfile::tempdir().unwrap();
     let staging = BlobStage::new(staging_dir.path().to_path_buf());
 
-    let mappings = v1_mappings(
-        &source_server,
-        &target_server,
-        &[("src-a", "tgt-a"), ("src-b", "tgt-b")],
-    );
+    // One target client per mapping, so each pulls and pushes on its own connection state.
+    let source_client = mock_client(&source_server);
+    let mappings = [("src-a", "tgt-a"), ("src-b", "tgt-b")]
+        .into_iter()
+        .map(|(src, tgt)| {
+            resolved_mapping(
+                Arc::clone(&source_client),
+                src,
+                tgt,
+                vec![target_entry("target", mock_client(&target_server))],
+                vec![TagPair::same("v1")],
+            )
+        })
+        .collect();
     let report = run_sync_with_concurrency(mappings, 10, staging).await;
 
     // Drop scoped mocks before checking received requests.
@@ -951,10 +954,6 @@ async fn sync_source_pull_dedup_with_staging() {
         "shared blob should be pulled from source exactly once (dedup), got {source_gets_for_shared}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Blob concurrency bound: Semaphore(6) correctness with >6 layers
-// ---------------------------------------------------------------------------
 
 /// An image with more layers than the per-image blob concurrency limit (6)
 /// still syncs: the semaphore neither deadlocks nor drops permits.
@@ -986,10 +985,6 @@ async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
     assert_eq!(report.images[0].blob_stats.transferred, 11);
     assert_eq!(report.stats.blobs_transferred, 11);
 }
-
-// ---------------------------------------------------------------------------
-// Tests: leader-follower watch channel, adversarial timing
-// ---------------------------------------------------------------------------
 
 /// The leader's manifest push succeeds instantly, while the follower's config
 /// pull is delayed. The leader calls `mark_repo_committed` before the follower
@@ -1269,26 +1264,10 @@ async fn sync_cross_image_blob_claim_no_deadlock() {
     let parts_b = builder_b.build();
 
     parts_a.mount_source(&source_server, "src-a", "v1").await;
-    // Source B: manifest immediate, every blob pull delayed 50ms.
-    mount_source_manifest(&source_server, "src-b", "v1", &parts_b.bytes).await;
-    mount_blob_pull_delayed(
-        &source_server,
-        "src-b",
-        &parts_b.config_desc.digest,
-        &parts_b.config_data,
-        Duration::from_millis(50),
-    )
-    .await;
-    for (desc, data) in parts_b.layer_descs.iter().zip(&parts_b.layers_data) {
-        mount_blob_pull_delayed(
-            &source_server,
-            "src-b",
-            &desc.digest,
-            data,
-            Duration::from_millis(50),
-        )
+    // Source B's blob pulls are delayed 50ms.
+    parts_b
+        .mount_source_delayed(&source_server, "src-b", "v1", Duration::from_millis(50))
         .await;
-    }
 
     let blobs: Vec<&Digest> = [&parts_a.config_desc.digest, &parts_b.config_desc.digest]
         .into_iter()
@@ -1376,35 +1355,28 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
     assert_eq!(report.images[0].blob_stats.transferred, 1);
 }
 
-/// A wait for another image's manifest commit is bounded by the mount-source
-/// wait deadline.
-///
-/// Two images at different repos share one layer, and both manifest PUTs are
-/// slow. Whichever image uploads the layer leaves it at its repo uncommitted
-/// for the length of its manifest PUT, so the other image waits on that
-/// repo's commit watch. The deadline expires before the commit, and the
-/// waiting image pushes the layer instead of mounting it. Without the bound,
-/// it would wait out the slow PUT and then mount.
-#[tokio::test(flavor = "current_thread")]
-async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let shared = b"bounded-wait-shared-layer";
-    let parts_a = ManifestBuilder::new(b"bounded-wait-config-a")
+/// Two images at `tgt-a` and `tgt-b` share one layer, and both manifest PUTs
+/// answer only after `commit_delay`. Whichever image uploads the layer leaves
+/// it at its repo uncommitted for that long, so the other waits on that repo's
+/// commit watch. No mount is ever fulfilled.
+async fn mount_slow_commit_pair(
+    source: &MockServer,
+    target: &MockServer,
+    commit_delay: Duration,
+) -> (ManifestParts, ManifestParts) {
+    let shared = b"slow-commit-shared-layer";
+    let parts_a = ManifestBuilder::new(b"slow-commit-config-a")
         .layer(shared)
         .build();
-    let parts_b = ManifestBuilder::new(b"bounded-wait-config-b")
+    let parts_b = ManifestBuilder::new(b"slow-commit-config-b")
         .layer(shared)
         .build();
-    parts_a.mount_source(&source_server, "src-a", "v1").await;
-    parts_b.mount_source(&source_server, "src-b", "v1").await;
+    parts_a.mount_source(source, "src-a", "v1").await;
+    parts_b.mount_source(source, "src-b", "v1").await;
 
     for (repo, parts) in [("tgt-a", &parts_a), ("tgt-b", &parts_b)] {
-        mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        mount_blob_not_found(&target_server, repo, &parts.config_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &parts.layer_descs[0].digest).await;
-        // A mount is never fulfilled: the wait must expire first.
+        mount_manifest_head_not_found(target, repo, "v1").await;
+        parts.mount_target_blob_misses(target, repo).await;
         Mock::given(method("POST"))
             .and(path(format!("/v2/{repo}/blobs/uploads/")))
             .and(query_param(
@@ -1414,36 +1386,45 @@ async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
             .respond_with(ResponseTemplate::new(201))
             .with_priority(1)
             .expect(0)
-            .mount(&target_server)
+            .named(format!("{repo}: no mount is fulfilled"))
+            .mount(target)
             .await;
-        mount_blob_push(&target_server, repo).await;
+        mount_blob_push(target, repo).await;
         Mock::given(method("PUT"))
             .and(path(format!("/v2/{repo}/manifests/v1")))
-            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(3)))
-            .mount(&target_server)
+            .respond_with(ResponseTemplate::new(201).set_delay(commit_delay))
+            .mount(target)
             .await;
     }
+    (parts_a, parts_b)
+}
 
-    // One client per mapping: both slow manifest PUTs must run at once, which
-    // a shared client's initial manifest-write window of 1 would serialize.
-    let mappings = [("src-a", "tgt-a"), ("src-b", "tgt-b")]
+/// One mapping per image of [`mount_slow_commit_pair`], each with its own
+/// clients: both slow manifest PUTs must run at once, which a shared client's
+/// initial manifest-write window of 1 would serialize.
+fn slow_commit_mappings(source: &MockServer, target: &MockServer) -> Vec<ResolvedMapping> {
+    [("src-a", "tgt-a"), ("src-b", "tgt-b")]
         .into_iter()
-        .map(|(src, tgt)| {
-            mapping_with_distinct_repos(
-                &source_server,
-                &target_server,
-                src,
-                tgt,
-                vec![TagPair::same("v1")],
-            )
-        })
-        .collect();
+        .map(|(src, tgt)| mapping_with_distinct_repos(source, target, src, tgt, same_tags(&["v1"])))
+        .collect()
+}
+
+/// A wait for another image's manifest commit is bounded by the mount-source
+/// wait deadline. The deadline expires before the slow commit, and the waiting
+/// image pushes the layer instead of mounting it. Without the bound, it would
+/// wait out the slow PUT and then mount.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    mount_slow_commit_pair(&source_server, &target_server, Duration::from_secs(3)).await;
+
     let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_mount_source_wait_deadline(Duration::from_millis(500));
     let report = tokio::time::timeout(
         Duration::from_secs(20),
         engine.run(
-            mappings,
+            slow_commit_mappings(&source_server, &target_server),
             empty_cache(),
             BlobStage::disabled(),
             &NullProgress,
@@ -1457,6 +1438,56 @@ async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
     assert_eq!(report.stats.blobs_mounted, 0);
     // Each image pushes its config and the shared layer.
     assert_eq!(report.stats.blobs_transferred, 4);
+}
+
+/// Shutdown while one image waits on the other's slow manifest commit drains
+/// the engine within the drain deadline instead of waiting out the 60s
+/// mount-source wait or the 30s commit. Exactly one image has uploaded the
+/// shared layer by then: the other was still waiting on its commit.
+#[tokio::test(flavor = "current_thread")]
+async fn resolver_cancel_during_wait_drops_cleanly() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (parts, _) =
+        mount_slow_commit_pair(&source_server, &target_server, Duration::from_secs(30)).await;
+
+    let shutdown = ShutdownSignal::new();
+    // Past the instant uploads, well inside the commit and the wait.
+    trigger_shutdown_after(&shutdown, Duration::from_secs(1));
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
+        .with_drain_deadline(Duration::from_millis(100))
+        .with_mount_source_wait_deadline(Duration::from_secs(60));
+
+    let started = std::time::Instant::now();
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        engine.run(
+            slow_commit_mappings(&source_server, &target_server),
+            empty_cache(),
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&shutdown),
+        ),
+    )
+    .await
+    .expect("engine must drain on shutdown during the resolver wait");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "drained after {:?}, not at the drain deadline",
+        started.elapsed()
+    );
+    assert_eq!(report.stats.images_synced, 0, "no image commits in time");
+    let shared_uploads = count_blob_uploads(
+        &target_server,
+        PathMatch::Contains("/blobs/uploads/"),
+        &parts.layer_descs[0].digest,
+    )
+    .await;
+    assert_eq!(
+        shared_uploads, 1,
+        "the shared layer is uploaded once; its waiter had not pushed it"
+    );
 }
 
 /// Two images share a blob and run concurrently; the blob already exists at
@@ -1514,24 +1545,14 @@ async fn sync_shared_blob_present_at_one_repo_is_never_pushed_there() {
     .expect("engine should not deadlock on the shared blob's claim");
 
     assert_all_synced(&report, 2, "both images should sync");
-    let shared_digest = parts_b.layer_descs[0].digest.to_string();
-    let pushed_to_b = target_server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r.method.as_str() == "PUT"
-                && r.url.path().starts_with("/v2/tgt-b/blobs/uploads/")
-                && r.url.query().is_some_and(|q| q.contains(&shared_digest))
-        })
-        .count();
+    let pushed_to_b = count_blob_uploads(
+        &target_server,
+        PathMatch::Contains("/v2/tgt-b/blobs/uploads/"),
+        &parts_b.layer_descs[0].digest,
+    )
+    .await;
     assert_eq!(pushed_to_b, 0, "tgt-b already has the shared blob");
 }
-
-// ---------------------------------------------------------------------------
-// Tests: bounded-deadline mount-source resolver
-// ---------------------------------------------------------------------------
 
 /// A follower's mount waits for the leader's manifest commit, then succeeds
 /// with 201: committed-only mount sources mean every mount attempt has a
@@ -1677,8 +1698,8 @@ async fn mount_resolver_timeout_falls_back_to_push() {
 /// but neither is committed. The bounded deadline breaks the cycle; both fall
 /// through to push and both manifests commit.
 ///
-/// The cycle is pre-seeded in the cache; building a true prior-run cycle
-/// end to end would need coordinated multi-step mock state.
+/// shortcut: the cycle is seeded in the cache, not built by two real runs;
+/// upgrade when the mock server can carry state across runs.
 #[tokio::test(flavor = "current_thread")]
 async fn prior_run_cycle_breaks_via_deadline() {
     let source_server = MockServer::start().await;
@@ -1750,9 +1771,8 @@ async fn prior_run_cycle_breaks_via_deadline() {
 /// After a mount source is pre-marked as stale in the cache, the resolver
 /// skips it and uses the remaining committed source to mount successfully.
 ///
-/// The stale exclusion is pre-seeded in the cache; simulating
-/// `mark_blob_repo_stale` end to end (via a 202) would need a per-from-repo
-/// mount mock beyond the current helpers.
+/// shortcut: the stale exclusion is seeded in the cache, not produced by a
+/// 202 on a mount; upgrade when a mount mock can answer per `from` repo.
 #[tokio::test(flavor = "current_thread")]
 async fn resolver_retries_mount_after_source_marked_stale() {
     let source_server = MockServer::start().await;
@@ -1788,11 +1808,10 @@ async fn resolver_retries_mount_after_source_marked_stale() {
         );
     }
 
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
         "tgt-b",
-        "tgt-b",
-        vec![target_entry("target", mock_client(&target_server))],
         vec![TagPair::same("v1")],
     );
     let report = run_sync_with_cache(vec![mapping], cache).await;
@@ -1807,63 +1826,6 @@ async fn resolver_retries_mount_after_source_marked_stale() {
         report.images[0].blob_stats.transferred, 1,
         "config should be pushed (not in cache)"
     );
-}
-
-/// Cancel signal during resolver wait causes the engine to drain cleanly
-/// without panic or hang.
-///
-/// A ghost source in the cache (never committed) causes the resolver
-/// to wait. Cancel fires; engine drains within the drain deadline.
-#[tokio::test(flavor = "current_thread")]
-async fn resolver_cancel_during_wait_drops_cleanly() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let img = ManifestBuilder::new(b"cancel-cfg")
-        .layer(b"cancel-layer")
-        .build();
-    img.mount_source(&source_server, "tgt-a", "v1").await;
-    img.mount_target(&target_server, "tgt-a", "v1").await;
-
-    // ghost-src has the layer from a prior run but is never committed here.
-    let cache = empty_cache();
-    cache.borrow_mut().set_blob_completed(
-        "target",
-        img.layer_descs[0].digest.clone(),
-        RepositoryName::new("ghost-src").unwrap(),
-    );
-
-    let shutdown = ShutdownSignal::new();
-    // Drain deadline << mount-source wait deadline so the engine exits via drain.
-    let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_drain_deadline(Duration::from_millis(100))
-        .with_mount_source_wait_deadline(Duration::from_secs(60));
-
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
-        "tgt-a",
-        "tgt-a",
-        vec![target_entry("target", mock_client(&target_server))],
-        vec![TagPair::same("v1")],
-    );
-
-    // Cancel immediately so the engine shuts down during the resolver wait.
-    shutdown.trigger();
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.run(
-            vec![mapping],
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        ),
-    )
-    .await;
-
-    // Image status may be Cancelled or Synced depending on scheduling; either is correct.
-    let _report = result.expect("engine must drain cleanly on cancel during resolver wait");
 }
 
 /// A copy between two repositories of one registry, with one client as

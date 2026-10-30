@@ -26,7 +26,7 @@ use std::time::Duration;
 use ocync_distribution::spec::RepositoryName;
 use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{RegistryAlias, TagPair, TargetEntry};
+use ocync_sync::engine::{TagPair, TargetEntry};
 use wiremock::MockServer;
 
 use helpers::*;
@@ -140,10 +140,8 @@ async fn run_engine_default(
                 None
             };
             let entry = TargetEntry {
-                name: RegistryAlias::new("target"),
-                client: Arc::clone(&fixture.target_client),
                 batch_checker,
-                existing_tags: HashSet::new(),
+                ..target_entry("target", Arc::clone(&fixture.target_client))
             };
             resolved_mapping(
                 Arc::clone(&fixture.source_client),

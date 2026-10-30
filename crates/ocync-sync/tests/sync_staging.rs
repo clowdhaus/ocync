@@ -14,34 +14,6 @@ use wiremock::MockServer;
 
 use helpers::*;
 
-/// Mount `parts` at `repo:v1` on the source with every blob GET answering
-/// only after `delay`, and the target empty.
-async fn mount_slow_blobs(
-    parts: &ManifestParts,
-    source: &MockServer,
-    target: &MockServer,
-    delay: Duration,
-) {
-    mount_source_manifest(source, "repo", "v1", &parts.bytes).await;
-    mount_blob_pull_delayed(
-        source,
-        "repo",
-        &parts.config_desc.digest,
-        &parts.config_data,
-        delay,
-    )
-    .await;
-    mount_blob_pull_delayed(
-        source,
-        "repo",
-        &parts.layer_descs[0].digest,
-        &parts.layers_data[0],
-        delay,
-    )
-    .await;
-    parts.mount_target(target, "repo", "v1").await;
-}
-
 /// With staging on and two targets, each source request is made exactly once
 /// (`expect(1)`) and both targets are pushed from the staged files, which
 /// exist on disk with the pulled content.
@@ -109,13 +81,10 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
     let parts = ManifestBuilder::new(b"stuck-config")
         .layer(b"stuck-layer")
         .build();
-    mount_slow_blobs(
-        &parts,
-        &source_server,
-        &target_server,
-        Duration::from_secs(60),
-    )
-    .await;
+    parts
+        .mount_source_delayed(&source_server, "repo", "v1", Duration::from_secs(60))
+        .await;
+    parts.mount_target(&target_server, "repo", "v1").await;
 
     let mapping = mapping_from_servers(
         &source_server,
@@ -128,17 +97,18 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
 
     let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
-    // The image may or may not be reported, depending on whether discovery
-    // finished before the deadline. The invariant is that the engine returns.
-    assert!(
-        report.images.len() <= 1,
-        "should have at most 1 image result"
+    // A 60s blob that completed would sync the image: the deadline must cut it.
+    assert_eq!(
+        report.stats.images_synced, 0,
+        "the drain deadline should abandon the stuck transfer"
     );
 }
 
-/// `with_drain_deadline` is honoured: blob GETs take 5s, which the default 25s
-/// deadline would let finish, but a 2s deadline abandons them.
-#[tokio::test(start_paused = true)]
+/// `with_drain_deadline` is honoured: blob GETs take 3s, which the default 25s
+/// deadline would let finish, but a 1s deadline abandons them.
+///
+/// Real time: a paused clock would elapse either deadline at once.
+#[tokio::test]
 async fn sync_custom_drain_deadline_abandons_before_default_would() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
@@ -146,13 +116,10 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     let parts = ManifestBuilder::new(b"drain-cfg")
         .layer(b"drain-layer")
         .build();
-    mount_slow_blobs(
-        &parts,
-        &source_server,
-        &target_server,
-        Duration::from_secs(5),
-    )
-    .await;
+    parts
+        .mount_source_delayed(&source_server, "repo", "v1", Duration::from_secs(3))
+        .await;
+    parts.mount_target(&target_server, "repo", "v1").await;
 
     let mapping = mapping_from_servers(
         &source_server,
@@ -164,7 +131,7 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     trigger_shutdown_after(&shutdown, Duration::from_millis(10));
 
     let report = SyncEngine::new(fast_retry(), concurrency(50))
-        .with_drain_deadline(Duration::from_secs(2))
+        .with_drain_deadline(Duration::from_secs(1))
         .run(
             vec![mapping],
             empty_cache(),

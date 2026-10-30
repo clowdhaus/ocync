@@ -599,19 +599,11 @@ async fn sync_retry_exhaustion_returns_final_error() {
 /// Syncs `repo-a` then `repo-b` through one source client and one target
 /// client, sequentially, so repo-a's blobs are known mount sources for repo-b.
 async fn sync_repo_a_then_repo_b(source: &MockServer, target: &MockServer) -> SyncReport {
-    let (source_client, target_client) = (mock_client(source), mock_client(target));
-    let mappings = ["repo-a", "repo-b"]
-        .into_iter()
-        .map(|repo| {
-            resolved_mapping(
-                source_client.clone(),
-                repo,
-                repo,
-                vec![target_entry("target", target_client.clone())],
-                vec![TagPair::same("v1")],
-            )
-        })
-        .collect();
+    let mappings = v1_mappings(
+        source,
+        target,
+        &[("repo-a", "repo-a"), ("repo-b", "repo-b")],
+    );
     run_sync_sequential(mappings).await
 }
 
@@ -688,8 +680,8 @@ async fn sync_cross_repo_mount_falls_back_to_pull_push() {
         let report = sync_repo_a_then_repo_b(&source_server, &target_server).await;
 
         assert_eq!(report.images.len(), 2, "{name}");
-        assert_status!(report, 0, ImageStatus::Synced);
-        assert_status!(report, 1, ImageStatus::Synced);
+        assert_status!(report, 0, ImageStatus::Synced, "{name}");
+        assert_status!(report, 1, ImageStatus::Synced, "{name}");
         assert_eq!(report.images[1].blob_stats.mounted, 0, "{name}");
         assert_eq!(report.images[1].blob_stats.transferred, 2, "{name}");
     }

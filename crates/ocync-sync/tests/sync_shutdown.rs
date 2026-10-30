@@ -13,8 +13,7 @@ use wiremock::MockServer;
 use helpers::*;
 
 /// With shutdown triggered before the run, the engine stops taking discovery
-/// work and returns. Whether in-flight work completes depends on timing, so
-/// the only invariant is that it returns with at most the two images.
+/// work: it returns with no image reported and no request made to the source.
 #[tokio::test]
 async fn sync_shutdown_stops_new_work() {
     let source_server = MockServer::start().await;
@@ -32,16 +31,18 @@ async fn sync_shutdown_stops_new_work() {
         &source_server,
         &target_server,
         "repo",
-        vec![TagPair::same("v1"), TagPair::same("v2")],
+        same_tags(&["v1", "v2"]),
     );
     let shutdown = ShutdownSignal::new();
     shutdown.trigger();
 
     let report = run_sync_with_shutdown(vec![mapping], &shutdown).await;
 
-    assert!(
-        report.images.len() <= 2,
-        "should have at most 2 images (may have fewer if shutdown interrupted discovery)"
+    assert!(report.images.is_empty(), "{:?}", report.images);
+    assert_eq!(
+        count_requests(&source_server, None, PathMatch::Any).await,
+        0,
+        "shutdown before the run must stop discovery before it asks the source"
     );
 }
 

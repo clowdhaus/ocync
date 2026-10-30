@@ -4,9 +4,9 @@
 //! and corrupt files are silently discarded, and that transient blob states
 //! are not written to disk.
 
-mod helpers;
+#[path = "helpers/digests.rs"]
+mod digests;
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority};
 use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 
-use helpers::{digest_a, digest_b, repo};
+use digests::{digest_a, digest_b, repo};
 
 fn snap_key(auth: &str, repo_name: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(&RegistryAuthority::new(auth), &repo(repo_name), tag)
@@ -356,24 +356,4 @@ fn snapshot_lookup_returns_none_for_unknown_key() {
             "a different {name} must not match"
         );
     }
-}
-
-#[test]
-fn prune_snapshots_removes_unlisted_keys() {
-    let mut cache = TransferStateCache::new();
-    let keep = snap_key("src.io:443", "repo/a", "v1");
-    let drop = snap_key("src.io:443", "repo/b", "v2");
-    cache.set_source_snapshot(
-        keep.clone(),
-        snapshot(digest_a(), digest_a(), no_platform_filter()),
-    );
-    cache.set_source_snapshot(
-        drop.clone(),
-        snapshot(digest_b(), digest_b(), no_platform_filter()),
-    );
-
-    cache.prune_snapshots(&HashSet::from([keep.clone()]));
-
-    assert!(cache.source_snapshot(&keep).is_some());
-    assert!(cache.source_snapshot(&drop).is_none());
 }

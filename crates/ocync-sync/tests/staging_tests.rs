@@ -1,14 +1,15 @@
 //! Integration tests for [`BlobStage`]: round-trip, crash recovery, eviction,
 //! streaming writes and disabled mode.
 
-mod helpers;
+#[path = "helpers/digests.rs"]
+mod digests;
 
 use std::io;
 
 use ocync_distribution::Digest;
 use ocync_sync::staging::BlobStage;
 
-use helpers::{digest_a, digest_b};
+use digests::{digest_a, digest_b};
 
 const DIGEST_C: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 

@@ -17,29 +17,6 @@ use ocync_sync::retry::RetryConfig;
 use url::Url;
 use wiremock::MockServer;
 
-/// A sha256 digest from a short suffix, zero-padded to 64 hex chars.
-pub fn make_digest(suffix: &str) -> Digest {
-    format!("sha256:{suffix:0>64}").parse().unwrap()
-}
-
-const DIGEST_A: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const DIGEST_B: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-/// The digest of the empty blob.
-pub fn digest_a() -> Digest {
-    DIGEST_A.parse().unwrap()
-}
-
-/// A digest unequal to [`digest_a`].
-pub fn digest_b() -> Digest {
-    DIGEST_B.parse().unwrap()
-}
-
-/// A repository name that must be valid.
-pub fn repo(name: &str) -> RepositoryName {
-    RepositoryName::new(name).unwrap()
-}
-
 /// The base URL of `server`.
 pub fn mock_url(server: &MockServer) -> Url {
     Url::parse(&server.uri()).unwrap()
@@ -146,13 +123,7 @@ pub fn mapping_from_servers(
     repo: &str,
     tags: Vec<TagPair>,
 ) -> ResolvedMapping {
-    resolved_mapping(
-        mock_client(source),
-        repo,
-        repo,
-        vec![target_entry("target", mock_client(target))],
-        tags,
-    )
+    mapping_with_distinct_repos(source, target, repo, repo, tags)
 }
 
 /// As [`mapping_from_servers`] with different source and target repos.
@@ -189,6 +160,34 @@ pub fn mapping_to_targets(
             .collect(),
         tags,
     )
+}
+
+/// Tag pairs that keep each name in `tags` unchanged.
+pub fn same_tags(tags: &[&str]) -> Vec<TagPair> {
+    tags.iter().map(|t| TagPair::same(*t)).collect()
+}
+
+/// One `v1` mapping per `(source_repo, target_repo)` pair, all sharing one
+/// source client and one target client (alias `target`).
+pub fn v1_mappings(
+    source: &MockServer,
+    target: &MockServer,
+    repos: &[(&str, &str)],
+) -> Vec<ResolvedMapping> {
+    let source_client = mock_client(source);
+    let target_client = mock_client(target);
+    repos
+        .iter()
+        .map(|(src, tgt)| {
+            resolved_mapping(
+                Arc::clone(&source_client),
+                src,
+                tgt,
+                vec![target_entry("target", Arc::clone(&target_client))],
+                same_tags(&["v1"]),
+            )
+        })
+        .collect()
 }
 
 /// An `ImageManifest` as JSON bytes and its digest.

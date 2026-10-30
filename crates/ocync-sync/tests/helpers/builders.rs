@@ -2,6 +2,8 @@
 
 #![allow(dead_code, unused_imports, unreachable_pub)]
 
+use std::time::Duration;
+
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{Descriptor, ImageIndex, ImageManifest, MediaType, Platform};
 use wiremock::MockServer;
@@ -94,6 +96,29 @@ impl ManifestParts {
     pub async fn mount_source(&self, server: &MockServer, repo: &str, reference: &str) {
         mount_source_manifest(server, repo, reference, &self.bytes).await;
         self.mount_blob_pulls(server, repo).await;
+    }
+
+    /// As [`mount_source`](Self::mount_source), but every blob GET answers
+    /// only after `delay`; the manifest answers at once.
+    pub async fn mount_source_delayed(
+        &self,
+        server: &MockServer,
+        repo: &str,
+        reference: &str,
+        delay: Duration,
+    ) {
+        mount_source_manifest(server, repo, reference, &self.bytes).await;
+        mount_blob_pull_delayed(
+            server,
+            repo,
+            &self.config_desc.digest,
+            &self.config_data,
+            delay,
+        )
+        .await;
+        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
+            mount_blob_pull_delayed(server, repo, &desc.digest, data, delay).await;
+        }
     }
 
     /// As [`mount_source`](Self::mount_source), but the manifest and each blob

@@ -7,6 +7,8 @@
 //!   subject (partial existence, rate limits, `expect(N)` push counts).
 //! - `fixtures.rs`: mapping constructors, clients and retry config.
 //!   `simple_image_manifest` is for HEAD-check tests over fake digests.
+//! - `digests.rs`: digest and repository fixtures with no wiremock dependency;
+//!   filesystem-only test binaries include it alone through `#[path]`.
 //! - `registry2.rs`: real `registry:2` containers and a corpus to fill them.
 
 // Each test file is its own crate, so `pub` is the visibility for
@@ -24,6 +26,7 @@ use ocync_sync::staging::BlobStage;
 use ocync_sync::{ImageStatus, SyncReport, shutdown::ShutdownSignal};
 
 pub mod builders;
+pub mod digests;
 pub mod fixtures;
 pub mod mocks;
 pub mod registry2;
@@ -32,6 +35,7 @@ pub use builders::{
     ArtifactBuilder, ArtifactParts, IndexBuilder, IndexParts, ManifestBuilder, ManifestParts,
     ReferrersIndexBuilder, SHARED_TAGS, linux, mount_shared_index, platform,
 };
+pub use digests::*;
 pub use fixtures::*;
 pub use mocks::*;
 pub use registry2::*;
@@ -159,12 +163,23 @@ pub fn assert_all_synced(report: &SyncReport, want: usize, name: &str) {
     }
 }
 
-/// Assert `report.images[idx].status` matches a pattern.
+/// Assert `report.images[idx].status` matches a pattern. A trailing format
+/// string names the table row in the failure.
 macro_rules! assert_status {
     ($report:expr, $idx:expr, $pattern:pat) => {
         assert!(
             matches!($report.images[$idx].status, $pattern),
             "image[{}]: expected {}, got {:?}",
+            $idx,
+            stringify!($pattern),
+            $report.images[$idx].status,
+        );
+    };
+    ($report:expr, $idx:expr, $pattern:pat, $($label:tt)+) => {
+        assert!(
+            matches!($report.images[$idx].status, $pattern),
+            "{}: image[{}]: expected {}, got {:?}",
+            format!($($label)+),
             $idx,
             stringify!($pattern),
             $report.images[$idx].status,

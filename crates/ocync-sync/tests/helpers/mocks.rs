@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::MediaType;
+use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -120,20 +121,22 @@ pub async fn mount_blob_push(server: &MockServer, repo: &str) {
 
 /// As [`mount_blob_push`], but the POST and the PUT must each be hit exactly
 /// `uploads` times (`0` asserts nothing is uploaded); PATCH is unconstrained.
-pub async fn mount_blob_push_expecting(server: &MockServer, repo: &str, uploads: u64) {
-    mount_uploads(server, repo, Some(uploads)).await;
+/// `row` names the table row in a failed expectation.
+pub async fn mount_blob_push_expecting(server: &MockServer, repo: &str, uploads: u64, row: &str) {
+    mount_uploads(server, repo, Some((uploads, row))).await;
 }
 
-async fn mount_uploads(server: &MockServer, repo: &str, uploads: Option<u64>) {
+async fn mount_uploads(server: &MockServer, repo: &str, expected: Option<(u64, &str)>) {
     let session = format!("/v2/{repo}/blobs/uploads/upload-id");
-    let counted = |mock: Mock| match uploads {
-        Some(n) => mock.expect(n),
+    let counted = |mock: Mock, what: &str| match expected {
+        Some((n, row)) => mock.expect(n).named(format!("{row}: upload {what}")),
         None => mock,
     };
     counted(
         Mock::given(method("POST"))
             .and(path(format!("/v2/{repo}/blobs/uploads/")))
             .respond_with(ResponseTemplate::new(202).insert_header("location", session.as_str())),
+        "POST",
     )
     .mount(server)
     .await;
@@ -146,6 +149,7 @@ async fn mount_uploads(server: &MockServer, repo: &str, uploads: Option<u64>) {
         Mock::given(method("PUT"))
             .and(path(session.as_str()))
             .respond_with(ResponseTemplate::new(201)),
+        "PUT",
     )
     .mount(server)
     .await;
@@ -164,11 +168,25 @@ pub async fn mount_blob_mount_accepted(server: &MockServer, repo: &str, digest: 
         .await;
 }
 
+/// A 200 manifest response naming `digest`, as a HEAD or GET on it would answer.
+pub fn digest_response(digest: &Digest, media_type: MediaType) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("docker-content-digest", digest.to_string())
+        .insert_header("content-type", media_type.as_str())
+        .insert_header("content-length", "100")
+}
+
+/// A manifest HEAD on `reference` answering `response`, not yet mounted so a
+/// caller can add `.expect(n)`.
+pub fn manifest_head_mock(repo: &str, reference: &str, response: ResponseTemplate) -> Mock {
+    Mock::given(method("HEAD"))
+        .and(path(format!("/v2/{repo}/manifests/{reference}")))
+        .respond_with(response)
+}
+
 /// Mount a manifest HEAD returning 404.
 pub async fn mount_manifest_head_not_found(server: &MockServer, repo: &str, tag: &str) {
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{repo}/manifests/{tag}")))
-        .respond_with(ResponseTemplate::new(404))
+    manifest_head_mock(repo, tag, ResponseTemplate::new(404))
         .mount(server)
         .await;
 }
@@ -180,25 +198,21 @@ pub async fn mount_manifest_head_matching(
     tag: &str,
     digest: &Digest,
 ) {
-    Mock::given(method("HEAD"))
-        .and(path(format!("/v2/{repo}/manifests/{tag}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("docker-content-digest", digest.to_string())
-                .insert_header("content-type", MediaType::OciManifest.as_str())
-                .insert_header("content-length", "100"),
-        )
+    manifest_head_mock(repo, tag, digest_response(digest, MediaType::OciManifest))
         .mount(server)
         .await;
 }
 
-/// Mount a manifest PUT returning 201.
-pub async fn mount_manifest_push(server: &MockServer, repo: &str, reference: &str) {
+/// A manifest PUT returning 201, not yet mounted so a caller can add `.expect(n)`.
+pub fn manifest_push_mock(repo: &str, reference: &str) -> Mock {
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{repo}/manifests/{reference}")))
         .respond_with(ResponseTemplate::new(201))
-        .mount(server)
-        .await;
+}
+
+/// Mount a manifest PUT returning 201.
+pub async fn mount_manifest_push(server: &MockServer, repo: &str, reference: &str) {
+    manifest_push_mock(repo, reference).mount(server).await;
 }
 
 /// Mount a fresh target for blobs given only as digests: manifest HEAD 404,
@@ -217,13 +231,56 @@ pub async fn mount_target_fresh(
     mount_manifest_push(server, repo, tag).await;
 }
 
-/// Requests `server` received with `verb`, on exactly `only_path` when given.
-pub async fn count_requests(server: &MockServer, verb: &str, only_path: Option<&str>) -> usize {
+/// Which request paths [`count_requests`] counts.
+#[derive(Clone, Copy)]
+pub enum PathMatch<'a> {
+    Any,
+    Exact(&'a str),
+    Contains(&'a str),
+}
+
+impl PathMatch<'_> {
+    fn matches(self, request_path: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(p) => request_path == p,
+            Self::Contains(needle) => request_path.contains(needle),
+        }
+    }
+}
+
+/// Requests `server` received, of `verb` when given, whose path satisfies `path`.
+pub async fn count_requests(
+    server: &MockServer,
+    verb: Option<&Method>,
+    path: PathMatch<'_>,
+) -> usize {
     server
         .received_requests()
         .await
         .unwrap()
         .iter()
-        .filter(|r| r.method.as_str() == verb && only_path.is_none_or(|p| r.url.path() == p))
+        .filter(|r| verb.is_none_or(|v| r.method == *v) && path.matches(r.url.path()))
+        .count()
+}
+
+/// Blob upload finalizations (PUT) of `digest` that `server` received on a
+/// path satisfying `path`. The query carries the digest URL-encoded, so it is
+/// matched on its hex.
+pub async fn count_blob_uploads(
+    server: &MockServer,
+    path: PathMatch<'_>,
+    digest: &Digest,
+) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.method == Method::PUT
+                && path.matches(r.url.path())
+                && r.url.query().is_some_and(|q| q.contains(digest.hex()))
+        })
         .count()
 }
