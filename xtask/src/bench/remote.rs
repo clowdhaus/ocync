@@ -47,18 +47,32 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) provider: String,
 
-    /// Fetch results from the last run instead of starting a new one. While a
-    /// run is live these are its partial results.
-    #[arg(long)]
+    /// Copy the newest results on the instance instead of starting a run.
+    /// They are a live run's partial results only once its benchmark has
+    /// started; before that they are the previous run's. Conflicts with every
+    /// option that shapes a run.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "force",
+            "git_ref",
+            "tools",
+            "scenario",
+            "limit",
+            "skip_registries",
+            "skip_prewarm",
+            "no_proxy",
+        ]
+    )]
     pub(crate) fetch: bool,
 
     /// Kill a benchmark still running on the instance and start fresh.
     /// Without it, a live run is left alone and this command fails.
-    #[arg(long, conflicts_with = "fetch")]
+    #[arg(long)]
     pub(crate) force: bool,
 
     /// Git ref to checkout on the instance (default: current branch).
-    #[arg(long, conflicts_with = "fetch")]
+    #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
     /// Tools to benchmark (passed through to `cargo xtask bench`).
@@ -217,11 +231,19 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         RemoteOutcome::Refused => {
             return Err(
                 "a benchmark is still running on the instance; pass --force to kill it, \
-                 or --fetch to copy the live run's partial results"
+                 or --fetch to copy the newest results there (a live run's partial results \
+                 once its benchmark has started)"
                     .into(),
             );
         }
-        RemoteOutcome::Exited(code) => code,
+        RemoteOutcome::FailedBeforeStart(code) => {
+            return Err(format!(
+                "remote script exited with code {code} before the benchmark started; \
+                 not fetching results"
+            )
+            .into());
+        }
+        RemoteOutcome::Ran(code) => code,
     };
 
     if exit_code != 0 {
@@ -235,23 +257,49 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// A line the remote script prints that says how far it got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sentinel {
+    /// [`RUN_IN_PROGRESS_LINE`]: the guard found a live run.
+    Refusal,
+    /// [`BENCH_STARTED_LINE`]: the benchmark runner was launched.
+    Started,
+}
+
+impl Sentinel {
+    /// The sentinel `line` is, if any.
+    fn from_line(line: &str) -> Option<Self> {
+        match line {
+            RUN_IN_PROGRESS_LINE => Some(Self::Refusal),
+            BENCH_STARTED_LINE => Some(Self::Started),
+            _ => None,
+        }
+    }
+}
+
 /// How the remote script ended.
+#[derive(Debug, PartialEq, Eq)]
 enum RemoteOutcome {
     /// The guard found a live run and left it alone.
     Refused,
-    /// The script ran to its end with this exit code.
-    Exited(i32),
+    /// The script failed before the benchmark started, so the newest results
+    /// on the instance are not this run's.
+    FailedBeforeStart(i32),
+    /// The benchmark started and the script ended with this exit code.
+    Ran(i32),
 }
 
 impl RemoteOutcome {
-    /// A script that printed [`RUN_IN_PROGRESS_LINE`] was refused, whatever
-    /// its exit code: `set -e` makes any failing command exit with any code,
-    /// the refusal's own `exit 3` included.
-    fn new(refusal_line_seen: bool, exit_code: Option<i32>) -> Self {
-        if refusal_line_seen {
-            Self::Refused
-        } else {
-            Self::Exited(exit_code.unwrap_or(1))
+    /// The outcome of a script whose first sentinel line was `sentinel`.
+    /// A refusal is the line, whatever the exit code: `set -e` makes any
+    /// failing command exit with any code, the refusal's own `exit 3`
+    /// included. Without a sentinel the script never reached the benchmark.
+    fn new(sentinel: Option<Sentinel>, exit_code: Option<i32>) -> Self {
+        let code = exit_code.unwrap_or(1);
+        match sentinel {
+            Some(Sentinel::Refusal) => Self::Refused,
+            Some(Sentinel::Started) => Self::Ran(code),
+            None => Self::FailedBeforeStart(code),
         }
     }
 }
@@ -285,18 +333,18 @@ fn ssh_stream(
     }
 
     // Stream stdout line by line for real-time progress.
-    let mut refused = false;
+    let mut sentinel = None;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = line?;
-            refused |= line == RUN_IN_PROGRESS_LINE;
+            sentinel = sentinel.or(Sentinel::from_line(&line));
             eprintln!("{line}");
         }
     }
 
     let status = child.wait()?;
-    Ok(RemoteOutcome::new(refused, status.code()))
+    Ok(RemoteOutcome::new(sentinel, status.code()))
 }
 
 /// Fetch results from the instance via SCP.
@@ -446,6 +494,10 @@ impl ExistingRun {
 /// Line the remote script prints, before exiting 3, when it refuses to
 /// replace a live run.
 const RUN_IN_PROGRESS_LINE: &str = "bench-remote: a benchmark is already running on this instance";
+
+/// Line the remote script prints right after it launches the benchmark runner.
+/// Results fetched after it are this run's, whole or partial.
+const BENCH_STARTED_LINE: &str = "bench-remote: benchmark started, streaming log...";
 
 /// Seconds `--force` waits for a killed run to release the run lock.
 const KILL_WAIT_SECS: u32 = 30;
@@ -651,7 +703,7 @@ RUNNER_EOF
 export EXIT_FILE
 {runner_launch}
 BENCH_PID=$!
-echo "bench-remote: started (PID $BENCH_PID), streaming log..."
+echo "{BENCH_STARTED_LINE}"
 
 # Stream log until bench exits. --pid= makes tail exit when process dies.
 tail -n+1 -f "$LOG_FILE" --pid="$BENCH_PID"
@@ -725,6 +777,7 @@ fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::io::BufRead;
 
     use super::*;
@@ -835,16 +888,33 @@ mod tests {
     }
 
     #[test]
-    fn fetch_conflicts_with_force_and_git_ref() {
+    fn fetch_conflicts_with_every_run_option() {
         use clap::Parser;
-        for extra in [&["--force"][..], &["--git-ref", "main"][..]] {
+        for extra in [
+            &["--force"][..],
+            &["--git-ref", "main"][..],
+            &["--tools", "ocync"][..],
+            &["--scenario", "cold"][..],
+            &["--limit", "3"][..],
+            &["--skip-registries", "docker.io"][..],
+            &["--skip-prewarm"][..],
+            &["--no-proxy"][..],
+        ] {
             let argv = ["xtask", "--provider", "aws", "--fetch"]
                 .into_iter()
                 .chain(extra.iter().copied());
             let err = Cli::try_parse_from(argv).err().unwrap();
-            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
         }
         assert!(Cli::try_parse_from(["xtask", "--provider", "aws", "--fetch"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["xtask", "--provider", "aws", "--fetch", "--output", "out"])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -932,19 +1002,54 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_is_the_sentinel_line_not_exit_3() {
-        assert!(matches!(
-            RemoteOutcome::new(true, Some(0)),
-            RemoteOutcome::Refused
-        ));
-        assert!(matches!(
-            RemoteOutcome::new(false, Some(3)),
-            RemoteOutcome::Exited(3)
-        ));
-        assert!(matches!(
-            RemoteOutcome::new(false, None),
-            RemoteOutcome::Exited(1)
-        ));
+    fn the_outcome_follows_the_sentinel_line_not_the_exit_code() {
+        let rows = [
+            (Some(Sentinel::Refusal), Some(0), RemoteOutcome::Refused),
+            (Some(Sentinel::Refusal), Some(3), RemoteOutcome::Refused),
+            (Some(Sentinel::Started), Some(0), RemoteOutcome::Ran(0)),
+            (Some(Sentinel::Started), Some(3), RemoteOutcome::Ran(3)),
+            (Some(Sentinel::Started), None, RemoteOutcome::Ran(1)),
+            // A failure with no started line never reached the benchmark,
+            // whatever its exit code.
+            (None, Some(3), RemoteOutcome::FailedBeforeStart(3)),
+            (None, Some(1), RemoteOutcome::FailedBeforeStart(1)),
+            (None, None, RemoteOutcome::FailedBeforeStart(1)),
+        ];
+        for (sentinel, code, want) in rows {
+            assert_eq!(
+                RemoteOutcome::new(sentinel, code),
+                want,
+                "{sentinel:?} {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_lines_are_matched_whole() {
+        assert_eq!(
+            Sentinel::from_line(RUN_IN_PROGRESS_LINE),
+            Some(Sentinel::Refusal)
+        );
+        assert_eq!(
+            Sentinel::from_line(BENCH_STARTED_LINE),
+            Some(Sentinel::Started)
+        );
+        assert_eq!(
+            Sentinel::from_line(&format!("{BENCH_STARTED_LINE} (PID 1)")),
+            None
+        );
+        assert_eq!(Sentinel::from_line("[1/4] Updating repo..."), None);
+    }
+
+    #[test]
+    fn the_script_prints_the_started_line_only_after_launching_the_runner() {
+        let script = script_for(ExistingRun::Refuse);
+
+        assert_eq!(script.matches(BENCH_STARTED_LINE).count(), 1);
+        assert!(
+            script.find(BENCH_STARTED_LINE).unwrap()
+                > script.find(r#"bash "$RUNNER_FILE""#).unwrap()
+        );
     }
 
     #[test]
@@ -996,6 +1101,7 @@ mod tests {
         assert!(!stray.exists(), "the stray file survived");
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Previous {
         /// A run holds the lock, in its own process group.
@@ -1008,6 +1114,7 @@ mod tests {
     }
 
     /// Starts `script` as its own session leader, so its pid is its group id.
+    #[cfg(target_os = "linux")]
     fn session_leader(script: &str, lock: &Path) -> std::process::Child {
         Command::new("setsid")
             .args(["bash", "-c", script])
@@ -1018,6 +1125,7 @@ mod tests {
     }
 
     /// Whether any process is left in process group `pgid`.
+    #[cfg(target_os = "linux")]
     fn group_alive(pgid: u32) -> bool {
         Command::new("bash")
             .args(["-c", r#"kill -0 -- "-$0" 2>/dev/null"#, &pgid.to_string()])
@@ -1028,6 +1136,7 @@ mod tests {
 
     /// Runs the guard for `existing` followed by `echo proceeded`, with
     /// `path` as the guard's `PATH` when given.
+    #[cfg(target_os = "linux")]
     fn run_guard(
         existing: ExistingRun,
         lock: &Path,
@@ -1049,11 +1158,13 @@ mod tests {
         command.output().unwrap()
     }
 
+    // The generated script targets the Linux bench instance: it needs
+    // util-linux `setsid` and `flock`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn existing_run_guard_refuses_kills_or_proceeds() {
         use std::os::unix::process::ExitStatusExt;
 
-        const REFUSAL: &str = "bench-remote: a benchmark is already running on this instance";
         // (policy, previous run, guard exit, refusal printed, proceeded,
         //  previous run survives)
         let rows = [
@@ -1134,7 +1245,7 @@ mod tests {
                 "row {n}: guard exit: {stdout}"
             );
             assert_eq!(
-                stdout.contains(REFUSAL),
+                stdout.contains(RUN_IN_PROGRESS_LINE),
                 refusal,
                 "row {n}: refusal line: {stdout}"
             );
@@ -1160,6 +1271,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_flock_that_fails_is_an_error_not_a_held_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1194,6 +1306,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_remote_command_runs_the_script_as_a_group_leader() {
         use std::os::unix::process::CommandExt;

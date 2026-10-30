@@ -504,7 +504,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .scenarios
             .iter()
             .map(|s| report::ScenarioRecord {
-                name: s.kind.label(),
+                name: s.kind.label().to_string(),
                 shuffle_seed: s.shuffle_seed,
                 tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
                 tools: s
@@ -618,7 +618,7 @@ impl std::fmt::Display for Pass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Prime => f.write_str("prime"),
-            Self::Measured(kind) => f.write_str(&kind.slug()),
+            Self::Measured(kind) => write!(f, "{}", kind.slug()),
         }
     }
 }

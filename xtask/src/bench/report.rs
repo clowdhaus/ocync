@@ -177,24 +177,42 @@ pub(crate) enum ScenarioKind {
 impl ScenarioKind {
     /// Human-readable scenario name, the heading of its report section and
     /// its name in the JSON archive (e.g. `"Cold sync"`).
-    pub(crate) fn label(self) -> String {
-        match self {
-            Self::Cold => "Cold sync".to_string(),
-            Self::Warm => "Warm sync (no-op)".to_string(),
-            Self::Partial => "Partial sync (~5% changed)".to_string(),
-            Self::Scale { images } => format!("Scale ({images} images)"),
-            Self::Prepare => "Prepare (dry-run)".to_string(),
-        }
+    pub(crate) fn label(self) -> impl std::fmt::Display {
+        Label(self)
     }
 
     /// File-name stem for this scenario's measured runs (e.g. `"scale-10"`).
-    pub(crate) fn slug(self) -> String {
-        match self {
-            Self::Cold => "cold".to_string(),
-            Self::Warm => "warm".to_string(),
-            Self::Partial => "partial".to_string(),
-            Self::Scale { images } => format!("scale-{images}"),
-            Self::Prepare => "prepare".to_string(),
+    pub(crate) fn slug(self) -> impl std::fmt::Display {
+        Slug(self)
+    }
+}
+
+/// Writes [`ScenarioKind::label`].
+struct Label(ScenarioKind);
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            ScenarioKind::Cold => f.write_str("Cold sync"),
+            ScenarioKind::Warm => f.write_str("Warm sync (no-op)"),
+            ScenarioKind::Partial => f.write_str("Partial sync (~5% changed)"),
+            ScenarioKind::Scale { images } => write!(f, "Scale ({images} images)"),
+            ScenarioKind::Prepare => f.write_str("Prepare (dry-run)"),
+        }
+    }
+}
+
+/// Writes [`ScenarioKind::slug`].
+struct Slug(ScenarioKind);
+
+impl std::fmt::Display for Slug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            ScenarioKind::Cold => f.write_str("cold"),
+            ScenarioKind::Warm => f.write_str("warm"),
+            ScenarioKind::Partial => f.write_str("partial"),
+            ScenarioKind::Scale { images } => write!(f, "scale-{images}"),
+            ScenarioKind::Prepare => f.write_str("prepare"),
         }
     }
 }
@@ -523,14 +541,21 @@ fn summary_markdown(report: &BenchReport) -> String {
     }
     out.push('\n');
 
-    // Determine column order: ocync first, then remaining tools in sorted order.
+    // Column order: ocync first, then the remaining tools in sorted order. Each
+    // scenario keeps only the tools that ran in it.
     let columns = tool_columns(report);
 
     // Per-scenario detailed tables.
     for scenario in &report.scenarios {
         out.push_str(&format!("## {}\n\n", scenario.kind.label()));
 
-        render_metric_table(&columns, &runs_by_tool(scenario), &mut out);
+        let by_tool = runs_by_tool(scenario);
+        let ran: Vec<Tool> = columns
+            .iter()
+            .copied()
+            .filter(|tool| by_tool.contains_key(tool))
+            .collect();
+        render_metric_table(&ran, &by_tool, &mut out);
         if let Some(footnote) = referrer_footnote(scenario) {
             out.push_str(&footnote);
         }
@@ -1115,33 +1140,39 @@ mod tests {
     }
 
     #[test]
-    fn summary_markdown_missing_tool_shows_dash() {
-        let report = BenchReport {
-            timestamp: "2026-04-15-100000".to_string(),
-            instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
-            relay_versions: BTreeMap::new(),
-            tool_versions: BTreeMap::from([
-                (Tool::Ocync, "0.1.0".to_string()),
-                (Tool::Dregsy, "0.5.0".to_string()),
-            ]),
-            scenarios: vec![ScenarioResult::unshuffled(
-                ScenarioKind::Cold,
-                vec![ToolRun {
-                    tool: Tool::Ocync,
-                    wall_clock_secs: 47.0,
-                    exit_code: Some(0),
-                    peak_rss_kb: Some(65536),
-                    proxy_metrics: None,
-                    phase_timing_ms: BTreeMap::new(),
-                }],
-            )],
+    fn a_scenario_table_has_a_column_per_tool_that_ran_in_it() {
+        let run = |tool| ToolRun {
+            tool,
+            wall_clock_secs: 47.0,
+            exit_code: Some(0),
+            peak_rss_kb: Some(65536),
+            proxy_metrics: None,
+            phase_timing_ms: BTreeMap::new(),
         };
+        let mut report = sample_report();
+        report.tool_versions = BTreeMap::from([
+            (Tool::Ocync, "0.1.0".to_string()),
+            (Tool::Dregsy, "0.5.0".to_string()),
+            (Tool::Regsync, "0.9.0".to_string()),
+        ]);
+        report.scenarios = vec![
+            ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                vec![run(Tool::Regsync), run(Tool::Ocync), run(Tool::Dregsy)],
+            ),
+            ScenarioResult::unshuffled(ScenarioKind::Scale { images: 10 }, vec![run(Tool::Ocync)]),
+        ];
+
         let md = summary_markdown(&report);
-        // dregsy column shows "--"; ocync is NOT bolded because there's
-        // no competing tool with data for this metric.
-        assert!(md.contains("| Wall clock | 47s | -- |"), "md:\n{md}");
+
+        let cold = md.split("## Cold sync\n").nth(1).unwrap();
+        let scale = md.split("## Scale (10 images)\n").nth(1).unwrap();
+        assert!(
+            cold.contains("| Metric | ocync | dregsy | regsync |"),
+            "md:\n{md}"
+        );
+        assert!(scale.contains("| Metric | ocync |\n"), "md:\n{md}");
+        assert!(!scale.contains("dregsy") && !scale.contains("regsync"));
     }
 
     #[test]
@@ -1366,7 +1397,7 @@ mod tests {
 
         let cold = find_scenario(&report.scenarios, ScenarioKind::Cold).unwrap();
 
-        assert_eq!(cold.kind.label(), "Cold sync");
+        assert_eq!(cold.kind.label().to_string(), "Cold sync");
         assert!(find_scenario(&report.scenarios, ScenarioKind::Warm).is_none());
         assert!(find_scenario(&report.scenarios, ScenarioKind::Scale { images: 25 }).is_none());
     }
