@@ -66,7 +66,7 @@
   <!-- Feature ticks -->
   <circle cx="74" cy="380" r="8" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
   <path d="M70 380 L73 383 L78 377" stroke="url(#cyan-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  <text x="92" y="386" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" fill="#bcc6ec">Zero duplicate blob fetches</text>
+  <text x="92" y="386" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" fill="#bcc6ec">Blob deduplication across images</text>
 
   <circle cx="74" cy="420" r="8" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.18"/>
   <path d="M70 420 L73 423 L78 417" stroke="url(#purple-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
@@ -79,13 +79,13 @@
   <!-- Right section: Stat cards -->
   <rect x="620" y="70" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="115" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
-  <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">4x</text>
+  <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">3x</text>
   <text x="810" y="155" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">faster than</text>
-  <text x="810" y="180" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">alternatives</text>
+  <text x="810" y="180" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">regsync</text>
 
   <rect x="620" y="230" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="275" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
-  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">30%</text>
+  <text x="660" y="330" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#purple-grad)">19%</text>
   <text x="845" y="315" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">fewer</text>
   <text x="845" y="340" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">requests</text>
 
