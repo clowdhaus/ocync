@@ -1,17 +1,16 @@
 //! CPU profile harness for the sync engine.
 //!
 //! Pushes a deterministic corpus of small images to one local `registry:2`,
-//! then syncs it to a second local `registry:2` so a profiler can sample
-//! `SyncEngine::run`. Tests are `#[ignore]`'d -- they spin up Docker
-//! containers and run in the seconds-range, intended for ad-hoc profiling.
+//! then syncs it to a second so a profiler can sample `SyncEngine::run`. The
+//! tests are `#[ignore]`d: they start Docker containers and are for ad-hoc
+//! profiling.
 //!
 //! ## Tests
 //!
-//! - `profile_small_images` -- HTTP-only. Baseline. Useful for SHA-256,
-//!   JSON parsing, and task-scheduling cost.
-//! - `profile_small_images_tls` -- TLS-terminated via `registry:2`'s
-//!   built-in HTTPS support with a self-signed cert generated at test
-//!   start. Surfaces rustls handshake + AEAD cost.
+//! - `profile_small_images`: plain HTTP baseline (SHA-256, JSON parsing, task
+//!   scheduling).
+//! - `profile_small_images_tls`: HTTPS with a self-signed certificate
+//!   (rustls handshake and AEAD cost).
 //!
 //! ## Usage
 //!
@@ -21,27 +20,24 @@
 //!   --ignored --nocapture --exact profile_small_images
 //! ```
 //!
-//! Then `samply load /tmp/sync.profile` to view the trace. Look for the
-//! `[profile] PROFILE BEGIN` / `[profile] PROFILE END` stderr markers to
-//! scope the analysis window in the UI.
+//! Then `samply load /tmp/sync.profile`. The `[profile] PROFILE BEGIN` and
+//! `[profile] PROFILE END` stderr markers scope the analysis window.
 //!
 //! ## Tunables
 //!
 //! - `OCYNC_PROFILE_IMAGES`        number of images (default: 200)
 //! - `OCYNC_PROFILE_LAYERS`        layers per image (default: 2)
-//! - `OCYNC_PROFILE_BYTES`         bytes per layer (default: 16384). Bump to
-//!   ~5 MB to amplify SHA-256 cost like a real container layer.
-//! - `OCYNC_PROFILE_WORKERS`       `max_concurrent_transfers` (default: 50;
-//!   note the engine default is 10 -- the harness deliberately oversubscribes
-//!   to stress h2 stream budgeting).
-//! - `OCYNC_PROFILE_HTTP1=1`       refuse to negotiate HTTP/2 via ALPN for
-//!   metadata and uploads (blob downloads always use HTTP/1.1). Used to
-//!   isolate HTTP/2 multiplexing stalls from the rest of the path.
-//! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing
-//!   for A/B testing the pre-fix behavior.
-//! - `OCYNC_PROFILE_UPLOAD_CAP`    override per-`RegistryClient`
-//!   `blob_upload_concurrency` (default: 64). Lower to verify the
-//!   per-target upload cap binds.
+//! - `OCYNC_PROFILE_BYTES`         bytes per layer (default: 16384). About 5 MB
+//!   gives a real layer's SHA-256 cost.
+//! - `OCYNC_PROFILE_WORKERS`       `max_concurrent_transfers` (default: 50, over
+//!   the engine default of 10 to stress h2 stream budgeting).
+//! - `OCYNC_PROFILE_HTTP1=1`       refuse HTTP/2 via ALPN for metadata and
+//!   uploads (blob downloads are always HTTP/1.1), to isolate HTTP/2
+//!   multiplexing stalls.
+//! - `OCYNC_PROFILE_H2_ADAPTIVE=0` disable HTTP/2 adaptive-window sizing, to
+//!   compare against the default.
+//! - `OCYNC_PROFILE_UPLOAD_CAP`    per-`RegistryClient` `blob_upload_concurrency`
+//!   (default: 64); lower it to check the per-target cap binds.
 
 mod helpers;
 
@@ -49,8 +45,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ocync_distribution::{RegistryClient, RegistryClientBuilder};
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
+use ocync_sync::engine::TagPair;
 use ocync_sync::staging::BlobStage;
 use url::Url;
 
@@ -65,9 +60,6 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn make_client(url: Url, accept_invalid_certs: bool) -> Arc<RegistryClient> {
     let force_http1 = std::env::var("OCYNC_PROFILE_HTTP1").ok().as_deref() == Some("1");
-    // Adaptive window is on by default in the builder. Set
-    // OCYNC_PROFILE_H2_ADAPTIVE=0 to disable for A/B testing the
-    // pre-fix behavior.
     let mut builder = RegistryClientBuilder::new(url)
         .allow_invalid_certs(accept_invalid_certs)
         .force_http1(force_http1);
@@ -114,35 +106,25 @@ async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: 
         })
         .collect::<Vec<_>>();
 
-    let engine = SyncEngine::new(fast_retry(), concurrency(workers));
-
     eprintln!("[profile] PROFILE BEGIN {label} workers={workers}");
     let sync_start = Instant::now();
-    let report = engine
-        .run(
-            mappings,
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_engine(
+        mappings,
+        fast_retry(),
+        workers,
+        empty_cache(),
+        BlobStage::disabled(),
+        None,
+    )
+    .await;
     let sync_elapsed = sync_start.elapsed();
     eprintln!("[profile] PROFILE END {label} elapsed={sync_elapsed:?}");
 
-    let synced = report
-        .images
-        .iter()
-        .filter(|r| matches!(r.status, ocync_sync::ImageStatus::Synced))
-        .count();
     eprintln!(
-        "[profile] {label}: images={n_images} synced={synced} blobs_transferred={} bytes={}",
-        report.stats.blobs_transferred, report.stats.bytes_transferred,
+        "[profile] {label}: images={n_images} synced={} blobs_transferred={} bytes={}",
+        report.stats.images_synced, report.stats.blobs_transferred, report.stats.bytes_transferred,
     );
-    assert_eq!(
-        synced, n_images,
-        "expected all {n_images} images to sync; got {synced}",
-    );
+    assert_all_synced(&report, n_images, label);
 }
 
 #[tokio::test(flavor = "current_thread")]

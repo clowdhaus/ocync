@@ -680,25 +680,31 @@ mod tests {
     }
 
     #[test]
-    fn prune_snapshots_with_empty_live_keys_clears_all() {
+    fn prune_snapshots_keeps_only_live_keys() {
+        let key = |tag| SnapshotKey::new(&RegistryAuthority::new("src.io:443"), &repo("r"), tag);
+        let snapshot = |digest| SourceSnapshot {
+            source_digest: digest,
+            filtered_digest: other_digest(),
+            platform_filter_key: PlatformFilterKey::from_filters(None),
+        };
         let mut cache = TransferStateCache::new();
-        cache.set_source_snapshot(
-            SnapshotKey::new(&RegistryAuthority::new("src.io:443"), &repo("r"), "v1"),
-            SourceSnapshot {
-                source_digest: test_digest(),
-                filtered_digest: other_digest(),
-                platform_filter_key: PlatformFilterKey::from_filters(None),
-            },
+        cache.set_source_snapshot(key("v1"), snapshot(test_digest()));
+        cache.set_source_snapshot(key("v2"), snapshot(other_digest()));
+
+        cache.prune_snapshots(&HashSet::from([key("v1")]));
+        assert!(
+            cache.source_snapshot(&key("v1")).is_some(),
+            "listed key kept"
         );
+        assert!(
+            cache.source_snapshot(&key("v2")).is_none(),
+            "unlisted key dropped"
+        );
+
         cache.prune_snapshots(&HashSet::new());
         assert!(
-            cache
-                .source_snapshot(&SnapshotKey::new(
-                    &RegistryAuthority::new("src.io:443"),
-                    &repo("r"),
-                    "v1"
-                ))
-                .is_none()
+            cache.source_snapshot(&key("v1")).is_none(),
+            "no live keys clears all"
         );
     }
 }

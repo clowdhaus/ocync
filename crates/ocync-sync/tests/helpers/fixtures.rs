@@ -1,4 +1,4 @@
-//! Factory functions for constructing test fixtures with sensible defaults.
+//! Mapping, client and digest fixtures for the sync integration tests.
 
 #![allow(dead_code, unused_imports, unreachable_pub)]
 
@@ -17,15 +17,19 @@ use ocync_sync::retry::RetryConfig;
 use url::Url;
 use wiremock::MockServer;
 
-/// Build a valid sha256 digest from a short suffix, zero-padded to 64 hex chars.
-pub fn make_digest(suffix: &str) -> Digest {
-    format!("sha256:{suffix:0>64}").parse().unwrap()
-}
+use super::digests::repo;
 
+/// The answer refusing a manifest because the registry lacks a blob it
+/// references.
+pub const MANIFEST_BLOB_UNKNOWN: &str =
+    r#"{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#;
+
+/// The base URL of `server`.
 pub fn mock_url(server: &MockServer) -> Url {
     Url::parse(&server.uri()).unwrap()
 }
 
+/// A client for `server` with default settings.
 pub fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
     Arc::new(
         RegistryClientBuilder::new(mock_url(server))
@@ -34,10 +38,8 @@ pub fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClien
     )
 }
 
-/// Build a `RegistryClient` whose `base_url` has an ECR hostname but all
-/// traffic is redirected (via `RegistryClientBuilder::resolve`) to the mock
-/// server's local port. Used to exercise ECR-specific code paths (mount
-/// short-circuit) without a real ECR endpoint.
+/// A client whose base URL has an ECR hostname but whose traffic is resolved
+/// to `server`, to reach ECR-specific paths (mount short-circuit) locally.
 pub fn ecr_mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
     let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
     let mock_port = mock_url(server).port().unwrap();
@@ -53,25 +55,47 @@ pub fn ecr_mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryC
     )
 }
 
+/// A non-zero image concurrency for `SyncEngine::new`, so call sites keep a
+/// plain number.
+pub fn concurrency(n: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(n).expect("test concurrency is non-zero")
+}
+
+/// Retry settings with millisecond backoff and two retries.
 pub fn fast_retry() -> RetryConfig {
     RetryConfig {
         max_retries: 2,
         initial_backoff: std::time::Duration::from_millis(1),
         max_backoff: std::time::Duration::from_millis(10),
         backoff_multiplier: 2,
-        // Disable the manifest-commit blob-visibility wait in tests so
-        // the engine's behaviour matches what existed before the wait
-        // was introduced. Tests targeting the wait itself construct
-        // their own RetryConfig with a non-zero value.
+        // Zero skips the manifest-commit blob-visibility wait: mock batch
+        // checkers do not reflect the engine's uploads. Tests of the wait
+        // build their own `RetryConfig`.
         manifest_commit_wait: std::time::Duration::ZERO,
     }
 }
 
+/// A fresh in-memory transfer state cache.
 pub fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
     Rc::new(RefCell::new(TransferStateCache::new()))
 }
 
-/// Build a [`SnapshotKey`] for tests using the standard test authority.
+/// A cache holding each of `digests` as completed at `repo_name` on `target`.
+pub fn cache_with(
+    target: &str,
+    repo: &RepositoryName,
+    digests: &[&Digest],
+) -> Rc<RefCell<TransferStateCache>> {
+    let cache = empty_cache();
+    for digest in digests {
+        cache
+            .borrow_mut()
+            .set_blob_completed(target, (*digest).clone(), repo.clone());
+    }
+    cache
+}
+
+/// A [`SnapshotKey`] under the standard test authority.
 pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(
         &RegistryAuthority::new("source.test.io:443"),
@@ -80,7 +104,7 @@ pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
     )
 }
 
-/// Shorthand for a [`TargetEntry`] without a batch checker.
+/// A [`TargetEntry`] without a batch checker.
 pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
     TargetEntry {
         name: RegistryAlias::new(name),
@@ -90,7 +114,8 @@ pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>)
     }
 }
 
-/// Construct a `ResolvedMapping` for tests with sensible defaults.
+/// A `ResolvedMapping` with no platform filter or immutable glob and the
+/// default artifacts config (enabled, no type filters).
 pub fn resolved_mapping(
     source_client: Arc<ocync_distribution::RegistryClient>,
     source_repo: &str,
@@ -114,25 +139,17 @@ pub fn resolved_mapping(
     }
 }
 
-/// Build a `ResolvedMapping` directly from mock servers (inlines `mock_client` + `target_entry`).
-///
-/// Convenience for the 60% of tests that have one source, one target, same repo name.
+/// One source, one target named `target`, the same repo name on both.
 pub fn mapping_from_servers(
     source: &MockServer,
     target: &MockServer,
     repo: &str,
     tags: Vec<TagPair>,
 ) -> ResolvedMapping {
-    resolved_mapping(
-        mock_client(source),
-        repo,
-        repo,
-        vec![target_entry("target", mock_client(target))],
-        tags,
-    )
+    mapping_with_distinct_repos(source, target, repo, repo, tags)
 }
 
-/// Build a `ResolvedMapping` with distinct source/target repos.
+/// As [`mapping_from_servers`] with different source and target repos.
 pub fn mapping_with_distinct_repos(
     source: &MockServer,
     target: &MockServer,
@@ -149,14 +166,61 @@ pub fn mapping_with_distinct_repos(
     )
 }
 
-/// Serialize an `ImageManifest` to JSON bytes and compute its digest.
+/// Fan one source out to several named targets, the same repo name everywhere.
+pub fn mapping_to_targets(
+    source: &MockServer,
+    targets: &[(&str, &MockServer)],
+    repo: &str,
+    tags: Vec<TagPair>,
+) -> ResolvedMapping {
+    resolved_mapping(
+        mock_client(source),
+        repo,
+        repo,
+        targets
+            .iter()
+            .map(|(name, server)| target_entry(name, mock_client(server)))
+            .collect(),
+        tags,
+    )
+}
+
+/// Tag pairs that keep each name in `tags` unchanged.
+pub fn same_tags(tags: &[&str]) -> Vec<TagPair> {
+    tags.iter().map(|t| TagPair::same(*t)).collect()
+}
+
+/// One `v1` mapping per `(source_repo, target_repo)` pair, all sharing one
+/// source client and one target client (alias `target`).
+pub fn v1_mappings<S: AsRef<str>>(
+    source: &MockServer,
+    target: &MockServer,
+    repos: &[(S, S)],
+) -> Vec<ResolvedMapping> {
+    let source_client = mock_client(source);
+    let target_client = mock_client(target);
+    repos
+        .iter()
+        .map(|(src, tgt)| {
+            resolved_mapping(
+                Arc::clone(&source_client),
+                src.as_ref(),
+                tgt.as_ref(),
+                vec![target_entry("target", Arc::clone(&target_client))],
+                same_tags(&["v1"]),
+            )
+        })
+        .collect()
+}
+
+/// An `ImageManifest` as JSON bytes and its digest.
 pub fn serialize_manifest(manifest: &ImageManifest) -> (Vec<u8>, Digest) {
     let bytes = serde_json::to_vec(manifest).unwrap();
-    let hash = ocync_distribution::sha256::Sha256::digest(&bytes);
-    let digest = Digest::from_sha256(hash);
+    let digest = blob_digest(&bytes);
     (bytes, digest)
 }
 
+/// A descriptor with a fixed size of 100, for fake-digest tests.
 pub fn make_descriptor(digest: Digest, media_type: MediaType) -> Descriptor {
     Descriptor {
         media_type,
@@ -168,6 +232,7 @@ pub fn make_descriptor(digest: Digest, media_type: MediaType) -> Descriptor {
     }
 }
 
+/// A one-layer manifest over fake digests, for HEAD-check and discovery tests.
 pub fn simple_image_manifest(config_digest: &Digest, layer_digest: &Digest) -> ImageManifest {
     ImageManifest {
         schema_version: 2,
@@ -183,13 +248,13 @@ pub fn simple_image_manifest(config_digest: &Digest, layer_digest: &Digest) -> I
     }
 }
 
-/// Compute the real SHA-256 digest for test blob data.
+/// The real SHA-256 digest of `data`.
 pub fn blob_digest(data: &[u8]) -> Digest {
     let hash = ocync_distribution::sha256::Sha256::digest(data);
     Digest::from_sha256(hash)
 }
 
-/// Build a descriptor with the real digest and size of the given data.
+/// A descriptor with the real digest and size of `data`.
 pub fn blob_descriptor(data: &[u8], media_type: MediaType) -> Descriptor {
     Descriptor {
         media_type,
