@@ -22,7 +22,7 @@ fn digest_of(bytes: &[u8]) -> Digest {
 }
 
 /// Parse a digest a registry sent, ignoring surrounding whitespace.
-fn parse_digest(raw: &str) -> Result<Digest, String> {
+pub(crate) fn parse_digest(raw: &str) -> Result<Digest, String> {
     raw.trim()
         .parse()
         .map_err(|e: ocync_distribution::Error| e.to_string())
@@ -233,7 +233,7 @@ enum Difference {
         expected: Digest,
         actual: Digest,
     },
-    /// The registry answers 404, or 401 after a new token, as it does for a
+    /// The registry answers 404, 403, or 401 after a new token, as it does for a
     /// deleted repository.
     Gone { image: ImageRef },
 }
@@ -249,7 +249,7 @@ impl fmt::Display for Difference {
             } => write!(f, "{image}: expected {expected}, now {actual}"),
             Self::Gone { image } => write!(
                 f,
-                "{image}: no longer at the source (404, or 401 after a new token)"
+                "{image}: no longer at the source (404, 403, or 401 after a new token)"
             ),
         }
     }
@@ -276,7 +276,7 @@ impl fmt::Display for RecheckError {
 impl std::error::Error for RecheckError {}
 
 /// Judge the refs that resolved against `lock`. Equal digests mean identical
-/// manifest bytes, children included. A tag answered 404, or 401 after a new
+/// manifest bytes, children included. A tag answered 404, 403, or 401 after a new
 /// token, has moved; any other failure only leaves the check incomplete.
 fn check_unmoved(
     lock: &Lock,
@@ -300,7 +300,7 @@ fn check_unmoved(
     let (gone, unreachable): (Vec<_>, Vec<_>) = failed.iter().cloned().partition(|(_, e)| {
         matches!(
             e.status,
-            Some(StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED)
+            Some(StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         )
     });
     differences.extend(
@@ -857,7 +857,7 @@ mod tests {
 
         // Catches: a tag or repository deleted at the source (Docker Hub and
         // quay answer 401) being waved through as an outage.
-        for status in [404, 401] {
+        for status in [404, 403, 401] {
             let Err(RecheckError::Moved(text)) = check_unmoved(
                 &lock,
                 &resolved_of(&[("s/a:1", '1')]),

@@ -102,7 +102,7 @@ fn imds_or_unknown(path: &str) -> String {
 }
 
 /// Corpus size metadata.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
     /// Number of distinct images.
     pub(crate) images: usize,

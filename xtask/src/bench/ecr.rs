@@ -73,9 +73,7 @@ struct RepoListing {
 impl RepoListing {
     /// Record one `ListImages` entry.
     fn insert(&mut self, tag: Option<&str>, digest: &str) -> Result<(), String> {
-        let digest: Digest = digest
-            .parse()
-            .map_err(|e: ocync_distribution::Error| e.to_string())?;
+        let digest = crate::bench::lock::parse_digest(digest)?;
         if let Some(tag) = tag {
             self.tags.insert(tag.to_owned(), digest.clone());
         }

@@ -584,7 +584,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    report::write_report(&output_dir, &report)?;
+    report::write_report(&output_dir, &report)
+        .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
     eprintln!("bench: summary written to {}", output_dir.display());
 
     let target_registry = &corpus.settings.target_registry;
@@ -769,6 +770,10 @@ fn check_regression(
             requests: run.proxy_metrics.as_ref().map_or(0, |m| m.requests),
             total_bytes: run.proxy_metrics.as_ref().map_or(0, |m| m.response_bytes),
             corpus_locked_at: corpus_locked_at.cloned(),
+            corpus: report::CorpusInfo {
+                images: report.corpus_size,
+                tags: report.total_tags,
+            },
         };
 
         if baseline_path.exists() {

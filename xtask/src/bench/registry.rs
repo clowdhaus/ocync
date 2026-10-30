@@ -1,5 +1,8 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
 //! normalization, the manifest `Accept` list and the OCI bearer-token flow.
+//!
+//! Independent of ocync's own registry client on purpose: the harness checks
+//! the tool under test, so a bug in that client must not also be in the check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
