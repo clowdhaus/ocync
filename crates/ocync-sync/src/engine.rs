@@ -340,6 +340,16 @@ fn image_result(source: &ImageRef, target: &ImageRef, status: ImageStatus) -> Im
     }
 }
 
+/// The failed status for `err`, with the retries this task made.
+fn failed_status(kind: ErrorKind, err: &crate::Error) -> ImageStatus {
+    ImageStatus::Failed {
+        kind,
+        error: err.to_string(),
+        retries: retries_made(),
+        status_code: err.status_code().map(|s| s.as_u16()),
+    }
+}
+
 /// Build an `ImageResult` for a skipped image (zero transfer, zero duration).
 fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -> ImageResult {
     image_result(source, target, ImageStatus::Skipped { reason })
@@ -1499,30 +1509,17 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
     {
         Ok(data) => Rc::new(data),
         Err(err) => {
-            let error_str = err.to_string();
-            let status_code = err.status_code().map(|s| s.as_u16());
             warn!(
                 source_repo = %source.repo,
                 source_tag = %source.tag,
-                error = %error_str,
+                error = %err,
                 "source pull failed, skipping all targets"
             );
             let fail_results: Vec<ImageResult> = targets
                 .iter()
                 .map(|t| ImageResult {
-                    image_id: Uuid::now_v7(),
-                    source: source.to_string(),
                     target: format!("{} ({}):{}", target.repo, t.name, target.tag),
-                    status: ImageStatus::Failed {
-                        kind: ErrorKind::ManifestPull,
-                        error: error_str.clone(),
-                        retries: retries_made(),
-                        status_code,
-                    },
-                    bytes_transferred: 0,
-                    blob_stats: BlobTransferStats::default(),
-                    duration: Duration::ZERO,
-                    artifacts_skipped: false,
+                    ..image_result(source, target, failed_status(ErrorKind::ManifestPull, &err))
                 })
                 .collect();
             // The cache is not updated on pull failure.
@@ -1640,12 +1637,7 @@ async fn execute_item(
         cache
             .borrow_mut()
             .notify_repo_failed(&item.target_name, &item.target.repo);
-        let status = ImageStatus::Failed {
-            kind: ErrorKind::BlobTransfer,
-            error: err.to_string(),
-            retries: retries_made(),
-            status_code: err.status_code().map(|s| s.as_u16()),
-        };
+        let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
 
@@ -1724,17 +1716,13 @@ async fn execute_item(
                 outcome.into_result(&item.source, &item.target, status, start)
             } else {
                 warn!(target_name = %item.target_name, error = %err, "manifest push failed");
-                let status = ImageStatus::Failed {
-                    // A refused manifest's repair can fail copying a blob.
-                    kind: if err.is_blob_transfer() {
-                        ErrorKind::BlobTransfer
-                    } else {
-                        ErrorKind::ManifestPush
-                    },
-                    error: err.to_string(),
-                    retries: retries_made(),
-                    status_code: err.status_code().map(|s| s.as_u16()),
+                // A refused manifest's repair can fail copying a blob.
+                let kind = if err.is_blob_transfer() {
+                    ErrorKind::BlobTransfer
+                } else {
+                    ErrorKind::ManifestPush
                 };
+                let status = failed_status(kind, &err);
                 outcome.into_result(&item.source, &item.target, status, start)
             }
         }
