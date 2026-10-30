@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bench::Provider;
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::runner::Tool;
 
@@ -46,8 +47,10 @@ pub(crate) struct RunRecord {
 /// Machine metadata for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MachineInfo {
-    /// Cloud provider: `"aws"`, `"gcp"`, `"azure"`, or `"other"`.
-    pub(crate) provider: String,
+    /// Cloud provider, absent when the target registry is none of the three
+    /// clouds' own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<Provider>,
     /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
     pub(crate) instance_type: String,
     /// CPU architecture (e.g. `x86_64`, `aarch64`).
@@ -1181,7 +1184,7 @@ mod tests {
             timestamp: "2026-04-18-021040".into(),
             git_ref: "d121864".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
@@ -1221,7 +1224,7 @@ mod tests {
         let parsed: RunRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.timestamp, "2026-04-18-021040");
         assert_eq!(parsed.git_ref, "d121864");
-        assert_eq!(parsed.machine.provider, "aws");
+        assert_eq!(parsed.machine.provider, Some(Provider::Aws));
         assert_eq!(parsed.machine.memory_gib, 32.0);
         assert_eq!(parsed.corpus.images, 42);
         assert_eq!(parsed.scenarios[0].tools[0].metrics.requests, 4131);
@@ -1234,7 +1237,7 @@ mod tests {
             timestamp: "2026-04-18-100000".into(),
             git_ref: "abc1234".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
@@ -1270,7 +1273,7 @@ mod tests {
             timestamp: "2026-04-18-110000".into(),
             git_ref: "def5678".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c7g.xlarge".into(),
                 arch: "aarch64".into(),
                 vcpus: 4,
@@ -1301,7 +1304,7 @@ mod tests {
             timestamp: "2026-04-18-120000".into(),
             git_ref: "aaa1111".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "unknown".into(),
                 arch: "unknown".into(),
                 vcpus: 0,

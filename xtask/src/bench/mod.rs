@@ -15,7 +15,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
 use regression::Baseline;
@@ -29,8 +30,13 @@ pub(crate) struct BenchArgs {
     pub(crate) scenario: Scenario,
 
     /// Comma-separated list of tools to benchmark.
-    #[arg(long, value_delimiter = ',', default_value = "ocync")]
-    pub(crate) tools: Vec<String>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        ignore_case = true,
+        default_value = "ocync"
+    )]
+    pub(crate) tools: Vec<Tool>,
 
     /// Path to corpus YAML file.
     #[arg(long, default_value = "bench/corpus.yaml")]
@@ -99,7 +105,7 @@ pub(crate) struct BenchArgs {
 }
 
 /// Benchmark scenario to run (CLI subcommand).
-#[derive(Subcommand, Debug, Clone, Copy)]
+#[derive(Subcommand, ValueEnum, Debug, Clone, Copy)]
 pub(crate) enum Scenario {
     /// Full sync (cold) then immediate re-sync (warm).
     Sync,
@@ -209,21 +215,81 @@ fn reject_tmpfs_tmpdir() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Derives the registry key from a target registry hostname.
-///
-/// Used to choose the JSON archive filename (`ecr.json`, `gcr.json`, etc.).
-fn registry_key(target_registry: &str) -> &'static str {
-    if target_registry.contains(".ecr.") && target_registry.contains(".amazonaws.com") {
-        "ecr"
-    } else if target_registry == "gcr.io"
-        || target_registry.ends_with(".gcr.io")
-        || target_registry.ends_with("-docker.pkg.dev")
-    {
-        "gcr"
-    } else if target_registry.ends_with(".azurecr.io") {
-        "acr"
-    } else {
-        "other"
+/// The spelling clap accepts for `value`.
+pub(crate) fn value_name<T: ValueEnum>(value: &T) -> String {
+    value
+        .to_possible_value()
+        .expect("no variant is skipped")
+        .get_name()
+        .to_owned()
+}
+
+/// Cloud a benchmark instance runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Provider {
+    /// Amazon Web Services.
+    Aws,
+    /// Google Cloud.
+    Gcp,
+    /// Microsoft Azure.
+    Azure,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&value_name(self))
+    }
+}
+
+/// The registry service a run's target registry hostname belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryKind {
+    /// Amazon ECR.
+    Ecr,
+    /// Google Container Registry or Artifact Registry.
+    Gcr,
+    /// Azure Container Registry.
+    Acr,
+    /// Any other registry.
+    Other,
+}
+
+impl RegistryKind {
+    /// Classifies a target registry hostname.
+    fn of(target_registry: &str) -> Self {
+        if target_registry.contains(".ecr.") && target_registry.contains(".amazonaws.com") {
+            Self::Ecr
+        } else if target_registry == "gcr.io"
+            || target_registry.ends_with(".gcr.io")
+            || target_registry.ends_with("-docker.pkg.dev")
+        {
+            Self::Gcr
+        } else if target_registry.ends_with(".azurecr.io") {
+            Self::Acr
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Stem of the JSON archive file that holds this registry's runs.
+    fn archive_stem(self) -> &'static str {
+        match self {
+            Self::Ecr => "ecr",
+            Self::Gcr => "gcr",
+            Self::Acr => "acr",
+            Self::Other => "other",
+        }
+    }
+
+    /// The cloud that hosts this registry, if it is one of the three.
+    fn provider(self) -> Option<Provider> {
+        match self {
+            Self::Ecr => Some(Provider::Aws),
+            Self::Gcr => Some(Provider::Gcp),
+            Self::Acr => Some(Provider::Azure),
+            Self::Other => None,
+        }
     }
 }
 
@@ -249,16 +315,6 @@ fn git_ref() -> String {
         );
         "unknown".into()
     })
-}
-
-/// Derives the cloud provider name from a registry key.
-fn provider_for_registry(key: &str) -> &'static str {
-    match key {
-        "ecr" => "aws",
-        "gcr" => "gcp",
-        "acr" => "azure",
-        _ => "other",
-    }
 }
 
 /// Run the benchmark suite.
@@ -312,17 +368,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
     };
 
-    // 2. Parse tools from args.
-    let tools: Vec<Tool> = args
-        .tools
-        .iter()
-        .map(|s| Tool::parse(s))
-        .collect::<Result<Vec<_>, _>>()?;
+    let tools = args.tools.clone();
 
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
         args.scenario,
-        args.tools.join(","),
+        runner::join_tools(&tools),
         corpus.images.len(),
         corpus.total_tags(),
     );
@@ -480,13 +531,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // 8. Append compact run record to per-registry JSON archive.
     let target_registry = &corpus.settings.target_registry;
-    let reg_key = registry_key(target_registry);
+    let registry = RegistryKind::of(target_registry);
+    let reg_key = registry.archive_stem();
     let git_ref = git_ref();
     let record = report::RunRecord {
         timestamp: report.timestamp.clone(),
         git_ref,
         machine: report::MachineInfo {
-            provider: provider_for_registry(reg_key).into(),
+            provider: registry.provider(),
             instance_type: report.instance.instance_type.clone(),
             arch: report.instance.arch.clone(),
             vcpus: report.instance.vcpus,
@@ -1872,13 +1924,7 @@ fn days_to_civil(days: u64) -> (u32, u32, u32) {
 
 impl std::fmt::Display for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Scenario::Sync => f.write_str("sync"),
-            Scenario::Partial => f.write_str("partial"),
-            Scenario::Scale => f.write_str("scale"),
-            Scenario::Prepare => f.write_str("prepare"),
-            Scenario::All => f.write_str("all"),
-        }
+        f.write_str(&value_name(self))
     }
 }
 
@@ -1941,43 +1987,62 @@ mod tests {
     }
 
     #[test]
-    fn provider_for_registry_mapping() {
-        assert_eq!(provider_for_registry("ecr"), "aws");
-        assert_eq!(provider_for_registry("gcr"), "gcp");
-        assert_eq!(provider_for_registry("acr"), "azure");
-        assert_eq!(provider_for_registry("other"), "other");
-        assert_eq!(provider_for_registry("unknown"), "other");
+    fn registry_kind_names_archive_and_provider() {
+        for (host, stem, provider) in [
+            (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "111111111111.dkr.ecr.eu-west-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            ("gcr.io", "gcr", Some(Provider::Gcp)),
+            ("us-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
+            ("europe-west1-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
+            ("myregistry.azurecr.io", "acr", Some(Provider::Azure)),
+            ("ghcr.io", "other", None),
+            ("docker.io", "other", None),
+            ("quay.io", "other", None),
+        ] {
+            let kind = RegistryKind::of(host);
+            assert_eq!(kind.archive_stem(), stem, "{host}");
+            assert_eq!(kind.provider(), provider, "{host}");
+        }
     }
 
     #[test]
-    fn registry_key_ecr() {
-        assert_eq!(
-            registry_key("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
-            "ecr"
-        );
-        assert_eq!(
-            registry_key("111111111111.dkr.ecr.eu-west-1.amazonaws.com"),
-            "ecr"
-        );
-    }
+    fn bench_args_parse_closed_sets_and_refuse_anything_else() {
+        use clap::Parser;
+        use clap::error::ErrorKind;
 
-    #[test]
-    fn registry_key_gcr() {
-        assert_eq!(registry_key("gcr.io"), "gcr");
-        assert_eq!(registry_key("us-docker.pkg.dev"), "gcr");
-        assert_eq!(registry_key("europe-west1-docker.pkg.dev"), "gcr");
-    }
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: BenchArgs,
+        }
 
-    #[test]
-    fn registry_key_acr() {
-        assert_eq!(registry_key("myregistry.azurecr.io"), "acr");
-    }
+        let ok = Cli::try_parse_from(["xtask", "--tools", "Ocync,DREGSY,regsync", "prepare"])
+            .unwrap()
+            .args;
+        assert_eq!(ok.tools, [Tool::Ocync, Tool::Dregsy, Tool::Regsync]);
+        assert!(matches!(ok.scenario, Scenario::Prepare));
 
-    #[test]
-    fn registry_key_other() {
-        assert_eq!(registry_key("ghcr.io"), "other");
-        assert_eq!(registry_key("docker.io"), "other");
-        assert_eq!(registry_key("quay.io"), "other");
+        for (name, argv, kind) in [
+            (
+                "tool",
+                &["--tools", "ocync,skopeo", "sync"][..],
+                ErrorKind::InvalidValue,
+            ),
+            ("scenario", &["cold"][..], ErrorKind::InvalidSubcommand),
+        ] {
+            let err = Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied()))
+                .err()
+                .unwrap_or_else(|| panic!("{name}: accepted"));
+            assert_eq!(err.kind(), kind, "{name}");
+        }
     }
 
     #[test]

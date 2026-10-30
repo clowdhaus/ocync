@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Benchmark tool variant. Declaration order is the order of columns in the
 /// reports, so ocync leads.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 pub(crate) enum Tool {
     /// The ocync OCI sync tool.
     Ocync,
@@ -28,24 +28,21 @@ impl Tool {
             Tool::Regsync => "regsync",
         }
     }
-
-    /// Parses a tool name case-insensitively.
-    pub(crate) fn parse(s: &str) -> Result<Tool, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "ocync" => Ok(Tool::Ocync),
-            "dregsy" => Ok(Tool::Dregsy),
-            "regsync" => Ok(Tool::Regsync),
-            other => Err(format!(
-                "unknown tool: {other:?}; expected one of: ocync, dregsy, regsync"
-            )),
-        }
-    }
 }
 
 impl std::fmt::Display for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.binary())
     }
+}
+
+/// The tools as a comma-separated list, the form `--tools` takes.
+pub(crate) fn join_tools(tools: &[Tool]) -> String {
+    tools
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The result of running a benchmark tool once.
@@ -645,13 +642,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_parse_case_insensitive() {
-        assert_eq!(Tool::parse("Ocync").unwrap(), Tool::Ocync);
-        assert_eq!(Tool::parse("DREGSY").unwrap(), Tool::Dregsy);
-        assert_eq!(Tool::parse("regsync").unwrap(), Tool::Regsync);
+    fn join_tools_is_the_form_tools_flag_parses() {
         assert_eq!(
-            Tool::parse("unknown").unwrap_err(),
-            "unknown tool: \"unknown\"; expected one of: ocync, dregsy, regsync"
+            join_tools(&[Tool::Ocync, Tool::Dregsy, Tool::Regsync]),
+            "ocync,dregsy,regsync"
         );
     }
 
