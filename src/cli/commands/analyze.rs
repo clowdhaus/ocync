@@ -1,12 +1,9 @@
-//! The `analyze` subcommand - reports blob sharing and cross-repo mount potential
+//! The `analyze` subcommand: reports blob sharing and cross-repo mount potential
 //! without performing any sync.
 //!
 //! Pulls source manifests only (never blobs), walks index manifests to collect
-//! all platform-specific blob descriptors, and aggregates by digest to show:
-//! - Total unique blobs and total bytes
-//! - Shared blobs (same digest across 2+ images) and deduplicated bytes saved
-//! - Per-target-registry mount opportunities (how many pushes cross-repo mount
-//!   would replace)
+//! every platform's blob descriptors, and aggregates by digest into unique and
+//! shared blob totals plus per-target mount opportunities.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -21,9 +18,9 @@ use ocync_sync::ShutdownSignal;
 use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
-    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, UnresolvedMapping,
-    build_clients, log_unresolved_mapping, referenced_registries, resolve_mapping,
-    shared_failure_code, with_prepare_progress,
+    ClientMap, DroppedTarget, MappingResolution, MinTags, PreparePhase, PrepareTracker,
+    ResolutionAndDropped, UnresolvedMapping, build_clients, log_unresolved_mapping,
+    referenced_registries, resolve_mapping, shared_failure_code, with_prepare_progress,
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
@@ -46,18 +43,14 @@ struct BlobAggregate {
     size: u64,
     /// Image references (`source/repo:tag`) that include this blob.
     images: BTreeSet<String>,
-    /// Target registry aliases this blob would be pushed to.
-    targets: BTreeSet<String>,
-    /// Target repositories this blob would be pushed to, per target registry.
-    /// `target_alias → {target_repo}`.
+    /// Target repositories this blob would be pushed to, keyed by target registry alias.
     target_repos: BTreeMap<String, BTreeSet<RepositoryName>>,
 }
 
 /// What an analysis produced, including what it could not read.
 ///
-/// The three image counts are disjoint views of the same attempts: `analyzed`
-/// is every image that contributed blobs, `partial` is the subset of those
-/// missing at least one platform, and `failed` contributed nothing at all.
+/// `analyzed` is every image that contributed blobs, `partial` the subset of
+/// those missing at least one platform, and `failed` contributed nothing.
 #[derive(Debug, Default)]
 struct Analysis {
     blobs: HashMap<Digest, BlobAggregate>,
@@ -69,9 +62,8 @@ struct Analysis {
     failed: usize,
     /// Mappings that produced no images to read.
     ///
-    /// The same shape `sync` reports, so one consumer can read both. Each
-    /// carries its classification, so a wholly denied analysis exits 4 the way
-    /// `sync` does rather than collapsing to the generic failure.
+    /// The same shape `sync` reports. Each carries its classification, so a
+    /// wholly denied analysis exits 4 like `sync`.
     unresolved: Vec<UnresolvedMapping>,
     /// Targets excluded from the mount-savings estimate.
     dropped: Vec<DroppedTarget>,
@@ -81,13 +73,9 @@ struct Analysis {
 
 /// Mappings resolved, and images pulled, at once.
 ///
-/// Analysis is pure read traffic against the source registry: a tag listing
-/// per mapping and a manifest pull per image, all independent. Same value and
-/// same reasoning as `sync`'s
-/// [`PREPARE_MAPPING_CONCURRENCY`](super::synchronize::PREPARE_MAPPING_CONCURRENCY),
-/// kept separate because the two commands can be tuned apart: a ceiling on
-/// open work, not a request rate, with each client's AIMD window still
-/// governing how hard any one registry is hit.
+/// Same value as `sync`'s `PREPARE_MAPPING_CONCURRENCY`, kept separate so the
+/// two can be tuned apart. A ceiling on open work, not a request rate: each
+/// client's AIMD window still governs how hard a registry is hit.
 const ANALYZE_CONCURRENCY: usize = 16;
 
 /// Run the analyze command.
@@ -96,13 +84,11 @@ pub(crate) async fn run(
     shutdown: &ShutdownSignal,
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
-    // Analyze doesn't push anything, so no batch checkers needed.
+    // Nothing is pushed, so no batch checkers.
     let no_checkers: HashMap<String, Rc<dyn BatchBlobChecker>> = HashMap::new();
 
-    // Client construction mints a token per registry and every mapping lists a
-    // repository's tags, all before the first `analyzing` line. The ticker has
-    // to span the whole loop, not just the client build, or the tag-listing
-    // stretch it exists for stays silent.
+    // The ticker spans client construction and tag listing as well as the
+    // pulls: both run before the first `analyzing` line.
     let tracker = PrepareTracker::default();
     let analysis = with_prepare_progress(&tracker, "analysis", async {
         let credentials = RunCredentials::default();
@@ -145,24 +131,16 @@ pub(crate) async fn run(
 
 /// Walk every mapping and tag, recording blobs and what could not be read.
 ///
-/// Both walks overlap their network waits: mappings resolve concurrently, then
-/// every image across every mapping is pulled from one flattened list. The
-/// flattening is what makes the second walk worth anything -- a config of many
-/// mappings holding a handful of tags each would otherwise be as serial as
-/// before, because each mapping's walk is only a request or two long.
+/// Mappings resolve concurrently, then every image across every mapping is
+/// pulled from one flattened list; per-mapping walks are only a request or two
+/// long and would otherwise stay serial. Both walks are unordered so a slow
+/// mapping (a repository with tens of thousands of tags) does not hold slots
+/// that finished work behind it could use.
 ///
-/// Both walks free each slot as its own work finishes rather than when the
-/// oldest one does. An ordered queue would let a single mapping listing a
-/// repository with tens of thousands of tags hold its slot while everything
-/// that finished behind it holds theirs, which leaves the window slack and
-/// gives back most of the overlap.
-///
-/// Aggregation stays sequential: `analysis.blobs` has one owner and one
-/// consumer loop. It no longer runs in config order, which the report does not
-/// need -- every figure it prints is a count, a sum, or a sorted container, so
-/// it reads the same whichever registry answered first. Mapping bookkeeping
-/// does need config order, so those outcomes are put back in order once they
-/// are all in.
+/// Aggregation stays sequential with one owner of `analysis.blobs`. Its order
+/// does not matter (every printed figure is a count, a sum or a sorted
+/// container); mapping bookkeeping does, so those outcomes are re-sorted into
+/// config order.
 async fn collect_analysis(
     config: &Config,
     clients: &ClientMap,
@@ -172,32 +150,26 @@ async fn collect_analysis(
     concurrency: usize,
 ) -> Analysis {
     let mut analysis = Analysis::default();
-    // Begun here rather than by the caller so this function owns both of the
-    // steps it runs, the way `sync`'s `resolve_all` does.
     tracker.begin(PreparePhase::Mappings, config.mappings.len());
 
-    /// One mapping's resolution, or `None` if shutdown reached it first.
-    type MappingOutcome = Option<(Result<MappingResolution, CliError>, Vec<DroppedTarget>)>;
-
-    // --- Resolve every mapping ---
-    //
     // `None` marks a mapping shutdown reached before it started. Checked
-    // inside the task rather than once before the fan-out so a signal part way
-    // through still stops the work that has not begun, which is what the
-    // sequential loop's `break` did.
-    let mut indexed: Vec<(usize, MappingOutcome)> =
+    // inside the task so a signal part way through still stops work that has
+    // not begun.
+    let mut indexed: Vec<(usize, Option<ResolutionAndDropped>)> =
         futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
             async move {
                 if shutdown.is_triggered() {
                     return (idx, None);
                 }
-                // Held for the whole task so every exit still counts the mapping:
-                // one that skipped it would strand the progress line short of its
-                // total.
+                // Held for the whole task so every exit counts the mapping and
+                // the progress line reaches its total.
                 let _item = tracker.track(&mapping.from);
                 (
                     idx,
-                    Some(resolve_mapping(mapping, config, clients, no_checkers, false).await),
+                    Some(
+                        resolve_mapping(mapping, config, clients, no_checkers, MinTags::Enforce)
+                            .await,
+                    ),
                 )
             }
         }))
@@ -205,7 +177,7 @@ async fn collect_analysis(
         .collect()
         .await;
     indexed.sort_by_key(|(idx, _)| *idx);
-    let outcomes: Vec<MappingOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
+    let outcomes: Vec<Option<ResolutionAndDropped>> = indexed.into_iter().map(|(_, o)| o).collect();
 
     let mut resolved_mappings = Vec::new();
     for (mapping, outcome) in config.mappings.iter().zip(outcomes) {
@@ -214,9 +186,8 @@ async fn collect_analysis(
             continue;
         };
 
-        // Dropped targets arrive whatever the outcome: analyze reports what a
-        // sync would move, so a target it cannot reach changes the answer even
-        // when the mapping itself then fails.
+        // Dropped targets arrive whatever the outcome: an unreachable target
+        // changes the estimate even when the mapping then fails.
         for target in &dropped {
             tracing::warn!(
                 from = %target.from,
@@ -230,14 +201,11 @@ async fn collect_analysis(
         match outcome {
             Ok(MappingResolution::Resolved(r)) => resolved_mappings.push(r),
             Ok(MappingResolution::NoMatchingTags(_)) => {}
-            // One unresolvable mapping must not cost the analysis every
-            // mapping behind it, same as `sync`.
+            // One unresolvable mapping must not cost the mappings behind it.
+            // Its classification is kept so a wholly denied analysis exits as
+            // a denial, not a generic failure.
             Err(err) => {
                 log_unresolved_mapping(&mapping.from, &err);
-                // A mapping the analysis could not resolve is a hole in the
-                // estimate exactly like an image it could not read. Its
-                // classification is kept so a wholly denied analysis reports
-                // as a denial rather than a generic failure.
                 analysis.unresolved.push(UnresolvedMapping {
                     from: mapping.from.clone(),
                     code: err.exit_code(),
@@ -247,20 +215,18 @@ async fn collect_analysis(
         }
     }
 
-    // --- Walk every image, flattened across mappings ---
     let images: Vec<(usize, String)> = resolved_mappings
         .iter()
         .enumerate()
         .flat_map(|(idx, m)| m.tags.iter().map(move |t| (idx, t.source.clone())))
         .collect();
 
-    // Its own step, so the progress line keeps meaning something. Resolution
-    // finishes long before the walk does, and without this the ticker would
-    // report a completed mapping count for the whole of the slower half.
+    // Its own step: resolution finishes long before the walk, and the ticker
+    // would otherwise report a completed mapping count for the slower half.
     tracker.begin(PreparePhase::Images, images.len());
 
-    // The engine owns the retry policy for the transfer phase; this walk runs
-    // before the engine exists, so it carries the same defaults itself.
+    // This walk runs before the engine exists, so it carries the engine's
+    // default retry policy itself.
     let retry = RetryConfig::default();
     let retry = &retry;
 
@@ -273,8 +239,7 @@ async fn collect_analysis(
             }
             let _item = tracker.track(&image_ref);
             tracing::info!(image = %image_ref, "analyzing");
-            // One unreadable image must not end the analysis: the remaining
-            // tags and mappings are independent of it.
+            // One unreadable image must not end the analysis.
             let pulled = pull_image_descriptors(
                 &resolved.source_client,
                 &resolved.source_repo,
@@ -307,10 +272,8 @@ async fn collect_analysis(
                     );
                 }
                 analysis.analyzed += 1;
-                // A skipped index child still leaves this image's other
-                // platforms recorded, so it counts as analyzed. Conflating it
-                // with a total failure reported a mostly-complete run as zero
-                // images and exited 2.
+                // A skipped index child still leaves the image's other
+                // platforms recorded, so it counts as analyzed, not failed.
                 if matches!(completeness, Completeness::Partial) {
                     analysis.partial += 1;
                 }
@@ -333,13 +296,9 @@ async fn collect_analysis(
     analysis
 }
 
-/// Exit code for an analysis that could not read everything it was asked to.
-///
-/// An incomplete estimate must not look like a clean one: the totals are short
-/// by whatever the unread images and unreachable targets hold.
+/// An incomplete estimate must not look clean: the totals are short by
+/// whatever unread images, unreachable targets and an interrupted walk hold.
 fn analyze_exit_code(analysis: &Analysis) -> ExitCode {
-    // An interrupted walk is a truncated report, which is the same kind of
-    // incompleteness as an unreadable image and must not read as clean.
     if analysis.failed == 0
         && analysis.partial == 0
         && analysis.unresolved.is_empty()
@@ -352,12 +311,11 @@ fn analyze_exit_code(analysis: &Analysis) -> ExitCode {
         return ExitCode::PartialFailure;
     }
     // Something was read, or the only defect was an unreachable target: the
-    // report exists, it is just short. `sync` reports the same case as partial.
+    // report exists but is short, which `sync` also reports as partial.
     if analysis.analyzed > 0 || (analysis.failed == 0 && analysis.unresolved.is_empty()) {
         return ExitCode::PartialFailure;
     }
-    // Nothing readable at all. Keep the specific cause when every failure
-    // agrees on one, so a wholly denied analysis exits 4 like `sync`.
+    // Nothing readable: keep the specific cause when every failure agrees.
     let codes = analysis
         .unresolved
         .iter()
@@ -378,23 +336,16 @@ enum Completeness {
 /// Pull a manifest, recursing into index children, and return every blob
 /// descriptor it references.
 ///
-/// Recording is the caller's job. Splitting it out is what lets images be
-/// pulled concurrently: the network half borrows nothing mutable, so the
-/// aggregate map keeps a single owner and one deterministic write order.
+/// Recording is the caller's job: this half borrows nothing mutable, so images
+/// pull concurrently while the aggregate keeps a single owner.
 ///
-/// Index children stay sequential within an image. The images themselves
-/// already overlap, and the client's AIMD window saturates well below the
-/// number of images in flight, so nesting a second level of concurrency here
-/// would add no throughput.
+/// Index children stay sequential within an image: images already overlap and
+/// the AIMD window saturates well below the number in flight.
 ///
-/// Every pull is retried here. This walk is the highest-volume request path in
-/// the prepare phase, one manifest read per tag plus one per platform, all
-/// against the same source registry at `ANALYZE_CONCURRENCY`, so it is exactly
-/// the shape that provokes a throttle. The retry lives at this call site
-/// rather than inside `manifest_pull` because the engine wraps its own
-/// `manifest_pull` calls in `with_retry`; putting one further down would
-/// multiply the two. `analyze` runs before the engine exists, so it brings its
-/// own.
+/// Every pull is retried here, not inside `manifest_pull`: the engine wraps its
+/// own `manifest_pull` calls in `with_retry`, so a lower retry would multiply
+/// the two. This walk is the highest-volume request path of the prepare phase
+/// against one source registry, the shape that provokes a throttle.
 async fn pull_image_descriptors(
     source_client: &ocync_distribution::RegistryClient,
     source_repo: &RepositoryName,
@@ -411,11 +362,10 @@ async fn pull_image_descriptors(
     let mut descriptors = descriptors_of(&pulled.manifest);
     let mut completeness = Completeness::Full;
 
-    // Recurse into index children to collect per-platform manifest blobs.
     if let ManifestKind::Index(index) = &pulled.manifest {
         for child in &index.manifests {
-            // Platforms are independent: a missing arm64 manifest should not
-            // discard the amd64 blobs already recorded for this image.
+            // Platforms are independent: a missing arm64 manifest must not
+            // discard the amd64 blobs.
             let child_ref = child.digest.to_string();
             match with_retry(retry, "analyze child manifest pull", || {
                 source_client.manifest_pull(source_repo, &child_ref)
@@ -439,13 +389,12 @@ async fn pull_image_descriptors(
     Ok((descriptors, completeness))
 }
 
-/// Descriptor data extracted from a manifest.
+/// Digest and size of one blob a manifest references.
 struct BlobDescriptor {
     digest: Digest,
     size: u64,
 }
 
-/// Return the (digest, size) of every blob referenced by a manifest.
 fn descriptors_of(manifest: &ManifestKind) -> Vec<BlobDescriptor> {
     match manifest {
         ManifestKind::Image(image) => {
@@ -462,7 +411,7 @@ fn descriptors_of(manifest: &ManifestKind) -> Vec<BlobDescriptor> {
             }
             out
         }
-        // Index descriptors themselves aren't blobs we push; children handle that.
+        // Index children carry the blobs.
         ManifestKind::Index(_) => Vec::new(),
     }
 }
@@ -478,27 +427,20 @@ fn record_blob(
     let entry = blobs.entry(digest).or_insert_with(|| BlobAggregate {
         size,
         images: BTreeSet::new(),
-        targets: BTreeSet::new(),
         target_repos: BTreeMap::new(),
     });
     entry.images.insert(image_ref.to_owned());
     for target in targets {
-        let alias = target.name.to_string();
-        entry.targets.insert(alias.clone());
         entry
             .target_repos
-            .entry(alias)
+            .entry(target.name.to_string())
             .or_default()
             .insert(target_repo.clone());
     }
 }
 
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
-
-/// Compute per-target-registry mount savings: count of redundant pushes and
-/// total bytes that cross-repo mount would avoid.
+/// Per-target-registry count of redundant pushes and bytes cross-repo mount
+/// would avoid.
 fn compute_mount_savings(blobs: &HashMap<Digest, BlobAggregate>) -> BTreeMap<String, (usize, u64)> {
     let mut savings: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for blob in blobs.values() {
@@ -577,8 +519,7 @@ fn print_json(analysis: &Analysis) -> Result<(), CliError> {
         "images_partial": analysis.partial,
         "images_failed": analysis.failed,
         "unresolved_mappings": analysis.unresolved,
-        // A target the estimate could not reach changes the answer, so it is
-        // part of the document rather than a log line only.
+        // An unreachable target changes the estimate, so it is in the document.
         "dropped_targets": analysis.dropped,
         "total_blobs": blobs.len(),
         "total_bytes": blobs.values().map(|b| b.size).sum::<u64>(),
@@ -621,120 +562,66 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_analysis_is_a_clean_exit() {
-        assert_eq!(analyze_exit_code(&analysis(3, 0, 0, 0)), ExitCode::Success);
-        assert_eq!(analyze_exit_code(&analysis(0, 0, 0, 0)), ExitCode::Success);
+    fn exit_code_reflects_how_complete_the_analysis_is() {
+        let cases = [
+            ("complete", analysis(3, 0, 0, 0), ExitCode::Success),
+            ("empty and clean", analysis(0, 0, 0, 0), ExitCode::Success),
+            // A missing platform still leaves the others recorded: partial, not failed.
+            (
+                "partial image",
+                analysis(1, 1, 0, 0),
+                ExitCode::PartialFailure,
+            ),
+            ("nothing readable", analysis(0, 0, 3, 0), ExitCode::Failure),
+            (
+                "some readable",
+                analysis(2, 0, 1, 0),
+                ExitCode::PartialFailure,
+            ),
+            // A run cut short by SIGINT is a truncated report, not a clean one.
+            (
+                "interrupted",
+                Analysis {
+                    interrupted: true,
+                    ..analysis(3, 0, 0, 0)
+                },
+                ExitCode::PartialFailure,
+            ),
+            // As much a hole in the estimate as an image it could not read.
+            (
+                "unresolved mapping alone",
+                Analysis {
+                    unresolved: vec![unresolved_mapping("repo/one", ExitCode::AuthError)],
+                    ..analysis(3, 0, 0, 0)
+                },
+                ExitCode::PartialFailure,
+            ),
+            // An unreachable target changes the mount-savings answer.
+            (
+                "unreachable target alone",
+                analysis(3, 0, 0, 1),
+                ExitCode::PartialFailure,
+            ),
+        ];
+        for (name, analysis, want) in cases {
+            assert_eq!(analyze_exit_code(&analysis), want, "{name}");
+        }
     }
-
-    /// An image missing one platform still contributed the others, so the
-    /// report is partial, not empty. Counting it as a total failure reported a
-    /// mostly-complete run as zero images analyzed and exited 2.
-    #[test]
-    fn a_partial_image_is_partial_not_failed() {
-        assert_eq!(
-            analyze_exit_code(&analysis(1, 1, 0, 0)),
-            ExitCode::PartialFailure
-        );
-    }
-
-    #[test]
-    fn nothing_readable_is_a_failure() {
-        assert_eq!(analyze_exit_code(&analysis(0, 0, 3, 0)), ExitCode::Failure);
-    }
-
-    #[test]
-    fn some_readable_is_partial() {
-        assert_eq!(
-            analyze_exit_code(&analysis(2, 0, 1, 0)),
-            ExitCode::PartialFailure
-        );
-    }
-
-    /// A run cut short by SIGINT is a truncated report, not a clean one.
-    #[test]
-    fn an_interrupted_analysis_is_partial() {
-        let mut a = analysis(3, 0, 0, 0);
-        a.interrupted = true;
-        assert_eq!(analyze_exit_code(&a), ExitCode::PartialFailure);
-    }
-
-    /// A mapping the analysis could not resolve is as much a hole in the
-    /// estimate as an image it could not read.
-    #[test]
-    fn an_unresolved_mapping_alone_is_partial() {
-        let mut a = analysis(3, 0, 0, 0);
-        a.unresolved = vec![UnresolvedMapping {
-            from: "repo/one".into(),
-            error: "403 Forbidden".into(),
-            code: ExitCode::AuthError,
-        }];
-        assert_eq!(analyze_exit_code(&a), ExitCode::PartialFailure);
-    }
-
-    /// An unreachable target changes the mount-savings answer even when every
-    /// image read cleanly, so it cannot report as a clean run.
-    #[test]
-    fn an_unreachable_target_alone_is_partial() {
-        assert_eq!(
-            analyze_exit_code(&analysis(3, 0, 0, 1)),
-            ExitCode::PartialFailure
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Prepare-phase concurrency
-    // -----------------------------------------------------------------------
 
     use crate::cli::commands::test_support::{
-        Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names, test_client,
+        max_in_flight, repo_names, slow_registry, unresolved_mapping,
     };
 
-    /// A registry that answers tag listings and manifest pulls after `delay`,
-    /// recording each separately.
-    async fn slow_registry(
-        repos: &[String],
-        tags: &[&str],
-        delay: std::time::Duration,
-    ) -> (wiremock::MockServer, Config, ClientMap, Arrivals, Arrivals) {
-        let server = wiremock::MockServer::start().await;
-        let tag_arrivals = arrivals();
-        let manifest_arrivals = arrivals();
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/v2/repo/img\d+/tags/list$",
-            ))
-            .respond_with(SlowRecorder::tag_list(&tag_arrivals, delay, tags))
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/v2/repo/img\d+/manifests/.+$",
-            ))
-            .respond_with(SlowRecorder::image_manifest(&manifest_arrivals, delay))
-            .mount(&server)
-            .await;
-
-        let yaml = config_yaml(&server, repos, "      glob: [\"*\"]\n");
-        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
-        let clients = ClientMap::from([
-            ("src".to_string(), Ok(test_client(&server.uri()))),
-            ("dst".to_string(), Ok(test_client(&server.uri()))),
-        ]);
-        (server, config, clients, tag_arrivals, manifest_arrivals)
-    }
-
-    /// Analysis must resolve its mappings concurrently, like `sync` does.
+    /// Many mappings with few tags each: a per-mapping walk would stay serial.
     #[tokio::test]
-    async fn collect_analysis_resolves_mappings_concurrently() {
+    async fn collect_analysis_overlaps_tag_listings_and_manifest_pulls() {
         let delay = std::time::Duration::from_millis(250);
         let repos = repo_names(8);
-        let (_server, config, clients, tag_arrivals, _) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &ShutdownSignal::new(),
             &PrepareTracker::default(),
@@ -743,60 +630,32 @@ mod tests {
         .await;
 
         assert_eq!(analysis.analyzed, 8, "every image must be analyzed");
-        let observed = max_in_flight(&tag_arrivals, delay);
+        let observed = max_in_flight(&reg.tag_arrivals, delay);
         assert!(
             observed > 1,
             "tag listings must overlap; saw at most {observed} in flight"
         );
-    }
-
-    /// The image walk must overlap across mappings, not just within one.
-    ///
-    /// The shape that matters is many mappings holding few tags each: walking
-    /// one mapping's tags at a time leaves that config as slow as it ever was,
-    /// because each mapping's walk is one request long.
-    #[tokio::test]
-    async fn collect_analysis_pulls_images_concurrently_across_mappings() {
-        let delay = std::time::Duration::from_millis(250);
-        let repos = repo_names(8);
-        let (_server, config, clients, _, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
-
-        let analysis = collect_analysis(
-            &config,
-            &clients,
-            &HashMap::new(),
-            &ShutdownSignal::new(),
-            &PrepareTracker::default(),
-            ANALYZE_CONCURRENCY,
-        )
-        .await;
-
-        assert_eq!(analysis.analyzed, 8);
-        let observed = max_in_flight(&manifest_arrivals, delay);
+        let observed = max_in_flight(&reg.manifest_arrivals, delay);
         assert!(
             observed > 1,
             "manifest pulls must overlap across mappings; saw at most {observed} in flight"
         );
     }
 
-    /// Shutdown before the walk starts must stop it, not just flag it.
-    ///
-    /// The negative half is the registry: a check that ran after the fan-out
-    /// would still have listed every mapping's tags before noticing.
+    /// The registry arrivals are the negative half: a check after the fan-out
+    /// would still have listed every mapping's tags.
     #[tokio::test]
     async fn collect_analysis_starts_nothing_once_shutdown_is_triggered() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(8);
-        let (_server, config, clients, tag_arrivals, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         shutdown.trigger();
 
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &shutdown,
             &PrepareTracker::default(),
@@ -807,45 +666,45 @@ mod tests {
         assert!(analysis.interrupted, "the report must say it is truncated");
         assert_eq!(analysis.analyzed, 0);
         assert_eq!(
-            tag_arrivals.lock().expect("no panic in a stub").len(),
+            reg.tag_arrivals.lock().expect("no panic in a stub").len(),
             0,
             "no mapping should have been resolved"
         );
         assert_eq!(
-            manifest_arrivals.lock().expect("no panic in a stub").len(),
+            reg.manifest_arrivals
+                .lock()
+                .expect("no panic in a stub")
+                .len(),
             0,
             "and no image should have been pulled"
         );
     }
 
-    /// Shutdown part way through leaves a truncated report, not a clean one.
-    ///
-    /// More images than the concurrency bound, so the ones past the first
-    /// batch have not started when the signal lands and must not start.
+    /// More images than the concurrency bound, so those past the first batch
+    /// have not started when the signal lands and must not start.
     #[tokio::test]
     async fn collect_analysis_stops_pulling_images_after_shutdown() {
         let delay = std::time::Duration::from_millis(1);
         let images = ANALYZE_CONCURRENCY * 3;
         let repos = repo_names(images);
-        let (_server, config, clients, _, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let reg = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         let no_checkers = HashMap::new();
         let tracker = PrepareTracker::default();
         let analysis = {
-            // Triggered once resolution is done and the image walk is under
-            // way, so the walk is what gets cut short.
+            // Triggered once the image walk is under way.
             let walk = collect_analysis(
-                &config,
-                &clients,
+                &reg.config,
+                &reg.clients,
                 &no_checkers,
                 &shutdown,
                 &tracker,
                 ANALYZE_CONCURRENCY,
             );
             let trip = async {
-                while manifest_arrivals
+                while reg
+                    .manifest_arrivals
                     .lock()
                     .expect("no panic in a stub")
                     .is_empty()
@@ -866,12 +725,8 @@ mod tests {
         );
     }
 
-    /// How long an analysis takes as its two walks are widened.
-    ///
-    /// The config shape is the one that exposes the flattened image walk: many
-    /// mappings holding a single tag each, so a per-mapping walk would still
-    /// be one request long and gain nothing. Concurrency 1 is the behaviour
-    /// this replaced.
+    /// Elapsed time as the two walks are widened, over many one-tag mappings
+    /// (the shape that exposes the flattened image walk).
     #[tokio::test]
     #[ignore = "wall-clock benchmark against a latency-injected mock registry"]
     async fn analyze_benchmark_walk_concurrency() {
@@ -890,14 +745,13 @@ mod tests {
 
         let mut baseline: Option<std::time::Duration> = None;
         for concurrency in [1usize, 4, 8, 16, 32] {
-            // Fresh server and clients per row: AIMD widens as a registry keeps
-            // answering, so reuse would hand later rows a head start.
-            let (_server, config, clients, _, _) = slow_registry(&repos, &["v1"], delay).await;
+            // Fresh server and clients per row: AIMD widens with reuse.
+            let reg = slow_registry(&repos, &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let analysis = collect_analysis(
-                &config,
-                &clients,
+                &reg.config,
+                &reg.clients,
                 &HashMap::new(),
                 &ShutdownSignal::new(),
                 &PrepareTracker::default(),
@@ -920,21 +774,18 @@ mod tests {
         );
     }
 
-    /// The image walk has to drive the progress line too.
-    ///
-    /// Resolution finishes long before the walk does. Left on the mapping
-    /// step, the ticker would report `done=N total=N` for the whole of the
-    /// slower half, which reads as a finished run that never ends.
+    /// Left on the mapping step, the ticker would report `done=N total=N` for
+    /// the whole image walk.
     #[tokio::test]
     async fn collect_analysis_reports_the_image_walk_as_its_own_step() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(3);
-        let (_server, config, clients, _, _) = slow_registry(&repos, &["v1", "v2"], delay).await;
+        let reg = slow_registry(&repos, &["v1", "v2"], delay).await;
 
         let tracker = PrepareTracker::default();
         let analysis = collect_analysis(
-            &config,
-            &clients,
+            &reg.config,
+            &reg.clients,
             &HashMap::new(),
             &ShutdownSignal::new(),
             &tracker,

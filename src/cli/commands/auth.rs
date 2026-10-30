@@ -1,4 +1,4 @@
-//! The `auth check` subcommand - credential validation.
+//! The `auth check` subcommand: credential validation.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -13,17 +13,16 @@ pub(crate) async fn run_check(configs: &[PathBuf]) -> Result<ExitCode, CliError>
 }
 
 /// [`run_check`] with the status sink injected, so a test can assert which
-/// files and registries were actually reached.
+/// files and registries were reached.
 async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<ExitCode, CliError> {
     // `ping` treats 401 as reachable, so a denial almost always arrives from
-    // client construction. Keeping the classification is what lets a wholly
-    // denied check exit 4 instead of a generic partial failure.
+    // client construction; keeping its classification lets a wholly denied
+    // check exit 4.
     let mut worst = Worst::Clean;
     let credentials = RunCredentials::default();
 
     for path in configs {
-        // `-c` is repeatable and the files are independent, so one unreadable
-        // config must not skip the registries defined in the others.
+        // Files are independent: one unreadable config must not skip the others.
         let config = match load_config(path) {
             Ok(config) => config,
             Err(err) => {
@@ -42,8 +41,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
                     }
                     Err(err) => {
                         let _ = writeln!(out, "  FAIL  {name} ({safe_url}) -- {err}");
-                        // `ping` accepts 401 as reachable but returns Err on
-                        // 403, which is a denial and keeps the auth code.
+                        // `ping` accepts 401 but errs on 403, a denial.
                         worst = worst.max(if err.is_auth_error() {
                             Worst::Denied
                         } else {
@@ -66,14 +64,10 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
     Ok(worst.exit_code())
 }
 
-/// Pick the exit code for a completed check.
-///
-/// Ordered by which cause the operator has to fix first: an unreadable config
-/// outranks a denial, which outranks a generic failure.
 /// The worst thing a credential check ran into.
 ///
-/// Ordered by which cause the operator has to fix first, so folding is
-/// `max` and the precedence lives in the type rather than an if-chain.
+/// Ordered by which cause the operator must fix first (an unreadable config,
+/// then a denial, then a generic failure), so folding is `max`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Worst {
     /// Every registry answered.
@@ -102,29 +96,21 @@ impl Worst {
 mod tests {
     use super::*;
 
-    /// `-c` is repeatable and the files are independent, so a broken one must
-    /// not skip the rest, and must keep the config exit code rather than
-    /// being flattened into a credential failure.
-    ///
-    /// Both files are named in the output, which is what distinguishes
-    /// continuing from returning early: an early return would report only the
-    /// first and still produce the same exit code.
+    /// A broken config must not skip the rest, and keeps the config exit code.
+    /// Both files appearing in the output distinguishes continuing from an
+    /// early return, which would give the same exit code.
     #[tokio::test]
     async fn unreadable_config_is_reported_without_skipping_the_others() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bad = dir.path().join("bad.yaml");
         let good = dir.path().join("good.yaml");
-        // Not valid config, so `load_config` fails.
         std::fs::File::create(&bad)
             .and_then(|mut f| f.write_all(b"mappings: [[[["))
             .expect("write bad config");
-        // Valid, and names one registry that resolves offline.
         std::fs::File::create(&good)
             .and_then(|mut f| {
                 f.write_all(
-                    // A URL that fails to parse, so the check reports the
-                    // registry without issuing a request: the test must not
-                    // depend on name resolution or a network timeout.
+                    // A URL that fails to parse, so no request is issued.
                     b"registries:\n  r:\n    url: \"exa mple\"\n    auth_type: static_token\n    token: t\nmappings: []\n",
                 )
             })
@@ -145,16 +131,14 @@ mod tests {
             out.contains("bad.yaml"),
             "the broken file is reported: {out}"
         );
-        // The half an early return would fail: the file *after* the broken one
-        // was still checked.
+        // The file after the broken one was still checked.
         assert!(
             out.contains("  r "),
             "the registry from the later config was still checked: {out}"
         );
     }
 
-    /// A denied credential keeps the auth exit code rather than collapsing
-    /// into the generic partial failure.
+    /// A denial keeps the auth exit code instead of collapsing to partial failure.
     #[test]
     fn auth_failures_outrank_a_generic_partial_failure() {
         assert_eq!(Worst::Denied.exit_code(), ExitCode::AuthError);
@@ -162,8 +146,7 @@ mod tests {
         assert_eq!(Worst::Failed.exit_code(), ExitCode::PartialFailure);
         assert_eq!(Worst::Clean.exit_code(), ExitCode::Success);
 
-        // The ordering is the precedence: a broken config is the cause to fix
-        // before a denial, and a denial before a generic failure.
+        // The ordering is the precedence.
         assert!(Worst::Unreadable > Worst::Denied);
         assert!(Worst::Denied > Worst::Failed);
         assert!(Worst::Failed > Worst::Clean);

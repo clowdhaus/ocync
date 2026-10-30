@@ -1,4 +1,4 @@
-//! The `tags` subcommand - lists and filters tags from a repository.
+//! The `tags` subcommand: lists and filters tags from a repository.
 
 use ocync_sync::filter::FilterConfig;
 
@@ -6,9 +6,10 @@ use crate::TagsArgs;
 use crate::cli::config::load_config;
 use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_client};
 
+/// Print the repository's tags that pass the given filters, one per line.
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
-    // Resolve auth settings from config if provided, otherwise auto-detect.
+    // Without `--config`, auth is auto-detected.
     let registries = match &args.config {
         Some(config_path) => load_config(config_path)?.registries.into_values().collect(),
         None => Vec::new(),

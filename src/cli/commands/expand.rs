@@ -1,32 +1,37 @@
-//! The `expand` subcommand - shows resolved config with env var expansion.
+//! The `expand` subcommand: shows resolved config with env var expansion.
 
 use crate::ExpandArgs;
-use crate::cli::config::expand_config_for_display;
+use crate::cli::config::{SecretVars, expand_config_for_display};
 use crate::cli::{CliError, ExitCode};
 
+/// Print the config with `${VAR}` expressions expanded.
 pub(crate) fn run(args: &ExpandArgs) -> Result<ExitCode, CliError> {
-    let yaml = expand_config_for_display(&args.config, args.show_secrets)?;
-    print!("{yaml}");
+    print!("{}", render(args)?);
     Ok(ExitCode::Success)
+}
+
+/// The expanded config text; secret-pattern variables are rejected unless
+/// `--show-secrets` is set.
+fn render(args: &ExpandArgs) -> Result<String, CliError> {
+    let secrets = if args.show_secrets {
+        SecretVars::Allow
+    } else {
+        SecretVars::Block
+    };
+    Ok(expand_config_for_display(&args.config, secrets)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use crate::cli::config::expand_config_for_display;
-
-    fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        path
-    }
+    use super::render;
+    use crate::ExpandArgs;
+    use crate::cli::CliError;
+    use crate::cli::config::{ConfigError, SecretVars, expand_config_for_display};
+    use crate::cli::test_support::{lock_env, write_temp_config};
 
     #[test]
     fn expand_resolves_env_vars() {
-        let path = write_temp_config(
-            "expand_env",
+        let file = write_temp_config(
             r#"
 registries:
   ecr:
@@ -37,66 +42,51 @@ mappings:
       glob: "*"
 "#,
         );
-        // SAFETY: test is single-threaded and restores the original value.
+        let _env = lock_env();
+        // SAFETY: `lock_env` serializes the tests that set or remove variables.
         unsafe {
             std::env::set_var(
                 "OCYNC_TEST_ECR_URL",
                 "123456.dkr.ecr.us-east-1.amazonaws.com",
             )
         };
-        let expanded = expand_config_for_display(&path, true).unwrap();
+        let expanded = expand_config_for_display(file.path(), SecretVars::Allow).unwrap();
         assert!(expanded.contains("123456.dkr.ecr.us-east-1.amazonaws.com"));
         assert!(!expanded.contains("OCYNC_TEST_ECR_URL"));
         unsafe { std::env::remove_var("OCYNC_TEST_ECR_URL") };
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn expand_blocks_secret_vars_without_show_secrets() {
-        let path = write_temp_config(
-            "expand_blocked",
-            r#"
-registries:
-  hub:
-    url: "${OCYNC_EXPAND_SECRET_BLOCKED}"
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#,
-        );
-        unsafe { std::env::set_var("OCYNC_EXPAND_SECRET_BLOCKED", "s3cret") };
-        let result = expand_config_for_display(&path, false);
-        assert!(result.is_err());
-        unsafe { std::env::remove_var("OCYNC_EXPAND_SECRET_BLOCKED") };
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn expand_allows_secret_vars_with_show_secrets() {
-        let path = write_temp_config(
-            "expand_allowed",
-            r#"
-registries:
-  hub:
-    url: "${OCYNC_EXPAND_SECRET_ALLOWED}"
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#,
-        );
-        unsafe { std::env::set_var("OCYNC_EXPAND_SECRET_ALLOWED", "s3cret") };
-        let expanded = expand_config_for_display(&path, true).unwrap();
-        assert!(expanded.contains("s3cret"));
-        unsafe { std::env::remove_var("OCYNC_EXPAND_SECRET_ALLOWED") };
-        let _ = std::fs::remove_file(path);
+    fn show_secrets_flag_controls_secret_variables() {
+        let file = write_temp_config("token: \"${OCYNC_EXPAND_FLAG_SECRET}\"\n");
+        let _env = lock_env();
+        // SAFETY: `lock_env` serializes the tests that set or remove variables.
+        unsafe { std::env::set_var("OCYNC_EXPAND_FLAG_SECRET", "s3cret") };
+        // `Err` carries the blocked variable's name.
+        let cases = [
+            ("flag off blocks", false, Err("OCYNC_EXPAND_FLAG_SECRET")),
+            ("flag on shows", true, Ok("token: \"s3cret\"\n")),
+        ];
+        for (name, show_secrets, want) in cases {
+            let got = render(&ExpandArgs {
+                config: file.path().to_path_buf(),
+                show_secrets,
+            });
+            match (got, want) {
+                (Ok(text), Ok(want)) => assert_eq!(text, want, "{name}"),
+                (Err(CliError::Config(ConfigError::BlockedEnvVar(var))), Err(want)) => {
+                    assert_eq!(var, want, "{name}");
+                }
+                (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
+            }
+        }
+        unsafe { std::env::remove_var("OCYNC_EXPAND_FLAG_SECRET") };
     }
 
     #[test]
     fn expand_nonexistent_file() {
-        let result =
-            expand_config_for_display(std::path::Path::new("/tmp/ocync_test_missing.yaml"), false);
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let result = expand_config_for_display(&dir.path().join("missing.yaml"), SecretVars::Block);
         assert!(result.is_err());
     }
 }

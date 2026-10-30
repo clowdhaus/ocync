@@ -9,6 +9,8 @@ pub(crate) mod shutdown;
 
 #[cfg(test)]
 mod auth_dispatch_tests;
+#[cfg(test)]
+mod test_support;
 
 use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::acr::AcrAuth;
@@ -32,17 +34,12 @@ use url::Url;
 use crate::cli::config::{AuthType, RegistryConfig};
 use crate::{Cli, LogFormat};
 
-/// Process-global once-fire for the `auth_type: ghcr` deprecation warning.
-///
-/// `Ghcr` is a deprecated alias of `DockerConfig`. We emit a single
-/// `tracing::warn!` per process the first time it's resolved -- not per
-/// `build_registry_client` call, which would spam logs for `watch` mode or
-/// any caller that builds clients repeatedly.
+/// Gates the `auth_type: ghcr` deprecation warning to once per process, not
+/// once per `build_registry_client` call, which would spam `watch` logs.
 static GHCR_DEPRECATION_ONCE: Once = Once::new();
 
-/// Test-only counter incremented inside the `Once` body. Lets the dispatch
-/// test suite assert the warn fires at most once across many calls without
-/// installing a tracing subscriber harness.
+/// Counts `Once` body runs so tests can assert the warn fires at most once
+/// without a tracing subscriber harness.
 #[cfg(test)]
 pub(super) static GHCR_DEPRECATION_FIRES: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,20 +55,11 @@ fn warn_ghcr_deprecation_once(host: &str) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Exit codes (grep/POSIX convention)
-// ---------------------------------------------------------------------------
-
-/// Process exit codes following the grep/POSIX convention.
+/// Process exit codes following the grep/POSIX convention: 0 success, 1 partial
+/// failure, 2 failure, 3 config error, 4 auth error.
 ///
-/// - `Success` (0): all images synced or skipped
-/// - `PartialFailure` (1): some images failed, some succeeded
-/// - `Failure` (2): all images failed, or unclassified error
-/// - `ConfigError` (3): invalid configuration file
-/// - `AuthError` (4): authentication or authorization failure
-///
-/// Codes 3-4 are more specific than 2 (not more severe). Callers
-/// can branch: `>= 3` means the fix is in config/credentials.
+/// Codes 3-4 are more specific than 2, not more severe: `>= 3` means the fix
+/// is in config or credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitCode {
     /// All images synced or skipped successfully.
@@ -108,10 +96,6 @@ impl From<ExitCode> for std::process::ExitCode {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// CLI error type
-// ---------------------------------------------------------------------------
 
 /// Errors that can occur during CLI command execution.
 #[derive(Debug, thiserror::Error)]
@@ -154,31 +138,32 @@ impl CliError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared auth provider builder
-// ---------------------------------------------------------------------------
-
-/// Strip scheme and trailing slashes from a registry URL to get a bare hostname.
-///
-/// Used to normalize URLs for comparison across config values and parsed references.
+/// Strip scheme and trailing slashes from a registry URL to get a bare hostname,
+/// for comparing config values with parsed references.
 pub(crate) fn bare_hostname(s: &str) -> &str {
     s.trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/')
 }
 
-/// Map a registry hostname to the host used for the v2 API endpoint.
+/// Whether `hostname` is an ECR registry whose uploads need a batch checker.
+/// An explicit non-ECR `auth_type` is a hard opt-out even when the hostname
+/// matches; hostname detection applies only without one.
+pub(crate) fn is_ecr_registry(auth_type: Option<&AuthType>, hostname: &str) -> bool {
+    match auth_type {
+        Some(AuthType::Ecr) => true,
+        Some(_) => false,
+        None => detect_provider_kind(hostname) == Some(ProviderKind::Ecr),
+    }
+}
+
+/// Map a registry hostname to the host serving its v2 API.
 ///
-/// Docker Hub is a special case: its canonical identifier `docker.io` is what
-/// appears in image references and in auth token scopes, but the v2 API is
-/// served from `registry-1.docker.io`. The bare `docker.io` hostname 302s to
-/// `www.docker.com` (Docker's marketing site), so any HTTP request there
-/// fails. Every other container tool (docker, skopeo, crane, regclient)
-/// performs this same rewrite.
-///
-/// Only the HTTP endpoint is rewritten - auth scope, token service, and the
-/// canonical registry identifier used by [`bare_hostname`] stay as
-/// `docker.io`, which is what Docker Hub's token server expects.
+/// Docker Hub's canonical `docker.io` appears in references and token scopes,
+/// but the v2 API is at `registry-1.docker.io`; bare `docker.io` redirects to
+/// the marketing site. Only the HTTP endpoint is rewritten: auth scope, token
+/// service and [`bare_hostname`] stay `docker.io`, which its token server
+/// expects.
 pub(crate) fn endpoint_host(hostname: &str) -> &str {
     match hostname {
         "docker.io" => "registry-1.docker.io",
@@ -223,7 +208,9 @@ impl<'a> Registry<'a> {
 /// the next run, such as the next watch cycle, loads them afresh.
 #[derive(Debug, Default)]
 pub(crate) struct RunCredentials {
+    /// AWS credential providers keyed by profile and region.
     pub(crate) aws: AwsCredentialProviders,
+    /// The shared Google token.
     pub(crate) gcp: SharedGoogleToken,
 }
 
@@ -235,10 +222,8 @@ pub(crate) async fn build_registry_client(
     credentials: &RunCredentials,
 ) -> Result<RegistryClient, CliError> {
     let aws_credentials = &credentials.aws;
-    // Idempotent: required before any reqwest::Client::new() call below
-    // because reqwest is built with rustls-no-provider. The production
-    // entry point installs this at `main` startup; this call covers
-    // test entry points and any future caller that bypasses main.
+    // Idempotent. reqwest is built with rustls-no-provider, so a provider must
+    // exist before `reqwest::Client::new()`; this covers callers bypassing `main`.
     ocync_distribution::install_crypto_provider();
     let registry_config = registry.config();
     let (bare_host, address) = match registry {
@@ -255,8 +240,7 @@ pub(crate) async fn build_registry_client(
     let mut url = Url::parse(&address)
         .map_err(|e| CliError::Input(format!("invalid registry URL '{address}': {e}")))?;
     // Requests go to the endpoint host while `bare_host` stays the auth scope
-    // and service. Docker Hub requires this split: requests go to
-    // registry-1.docker.io, but the token scope/service stays docker.io.
+    // and service (the Docker Hub split).
     let endpoint = endpoint_host(bare_host);
     if endpoint != bare_host {
         url.set_host(Some(endpoint))
@@ -309,8 +293,7 @@ pub(crate) async fn build_registry_client(
                 warn_ghcr_deprecation_once(bare_host);
             }
             // A missing config file is a setup problem, not a rejected
-            // credential: `Input`, not `Auth`. The credential *exchange*
-            // below is the auth-classified step.
+            // credential: `Input`, not `Auth`.
             let docker_config = DockerConfig::load_default().map_err(|e| {
                 CliError::Input(format!(
                     "failed to load docker config for '{bare_host}': {e}"
@@ -325,8 +308,6 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         None => {
-            // Auto-detect auth provider from hostname. Detect once and match
-            // the result to avoid redundant regex evaluation.
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
                     let auth = EcrAuth::new(bare_host, None, aws_credentials)?;
@@ -346,7 +327,7 @@ pub(crate) async fn build_registry_client(
                 }
                 Some(ProviderKind::Ghcr | ProviderKind::DockerHub | ProviderKind::Chainguard)
                 | None => {
-                    // Try docker config - falls back to anonymous exchange if no creds found.
+                    // Docker config falls back to an anonymous exchange without creds.
                     match DockerConfig::load_default() {
                         Ok(config) => {
                             let auth =
@@ -355,7 +336,6 @@ pub(crate) async fn build_registry_client(
                             RegistryClient::builder(url).auth(auth)
                         }
                         Err(_) => {
-                            // No docker config file - use anonymous.
                             tracing::debug!(
                                 registry = bare_host,
                                 "no docker config found, using anonymous auth"
@@ -378,10 +358,6 @@ pub(crate) async fn build_registry_client(
         .map_err(|e| CliError::Input(format!("failed to build client for '{bare_host}': {e}")))
 }
 
-// ---------------------------------------------------------------------------
-// Logging setup
-// ---------------------------------------------------------------------------
-
 /// Initialize the tracing subscriber based on CLI flags.
 ///
 /// Priority: `RUST_LOG` env var > `--log-format` > text default. Sensitive
@@ -394,8 +370,8 @@ pub(crate) fn setup_logging(cli: &Cli) {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
 
-    // Cap HTTP transport crates to prevent credential leakage at trace level.
-    // These are appended unconditionally so they apply even when RUST_LOG is set.
+    // Cap HTTP transport crates so trace level cannot leak credentials from
+    // headers, even when RUST_LOG is set.
     let env_filter = env_filter
         .add_directive("hyper=warn".parse().unwrap())
         .add_directive("h2=warn".parse().unwrap())
@@ -403,9 +379,8 @@ pub(crate) fn setup_logging(cli: &Cli) {
         .add_directive("rustls=warn".parse().unwrap())
         .add_directive("tower=warn".parse().unwrap());
 
-    // stderr, not the default stdout: `--json` writes its document to stdout,
-    // and the periodic progress lines would otherwise be interleaved into it
-    // for the whole duration of exactly the long runs `--json` exists for.
+    // stderr, not stdout: `--json` writes its document to stdout, and log lines
+    // would interleave into it.
     match format {
         LogFormat::Json => {
             fmt()
@@ -425,7 +400,6 @@ pub(crate) fn setup_logging(cli: &Cli) {
     }
 }
 
-/// Map CLI verbosity flags to a tracing filter directive.
 fn verbosity_filter(quiet: bool, verbose: u8) -> &'static str {
     if quiet {
         "error"
@@ -443,189 +417,150 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verbosity_quiet_is_error() {
-        assert_eq!(verbosity_filter(true, 0), "error");
-        assert_eq!(verbosity_filter(true, 3), "error");
-    }
-
-    #[test]
-    fn verbosity_default_is_info() {
-        assert_eq!(verbosity_filter(false, 0), "info");
-    }
-
-    #[test]
-    fn verbosity_one_is_debug() {
-        assert_eq!(verbosity_filter(false, 1), "debug");
-    }
-
-    #[test]
-    fn verbosity_two_plus_is_trace() {
-        assert_eq!(verbosity_filter(false, 2), "trace");
-        assert_eq!(verbosity_filter(false, 3), "trace");
-    }
-
-    #[test]
-    fn exit_code_all_variants_distinct() {
-        assert_ne!(ExitCode::Success, ExitCode::PartialFailure);
-        assert_ne!(ExitCode::PartialFailure, ExitCode::Failure);
-        assert_ne!(ExitCode::Failure, ExitCode::ConfigError);
-        assert_ne!(ExitCode::ConfigError, ExitCode::AuthError);
-    }
-
-    #[test]
-    fn cli_error_exit_code_config() {
-        let err = CliError::Config(config::ConfigError::Parse("bad".into()));
-        assert_eq!(err.exit_code(), ExitCode::ConfigError);
-    }
-
-    #[test]
-    fn cli_error_exit_code_auth_failed() {
-        let err = CliError::Registry(ocync_distribution::Error::AuthFailed {
-            registry: "example.com".into(),
-            reason: "denied".into(),
-        });
-        assert_eq!(err.exit_code(), ExitCode::AuthError);
-    }
-
-    #[test]
-    fn cli_error_exit_code_registry_401() {
-        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
-            status: http::StatusCode::UNAUTHORIZED,
-            message: "no".into(),
-        });
-        assert_eq!(err.exit_code(), ExitCode::AuthError);
-    }
-
-    #[test]
-    fn cli_error_exit_code_registry_403() {
-        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
-            status: http::StatusCode::FORBIDDEN,
-            message: "denied".into(),
-        });
-        assert_eq!(err.exit_code(), ExitCode::AuthError);
-    }
-
-    #[test]
-    fn cli_error_exit_code_registry_500() {
-        let err = CliError::Registry(ocync_distribution::Error::RegistryError {
-            status: http::StatusCode::INTERNAL_SERVER_ERROR,
-            message: "broke".into(),
-        });
-        assert_eq!(err.exit_code(), ExitCode::Failure);
-    }
-
-    #[test]
-    fn cli_error_exit_code_input() {
-        let err = CliError::Input("bad url".into());
-        assert_eq!(err.exit_code(), ExitCode::Failure);
-    }
-
-    #[test]
-    fn cli_error_exit_code_auth() {
-        // A mapping denied credentials carries its own exit code, so a run
-        // denied everywhere is distinguishable from a generic failure.
-        let err = CliError::Auth("authentication failed for registry 'x': 403 Forbidden".into());
-        assert_eq!(err.exit_code(), ExitCode::AuthError);
-        // The negative half: a plain input error must not claim it.
-        assert_eq!(
-            CliError::Input("bad url".into()).exit_code(),
-            ExitCode::Failure
-        );
-    }
-
-    #[test]
-    fn cli_error_exit_code_filter() {
-        let err = CliError::Filter(ocync_sync::Error::LatestWithoutSort);
-        assert_eq!(err.exit_code(), ExitCode::ConfigError);
-    }
-
-    #[test]
-    fn bare_hostname_strips_https() {
-        assert_eq!(
-            bare_hostname("https://registry.example.com"),
-            "registry.example.com"
-        );
-    }
-
-    #[test]
-    fn bare_hostname_strips_http() {
-        assert_eq!(bare_hostname("http://localhost:5000"), "localhost:5000");
-    }
-
-    #[test]
-    fn bare_hostname_strips_trailing_slash() {
-        assert_eq!(
-            bare_hostname("https://registry.example.com/"),
-            "registry.example.com"
-        );
-    }
-
-    #[test]
-    fn bare_hostname_noop_for_bare_host() {
-        assert_eq!(
-            bare_hostname("registry.example.com"),
-            "registry.example.com"
-        );
-    }
-
-    #[test]
-    fn bare_hostname_preserves_port() {
-        assert_eq!(bare_hostname("localhost:5000"), "localhost:5000");
-    }
-
-    #[test]
-    fn endpoint_host_rewrites_docker_io() {
-        // Docker Hub's v2 API lives at registry-1.docker.io; the bare
-        // `docker.io` hostname redirects to the marketing site.
-        assert_eq!(endpoint_host("docker.io"), "registry-1.docker.io");
-    }
-
-    #[test]
-    fn endpoint_host_passes_through_other_registries() {
-        assert_eq!(endpoint_host("cgr.dev"), "cgr.dev");
-        assert_eq!(endpoint_host("ghcr.io"), "ghcr.io");
-        assert_eq!(endpoint_host("public.ecr.aws"), "public.ecr.aws");
-        assert_eq!(
-            endpoint_host("registry-1.docker.io"),
-            "registry-1.docker.io"
-        );
-    }
-
-    #[test]
-    fn endpoint_host_does_not_rewrite_non_canonical_docker_variants() {
-        // `docker.io:5000` is a different server entirely - only the exact
-        // canonical hostname is rewritten.
-        assert_eq!(endpoint_host("docker.io:5000"), "docker.io:5000");
-        assert_eq!(endpoint_host("sub.docker.io"), "sub.docker.io");
-    }
-
-    #[test]
-    fn all_auth_types_are_handled() {
-        // Exhaustive match ensures no AuthType variant is unhandled.
-        // If a new variant is added, this fails to compile.
-        let variants = [
-            AuthType::Ecr,
-            AuthType::Gar,
-            AuthType::Gcr,
-            AuthType::Acr,
-            AuthType::Ghcr,
-            AuthType::Anonymous,
-            AuthType::Basic,
-            AuthType::StaticToken,
-            AuthType::DockerConfig,
+    fn verbosity_filter_maps_flags_to_directives() {
+        let cases = [
+            ("quiet", true, 0, "error"),
+            ("quiet beats verbose", true, 3, "error"),
+            ("default", false, 0, "info"),
+            ("-v", false, 1, "debug"),
+            ("-vv", false, 2, "trace"),
+            ("-vvv", false, 3, "trace"),
         ];
-        for variant in &variants {
-            match variant {
-                AuthType::Ecr => {}
-                AuthType::Gar => {}
-                AuthType::Gcr => {}
-                AuthType::Acr => {}
-                AuthType::Ghcr => {}
-                AuthType::Anonymous => {}
-                AuthType::Basic => {}
-                AuthType::StaticToken => {}
-                AuthType::DockerConfig => {}
-            }
+        for (name, quiet, verbose, want) in cases {
+            assert_eq!(verbosity_filter(quiet, verbose), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn cli_error_exit_codes() {
+        use ocync_distribution::Error as DistError;
+        let registry_error = |status, message: &str| {
+            CliError::Registry(DistError::RegistryError {
+                status,
+                message: message.into(),
+            })
+        };
+        let cases = [
+            (
+                "config",
+                CliError::Config(config::ConfigError::Parse("bad".into())),
+                ExitCode::ConfigError,
+            ),
+            (
+                "auth failed",
+                CliError::Registry(DistError::AuthFailed {
+                    registry: "example.com".into(),
+                    reason: "denied".into(),
+                }),
+                ExitCode::AuthError,
+            ),
+            (
+                "registry 401",
+                registry_error(http::StatusCode::UNAUTHORIZED, "no"),
+                ExitCode::AuthError,
+            ),
+            (
+                "registry 403",
+                registry_error(http::StatusCode::FORBIDDEN, "denied"),
+                ExitCode::AuthError,
+            ),
+            (
+                "registry 500",
+                registry_error(http::StatusCode::INTERNAL_SERVER_ERROR, "broke"),
+                ExitCode::Failure,
+            ),
+            // The negative half of `auth`: a plain input error must not claim the auth code.
+            (
+                "input",
+                CliError::Input("bad url".into()),
+                ExitCode::Failure,
+            ),
+            // A mapping denied credentials carries its own code, so a run denied
+            // everywhere is distinguishable from a generic failure.
+            (
+                "auth",
+                CliError::Auth("authentication failed for registry 'x': 403 Forbidden".into()),
+                ExitCode::AuthError,
+            ),
+            (
+                "filter",
+                CliError::Filter(ocync_sync::Error::LatestWithoutSort),
+                ExitCode::ConfigError,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(err.exit_code(), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn bare_hostname_strips_scheme_and_trailing_slash() {
+        let cases = [
+            (
+                "https",
+                "https://registry.example.com",
+                "registry.example.com",
+            ),
+            ("http with port", "http://localhost:5000", "localhost:5000"),
+            (
+                "trailing slash",
+                "https://registry.example.com/",
+                "registry.example.com",
+            ),
+            (
+                "already bare",
+                "registry.example.com",
+                "registry.example.com",
+            ),
+            ("bare with port", "localhost:5000", "localhost:5000"),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(bare_hostname(input), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn is_ecr_registry_prefers_an_explicit_auth_type() {
+        const ECR_HOST: &str = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        let cases = [
+            (
+                "explicit ecr on another host",
+                Some(AuthType::Ecr),
+                "ghcr.io",
+                true,
+            ),
+            (
+                "explicit static token opts out of an ECR host",
+                Some(AuthType::StaticToken),
+                ECR_HOST,
+                false,
+            ),
+            ("no auth type on an ECR host", None, ECR_HOST, true),
+            ("no auth type on another host", None, "ghcr.io", false),
+        ];
+        for (name, auth_type, host, want) in cases {
+            assert_eq!(is_ecr_registry(auth_type.as_ref(), host), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn endpoint_host_rewrites_only_canonical_docker_io() {
+        let cases = [
+            ("docker hub", "docker.io", "registry-1.docker.io"),
+            ("cgr.dev", "cgr.dev", "cgr.dev"),
+            ("ghcr.io", "ghcr.io", "ghcr.io"),
+            ("public ecr", "public.ecr.aws", "public.ecr.aws"),
+            (
+                "already rewritten",
+                "registry-1.docker.io",
+                "registry-1.docker.io",
+            ),
+            // Different servers entirely; only the exact canonical name is rewritten.
+            ("docker.io with port", "docker.io:5000", "docker.io:5000"),
+            ("docker.io subdomain", "sub.docker.io", "sub.docker.io"),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(endpoint_host(input), want, "{name}");
         }
     }
 }

@@ -1,9 +1,10 @@
-//! The `validate` subcommand - offline config validation.
+//! The `validate` subcommand: offline config validation.
 
 use crate::ValidateArgs;
 use crate::cli::config::load_config;
 use crate::cli::{CliError, ExitCode};
 
+/// Load and validate the config without contacting any registry.
 pub(crate) fn run(args: &ValidateArgs) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
     let n_mappings = config.mappings.len();
@@ -17,21 +18,12 @@ pub(crate) fn run(args: &ValidateArgs) -> Result<ExitCode, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
-
-    fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        path
-    }
+    use crate::cli::test_support::write_temp_config;
 
     #[test]
     fn validate_valid_config() {
-        let path = write_temp_config(
-            "validate_valid",
+        let file = write_temp_config(
             r#"
 registries:
   hub:
@@ -44,70 +36,40 @@ mappings:
 "#,
         );
         let args = ValidateArgs {
-            config: path.clone(),
+            config: file.path().to_path_buf(),
         };
         let result = run(&args).unwrap();
         assert_eq!(result, ExitCode::Success);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn validate_invalid_yaml() {
-        let path = write_temp_config("validate_bad_yaml", "{{{{ not yaml");
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_missing_tags_block() {
-        let path = write_temp_config(
-            "validate_no_tags",
-            r#"
-mappings:
-  - from: library/nginx
-"#,
-        );
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_unknown_source_registry() {
-        let path = write_temp_config(
-            "validate_bad_ref",
-            r#"
-registries:
-  hub:
-    url: registry-1.docker.io
-mappings:
-  - from: nginx
-    source: nonexistent
-    tags:
-      glob: "*"
-"#,
-        );
-        let args = ValidateArgs {
-            config: path.clone(),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn validate_nonexistent_file() {
-        let args = ValidateArgs {
-            config: std::path::PathBuf::from("/tmp/ocync_test_does_not_exist.yaml"),
-        };
-        let result = run(&args);
-        assert!(result.is_err());
+    fn validate_rejects_bad_configs() {
+        // (name, config text or `None` for a missing file, error substring)
+        let cases = [
+            ("invalid yaml", Some("{{{{ not yaml"), "failed to parse"),
+            (
+                "missing tags block",
+                Some("\nmappings:\n  - from: library/nginx\n"),
+                "missing a tags block",
+            ),
+            (
+                "unknown source registry",
+                Some(
+                    "\nregistries:\n  hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    source: nonexistent\n    tags:\n      glob: \"*\"\n",
+                ),
+                "unknown registry 'nonexistent'",
+            ),
+            ("nonexistent file", None, "failed to read"),
+        ];
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        for (name, content, want) in cases {
+            let file = content.map(write_temp_config);
+            let config = match &file {
+                Some(file) => file.path().to_path_buf(),
+                None => dir.path().join("missing.yaml"),
+            };
+            let err = run(&ValidateArgs { config }).unwrap_err().to_string();
+            assert!(err.contains(want), "{name}: expected '{want}' in: {err}");
+        }
     }
 }
