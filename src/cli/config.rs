@@ -2031,19 +2031,44 @@ mappings:
     }
 
     #[test]
-    fn expanded_value_survives_quoted_yaml() {
-        // Quoted fields keep ":" and "#" inside the value rather than
-        // breaking the YAML structure or starting a comment.
+    fn expansion_substitutes_values_verbatim() {
+        // Expansion is plain text substitution: a quoted field keeps ":" and
+        // "#" inside the value, and an unquoted one is left for the user to
+        // quote rather than escaped.
         let cases = [
-            ("colon", "OCYNC_TEST_COLON", "host:8080", "url"),
-            ("hash", "OCYNC_TEST_HASH", "value#with#hashes", "key"),
+            (
+                "quoted colon",
+                "OCYNC_TEST_COLON",
+                "host:8080",
+                "url: \"${OCYNC_TEST_COLON}\"",
+                "url: \"host:8080\"",
+                Some(("url", "host:8080")),
+            ),
+            (
+                "quoted hash",
+                "OCYNC_TEST_HASH",
+                "value#with#hashes",
+                "key: \"${OCYNC_TEST_HASH}\"",
+                "key: \"value#with#hashes\"",
+                Some(("key", "value#with#hashes")),
+            ),
+            (
+                "unquoted colon",
+                "OCYNC_TEST_BARE_COLON",
+                "host:8080",
+                "url: ${OCYNC_TEST_BARE_COLON}",
+                "url: host:8080",
+                None,
+            ),
         ];
-        for (name, var, value, key) in cases {
+        for (name, var, value, yaml, want, parsed) in cases {
             unsafe { std::env::set_var(var, value) };
-            let yaml = format!("{key}: \"${{{var}}}\"");
-            let expanded = expand_env_vars(&yaml, SecretVars::Allow).unwrap();
-            let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
-            assert_eq!(map[key], value, "{name}");
+            let expanded = expand_env_vars(yaml, SecretVars::Allow).unwrap();
+            assert_eq!(expanded, want, "{name}");
+            if let Some((key, want_value)) = parsed {
+                let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
+                assert_eq!(map[key], want_value, "{name}");
+            }
             unsafe { std::env::remove_var(var) };
         }
     }
