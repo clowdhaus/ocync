@@ -626,6 +626,14 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 6,
             ..single
         },
+        Case {
+            name: "two tags, failing checker: one HEAD per blob, not per tag",
+            check: Check::Fails,
+            tags: &["v1", "v2"],
+            batch_calls: 2,
+            skipped: 6,
+            ..single
+        },
     ];
     for case in cases {
         let name = case.name;
@@ -735,26 +743,20 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             "{name}: transferred"
         );
         assert_eq!(report.stats.bytes_transferred, case.bytes, "{name}: bytes");
-        // The per-digest mocks miss a blob request on any other path.
+        // The per-digest mocks miss a blob request of another method or on
+        // another path; uploads are counted by their own mocks.
+        let blob_requests = async |server| {
+            count_requests(server, None, PathMatch::Contains("/blobs/sha256:")).await as u64
+        };
         assert_eq!(
-            count_requests(
-                &source_server,
-                Some(&Method::GET),
-                PathMatch::Contains("/blobs/")
-            )
-            .await,
-            all_pulls as usize,
-            "{name}: every source blob GET"
+            blob_requests(&source_server).await,
+            all_pulls,
+            "{name}: every source blob request is an expected GET"
         );
         assert_eq!(
-            count_requests(
-                &target_server,
-                Some(&Method::HEAD),
-                PathMatch::Contains("/blobs/")
-            )
-            .await,
-            all_heads as usize,
-            "{name}: every target blob HEAD"
+            blob_requests(&target_server).await,
+            all_heads,
+            "{name}: every target blob request is an expected HEAD"
         );
     }
 }
