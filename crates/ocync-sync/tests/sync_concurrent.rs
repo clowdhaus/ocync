@@ -939,13 +939,12 @@ async fn sync_source_pull_dedup_with_staging() {
 
     // Without dedup the shared blob would be pulled twice, once per image.
     let shared_blob_suffix = format!("/blobs/{}", parts_a.layer_descs[0].digest);
-    let source_gets_for_shared = source_server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| r.method.as_str() == "GET" && r.url.path().ends_with(&shared_blob_suffix))
-        .count();
+    let source_gets_for_shared = count_requests(
+        &source_server,
+        Some(&Method::GET),
+        PathMatch::Contains(&shared_blob_suffix),
+    )
+    .await;
     assert_eq!(
         source_gets_for_shared, 1,
         "shared blob should be pulled from source exactly once (dedup), got {source_gets_for_shared}"
@@ -1320,7 +1319,11 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
         .await;
 
     let target_name = "target";
-    let cache = cache_with(target_name, "tgt-a", &[&parts_a.layer_descs[0].digest]);
+    let cache = cache_with(
+        target_name,
+        &repo("tgt-a"),
+        &[&parts_a.layer_descs[0].digest],
+    );
     cache
         .borrow_mut()
         .mark_repo_committed(target_name, &repo("tgt-a"));
@@ -1742,7 +1745,7 @@ async fn prior_run_cycle_breaks_via_deadline() {
     }
 
     let layer = &img_a.layer_descs[0].digest;
-    let cache = cache_with("target", "repo-b", &[layer]);
+    let cache = cache_with("target", &repo("repo-b"), &[layer]);
     cache
         .borrow_mut()
         .set_blob_completed("target", layer.clone(), repo("repo-a"));
@@ -1781,7 +1784,7 @@ async fn resolver_retries_mount_after_source_marked_stale() {
 
     // tgt-a is committed and valid; stale-src was rejected earlier and must be excluded.
     let layer = &img.layer_descs[0].digest;
-    let cache = cache_with("target", "tgt-a", &[layer]);
+    let cache = cache_with("target", &repo("tgt-a"), &[layer]);
     {
         let mut c = cache.borrow_mut();
         c.mark_repo_committed("target", &repo("tgt-a"));

@@ -8,7 +8,9 @@
 
 mod helpers;
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +36,7 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
     let fixture = build_ten_image_fixture(Sharing::OnePair).await;
     let (report, checkers) = run_engine_default(&fixture, Checking::BatchChecker).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
-    let checks: Vec<usize> = checkers.iter().map(|c| c.checks.get()).collect();
+    let checks: Vec<usize> = checkers.iter().map(|c| c.get()).collect();
     assert_eq!(checks, [1; 10], "each mapping asks its checker once");
 }
 
@@ -138,7 +140,7 @@ async fn build_ten_image_fixture(sharing: Sharing) -> TenImageFixture {
 async fn run_engine_default(
     fixture: &TenImageFixture,
     checking: Checking,
-) -> (ocync_sync::SyncReport, Vec<Calls>) {
+) -> (ocync_sync::SyncReport, Vec<Rc<Cell<usize>>>) {
     let mut checkers = Vec::new();
     let mappings: Vec<_> = fixture
         .repos
@@ -148,8 +150,8 @@ async fn run_engine_default(
             let entry = match checking {
                 Checking::HeadPerBlob => target_entry("target", client),
                 Checking::BatchChecker => {
-                    let (checker, calls) = MockChecker::new(tgt, HashSet::new());
-                    checkers.push(calls);
+                    let (checker, checks) = MockChecker::new(tgt, HashSet::new());
+                    checkers.push(checks);
                     batch_target("target", client, checker)
                 }
             };

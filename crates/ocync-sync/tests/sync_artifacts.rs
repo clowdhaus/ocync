@@ -348,62 +348,94 @@ async fn artifact_blob_dedup_skips_existing() {
     );
 }
 
-/// A referrers API that answers 500 leaves artifacts unconfirmed, so the image
-/// still syncs and is flagged `artifacts_skipped`, even with `require_artifacts`
-/// (which fires only on confirmed absence).
-#[tokio::test]
-async fn artifact_transient_error_sets_artifacts_skipped() {
-    // (row, require_artifacts)
-    let cases = [("require_artifacts", true), ("artifacts optional", false)];
-    for (name, require_artifacts) in cases {
-        let source_server = MockServer::start().await;
-        let target_server = MockServer::start().await;
-
-        let parent = ManifestBuilder::new(b"err-cfg").layer(b"err-layer").build();
-        parent.mount_source(&source_server, "repo", "v1.0.0").await;
-        mount_referrers_status(&source_server, &parent.digest, 500).await;
-        parent.mount_target(&target_server, "repo", "v1.0.0").await;
-
-        let mapping = artifact_mapping(
-            &source_server,
-            &target_server,
-            ResolvedArtifacts {
-                require_artifacts,
-                ..ResolvedArtifacts::default()
-            },
-        );
-
-        let report = run_sync(vec![mapping]).await;
-
-        assert_eq!(report.images.len(), 1, "{name}");
-        assert_status!(report, 0, ImageStatus::Synced, "{name}");
-        assert!(report.images[0].artifacts_skipped, "{name}");
-        assert_eq!(report.stats.artifacts_skipped, 1, "{name}");
-    }
+/// What the source's referrers API answers for the parent image.
+#[derive(Clone, Copy, Debug)]
+enum Referrers {
+    /// A 500: whether artifacts exist is unconfirmed.
+    ServerError,
+    /// A 200 with an empty index: confirmed absence.
+    EmptyIndex,
 }
 
-/// A referrers API that answers 200 with an empty index confirms there are no
-/// artifacts: `require_artifacts` fails the image, otherwise it syncs, and in
-/// neither case is `artifacts_skipped` set (only a transient error sets it).
+/// Whether the mapping requires artifacts to exist.
+#[derive(Clone, Copy, Debug)]
+enum Require {
+    Required,
+    Optional,
+}
+
+/// How the referrers answer and `require_artifacts` combine. An unconfirmed
+/// answer syncs the image and flags `artifacts_skipped`, even when artifacts
+/// are required (that setting fires only on confirmed absence). A confirmed
+/// absence fails a required image, syncs an optional one, and never sets
+/// `artifacts_skipped`.
 #[tokio::test]
-async fn artifact_empty_referrers_index_is_confirmed_absence() {
-    // (row, require_artifacts): the image fails exactly when artifacts are required.
-    let cases = [("require_artifacts", true), ("artifacts optional", false)];
-    for (name, require_artifacts) in cases {
+async fn artifact_referrers_answer_and_require_decide_status_and_skipped() {
+    /// One combination and the image it must produce.
+    struct Case {
+        referrers: Referrers,
+        require: Require,
+        /// Whether the image fails with `RequiredArtifactsMissing`; otherwise it syncs.
+        fails: bool,
+        artifacts_skipped: bool,
+    }
+    use Referrers::{EmptyIndex, ServerError};
+    use Require::{Optional, Required};
+    let cases = [
+        Case {
+            referrers: ServerError,
+            require: Required,
+            fails: false,
+            artifacts_skipped: true,
+        },
+        Case {
+            referrers: ServerError,
+            require: Optional,
+            fails: false,
+            artifacts_skipped: true,
+        },
+        Case {
+            referrers: EmptyIndex,
+            require: Required,
+            fails: true,
+            artifacts_skipped: false,
+        },
+        Case {
+            referrers: EmptyIndex,
+            require: Optional,
+            fails: false,
+            artifacts_skipped: false,
+        },
+    ];
+    for Case {
+        referrers,
+        require,
+        fails,
+        artifacts_skipped,
+    } in cases
+    {
+        let name = format!("{referrers:?} with {require:?}");
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
 
         let parent = ManifestBuilder::new(b"req-cfg").layer(b"req-layer").build();
         parent.mount_source(&source_server, "repo", "v1.0.0").await;
-        let referrers = ReferrersIndexBuilder::new().build();
-        mount_referrers(&source_server, "repo", &parent.digest, &referrers).await;
+        match referrers {
+            ServerError => {
+                mount_referrers_status(&source_server, &parent.digest, 500).await;
+            }
+            EmptyIndex => {
+                let empty = ReferrersIndexBuilder::new().build();
+                mount_referrers(&source_server, "repo", &parent.digest, &empty).await;
+            }
+        }
         parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
         let mapping = artifact_mapping(
             &source_server,
             &target_server,
             ResolvedArtifacts {
-                require_artifacts,
+                require_artifacts: matches!(require, Required),
                 ..ResolvedArtifacts::default()
             },
         );
@@ -411,7 +443,7 @@ async fn artifact_empty_referrers_index_is_confirmed_absence() {
         let report = run_sync(vec![mapping]).await;
 
         assert_eq!(report.images.len(), 1, "{name}");
-        if require_artifacts {
+        if fails {
             assert_status!(
                 report,
                 0,
@@ -424,8 +456,15 @@ async fn artifact_empty_referrers_index_is_confirmed_absence() {
         } else {
             assert_status!(report, 0, ImageStatus::Synced, "{name}");
         }
-        assert!(!report.images[0].artifacts_skipped, "{name}");
-        assert_eq!(report.stats.artifacts_skipped, 0, "{name}");
+        assert_eq!(
+            report.images[0].artifacts_skipped, artifacts_skipped,
+            "{name}: image artifacts_skipped"
+        );
+        assert_eq!(
+            report.stats.artifacts_skipped,
+            u64::from(artifacts_skipped),
+            "{name}: stats artifacts_skipped"
+        );
     }
 }
 
@@ -502,32 +541,27 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     sig.mount_target(&target_server, "repo").await;
 
     let sig_blobs = [&sig.config_desc.digest, &sig.layer_desc.digest];
-    let cache = cache_with("target", "repo", &sig_blobs);
+    let cache = cache_with("target", &repo("repo"), &sig_blobs);
     let mapping = artifact_mapping(&source_server, &target_server, ResolvedArtifacts::default());
     let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
 
     assert_status!(report, 0, ImageStatus::Synced);
-    let requests = target_server.received_requests().await.unwrap();
-    let pushes_of = |p: &str| {
-        requests
-            .iter()
-            .filter(|r| r.method == Method::PUT && r.url.path() == p)
-            .count()
-    };
-    assert_eq!(
-        pushes_of(&sig_manifest),
-        2,
-        "refused once, then pushed again"
-    );
-    let sig_heads = requests
-        .iter()
-        .filter(|r| {
-            r.method == Method::HEAD
-                && sig_blobs
-                    .iter()
-                    .any(|d| r.url.path() == format!("/v2/repo/blobs/{d}"))
-        })
-        .count();
+    let sig_pushes = count_requests(
+        &target_server,
+        Some(&Method::PUT),
+        PathMatch::Exact(&sig_manifest),
+    )
+    .await;
+    assert_eq!(sig_pushes, 2, "refused once, then pushed again");
+    let mut sig_heads = 0;
+    for digest in sig_blobs {
+        sig_heads += count_requests(
+            &target_server,
+            Some(&Method::HEAD),
+            PathMatch::Exact(&format!("/v2/repo/blobs/{digest}")),
+        )
+        .await;
+    }
     assert_eq!(sig_heads, 2, "each dropped blob is checked again once");
 }
 

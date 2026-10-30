@@ -3,7 +3,7 @@
 
 mod helpers;
 
-use ocync_distribution::spec::{ImageIndex, MediaType, PlatformFilter};
+use ocync_distribution::spec::{ImageIndex, MediaType, Platform, PlatformFilter};
 use ocync_sync::ImageStatus;
 use ocync_sync::engine::TagPair;
 use wiremock::MockServer;
@@ -29,7 +29,16 @@ async fn sync_index_manifest_platform_filter() {
     let index = IndexBuilder::new()
         .manifest(&amd64, Some(linux("amd64")))
         .manifest(&arm64, Some(linux("arm64")))
-        .manifest(&win, Some(platform("windows", "amd64")))
+        .manifest(
+            &win,
+            Some(Platform {
+                architecture: "amd64".to_string(),
+                os: "windows".to_string(),
+                variant: None,
+                os_version: None,
+                os_features: None,
+            }),
+        )
         .build();
 
     // The index and amd64 are pulled once each; arm64 and windows never.

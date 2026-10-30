@@ -4,15 +4,16 @@
 
 mod helpers;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::MediaType;
+use ocync_distribution::spec::{MediaType, RepositoryName};
 use ocync_sync::cache::TransferStateCache;
-use ocync_sync::engine::{SyncEngine, TagPair};
+use ocync_sync::engine::{SyncEngine, TagPair, TargetEntry};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::staging::BlobStage;
@@ -26,7 +27,7 @@ use helpers::*;
 /// The cache an earlier run left, as watch mode keeps it between cycles:
 /// each of `digests` present at `repo` on target `target`.
 fn earlier_run_cache(digests: &[&Digest]) -> Rc<RefCell<TransferStateCache>> {
-    cache_with("target", "repo", digests)
+    cache_with("target", &repo("repo"), digests)
 }
 
 /// A retry config like [`fast_retry`] with the manifest-commit wait set.
@@ -135,7 +136,7 @@ async fn sync_warm_cache_mounts_from_a_cached_repo() {
 
         let cache = cache_with(
             "target",
-            "repo-a",
+            &repo("repo-a"),
             &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
         );
         if matches!(repo_a, RepoA::Committed) {
@@ -214,7 +215,7 @@ async fn sync_refused_mount_still_checks_the_target_repo() {
 
     let cache = cache_with(
         "target",
-        "repo-a",
+        &repo("repo-a"),
         &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
 
@@ -264,7 +265,7 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
     let target_name = "ecr-target";
     let cache = cache_with(
         target_name,
-        "repo-a",
+        &repo("repo-a"),
         &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
     // A committed repo is a valid mount source.
@@ -415,7 +416,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
     // A committed stale mount source makes the mount be attempted and fail.
     let cache = cache_with(
         "target",
-        "stale-repo",
+        &repo("stale-repo"),
         &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
     cache
@@ -506,16 +507,70 @@ enum Check {
     Absent,
     /// The batch call fails: every blob gets a HEAD.
     Fails,
-    /// The batch call answers for the config, layer 1 and layer 2.
-    Answers([Answer; 3]),
+    /// The batch call answers for each blob in order, config first.
+    Answers(&'static [Answer]),
 }
 
-/// What the cache holds when the run starts.
+/// What the cache holds when a run starts.
 #[derive(Clone, Copy, Debug)]
-enum Cache {
-    Cold,
-    /// The config blob is already known at the target repo.
+enum CacheAtStart {
+    /// Nothing.
+    Empty,
+    /// Only the config blob, verified at the target repo.
     ConfigVerified,
+    /// An earlier run recorded every blob at the target.
+    EarlierRun,
+    /// An earlier run recorded only the layers, so the config is sent before
+    /// a refusal.
+    LayersOnly,
+}
+
+/// The cache `start` describes over an image's `blobs` (config first), at
+/// `repo` on target "target".
+fn cache_holding(
+    start: CacheAtStart,
+    blobs: &[&Digest],
+    repo: &RepositoryName,
+) -> Rc<RefCell<TransferStateCache>> {
+    match start {
+        CacheAtStart::Empty => empty_cache(),
+        CacheAtStart::ConfigVerified => {
+            let cache = empty_cache();
+            cache
+                .borrow_mut()
+                .set_blob_verified("target", blobs[0].clone(), repo.clone());
+            cache
+        }
+        CacheAtStart::EarlierRun => cache_with("target", repo, blobs),
+        CacheAtStart::LayersOnly => cache_with("target", repo, &blobs[1..]),
+    }
+}
+
+/// A "target" entry on `client` with the existence check `check` over `blobs`
+/// (config first), asked about repo `tgt`, and its batch-call counter.
+fn checked_target(
+    check: Check,
+    client: Arc<ocync_distribution::RegistryClient>,
+    tgt: &str,
+    blobs: &[&Digest],
+) -> (TargetEntry, Rc<Cell<usize>>) {
+    let (checker, checks) = match check {
+        Check::Absent => return (target_entry("target", client), Rc::default()),
+        Check::Fails => MockChecker::failing(tgt),
+        Check::Answers(answers) => {
+            assert_eq!(answers.len(), blobs.len(), "one answer per blob");
+            let pick = |wanted| -> HashSet<Digest> {
+                blobs
+                    .iter()
+                    .zip(answers)
+                    .filter(|(_, a)| **a == wanted)
+                    .map(|(d, _)| (*d).clone())
+                    .collect()
+            };
+            MockChecker::leaving_out(tgt, pick(Answer::Exists), pick(Answer::Unknown))
+        }
+    };
+    (batch_target("target", client, checker), checks)
 }
 
 /// The config and two layers of the image the batch table syncs, all the same length.
@@ -530,7 +585,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
     struct Case {
         name: &'static str,
         check: Check,
-        cache: Cache,
+        cache: CacheAtStart,
         tags: &'static [&'static str],
         batch_calls: usize,
         /// Totals across every tag's image.
@@ -543,8 +598,8 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
     use Answer::{Exists, Missing, Unknown};
     let single = Case {
         name: "",
-        check: Check::Answers([Exists; 3]),
-        cache: Cache::Cold,
+        check: Check::Answers(&[Exists; 3]),
+        cache: CacheAtStart::Empty,
         tags: &["v1"],
         batch_calls: 1,
         skipped: 3,
@@ -566,12 +621,12 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         },
         Case {
             name: "warm cache and batch agree: the batch is still asked",
-            cache: Cache::ConfigVerified,
+            cache: CacheAtStart::ConfigVerified,
             ..single
         },
         Case {
             name: "one layer missing: only it is copied",
-            check: Check::Answers([Exists, Missing, Exists]),
+            check: Check::Answers(&[Exists, Missing, Exists]),
             skipped: 2,
             transferred: 1,
             bytes: 14,
@@ -580,7 +635,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         },
         Case {
             name: "two tags, one layer missing: copied once, the other tag skips it",
-            check: Check::Answers([Exists, Missing, Exists]),
+            check: Check::Answers(&[Exists, Missing, Exists]),
             tags: &["v1", "v2"],
             batch_calls: 2,
             skipped: 5,
@@ -591,7 +646,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         },
         Case {
             name: "unknown layer gets its own HEAD, the missing one none",
-            check: Check::Answers([Exists, Missing, Unknown]),
+            check: Check::Answers(&[Exists, Missing, Unknown]),
             skipped: 2,
             transferred: 1,
             bytes: 14,
@@ -600,7 +655,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         },
         Case {
             name: "nothing exists: every blob copied with no HEAD",
-            check: Check::Answers([Missing; 3]),
+            check: Check::Answers(&[Missing; 3]),
             skipped: 0,
             transferred: 3,
             bytes: 42,
@@ -652,7 +707,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         let (src, tgt) = ("src/nginx", "tgt/nginx");
         let answers = match case.check {
             Check::Answers(answers) => answers,
-            Check::Absent | Check::Fails => [Unknown; 3],
+            Check::Absent | Check::Fails => &[Unknown; 3],
         };
 
         for tag in case.tags {
@@ -691,40 +746,9 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         }
         mount_blob_push_expecting(&target_server, tgt, case.uploads, name).await;
 
-        let (target, calls) = match case.check {
-            Check::Absent => (
-                target_entry("target", mock_client(&target_server)),
-                Calls::default(),
-            ),
-            Check::Fails => {
-                let (checker, calls) = MockChecker::failing(tgt);
-                (
-                    batch_target("target", mock_client(&target_server), checker),
-                    calls,
-                )
-            }
-            Check::Answers(_) => {
-                let pick = |wanted| -> HashSet<Digest> {
-                    digests
-                        .into_iter()
-                        .zip(answers)
-                        .filter(|(_, a)| *a == wanted)
-                        .map(|(d, _)| d.clone())
-                        .collect()
-                };
-                let (checker, calls) = MockChecker::leaving_out(tgt, pick(Exists), pick(Unknown));
-                (
-                    batch_target("target", mock_client(&target_server), checker),
-                    calls,
-                )
-            }
-        };
-        let cache = empty_cache();
-        if matches!(case.cache, Cache::ConfigVerified) {
-            cache
-                .borrow_mut()
-                .set_blob_verified("target", digests[0].clone(), repo(tgt));
-        }
+        let (target, checks) =
+            checked_target(case.check, mock_client(&target_server), tgt, &digests);
+        let cache = cache_holding(case.cache, &digests, &repo(tgt));
         let mapping = resolved_mapping(
             mock_client(&source_server),
             src,
@@ -735,7 +759,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
 
         let report = run_sync_with_cache(vec![mapping], cache).await;
 
-        assert_eq!(calls.checks.get(), case.batch_calls, "{name}: batch calls");
+        assert_eq!(checks.get(), case.batch_calls, "{name}: batch calls");
         assert_all_synced(&report, case.tags.len(), name);
         assert_eq!(report.stats.blobs_skipped, case.skipped, "{name}: skipped");
         assert_eq!(
@@ -793,9 +817,9 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     mount_blob_push_expecting(&target_b_server, "repo", 1, "target-b").await;
     mount_manifest_push(&target_b_server, "repo", "v1").await;
 
-    let (checker_a, calls_a) =
+    let (checker_a, checks_a) =
         MockChecker::new("repo", HashSet::from([config.clone(), layer.clone()]));
-    let (checker_b, calls_b) = MockChecker::new("repo", HashSet::from([config.clone()]));
+    let (checker_b, checks_b) = MockChecker::new("repo", HashSet::from([config.clone()]));
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -811,12 +835,12 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(
-        calls_a.checks.get(),
+        checks_a.get(),
         1,
         "target-a batch checker must be called once"
     );
     assert_eq!(
-        calls_b.checks.get(),
+        checks_b.get(),
         1,
         "target-b batch checker must be called once"
     );
@@ -849,17 +873,6 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
     assert_eq!(report.stats.bytes_transferred, layer_data.len() as u64);
 }
 
-/// What the batch check answers about the blobs an earlier run cached.
-#[derive(Clone, Copy, Debug)]
-enum BatchAnswer {
-    /// Checked and missing.
-    Missing,
-    /// Left unknown by a partial failure.
-    Unknown,
-    /// The whole call failed.
-    Fails,
-}
-
 /// An earlier run's cache says both blobs are at the target, but the
 /// repository has lost them (deleted and recreated, or layers expired). A
 /// batch check that finds them missing wins over the cache with no further
@@ -869,10 +882,11 @@ enum BatchAnswer {
 /// registry refuses.
 #[tokio::test]
 async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
-    for answer in [
-        BatchAnswer::Missing,
-        BatchAnswer::Unknown,
-        BatchAnswer::Fails,
+    use Answer::{Missing, Unknown};
+    for check in [
+        Check::Answers(&[Missing; 2]),
+        Check::Answers(&[Unknown; 2]),
+        Check::Fails,
     ] {
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
@@ -885,16 +899,17 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         for (digest, data) in digests.into_iter().zip([&config_data[..], &layer_data[..]]) {
             blob_pull_mock("repo", digest, data)
                 .expect(1)
-                .named(format!("{answer:?}: blob GET {digest}"))
+                .named(format!("{check:?}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
-            let heads = match answer {
-                BatchAnswer::Missing => 0,
-                BatchAnswer::Unknown | BatchAnswer::Fails => 1,
+            // A blob the check reports missing needs no HEAD; any other answer sends one.
+            let heads = match check {
+                Check::Answers([Missing, ..]) => 0,
+                _ => 1,
             };
             blob_head_mock("repo", digest, 404)
                 .expect(heads)
-                .named(format!("{answer:?}: blob HEAD {digest}"))
+                .named(format!("{check:?}: blob HEAD {digest}"))
                 .mount(&target_server)
                 .await;
         }
@@ -902,50 +917,30 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         mount_blob_push(&target_server, "repo").await;
         mount_manifest_push(&target_server, "repo", "v1").await;
 
-        let (checker, calls) = match answer {
-            BatchAnswer::Missing => MockChecker::new("repo", HashSet::new()),
-            BatchAnswer::Unknown => MockChecker::leaving_out(
-                "repo",
-                HashSet::new(),
-                digests.into_iter().cloned().collect(),
-            ),
-            BatchAnswer::Fails => MockChecker::failing("repo"),
-        };
+        let (target, checks) = checked_target(check, mock_client(&target_server), "repo", &digests);
         let mapping = resolved_mapping(
             mock_client(&source_server),
             "repo",
             "repo",
-            vec![batch_target("target", mock_client(&target_server), checker)],
+            vec![target],
             vec![TagPair::same("v1")],
         );
         let report = run_sync_with_cache(vec![mapping], earlier_run_cache(&digests)).await;
 
-        assert_eq!(calls.checks.get(), 1, "{answer:?}");
-        assert_status!(report, 0, ImageStatus::Synced, "{answer:?}");
+        assert_eq!(checks.get(), 1, "{check:?}");
+        assert_status!(report, 0, ImageStatus::Synced, "{check:?}");
         assert_eq!(
             report.stats.blobs_skipped, 0,
-            "{answer:?}: the stale cache must not skip"
+            "{check:?}: the stale cache must not skip"
         );
-        assert_eq!(report.stats.blobs_transferred, 2, "{answer:?}");
+        assert_eq!(report.stats.blobs_transferred, 2, "{check:?}");
         assert_eq!(
             report.stats.bytes_transferred,
             (config_data.len() + layer_data.len()) as u64,
-            "{answer:?}",
+            "{check:?}",
         );
     }
 }
-/// What the cache holds when a run starts.
-#[derive(Clone, Copy, Debug)]
-enum CacheAtStart {
-    /// An earlier run recorded both blobs at the target.
-    EarlierRun,
-    /// An earlier run recorded only the layer, so the config is sent before
-    /// the refusal.
-    LayerOnly,
-    /// Nothing.
-    Empty,
-}
-
 /// How often the target refuses the manifest before accepting it.
 #[derive(Clone, Copy, Debug)]
 enum Refusals {
@@ -1001,7 +996,7 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
         ),
         repaired(
             "400 blob unknown with only the layer cached is repaired",
-            CacheAtStart::LayerOnly,
+            CacheAtStart::LayersOnly,
             MANIFEST_BLOB_UNKNOWN,
         ),
         Case {
@@ -1081,11 +1076,7 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
             "repo",
             vec![TagPair::same("v1")],
         );
-        let cache = match cache_at_start {
-            CacheAtStart::EarlierRun => earlier_run_cache(&digests),
-            CacheAtStart::LayerOnly => earlier_run_cache(&digests[1..]),
-            CacheAtStart::Empty => empty_cache(),
-        };
+        let cache = cache_holding(cache_at_start, &digests, &repo("repo"));
         let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
 
         assert_eq!(
@@ -1358,7 +1349,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
             .await;
     }
 
-    let (checker, calls) = MockChecker::new("repo", digests.into_iter().cloned().collect());
+    let (checker, checks) = MockChecker::new("repo", digests.into_iter().cloned().collect());
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -1374,7 +1365,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(
-        calls.checks.get(),
+        checks.get(),
         1,
         "batch checker must be called once, for target-a only"
     );
@@ -1447,7 +1438,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
             .await;
     }
 
-    let (checker, calls) = MockChecker::new("repo", digests.iter().cloned().collect());
+    let (checker, checks) = MockChecker::new("repo", digests.iter().cloned().collect());
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -1460,7 +1451,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(
-        calls.checks.get(),
+        checks.get(),
         1,
         "batch checker must be called exactly once for index manifest"
     );
@@ -1657,7 +1648,7 @@ async fn run_clears_repo_watches_without_cache_pruning() {
         )
         .await;
 
-    let digest: Digest = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+    let digest = digest_b();
     let mut cache = cache.borrow_mut();
     cache.set_blob_verified("target", digest.clone(), repo("repo"));
     assert_eq!(

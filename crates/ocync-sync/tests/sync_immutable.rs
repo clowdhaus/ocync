@@ -69,18 +69,13 @@ async fn immutable_tag_skip_when_present_at_target() {
     assert_eq!(report.stats.images_skipped, 2);
     assert_eq!(report.stats.immutable_tag_skips, 2);
 
-    let source_requests = source_server.received_requests().await.unwrap();
-    let target_requests = target_server.received_requests().await.unwrap();
-    assert_eq!(
-        source_requests.len(),
-        0,
-        "immutable skip must issue zero source requests"
-    );
-    assert_eq!(
-        target_requests.len(),
-        0,
-        "immutable skip must issue zero target requests"
-    );
+    for (side, server) in [("source", &source_server), ("target", &target_server)] {
+        assert_eq!(
+            count_requests(server, None, PathMatch::Any).await,
+            0,
+            "immutable skip must issue zero {side} requests"
+        );
+    }
 }
 
 /// A tag that matches the glob but is absent from the target's `existing_tags`

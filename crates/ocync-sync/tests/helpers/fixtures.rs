@@ -83,14 +83,14 @@ pub fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 /// A cache holding each of `digests` as completed at `repo_name` on `target`.
 pub fn cache_with(
     target: &str,
-    repo_name: &str,
+    repo: &RepositoryName,
     digests: &[&Digest],
 ) -> Rc<RefCell<TransferStateCache>> {
     let cache = empty_cache();
     for digest in digests {
         cache
             .borrow_mut()
-            .set_blob_completed(target, (*digest).clone(), repo(repo_name));
+            .set_blob_completed(target, (*digest).clone(), repo.clone());
     }
     cache
 }

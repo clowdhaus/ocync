@@ -448,20 +448,15 @@ impl ReferrersIndexBuilder {
     }
 }
 
-/// An `os/arch` platform with no variant.
-pub fn platform(os: &str, arch: &str) -> Platform {
+/// A `linux/<arch>` platform.
+pub fn linux(arch: &str) -> Platform {
     Platform {
         architecture: arch.to_string(),
-        os: os.to_string(),
+        os: "linux".to_string(),
         variant: None,
         os_version: None,
         os_features: None,
     }
-}
-
-/// A `linux/<arch>` platform.
-pub fn linux(arch: &str) -> Platform {
-    platform("linux", arch)
 }
 
 /// Tags that all point at one manifest, as alpine's floating tags do.

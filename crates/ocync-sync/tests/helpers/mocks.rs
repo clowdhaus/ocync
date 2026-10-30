@@ -18,6 +18,7 @@ use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockBuilder, MockServer, Request, ResponseTemplate};
 
+use super::digests::repo;
 use super::fixtures::target_entry;
 
 /// A manifest GET on `reference` returning `bytes` as `content_type`, not yet
@@ -307,7 +308,7 @@ pub async fn count_blob_uploads(
     .await
 }
 
-/// How many times a checker was asked, shared with the test.
+/// How many times a [`WaitTrackingChecker`] was asked, shared with the test.
 #[derive(Clone, Default)]
 pub struct Calls {
     /// Calls to `check_blob_existence`.
@@ -333,14 +334,14 @@ enum Mode {
 /// Mock batch checker. It asserts the engine passes the target repo (a wrong
 /// repo would otherwise go unnoticed) and counts its calls.
 pub struct MockChecker {
-    expected_repo: String,
+    expected_repo: RepositoryName,
     mode: Mode,
-    calls: Calls,
+    checks: Rc<Cell<usize>>,
 }
 
 impl MockChecker {
     /// A checker reporting `existing` present and every other digest missing.
-    pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
+    pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Rc<Cell<usize>>) {
         Self::leaving_out(expected_repo, existing, HashSet::new())
     }
 
@@ -349,24 +350,24 @@ impl MockChecker {
         expected_repo: &str,
         existing: HashSet<Digest>,
         unknown: HashSet<Digest>,
-    ) -> (Self, Calls) {
+    ) -> (Self, Rc<Cell<usize>>) {
         Self::with_mode(expected_repo, Mode::Answers { existing, unknown })
     }
 
     /// A checker whose every `check_blob_existence` call fails.
-    pub fn failing(expected_repo: &str) -> (Self, Calls) {
+    pub fn failing(expected_repo: &str) -> (Self, Rc<Cell<usize>>) {
         Self::with_mode(expected_repo, Mode::Fails)
     }
 
-    fn with_mode(expected_repo: &str, mode: Mode) -> (Self, Calls) {
-        let calls = Calls::default();
+    fn with_mode(expected_repo: &str, mode: Mode) -> (Self, Rc<Cell<usize>>) {
+        let checks = Rc::new(Cell::new(0));
         (
             Self {
-                expected_repo: expected_repo.to_owned(),
+                expected_repo: repo(expected_repo),
                 mode,
-                calls: calls.clone(),
+                checks: Rc::clone(&checks),
             },
-            calls,
+            checks,
         )
     }
 
@@ -380,8 +381,7 @@ impl MockChecker {
 
     fn assert_repo(&self, repo: &RepositoryName) {
         assert_eq!(
-            repo.as_str(),
-            self.expected_repo,
+            *repo, self.expected_repo,
             "mock: batch checker called with wrong repo"
         );
     }
@@ -395,7 +395,7 @@ impl BatchBlobChecker for MockChecker {
     ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
         self.assert_repo(repo);
         Box::pin(async move {
-            self.calls.checks.set(self.calls.checks.get() + 1);
+            self.checks.set(self.checks.get() + 1);
             let Mode::Answers { existing, unknown } = &self.mode else {
                 return Err(ocync_distribution::Error::EcrApi {
                     reason: "batch API unavailable".into(),
@@ -416,13 +416,19 @@ impl BatchBlobChecker for MockChecker {
 /// `check_blob_existence` calls. Every other checker keeps the trait default.
 pub struct WaitTrackingChecker {
     checker: MockChecker,
+    waits: Rc<Cell<usize>>,
 }
 
 impl WaitTrackingChecker {
     /// A checker reporting `existing` present and every other digest missing.
     pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
-        let (checker, calls) = MockChecker::new(expected_repo, existing);
-        (Self { checker }, calls)
+        let (checker, checks) = MockChecker::new(expected_repo, existing);
+        let waits = Rc::new(Cell::new(0));
+        let calls = Calls {
+            checks,
+            waits: Rc::clone(&waits),
+        };
+        (Self { checker, waits }, calls)
     }
 }
 
@@ -446,7 +452,7 @@ impl BatchBlobChecker for WaitTrackingChecker {
             .checker
             .existing()
             .is_some_and(|existing| digests.iter().all(|d| existing.contains(d)));
-        let waits = &self.checker.calls.waits;
+        let waits = &self.waits;
         Box::pin(async move {
             waits.set(waits.get() + 1);
             if all_known {

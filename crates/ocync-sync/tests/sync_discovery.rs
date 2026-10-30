@@ -880,6 +880,8 @@ fn numbered_tags(n: usize) -> Vec<TagPair> {
 
 /// The breaker never stalls the engine: every image syncs, every manifest is
 /// fetched exactly once, and the source client reports the budget the headers gave.
+/// The breaker's runtime effect (serializing discovery) is not externally
+/// observable here, so these rows prove completion and the header read only.
 #[tokio::test]
 async fn budget_circuit_breaker_syncs_every_image() {
     struct Case {
@@ -889,17 +891,17 @@ async fn budget_circuit_breaker_syncs_every_image() {
     }
     let cases = [
         Case {
-            name: "zero budget: breaker trips after every discovery, anti-stall finishes",
+            name: "zero budget: every image still syncs",
             tags: 15,
             remaining: Some(0),
         },
         Case {
-            name: "fewer than 10 tags: the threshold floor of 1 still trips the breaker",
+            name: "zero budget, fewer than 10 tags: every image still syncs",
             tags: 5,
             remaining: Some(0),
         },
         Case {
-            name: "no rate-limit header (ECR, GAR): breaker never engages",
+            name: "no rate-limit header (ECR, GAR): every image syncs and no budget is read",
             tags: 10,
             remaining: None,
         },

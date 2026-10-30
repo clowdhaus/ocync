@@ -34,7 +34,7 @@ pub mod registry2;
 
 pub use builders::{
     ArtifactBuilder, ArtifactParts, IndexBuilder, IndexParts, ManifestBuilder, ManifestParts,
-    ReferrersIndexBuilder, SHARED_TAGS, linux, mount_shared_index, platform,
+    ReferrersIndexBuilder, SHARED_TAGS, linux, mount_shared_index,
 };
 pub use digests::*;
 pub use fixtures::*;

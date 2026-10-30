@@ -16,8 +16,8 @@ use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, Transfer
 
 use digests::{digest_a, digest_b, repo};
 
-fn snap_key(auth: &str, repo_name: &str, tag: &str) -> SnapshotKey {
-    SnapshotKey::new(&RegistryAuthority::new(auth), &repo(repo_name), tag)
+fn snap_key_at(authority: &RegistryAuthority, repo_name: &str, tag: &str) -> SnapshotKey {
+    SnapshotKey::new(authority, &repo(repo_name), tag)
 }
 
 fn no_platform_filter() -> PlatformFilterKey {
@@ -258,7 +258,11 @@ fn blobs_and_source_snapshots_round_trip_together() {
     // (key, snapshot) with a two-platform, a one-platform and no platform filter.
     let snapshots = [
         (
-            snap_key("cgr.dev:443", "chainguard/nginx", "latest"),
+            snap_key_at(
+                &RegistryAuthority::new("cgr.dev:443"),
+                "chainguard/nginx",
+                "latest",
+            ),
             snapshot(
                 digest_a(),
                 digest_b(),
@@ -266,11 +270,15 @@ fn blobs_and_source_snapshots_round_trip_together() {
             ),
         ),
         (
-            snap_key("src1.io:443", "lib/nginx", "v1"),
+            snap_key_at(&RegistryAuthority::new("src1.io:443"), "lib/nginx", "v1"),
             snapshot(digest_a(), digest_b(), platform_filter(&["linux/amd64"])),
         ),
         (
-            snap_key("src2.io:443", "lib/redis", "latest"),
+            snap_key_at(
+                &RegistryAuthority::new("src2.io:443"),
+                "lib/redis",
+                "latest",
+            ),
             snapshot(digest_b(), digest_a(), no_platform_filter()),
         ),
     ];
@@ -288,10 +296,12 @@ fn blobs_and_source_snapshots_round_trip_together() {
     assert!(loaded.blob_present_at("reg1.io", &digest_a(), &repo("repo/a")));
     assert!(loaded.blob_present_at("reg2.io", &digest_b(), &repo("repo/b")));
     for (key, want) in &snapshots {
-        let got = loaded.source_snapshot(key).expect("snapshot survives");
-        assert_eq!(got.source_digest, want.source_digest);
-        assert_eq!(got.filtered_digest, want.filtered_digest);
-        assert_eq!(got.platform_filter_key, want.platform_filter_key);
+        let got = loaded
+            .source_snapshot(key)
+            .unwrap_or_else(|| panic!("snapshot survives: {key:?}"));
+        assert_eq!(got.source_digest, want.source_digest, "{key:?}");
+        assert_eq!(got.filtered_digest, want.filtered_digest, "{key:?}");
+        assert_eq!(got.platform_filter_key, want.platform_filter_key, "{key:?}");
     }
 }
 
@@ -337,8 +347,8 @@ fn platform_filter_key_identity() {
 #[test]
 fn snapshot_key_prevents_field_collision() {
     // Same total characters but different field boundaries.
-    let k1 = snap_key("reg.io:443", "lib/nginx", "v1");
-    let k2 = snap_key("reg.io:443", "lib", "nginx/v1");
+    let k1 = snap_key_at(&RegistryAuthority::new("reg.io:443"), "lib/nginx", "v1");
+    let k2 = snap_key_at(&RegistryAuthority::new("reg.io:443"), "lib", "nginx/v1");
     assert_ne!(k1, k2);
 }
 
@@ -346,13 +356,22 @@ fn snapshot_key_prevents_field_collision() {
 fn snapshot_lookup_returns_none_for_unknown_key() {
     let mut cache = TransferStateCache::new();
     cache.set_source_snapshot(
-        snap_key("src.io:443", "repo/a", "latest"),
+        snap_key_at(&RegistryAuthority::new("src.io:443"), "repo/a", "latest"),
         snapshot(digest_a(), digest_b(), no_platform_filter()),
     );
     for (name, key) in [
-        ("authority", snap_key("other.io:443", "repo/a", "latest")),
-        ("repo", snap_key("src.io:443", "repo/b", "latest")),
-        ("tag", snap_key("src.io:443", "repo/a", "v2")),
+        (
+            "authority",
+            snap_key_at(&RegistryAuthority::new("other.io:443"), "repo/a", "latest"),
+        ),
+        (
+            "repo",
+            snap_key_at(&RegistryAuthority::new("src.io:443"), "repo/b", "latest"),
+        ),
+        (
+            "tag",
+            snap_key_at(&RegistryAuthority::new("src.io:443"), "repo/a", "v2"),
+        ),
     ] {
         assert!(
             cache.source_snapshot(&key).is_none(),
