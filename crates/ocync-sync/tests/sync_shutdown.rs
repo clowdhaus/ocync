@@ -47,7 +47,7 @@ impl DelayedPull {
     }
 
     /// Run `run`, triggering `shutdown` once both blob GETs are in flight.
-    async fn run_shutting_down_in_flight<T>(
+    async fn run_shutting_down_in_flight<T: std::fmt::Debug>(
         &self,
         run: impl Future<Output = T>,
         shutdown: &ShutdownSignal,

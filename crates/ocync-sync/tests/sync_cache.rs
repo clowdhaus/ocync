@@ -618,6 +618,14 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             check: Check::Fails,
             ..single
         },
+        Case {
+            name: "two tags, no checker: one HEAD per blob, not per tag",
+            check: Check::Absent,
+            tags: &["v1", "v2"],
+            batch_calls: 0,
+            skipped: 6,
+            ..single
+        },
     ];
     for case in cases {
         let name = case.name;
@@ -652,13 +660,16 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                 .mount(&target_server)
                 .await;
         }
-        // Per blob, not per tag: a blob shared by tags is pulled once.
+        // Per blob, not per tag: a blob shared by tags is pulled or HEADed once.
+        let (mut all_pulls, mut all_heads) = (0, 0);
         for ((digest, data), answer) in digests.into_iter().zip(BATCH_BLOBS).zip(answers) {
             let (pulls, heads) = match answer {
                 Exists => (0, 0),
                 Missing => (1, 0),
                 Unknown => (0, 1),
             };
+            all_pulls += pulls;
+            all_heads += heads;
             blob_pull_mock(src, digest, data)
                 .expect(pulls)
                 .named(format!("{name}: blob GET {digest}"))
@@ -724,6 +735,27 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             "{name}: transferred"
         );
         assert_eq!(report.stats.bytes_transferred, case.bytes, "{name}: bytes");
+        // The per-digest mocks miss a blob request on any other path.
+        assert_eq!(
+            count_requests(
+                &source_server,
+                Some(&Method::GET),
+                PathMatch::Contains("/blobs/")
+            )
+            .await,
+            all_pulls as usize,
+            "{name}: every source blob GET"
+        );
+        assert_eq!(
+            count_requests(
+                &target_server,
+                Some(&Method::HEAD),
+                PathMatch::Contains("/blobs/")
+            )
+            .await,
+            all_heads as usize,
+            "{name}: every target blob HEAD"
+        );
     }
 }
 

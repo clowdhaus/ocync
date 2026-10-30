@@ -118,7 +118,7 @@ pub async fn run_sync_with_shutdown(
 /// if `run` returns before shutdown fired, or after 10s of wall-clock time if
 /// `run` is still going and `want` was never reached, which also bounds
 /// `start_paused` runs.
-pub async fn run_with_shutdown_at<T>(
+pub async fn run_with_shutdown_at<T: std::fmt::Debug>(
     run: impl Future<Output = T>,
     shutdown: &ShutdownSignal,
     want: usize,
@@ -142,7 +142,7 @@ pub async fn run_with_shutdown_at<T>(
     };
     assert!(
         shutdown.is_triggered(),
-        "the run finished before shutdown was triggered"
+        "the run returned before shutdown was triggered: {out:?}"
     );
     out
 }
