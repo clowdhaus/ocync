@@ -70,7 +70,7 @@ Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so
 - Do not write tests that capture tracing output via `set_default()` -- tracing's global `MAX_LEVEL` and callsite interest caching make per-test subscriber capture unreliable when `cargo test` runs tests in parallel within the same process. Test behavior via engine outcomes, not log messages.
 - Each test file starts with `mod helpers; use helpers::*;` -- helpers are NOT auto-discovered.
 - Helper sub-modules use `#![allow(dead_code, unused_imports, unreachable_pub)]` (required for test module visibility).
-- `MockBatchChecker`/`FailingBatchChecker` live in `sync_cache.rs` (not in shared helpers) since only cache tests use them.
+- Batch checker mocks live in `tests/helpers/mocks.rs`: `MockChecker::new` (listed digests present, the rest missing), `MockChecker::failing` (every check fails) and `WaitTrackingChecker`, which also counts the manifest-commit gate's `wait_for_blobs_available` calls.
 
 ### Writing new tests
 
@@ -117,8 +117,10 @@ Builders produce `*Parts` structs with `.mount_source()` / `.mount_target()` con
 - `run_sync_sequential(mappings)` -- max_concurrent=1 for deterministic ordering.
 - `run_sync_with_cache(mappings, cache)` -- caller-provided cache, max_concurrent=50.
 - `run_sync_with_shutdown(mappings, shutdown)` -- caller-provided shutdown signal.
+- `run_engine(mappings, retry, max_concurrent, cache, stage, shutdown)` -- every knob explicit, for custom retry, concurrency or staging.
+- `run_with_shutdown_at(run, shutdown, want, received)` -- drives a run and triggers shutdown once the mock server has received `want` requests, so it lands mid-transfer however slow the host is.
 
-Use `SyncEngine::new(...)` directly when the test needs custom concurrency, staging, `with_source_head_timeout`, or `with_drain_deadline`.
+Use `SyncEngine::new(...)` directly only for builder settings `run_engine` does not take, such as `with_source_head_timeout` or `with_drain_deadline`.
 
 ### Test design rules
 
