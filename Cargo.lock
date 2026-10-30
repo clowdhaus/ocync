@@ -4107,10 +4107,10 @@ name = "xtask"
 version = "0.8.2"
 dependencies = [
  "aws-config",
- "aws-lc-rs",
  "aws-sdk-ecr",
  "clap",
  "futures-util",
+ "ocync-distribution",
  "reqwest",
  "serde",
  "serde_json",

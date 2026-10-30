@@ -124,10 +124,10 @@ images:
     tags: ["7", "6"]
   - source: "public.ecr.aws/docker/library/nginx"
     tags: ["1.27", "1.26"]
-  # These three tags must resolve to one multi-arch index, so the run measures
-  # each child manifest being pulled and pushed once rather than once per tag.
-  # Any alpine release splits them: re-point `3.24` and `3.24.3` to the minor
-  # and patch that `3` resolves to, then run `cargo xtask bench-lock`.
+  # Alpine tags usually share one multi-arch index, so the run measures each
+  # child manifest pulled and pushed once rather than once per tag. The lock
+  # guarantees only that each tag stays at its own digest; if a release splits
+  # them, the tags are separate images and the numbers say so.
   - source: "public.ecr.aws/docker/library/alpine"
     tags: ["3", "3.24", "3.24.3"]
   - source: "public.ecr.aws/docker/library/golang"

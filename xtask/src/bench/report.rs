@@ -1194,7 +1194,8 @@ mod tests {
         let without = serde_json::to_string(&record).unwrap();
         assert!(!without.contains("corpus_locked_at"), "{without}");
 
-        record.corpus_locked_at = Some(LockedAt::parse("2026-10-30-120000").unwrap());
+        record.corpus_locked_at =
+            Some(crate::bench::lock::fixtures::locked_at("2026-10-30-120000"));
         let with = serde_json::to_string(&record).unwrap();
         assert!(
             with.contains(r#""corpus_locked_at":"2026-10-30-120000""#),

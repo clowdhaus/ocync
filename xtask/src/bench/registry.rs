@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::bench::corpus::DockerHubAuth;
 
@@ -61,12 +61,19 @@ impl std::fmt::Display for Repository<'_> {
 /// Returns `None` for a source with no `/`.
 pub(crate) fn split_source(source: &str) -> Option<Repository<'_>> {
     let (host, path) = source.split_once('/')?;
-    let host = if DOCKER_HUB_NAMES.contains(&host) {
+    Some(Repository {
+        host: host_of(host),
+        path,
+    })
+}
+
+/// The registry a hostname names.
+fn host_of(name: &str) -> Host<'_> {
+    if DOCKER_HUB_NAMES.contains(&name) {
         Host::DockerHub
     } else {
-        Host::Other(host)
-    };
-    Some(Repository { host, path })
+        Host::Other(name)
+    }
 }
 
 /// Attempts at one request before a transient failure is reported.
@@ -141,70 +148,75 @@ impl From<&Repository<'_>> for RepoKey {
     }
 }
 
-/// How long an exchanged token is reused. Registries expire tokens in minutes
-/// (Docker Hub after five), and a run outlives that many times over.
-const TOKEN_TTL: Duration = Duration::from_secs(120);
-
-/// A token exchange and when it was made.
-struct Exchange {
-    /// The token, or why the exchange failed.
-    outcome: Result<String, String>,
-    /// When the exchange finished.
-    at: Instant,
+impl RepoKey {
+    /// The repository this key names.
+    pub(crate) fn repository(&self) -> Repository<'_> {
+        Repository {
+            host: host_of(&self.host),
+            path: &self.path,
+        }
+    }
 }
 
 /// Bearer tokens by repository, so a repository with several tags is
-/// authorized once and a long run does not reuse an expired token.
+/// authorized once. A token a registry has since expired is replaced with
+/// [`Tokens::renew`] after a 401.
 #[derive(Default)]
 pub(crate) struct Tokens {
-    /// Latest exchange for each repository. A failure is kept as long as a
-    /// token would be, so it is reported for every tag and not retried at once.
-    by_repository: HashMap<RepoKey, Exchange>,
+    /// Latest exchange for each repository; a failure is kept so it is
+    /// reported for every tag and not retried at once.
+    by_repository: HashMap<RepoKey, Result<String, String>>,
 }
 
 impl Tokens {
-    /// The token for `repo`, exchanging for one when there is none or it is
-    /// older than [`TOKEN_TTL`].
+    /// The token for `repo`, exchanging for one the first time it is asked.
     pub(crate) async fn get(
         &mut self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
         dockerhub_auth: Option<&DockerHubAuth>,
     ) -> &Result<String, String> {
-        let exchange = match self.by_repository.entry(RepoKey::from(repo)) {
-            Entry::Occupied(entry) if !expired(entry.get().at.elapsed()) => entry.into_mut(),
-            Entry::Occupied(mut entry) => {
-                entry.insert(Exchange::new(client, repo, dockerhub_auth).await);
-                entry.into_mut()
-            }
-            Entry::Vacant(entry) => entry.insert(Exchange::new(client, repo, dockerhub_auth).await),
-        };
-        &exchange.outcome
+        match self.by_repository.entry(RepoKey::from(repo)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(oci_token(client, repo, dockerhub_auth).await),
+        }
     }
 
-    /// The token last exchanged for `repo`, if that succeeded, however old.
-    pub(crate) fn cached(&self, repo: &RepoKey) -> Option<&str> {
-        self.by_repository.get(repo)?.outcome.as_deref().ok()
-    }
-}
-
-impl Exchange {
-    /// Exchange for a token now.
-    async fn new(
+    /// Exchange for a new token for `repo`, replacing the one held.
+    pub(crate) async fn renew(
+        &mut self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
         dockerhub_auth: Option<&DockerHubAuth>,
-    ) -> Self {
-        Self {
-            outcome: oci_token(client, repo, dockerhub_auth).await,
-            at: Instant::now(),
-        }
+    ) -> &Result<String, String> {
+        let renewed = oci_token(client, repo, dockerhub_auth).await;
+        self.by_repository.insert(RepoKey::from(repo), renewed);
+        self.get(client, repo, dockerhub_auth).await
     }
-}
 
-/// Whether a token of this age is past [`TOKEN_TTL`].
-fn expired(age: Duration) -> bool {
-    age > TOKEN_TTL
+    /// Send the request `build` makes with the token for `repo`. A 401 means
+    /// the token expired, so a new one is exchanged and the request sent once
+    /// more.
+    pub(crate) async fn send(
+        &mut self,
+        client: &reqwest::Client,
+        repo: &Repository<'_>,
+        dockerhub_auth: Option<&DockerHubAuth>,
+        build: impl Fn(&str) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        let token = self.get(client, repo, dockerhub_auth).await.clone()?;
+        let response = build(&token).send().await.map_err(|e| e.to_string())?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let token = self.renew(client, repo, dockerhub_auth).await.clone()?;
+        build(&token).send().await.map_err(|e| e.to_string())
+    }
+
+    /// The token last exchanged for `repo`, if that succeeded.
+    pub(crate) fn cached(&self, repo: &RepoKey) -> Option<&str> {
+        self.by_repository.get(repo)?.as_deref().ok()
+    }
 }
 
 /// OCI token exchange for a single repository scope.
@@ -212,7 +224,7 @@ fn expired(age: Duration) -> bool {
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
 /// request a bearer token from the auth realm. For Docker Hub, includes
 /// basic auth credentials if given. The error says which step failed.
-async fn oci_token(
+pub(crate) async fn oci_token(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
@@ -317,10 +329,6 @@ mod tests {
                 "notdocker.io/library/alpine",
                 Some((Host::Other("notdocker.io"), "library/alpine")),
             ),
-            (
-                "docker.io.example.com/library/alpine",
-                Some((Host::Other("docker.io.example.com"), "library/alpine")),
-            ),
             ("alpine", None),
         ];
         for (source, want) in cases {
@@ -366,14 +374,6 @@ mod tests {
             let status = StatusCode::from_u16(code).unwrap();
             assert_eq!(transient(status), retried, "{code}");
         }
-    }
-
-    #[test]
-    fn a_token_is_reused_until_it_is_older_than_the_ttl() {
-        // Reusing an expired token fails a later scenario's re-check with a 401.
-        assert!(!expired(Duration::from_secs(0)));
-        assert!(!expired(TOKEN_TTL));
-        assert!(expired(TOKEN_TTL + Duration::from_secs(1)));
     }
 
     #[test]

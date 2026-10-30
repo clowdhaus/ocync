@@ -1,12 +1,13 @@
 //! ECR repository creation and deletion for benchmark isolation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use aws_sdk_ecr::Client;
+use ocync_distribution::Digest;
 
 use crate::bench::corpus::Corpus;
-use crate::bench::lock::{Digest, Entry, ImageRef, Lock};
+use crate::bench::lock::{Entry, ImageRef, Lock};
 use crate::bench::report::ScenarioKind;
 use crate::bench::runner::Tool;
 
@@ -64,15 +65,17 @@ pub(crate) async fn create_repos(client: &Client, corpus: &Corpus) -> Result<(),
 #[derive(Debug, Default)]
 struct RepoListing {
     /// Digest each tag names.
-    tags: BTreeMap<String, Digest>,
+    tags: HashMap<String, Digest>,
     /// Digest of every image in the repo, tagged or not.
-    digests: BTreeSet<Digest>,
+    digests: HashSet<Digest>,
 }
 
 impl RepoListing {
     /// Record one `ListImages` entry.
     fn insert(&mut self, tag: Option<&str>, digest: &str) -> Result<(), String> {
-        let digest = Digest::parse(digest)?;
+        let digest: Digest = digest
+            .parse()
+            .map_err(|e: ocync_distribution::Error| e.to_string())?;
         if let Some(tag) = tag {
             self.tags.insert(tag.to_owned(), digest.clone());
         }
@@ -97,16 +100,15 @@ enum Kind {
 struct Mismatch {
     /// The target repository.
     repo: String,
-    /// The source ref the tag was synced from.
-    image: ImageRef,
+    /// The tag.
+    tag: String,
     /// What differs.
     kind: Kind,
 }
 
 impl fmt::Display for Mismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { repo, image, kind } = self;
-        let tag = &image.tag;
+        let Self { repo, tag, kind } = self;
         match kind {
             Kind::TagAbsent { expected } => {
                 write!(f, "{repo}:{tag}: expected {expected}, tag absent")
@@ -125,22 +127,13 @@ impl fmt::Display for Mismatch {
 }
 
 /// Check one repo against the lock: each expected tag must name the locked
-/// digest, and each child of a locked index must be in the repo. `source` is
-/// the image the repo was synced from.
-fn check_repo(
-    repo: &str,
-    source: &str,
-    expected: &[(&str, &Entry)],
-    listing: &RepoListing,
-) -> Vec<Mismatch> {
+/// digest, and each child of a locked index must be in the repo.
+fn check_repo(repo: &str, expected: &[(&str, &Entry)], listing: &RepoListing) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
     for (tag, locked) in expected {
         let mismatch = |kind| Mismatch {
             repo: repo.to_owned(),
-            image: ImageRef {
-                source: source.to_owned(),
-                tag: (*tag).to_owned(),
-            },
+            tag: (*tag).to_owned(),
             kind,
         };
         match listing.tags.get(*tag) {
@@ -196,16 +189,6 @@ pub(crate) struct Target<'a> {
     pub(crate) lock: &'a Lock,
 }
 
-/// A failed content check.
-#[derive(Debug)]
-pub(crate) struct Failure {
-    /// Every problem found, in one message.
-    pub(crate) message: String,
-    /// The source refs whose synced content differs from the lock, so the
-    /// caller can tell a tool that changed content from a source that moved.
-    pub(crate) mismatched: BTreeSet<ImageRef>,
-}
-
 /// Verify that every (image, tag) in the corpus is at the target with the
 /// locked digest, and that every locked index child is there too.
 ///
@@ -217,9 +200,8 @@ pub(crate) async fn verify_sync(
     corpus: &Corpus,
     tool: Tool,
     kind: ScenarioKind,
-) -> Result<(), Failure> {
+) -> Result<(), String> {
     let mut problems: Vec<String> = Vec::new();
-    let mut mismatched = BTreeSet::new();
     let mut total_tags = 0usize;
 
     for img in &corpus.images {
@@ -245,7 +227,7 @@ pub(crate) async fn verify_sync(
                 continue;
             }
         };
-        let mismatches = check_repo(&repo_name, &img.source, &expected, &listing);
+        let mismatches = check_repo(&repo_name, &expected, &listing);
         if mismatches.is_empty() {
             eprintln!(
                 "  verify: {repo_name} OK ({} tags, {} images)",
@@ -254,7 +236,6 @@ pub(crate) async fn verify_sync(
             );
         }
         problems.extend(mismatches.iter().map(Mismatch::to_string));
-        mismatched.extend(mismatches.into_iter().map(|m| m.image));
     }
 
     if problems.is_empty() {
@@ -265,15 +246,12 @@ pub(crate) async fn verify_sync(
         );
         Ok(())
     } else {
-        Err(Failure {
-            message: format!(
-                "{tool} {} verification failed -- {} problems: {}",
-                kind.slug(),
-                problems.len(),
-                problems.join("; ")
-            ),
-            mismatched,
-        })
+        Err(format!(
+            "{tool} {} verification failed -- {} problems: {}",
+            kind.slug(),
+            problems.len(),
+            problems.join("; ")
+        ))
     }
 }
 
@@ -335,10 +313,7 @@ mod tests {
     fn mismatch(tag: &str, kind: Kind) -> Mismatch {
         Mismatch {
             repo: "bench/r".into(),
-            image: ImageRef {
-                source: "s/r".into(),
-                tag: tag.into(),
-            },
+            tag: tag.into(),
             kind,
         }
     }
@@ -356,7 +331,7 @@ mod tests {
             (None, '3'),
             (Some("v1"), '4'),
         ]);
-        assert_eq!(check_repo("bench/r", "s/r", &expected, &good), vec![]);
+        assert_eq!(check_repo("bench/r", &expected, &good), vec![]);
 
         let cases: [(&str, RepoListing, Vec<Mismatch>); 3] = [
             (
@@ -387,11 +362,7 @@ mod tests {
             ),
         ];
         for (name, listing, want) in cases {
-            assert_eq!(
-                check_repo("bench/r", "s/r", &expected, &listing),
-                want,
-                "{name}"
-            );
+            assert_eq!(check_repo("bench/r", &expected, &listing), want, "{name}");
         }
     }
 
@@ -400,7 +371,7 @@ mod tests {
         let index = locked('1', &['2']);
         let listing = listing(&[(Some("latest"), '1'), (Some("other"), '2')]);
         assert_eq!(
-            check_repo("bench/r", "s/r", &[("latest", &index)], &listing),
+            check_repo("bench/r", &[("latest", &index)], &listing),
             vec![]
         );
     }

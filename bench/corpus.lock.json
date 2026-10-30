@@ -1,6 +1,5 @@
 {
   "locked_at": "2026-10-30-220156",
-  "partial_overrides": "bench/corpus-partial-overrides.yaml",
   "images": {
     "cgr.dev/chainguard/busybox:latest": {
       "digest": "sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218",
