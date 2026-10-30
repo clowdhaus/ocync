@@ -651,6 +651,8 @@ mod tests {
         map.set_blob_failed("reg.io", &d, &repo("e"), "oops".into());
         // d2 holds only a Failed state, so its whole entry is stripped.
         map.set_blob_failed("reg.io", &d2, &repo("z"), "oops".into());
+        // A target left with no entries is dropped, not kept empty.
+        map.set_blob_failed("other.io", &d, &repo("a"), "oops".into());
 
         let persisted = map.filter_persistable();
 
@@ -665,6 +667,7 @@ mod tests {
         assert!(persisted.repo_state("reg.io", &d, &repo("c")).is_none());
         assert!(persisted.repo_state("reg.io", &d, &repo("e")).is_none());
         assert!(persisted.repos_iter("reg.io", &d2).next().is_none());
+        assert!(!persisted.inner.contains_key("other.io"));
     }
 
     /// Only `Verified` and `Completed` blobs count as present; an upload in
