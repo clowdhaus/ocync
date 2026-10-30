@@ -1,5 +1,6 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
-//! normalization, the manifest `Accept` list and the OCI bearer-token flow.
+//! normalization, the manifest `Accept` list, the OCI bearer-token flow and the
+//! retried manifest request.
 //!
 //! Independent of ocync's own registry client on purpose: the harness checks
 //! the tool under test, so a bug in that client must not also be in the check.
@@ -7,6 +8,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
+
+use reqwest::{Method, StatusCode};
 
 use crate::bench::corpus::DockerHubAuth;
 
@@ -97,8 +100,8 @@ fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
 
 /// Whether a response status is worth another attempt: the registry is
 /// throttling (429) or failing (5xx), not refusing the request.
-fn transient(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+fn transient(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// Send the request `build` makes, waiting out what is transient: a failed
@@ -218,6 +221,77 @@ impl Tokens {
     }
 }
 
+/// Why one manifest request failed.
+#[derive(Clone)]
+pub(crate) struct FetchError {
+    /// The registry's answer, when it gave one.
+    pub(crate) status: Option<StatusCode>,
+    /// What went wrong.
+    pub(crate) reason: String,
+}
+
+impl From<String> for FetchError {
+    fn from(reason: String) -> Self {
+        Self {
+            status: None,
+            reason,
+        }
+    }
+}
+
+/// The client, token store and credentials manifest requests go through.
+pub(crate) struct Access<'a> {
+    /// Client for every request.
+    pub(crate) client: &'a reqwest::Client,
+    /// Bearer tokens, exchanged as each repository is first asked for.
+    pub(crate) tokens: Tokens,
+    /// Docker Hub credentials for the token exchange, if any.
+    pub(crate) auth: Option<&'a DockerHubAuth>,
+}
+
+impl Access<'_> {
+    /// Request a manifest, retrying what [`send_retrying`] retries and
+    /// renewing an expired token once. Any other failing status is reported at
+    /// once, with the status.
+    pub(crate) async fn request_manifest(
+        &self,
+        method: Method,
+        repo: &Repository<'_>,
+        reference: &str,
+    ) -> Result<reqwest::Response, FetchError> {
+        let url = format!(
+            "https://{}/v2/{}/manifests/{reference}",
+            repo.host.api_host(),
+            repo.path
+        );
+        let response = self
+            .tokens
+            .send(
+                self.client,
+                repo,
+                self.auth,
+                Some(&format!("{repo}:{reference}")),
+                |token| {
+                    self.client
+                        .request(method.clone(), &url)
+                        .bearer_auth(token)
+                        .header("Accept", MANIFEST_ACCEPT)
+                },
+            )
+            .await
+            .map_err(|e| format!("manifest request {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response)
+        } else {
+            Err(FetchError {
+                status: Some(status),
+                reason: format!("manifest request returned {status}"),
+            })
+        }
+    }
+}
+
 /// Send with the current token. A 401 means the token expired, so exchange for
 /// another once and send again; whatever that answers is returned, so a
 /// registry that still refuses is reported, not asked again.
@@ -228,7 +302,7 @@ async fn send_renewing<E>(
 ) -> Result<reqwest::Response, E> {
     let used = token().await?;
     let response = send(&used).await?;
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+    if response.status() != StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
     send(&renew(&used).await?).await
@@ -378,7 +452,6 @@ mod tests {
 
     #[test]
     fn only_throttling_and_server_failures_are_retried() {
-        use reqwest::StatusCode;
         // A refusal retried would hammer a registry that said no; a throttle
         // or outage not retried would fail a run that a short wait saves.
         let cases = [

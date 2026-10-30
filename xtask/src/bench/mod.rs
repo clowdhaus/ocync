@@ -19,11 +19,13 @@ use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
+use ocync_distribution::Digest;
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
 use regression::Baseline;
-use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
+use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
 use runner::Tool;
 
 /// Which tools a benchmark runs, shared by `bench` and `bench-remote`.
@@ -459,6 +461,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         total_tags: corpus.total_tags(),
         tool_versions,
         relay_versions,
+        prewarm: None,
         scenarios: Vec::new(),
     };
 
@@ -468,13 +471,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    if args.skip_prewarm {
-        eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
-    } else if transfers.is_empty() {
-        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
-    } else {
-        cdn_prewarm(&refs, auth, &http).await;
-    }
+    report.prewarm = match &lock {
+        None => {
+            eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
+            None
+        }
+        Some(_) if args.skip_prewarm => {
+            eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+            Some(Prewarm::Skipped)
+        }
+        Some(lock) => Some(cdn_prewarm(lock, &refs, auth, &http).await),
+    };
 
     // A scenario after the first re-checks the sources, so a move during a long
     // run cannot put different content under later numbers. The first was
@@ -603,7 +610,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             region: report.instance.region.clone(),
             image_id: Some(report.instance.image_id.clone()),
         },
-        relays: report.relay_versions.clone(),
+        relays: Some(report.relay_versions.clone()),
+        prewarm: report.prewarm.clone(),
         corpus: report::CorpusInfo {
             images: report.corpus_size,
             tags: report.total_tags,
@@ -1354,58 +1362,91 @@ impl PrewarmRateController {
 struct PrewarmStats {
     hits: u64,
     misses: u64,
-    errors: u64,
+    /// Blobs that could not be warmed.
+    blob_errors: u64,
     /// Manifests that could not be read, so their blobs are not warmed.
     manifest_errors: u64,
+    /// Manifests and blobs not started because the deadline had passed.
+    skipped: u64,
 }
 
-/// What manifest and blob discovery collected.
+/// What manifest reading collected.
 #[derive(Default)]
 struct Discovered {
     /// (repository, digest) pairs, deduped so shared layers are fetched once.
     blobs: HashSet<(registry::RepoKey, String)>,
-    /// Child manifests already read, so tags sharing an index read it once.
-    children: HashSet<(registry::RepoKey, String)>,
     /// Statistics by registry host.
     stats: BTreeMap<String, PrewarmStats>,
 }
 
-/// The (repository, tag) of every manifest the pre-warm reads. A source with
-/// no `/` names no repository and is left out.
-fn manifest_targets(refs: &BTreeSet<lock::ImageRef>) -> Vec<(registry::RepoKey, &str)> {
-    refs.iter()
-        .filter_map(|image| {
-            let repo = registry::split_source(&image.source)?;
-            Some((registry::RepoKey::from(&repo), image.tag.as_str()))
-        })
+/// The (repository, digest) of every manifest the pre-warm reads: each ref's
+/// index children, or the ref's own manifest when it has none. The lock names
+/// them, so every tag is covered and no index is read by tag. A ref the lock
+/// lacks or a source with no registry cannot reach here, since
+/// [`lock::ensure_unmoved`] has refused both.
+fn manifests_to_read(
+    lock: &lock::Lock,
+    refs: &BTreeSet<lock::ImageRef>,
+) -> HashSet<(registry::RepoKey, Digest)> {
+    let mut manifests = HashSet::new();
+    for image in refs {
+        let (Some(repo), Some(entry)) = (
+            registry::split_source(&image.source),
+            lock.images.get(image),
+        ) else {
+            continue;
+        };
+        let repo = registry::RepoKey::from(&repo);
+        if entry.children.is_empty() {
+            manifests.insert((repo, entry.digest.clone()));
+        } else {
+            manifests.extend(entry.children.iter().map(|c| (repo.clone(), c.clone())));
+        }
+    }
+    manifests
+}
+
+/// Hosts with a manifest or blob that was not warmed.
+fn unwarmed(stats: &BTreeMap<String, PrewarmStats>) -> Vec<String> {
+    stats
+        .iter()
+        .filter(|(_, s)| s.blob_errors + s.manifest_errors + s.skipped > 0)
+        .map(|(host, _)| host.clone())
         .collect()
 }
 
-/// Hosts with a blob or manifest that was not warmed.
-fn unwarmed(stats: &BTreeMap<String, PrewarmStats>) -> Vec<&str> {
-    stats
-        .iter()
-        .filter(|(_, s)| s.errors + s.manifest_errors > 0)
-        .map(|(host, _)| host.as_str())
-        .collect()
-}
+/// Seconds from the start of the pre-warm after which no manifest read or
+/// blob request is started.
+const PREWARM_DEADLINE_SECS: u64 = 480;
 
 /// Pull every unique source blob once to warm CDN edge caches.
 ///
 /// Runs before any tool so all tools see identically warm CDN. Uses
 /// OCI token exchange for authentication so requests succeed (2xx) and
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
-/// NOT cached by CDN and would warm nothing. Every ref the run syncs has its
-/// manifest read, because tags of one image can name different layers.
+/// NOT cached by CDN and would warm nothing. The blobs come from the lock's
+/// manifests, read by digest, so every tag the run syncs is warmed.
+///
+/// The outcome says which registries were left cold, for the run record.
 async fn cdn_prewarm(
+    lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
     auth: Option<&corpus::DockerHubAuth>,
     client: &reqwest::Client,
-) {
-    let tokens = registry::Tokens::default();
+) -> Prewarm {
+    // Work not started by this time is skipped and counted. A request already
+    // started runs to its own timeout, and the CDN wait below follows, so the
+    // pre-warm can end later than this.
+    let prewarm_deadline = Instant::now() + Duration::from_secs(PREWARM_DEADLINE_SECS);
+    let access = registry::Access {
+        client,
+        tokens: registry::Tokens::default(),
+        auth,
+    };
+    let manifests = manifests_to_read(lock, refs);
     eprintln!(
         "bench: reading {} manifests to find blobs; pre-warming blob CDN...",
-        refs.len()
+        manifests.len()
     );
 
     // Blob URLs are served via 302 redirects to CloudFront -- completely
@@ -1419,15 +1460,16 @@ async fn cdn_prewarm(
         .unwrap();
 
     let mut found = Discovered::default();
-    for (key, tag) in manifest_targets(refs) {
-        if let Some(manifest) = fetch_manifest(client, &tokens, auth, &key, tag, &mut found).await {
-            extract_blob_digests(client, &manifest, &key, &tokens, auth, &mut found).await;
+    for (repo, digest) in &manifests {
+        if Instant::now() > prewarm_deadline {
+            found.stats.entry(repo.host.clone()).or_default().skipped += 1;
+        } else {
+            read_manifest(&access, repo, digest, &mut found).await;
         }
     }
     let Discovered {
         blobs: unique_blobs,
         stats,
-        ..
     } = found;
 
     let blob_count = unique_blobs.len();
@@ -1455,9 +1497,6 @@ async fn cdn_prewarm(
             .or_default();
     }
 
-    // Total pre-warm timeout: 8 minutes (leaves 2 min headroom in 10-min budget).
-    let prewarm_deadline = Instant::now() + Duration::from_secs(480);
-
     let sem = tokio::sync::Semaphore::new(20);
     const MAX_RETRIES: u32 = 3;
 
@@ -1468,20 +1507,10 @@ async fn cdn_prewarm(
             let blob_client = &blob_client;
             let per_registry_stats = &per_registry_stats;
             let rate_controllers = &rate_controllers;
-            let tokens = &tokens;
+            let access = &access;
             let registry = key.host.clone();
             let digest = digest.clone();
             async move {
-                // Check pre-warm timeout before starting.
-                if Instant::now() > prewarm_deadline {
-                    per_registry_stats
-                        .borrow_mut()
-                        .entry(registry)
-                        .or_default()
-                        .errors += 1;
-                    return;
-                }
-
                 // Rate limit: compute delay, drop borrow, sleep, re-borrow.
                 let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
                 if let Some(d) = delay {
@@ -1498,11 +1527,27 @@ async fn cdn_prewarm(
 
                 let mut retries = 0u32;
                 loop {
+                    // Every task starts at once, so the deadline can only be
+                    // judged here: after the rate-limit wait, after the permit
+                    // and before each retry.
+                    if Instant::now() > prewarm_deadline {
+                        per_registry_stats
+                            .borrow_mut()
+                            .entry(registry)
+                            .or_default()
+                            .skipped += 1;
+                        break;
+                    }
                     let url = format!("https://{}/v2/{}/blobs/{digest}", key.host, key.path);
-                    let resp = tokens
-                        .send(client, &key.repository(), auth, None, |token| {
-                            blob_client.get(&url).bearer_auth(token)
-                        })
+                    let resp = access
+                        .tokens
+                        .send(
+                            access.client,
+                            &key.repository(),
+                            access.auth,
+                            None,
+                            |token| blob_client.get(&url).bearer_auth(token),
+                        )
                         .await;
                     match resp {
                         Ok(r) if r.status().as_u16() == 429 => {
@@ -1520,7 +1565,7 @@ async fn cdn_prewarm(
                                     .borrow_mut()
                                     .entry(registry.clone())
                                     .or_default()
-                                    .errors += 1;
+                                    .blob_errors += 1;
                                 break;
                             }
                             let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
@@ -1565,7 +1610,7 @@ async fn cdn_prewarm(
                                 .borrow_mut()
                                 .entry(registry.clone())
                                 .or_default()
-                                .errors += 1;
+                                .blob_errors += 1;
                             break;
                         }
                         Err(e) => {
@@ -1574,7 +1619,7 @@ async fn cdn_prewarm(
                                 .borrow_mut()
                                 .entry(registry.clone())
                                 .or_default()
-                                .errors += 1;
+                                .blob_errors += 1;
                             break;
                         }
                     }
@@ -1593,19 +1638,20 @@ async fn cdn_prewarm(
                 format!(", {}ms/req", c.interval.as_millis())
             });
         eprintln!(
-            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} blobs failed, {} manifests failed{rate}",
+            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} blobs failed, {} manifests failed, {} skipped at the deadline{rate}",
             s.hits + s.misses,
             s.hits,
             s.misses,
-            s.errors,
-            s.manifest_errors
+            s.blob_errors,
+            s.manifest_errors,
+            s.skipped
         );
     }
     eprintln!("bench: blob CDN pre-warm done");
     let unwarmed = unwarmed(&stats);
     if !unwarmed.is_empty() {
         eprintln!(
-            "WARNING: pre-warm failed for {}; those sources are not warm, so the tool that runs first may pay the CDN misses and tool order matters",
+            "WARNING: pre-warm incomplete for {}; those sources are not warm, so the tool that runs first may pay the CDN misses and tool order matters",
             unwarmed.join(", ")
         );
     }
@@ -1615,56 +1661,41 @@ async fn cdn_prewarm(
     let wait_secs = 360; // 6 minutes
     eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+    Prewarm::Done { unwarmed }
 }
 
-/// The manifest in a response, or why there is none: a status that is not 2xx,
-/// or a body that is not JSON.
-fn decode_manifest(status: reqwest::StatusCode, body: &str) -> Result<serde_json::Value, String> {
-    if !status.is_success() {
-        return Err(status.to_string());
-    }
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a public image manifest; the error is reported, not parsed further"
-    )]
-    serde_json::from_str(body).map_err(|e| format!("not JSON: {e}"))
-}
-
-/// Read one manifest of `repo`, counting and printing a failure against its
-/// registry.
-async fn fetch_manifest(
-    client: &reqwest::Client,
-    tokens: &registry::Tokens,
-    auth: Option<&corpus::DockerHubAuth>,
+/// Read the manifest `digest` of `repo` and collect its blobs into `found`.
+/// One that cannot be read, or holds no `layers` (a nested index, say), is
+/// counted and printed against its registry, never passed as warm.
+async fn read_manifest(
+    access: &registry::Access<'_>,
     repo: &registry::RepoKey,
-    reference: &str,
+    digest: &Digest,
     found: &mut Discovered,
-) -> Option<serde_json::Value> {
-    let url = format!(
-        "https://{}/v2/{}/manifests/{reference}",
-        repo.host, repo.path
-    );
-    let sent = tokens
-        .send(client, &repo.repository(), auth, None, |token| {
-            client
-                .get(&url)
-                .bearer_auth(token)
-                .header("Accept", registry::MANIFEST_ACCEPT)
-        })
-        .await;
-    let read = match sent {
-        Ok(r) => {
-            let status = r.status();
-            match r.text().await {
-                Ok(body) => decode_manifest(status, &body),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        Err(e) => Err(e),
-    };
-    read.inspect_err(|why| {
+) {
+    let read = async {
+        let response = access
+            .request_manifest(Method::GET, &repo.repository(), &digest.to_string())
+            .await
+            .map_err(|e| e.reason)?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("body unreadable: {e}"))?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a public image manifest; the error is reported, not parsed further"
+        )]
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| format!("not JSON: {e}"))?;
+        collect_image_blobs(&manifest, repo, &mut found.blobs)
+            .then_some(())
+            .ok_or_else(|| "holds no layers".to_owned())
+    }
+    .await;
+    if let Err(why) = read {
         eprintln!(
-            "  manifest pre-warm: {}/{}:{reference}: {why}",
+            "  manifest pre-warm: {}/{}@{digest}: {why}",
             repo.host, repo.path
         );
         found
@@ -1672,50 +1703,13 @@ async fn fetch_manifest(
             .entry(repo.host.clone())
             .or_default()
             .manifest_errors += 1;
-    })
-    .ok()
-}
-
-/// Collect layer and config blob digests from a manifest JSON value.
-///
-/// Works for both image manifests (`layers` + `config`) and index manifests
-/// (`manifests` array -- fetches each child to discover its layers).
-async fn extract_blob_digests(
-    client: &reqwest::Client,
-    manifest: &serde_json::Value,
-    repo: &registry::RepoKey,
-    tokens: &registry::Tokens,
-    auth: Option<&corpus::DockerHubAuth>,
-    found: &mut Discovered,
-) {
-    // Image manifest: has `layers` array.
-    if collect_image_blobs(manifest, repo, &mut found.blobs) {
-        return;
-    }
-
-    // Index manifest: has `manifests` array. Fetch each child to discover
-    // its layers.
-    if let Some(children) = manifest.get("manifests").and_then(|m| m.as_array()) {
-        for child in children {
-            let Some(digest) = child.get("digest").and_then(|d| d.as_str()) else {
-                continue;
-            };
-            if !found.children.insert((repo.clone(), digest.to_owned())) {
-                continue;
-            }
-            if let Some(child_manifest) =
-                fetch_manifest(client, tokens, auth, repo, digest, found).await
-            {
-                collect_image_blobs(&child_manifest, repo, &mut found.blobs);
-            }
-        }
     }
 }
 
 /// Extract layer and config digests from an image manifest JSON.
 ///
-/// Returns `true` if this is an image manifest (has `layers`), `false`
-/// otherwise (caller should try index parsing).
+/// Returns `false` when the manifest has no `layers`, which the caller counts
+/// as an error.
 fn collect_image_blobs(
     manifest: &serde_json::Value,
     repo: &registry::RepoKey,
@@ -2090,86 +2084,57 @@ images:
             let present = refs.iter().any(|r| r.to_string() == image);
             assert_eq!(present, expected, "{} {image}", transfers[at]);
         }
+
+        // The run's refs are the union over scenarios, not the first one's.
+        assert_eq!(all_refs(&transfers, &corpus).len(), 4);
+        assert_eq!(all_refs(&transfers[..1], &corpus).len(), 2);
     }
 
-    fn warmed(scenario: Scenario) -> Vec<(String, String, String)> {
-        let dir = tempfile::tempdir().unwrap();
-        let overrides = dir.path().join("overrides.yaml");
-        std::fs::write(
-            &overrides,
-            "overrides:\n  - source: \"docker.io/library/alpine\"\n    tags: [\"3.20\"]\n",
-        )
-        .unwrap();
-        let corpus: Corpus = serde_yaml::from_str(
-            r#"
-corpus: { target_registry: "r.example", target_prefix: "bench" }
-images:
-  - source: "public.ecr.aws/amazonlinux/amazonlinux"
-    tags: ["2023", "2"]
-  - source: "docker.io/library/alpine"
-    tags: ["3", "3.24"]
-  - source: "bare"
-    tags: ["x"]
-"#,
-        )
-        .unwrap();
-        let transfers = plan(scenario, &corpus, overrides.to_str().unwrap()).unwrap();
-        let refs = all_refs(&transfers, &corpus);
-        manifest_targets(&refs)
+    #[test]
+    fn the_pre_warm_reads_the_locked_manifests_of_every_tag() {
+        // Catches: warming only an image's first tag, or reading an index by
+        // tag, so a later tag's blobs are cold for the first tool.
+        let lock = lock::Lock {
+            locked_at: lock::fixtures::locked_at("2026-10-30-214340"),
+            images: [
+                // An index: its children, not its own digest.
+                (
+                    "docker.io/library/alpine:3",
+                    lock::fixtures::entry('a', &['b', 'c']),
+                ),
+                // A single manifest: its own digest.
+                ("quay.io/org/app:1", lock::fixtures::entry('d', &[])),
+                // The same digest under a second tag: one read.
+                ("quay.io/org/app:1.0", lock::fixtures::entry('d', &[])),
+                // A second tag naming other content: also read.
+                ("quay.io/org/app:2", lock::fixtures::entry('e', &[])),
+                // The same digest in another repository: its own read.
+                ("quay.io/org/other:1", lock::fixtures::entry('d', &[])),
+            ]
             .into_iter()
-            .map(|(key, tag)| (key.host, key.path, tag.to_owned()))
-            .collect()
-    }
-
-    #[test]
-    fn the_pre_warm_reads_every_tag_of_every_synced_image() {
-        // Catches: warming only an image's first tag, so a later tag's blobs
-        // are cold for the first tool and the order of tools matters.
-        let ecr = |tag: &str| {
-            (
-                "public.ecr.aws".to_owned(),
-                "amazonlinux/amazonlinux".to_owned(),
-                tag.to_owned(),
-            )
+            .map(|(raw, entry)| (raw.to_owned().try_into().unwrap(), entry))
+            .collect(),
         };
-        let hub = |tag: &str| {
-            (
-                "registry-1.docker.io".to_owned(),
-                "library/alpine".to_owned(),
-                tag.to_owned(),
-            )
-        };
-        // Both tags of the first image, and nothing for a source with no repository.
-        assert_eq!(
-            warmed(Scenario::Sync),
-            [hub("3"), hub("3.24"), ecr("2"), ecr("2023")]
-        );
-        // The override's tag is read as well as the base corpus's.
-        assert_eq!(
-            warmed(Scenario::All),
-            [hub("3"), hub("3.20"), hub("3.24"), ecr("2"), ecr("2023")]
-        );
-    }
-
-    #[test]
-    fn a_manifest_that_is_not_2xx_json_is_an_error_with_its_status() {
-        // Catches: an error response parsed as a manifest and skipped unseen.
-        let cases = [
-            (200, r#"{"layers":[]}"#, Ok(())),
-            (404, r#"{"layers":[]}"#, Err("404 Not Found")),
-            (429, "", Err("429 Too Many Requests")),
-            (500, "oops", Err("500 Internal Server Error")),
-        ];
-        for (status, body, expected) in cases {
-            let status = reqwest::StatusCode::from_u16(status).unwrap();
-            let got = decode_manifest(status, body).map(|_| ());
-            assert_eq!(got, expected.map_err(str::to_owned), "{status}");
-        }
-        assert!(
-            decode_manifest(reqwest::StatusCode::OK, "<html>")
-                .unwrap_err()
-                .starts_with("not JSON")
-        );
+        let refs = lock.images.keys().cloned().collect();
+        let mut got: Vec<(String, String)> = manifests_to_read(&lock, &refs)
+            .into_iter()
+            .map(|(repo, digest)| {
+                (
+                    format!("{}/{}", repo.host, repo.path),
+                    digest.hex()[..1].to_owned(),
+                )
+            })
+            .collect();
+        got.sort();
+        let want = [
+            ("quay.io/org/app", "d"),
+            ("quay.io/org/app", "e"),
+            ("quay.io/org/other", "d"),
+            ("registry-1.docker.io/library/alpine", "b"),
+            ("registry-1.docker.io/library/alpine", "c"),
+        ]
+        .map(|(repo, digest)| (repo.to_owned(), digest.to_owned()));
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -2180,7 +2145,7 @@ images:
         stats.insert(
             "blob.example".to_owned(),
             PrewarmStats {
-                errors: 1,
+                blob_errors: 1,
                 ..PrewarmStats::default()
             },
         );
@@ -2191,7 +2156,17 @@ images:
                 ..PrewarmStats::default()
             },
         );
-        assert_eq!(unwarmed(&stats), ["blob.example", "manifest.example"]);
+        stats.insert(
+            "late.example".to_owned(),
+            PrewarmStats {
+                skipped: 1,
+                ..PrewarmStats::default()
+            },
+        );
+        assert_eq!(
+            unwarmed(&stats),
+            ["blob.example", "late.example", "manifest.example"]
+        );
     }
 
     #[test]

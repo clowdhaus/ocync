@@ -14,7 +14,7 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
-use crate::bench::registry::{self, Repository, Tokens};
+use crate::bench::registry::{self, Access, FetchError, Repository, Tokens};
 
 /// The digest of `bytes`.
 fn digest_of(bytes: &[u8]) -> Digest {
@@ -188,24 +188,6 @@ impl Lock {
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize lock: {e}"))?;
         text.push('\n');
         Ok(text)
-    }
-}
-
-/// Why one ref could not be resolved.
-#[derive(Clone)]
-struct FetchError {
-    /// The registry's answer, when it gave one.
-    status: Option<StatusCode>,
-    /// What went wrong.
-    reason: String,
-}
-
-impl From<String> for FetchError {
-    fn from(reason: String) -> Self {
-        Self {
-            status: None,
-            reason,
-        }
     }
 }
 
@@ -452,16 +434,7 @@ fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
     Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
 }
 
-/// The client, token store and credentials manifest requests go through.
-struct Access<'a> {
-    /// Client for every request.
-    client: &'a reqwest::Client,
-    /// Bearer tokens, exchanged as each repository is first asked for.
-    tokens: Tokens,
-    /// Docker Hub credentials for the token exchange, if any.
-    auth: Option<&'a DockerHubAuth>,
-}
-
+/// What the lock reads and writes through [`Access`].
 impl Access<'_> {
     /// Resolve every ref with `fetch`. Returns what resolved and each ref that
     /// did not, so the caller decides what an incomplete answer means.
@@ -485,47 +458,6 @@ impl Access<'_> {
             }
         }
         (resolved, failed)
-    }
-
-    /// Request a manifest, retrying what [`registry::send_retrying`] retries
-    /// and renewing an expired token once. Any other failing status is
-    /// reported at once, with the status.
-    async fn request_manifest(
-        &self,
-        method: Method,
-        repo: &Repository<'_>,
-        tag: &str,
-    ) -> Result<reqwest::Response, FetchError> {
-        let url = format!(
-            "https://{}/v2/{}/manifests/{tag}",
-            repo.host.api_host(),
-            repo.path
-        );
-        let response = self
-            .tokens
-            .send(
-                self.client,
-                repo,
-                self.auth,
-                Some(&format!("{repo}:{tag}")),
-                |token| {
-                    self.client
-                        .request(method.clone(), &url)
-                        .bearer_auth(token)
-                        .header("Accept", registry::MANIFEST_ACCEPT)
-                },
-            )
-            .await
-            .map_err(|e| format!("manifest request {e}"))?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(response)
-        } else {
-            Err(FetchError {
-                status: Some(status),
-                reason: format!("manifest request returned {status}"),
-            })
-        }
     }
 
     /// GET a manifest, hash its exact bytes and read them with `read`.

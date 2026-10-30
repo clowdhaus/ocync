@@ -42,14 +42,46 @@ pub(crate) struct RunRecord {
     ///
     /// dregsy transfers nothing itself, so skopeo's version moves dregsy's
     /// numbers. Recorded here rather than only in the per-run summary, which
-    /// is not tracked in git and dies with the instance. Absent when none was
-    /// recorded, which is not the same as no relay used.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) relays: BTreeMap<String, String>,
+    /// is not tracked in git and dies with the instance. Empty for a run that
+    /// used no relay; `None` for a record written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) relays: Option<BTreeMap<String, String>>,
+    /// How the CDN pre-warm went. A source that was not warmed changes what the
+    /// numbers mean. `None` when no pre-warm was decided, as in a record
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+/// What happened to the CDN pre-warm of a run that transfers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Prewarm {
+    /// Skipped with `--skip-prewarm`; the first tool may meet a cold CDN.
+    Skipped,
+    /// Ran. A registry in `unwarmed` had a manifest or blob that was not warmed.
+    Done {
+        /// Registries not fully warmed; empty when every source is warm.
+        unwarmed: Vec<String>,
+    },
+}
+
+impl Prewarm {
+    /// The line the summary carries, when the pre-warm left any source cold.
+    fn note(&self) -> Option<String> {
+        match self {
+            Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
+            Self::Done { unwarmed } if unwarmed.is_empty() => None,
+            Self::Done { unwarmed } => Some(format!(
+                "Pre-warm: not fully warm for {}",
+                unwarmed.join(", ")
+            )),
+        }
+    }
 }
 
 /// Machine metadata for a benchmark run.
@@ -82,11 +114,6 @@ pub(crate) struct MachineInfo {
     pub(crate) image_id: Option<String>,
 }
 
-/// The value recorded for instance metadata a live run could not read.
-fn unknown_string() -> String {
-    "unknown".to_string()
-}
-
 /// Reads an instance metadata field, warning when it cannot be resolved.
 ///
 /// `read_imds` returns `None` for an absent curl, an unreachable metadata
@@ -99,7 +126,7 @@ fn imds_or_unknown(path: &str) -> String {
             "WARNING: instance metadata {path} unavailable, recording \"unknown\". \
              Runs cannot be compared on it."
         );
-        unknown_string()
+        "unknown".to_owned()
     })
 }
 
@@ -399,6 +426,8 @@ pub(crate) struct BenchReport {
     /// Kept apart from [`Self::tool_versions`] because these are not
     /// benchmarked tools and must not become columns in the metric tables.
     pub(crate) relay_versions: BTreeMap<String, String>,
+    /// How the CDN pre-warm went; `None` when no scenario transfers.
+    pub(crate) prewarm: Option<Prewarm>,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioResult>,
 }
@@ -502,6 +531,9 @@ fn summary_markdown(report: &BenchReport) -> String {
         "Corpus: {} images, {} total tags\n\n",
         report.corpus_size, report.total_tags
     ));
+    if let Some(note) = report.prewarm.as_ref().and_then(Prewarm::note) {
+        out.push_str(&format!("{note}\n\n"));
+    }
 
     out.push_str("## Tool Versions\n\n");
     for (tool, version) in &report.tool_versions {
@@ -943,6 +975,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1074,6 +1107,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![],
         };
@@ -1132,7 +1166,8 @@ mod tests {
                 region: "us-east-1".into(),
                 image_id: None,
             },
-            relays: BTreeMap::new(),
+            relays: None,
+            prewarm: None,
             corpus: CorpusInfo {
                 images: 42,
                 tags: 55,
@@ -1174,6 +1209,13 @@ mod tests {
         let archive = include_str!("../../../bench/results/ecr.json");
         let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
         assert!(!records.is_empty());
+        // Catches: a record that does not rewrite as it was read, as when a
+        // field an old run never had is written as an empty value. Compared
+        // as values because the archive spells one float longer than Rust's
+        // shortest form.
+        let rewritten = serde_json::to_string_pretty(&records).unwrap();
+        let as_value = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(as_value(&rewritten), as_value(archive));
     }
 
     #[test]
@@ -1208,39 +1250,33 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_relays_or_image_rewrites_byte_identical() {
-        // Catches: rewriting an old record with `"relays":{}` or
-        // `"image_id":"unknown"`, which read as "no relay used" and "image
-        // unreadable" for runs that recorded neither.
-        let old = concat!(
-            r#"{"timestamp":"2026-04-18-021040","git_ref":"d121864","#,
-            r#""machine":{"instance_type":"c6in.4xlarge","arch":"x86_64","vcpus":16,"#,
-            r#""memory_gib":32.0,"network":"n","region":"us-east-1"},"#,
-            r#""corpus":{"images":1,"tags":1},"scenarios":[]}"#,
-        );
-        let record: RunRecord = serde_json::from_str(old).unwrap();
-        assert!(record.relays.is_empty());
-        assert_eq!(record.machine.image_id, None);
-        assert_eq!(serde_json::to_string(&record).unwrap(), old);
-    }
-
-    #[test]
-    fn recorded_relays_and_image_are_written() {
-        // Catches: the skip dropping a value a run did record.
+    fn a_pre_warm_outcome_round_trips_and_is_noted_only_when_a_source_is_cold() {
+        // Catches: a cold source recorded nowhere but stderr, and a record
+        // without the field gaining one.
         let mut record: RunRecord = serde_json::from_str(
             r#"{"timestamp":"t","git_ref":"g","machine":{"instance_type":"i","arch":"a",
             "vcpus":1,"memory_gib":1.0,"network":"n","region":"r"},
             "corpus":{"images":1,"tags":1},"scenarios":[]}"#,
         )
         .unwrap();
-        record.relays.insert("skopeo".into(), "1.0".into());
-        record.machine.image_id = Some("unknown".into());
+        assert_eq!(record.prewarm, None);
+        assert!(!serde_json::to_string(&record).unwrap().contains("prewarm"));
+
+        let cold = Prewarm::Done {
+            unwarmed: vec!["quay.io".to_owned()],
+        };
+        record.prewarm = Some(cold.clone());
         let written = serde_json::to_string(&record).unwrap();
-        assert!(
-            written.contains(r#""relays":{"skopeo":"1.0"}"#),
-            "{written}"
-        );
-        assert!(written.contains(r#""image_id":"unknown""#), "{written}");
+        let reread: RunRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(reread.prewarm, Some(cold.clone()), "{written}");
+
+        let all_warm = Prewarm::Done { unwarmed: vec![] };
+        assert_eq!(all_warm.note(), None);
+        assert!(cold.note().unwrap().contains("quay.io"));
+        assert!(Prewarm::Skipped.note().unwrap().contains("--skip-prewarm"));
+        let mut report = sample_report();
+        report.prewarm = Some(cold);
+        assert!(summary_markdown(&report).contains("Pre-warm: not fully warm for quay.io"));
     }
 
     #[test]
@@ -1260,7 +1296,8 @@ mod tests {
                 region: "us-east-1".into(),
                 image_id: None,
             },
-            relays: BTreeMap::new(),
+            relays: None,
+            prewarm: None,
             corpus: CorpusInfo {
                 images: 10,
                 tags: 15,
@@ -1297,7 +1334,8 @@ mod tests {
                 region: "us-east-1".into(),
                 image_id: None,
             },
-            relays: BTreeMap::new(),
+            relays: None,
+            prewarm: None,
             corpus: CorpusInfo { images: 5, tags: 8 },
             scenarios: vec![],
         };
@@ -1329,7 +1367,8 @@ mod tests {
                 region: "unknown".into(),
                 image_id: None,
             },
-            relays: BTreeMap::new(),
+            relays: None,
+            prewarm: None,
             corpus: CorpusInfo { images: 0, tags: 0 },
             scenarios: vec![],
         };
@@ -1344,6 +1383,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
@@ -1386,6 +1426,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Warm,
@@ -1462,6 +1503,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1553,6 +1595,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1608,6 +1651,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1686,6 +1730,7 @@ mod tests {
             corpus_size: 39,
             total_tags: 51,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![
                 ScenarioResult::unshuffled(
@@ -1739,6 +1784,7 @@ mod tests {
             corpus_size: 39,
             total_tags: 51,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Warm,
@@ -1769,6 +1815,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".into()),
                 (Tool::Dregsy, "0.5.0".into()),
@@ -1822,6 +1869,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Dregsy, "0.5.0".into())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
@@ -1852,6 +1900,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".into())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
