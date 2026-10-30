@@ -249,33 +249,59 @@ impl fmt::Display for PlatformFilter {
 /// An OCI repository name (e.g. `library/nginx`, `mirror/nginx`).
 ///
 /// Distinguishes repository names from tags, hostnames and other strings.
+///
+/// Deserialization goes through [`RepositoryName::new`] so a name read from a
+/// cache file obeys the same character rule as one parsed from user input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct RepositoryName(String);
+
+impl TryFrom<String> for RepositoryName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
 
 impl RepositoryName {
     /// A repository name: non-empty and only `[a-zA-Z0-9._/-]`, as
     /// [`Reference`](crate::Reference) parsing accepts.
     pub fn new(name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
-        if name.is_empty() {
-            return Err(Error::InvalidReference {
+        match Self::check(&name) {
+            Ok(()) => Ok(Self(name)),
+            Err(reason) => Err(Error::InvalidReference {
                 input: name,
-                reason: "repository name must be non-empty".into(),
-            });
+                reason,
+            }),
         }
-        if let Some(bad) = name
+    }
+
+    /// [`Self::new`] for a name taken from `reference`, so the error names
+    /// the whole reference the user wrote.
+    pub(crate) fn within(name: String, reference: &str) -> Result<Self, Error> {
+        Self::check(&name).map_err(|reason| Error::InvalidReference {
+            input: reference.to_owned(),
+            reason,
+        })?;
+        Ok(Self(name))
+    }
+
+    /// Why `name` is not a repository name, if it is not.
+    fn check(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("repository name must be non-empty".into());
+        }
+        match name
             .chars()
             .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
         {
-            return Err(Error::InvalidReference {
-                input: name,
-                reason: format!(
-                    "repository name contains invalid character '{bad}'; \
-                     allowed: [a-zA-Z0-9._/-]"
-                ),
-            });
+            Some(bad) => Err(format!(
+                "repository name contains invalid character '{bad}'; \
+                 allowed: [a-zA-Z0-9._/-]"
+            )),
+            None => Ok(()),
         }
-        Ok(Self(name))
     }
 
     /// Return the name as a string slice.
@@ -813,6 +839,20 @@ mod tests {
 
         assert!(RepositoryName::new("repo name").is_err());
         assert!(RepositoryName::new("repo#frag").is_err());
+    }
+
+    #[test]
+    fn repository_name_serde_round_trips_as_plain_string() {
+        let name = RepositoryName::new("library/nginx").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, r#""library/nginx""#);
+        let back: RepositoryName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, name);
+    }
+
+    #[test]
+    fn repository_name_deserialize_rejects_invalid() {
+        assert!(serde_json::from_str::<RepositoryName>(r#""bad name""#).is_err());
     }
 
     #[test]

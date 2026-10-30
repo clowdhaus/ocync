@@ -14,9 +14,11 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use super::detect::AzureCloud;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
@@ -67,27 +69,34 @@ fn ttl_from_unix_exp(exp: i64) -> Duration {
     }
 }
 
-/// Map ACR registry hostname to the matching Azure AD authority and
-/// container registry resource endpoint.
-///
-/// Expects a DNS hostname, as the ACR regex in `detect_provider_kind()`
-/// enforces.
-fn azure_endpoints(host: &str) -> (&'static str, &'static str) {
-    if host.ends_with(".azurecr.cn") {
-        (
-            "login.chinacloudapi.cn",
-            "https://containerregistry.azure.cn",
-        )
-    } else if host.ends_with(".azurecr.us") {
-        (
-            "login.microsoftonline.us",
-            "https://containerregistry.azure.us",
-        )
-    } else {
-        (
-            "login.microsoftonline.com",
-            "https://containerregistry.azure.net",
-        )
+impl AzureCloud {
+    /// The Entra ID authority host.
+    fn authority(self) -> &'static str {
+        match self {
+            Self::Public => "login.microsoftonline.com",
+            Self::China => "login.chinacloudapi.cn",
+            Self::UsGov => "login.microsoftonline.us",
+        }
+    }
+
+    /// The Entra ID v2.0 token endpoint for `tenant`.
+    fn token_url(self, tenant: &str) -> String {
+        format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority())
+    }
+
+    /// The `.default` scope of the container registry resource.
+    fn scope(self) -> String {
+        format!("{}/.default", self.resource())
+    }
+
+    /// The container registry resource, with no `&` or `#`, so it needs no
+    /// URL encoding.
+    fn resource(self) -> &'static str {
+        match self {
+            Self::Public => "https://containerregistry.azure.net",
+            Self::China => "https://containerregistry.azure.cn",
+            Self::UsGov => "https://containerregistry.azure.us",
+        }
     }
 }
 
@@ -299,33 +308,43 @@ enum CredentialError {
     Failed(CredentialFailure, String),
 }
 
-/// Source indexes in the credential chain.
-const SOURCE_CLIENT_SECRET: usize = 0;
-const SOURCE_WORKLOAD_IDENTITY: usize = 1;
-const SOURCE_MANAGED_IDENTITY: usize = 2;
-const SOURCE_AZURE_CLI: usize = 3;
-/// No cached source, in an `AtomicUsize` that cannot hold an `Option`.
-const SOURCE_NONE: usize = usize::MAX;
+/// A source in the credential chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    ClientSecret,
+    WorkloadIdentity,
+    ManagedIdentity,
+    AzureCli,
+}
+
+impl Source {
+    /// The sources in the order the chain tries them.
+    const CHAIN: [Source; 4] = [
+        Self::ClientSecret,
+        Self::WorkloadIdentity,
+        Self::ManagedIdentity,
+        Self::AzureCli,
+    ];
+}
 
 /// Azure credential chain that tries four credential sources in order and
 /// keeps using the first that succeeds until reset.
 struct AzureCredentialChain {
-    authority: &'static str,
-    resource: &'static str,
-    cached_source: AtomicUsize,
+    cloud: AzureCloud,
+    cached_source: Mutex<Option<Source>>,
     http: reqwest::Client,
 }
 
 impl fmt::Debug for AzureCredentialChain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AzureCredentialChain")
-            .field("authority", &self.authority)
+            .field("cloud", &self.cloud)
             .finish_non_exhaustive()
     }
 }
 
 impl AzureCredentialChain {
-    fn new(authority: &'static str, resource: &'static str) -> Self {
+    fn new(cloud: AzureCloud) -> Self {
         crate::install_crypto_provider();
         let http = no_redirect_builder()
             .connect_timeout(Duration::from_secs(1))
@@ -333,15 +352,30 @@ impl AzureCredentialChain {
             .build()
             .expect("failed to build Azure credential HTTP client");
         Self {
-            authority,
-            resource,
-            cached_source: AtomicUsize::new(SOURCE_NONE),
+            cloud,
+            cached_source: Mutex::new(None),
             http,
         }
     }
 
+    /// The source that last gave a token, if any.
+    fn cached(&self) -> Option<Source> {
+        *self
+            .cached_source
+            .lock()
+            .expect("cached source lock poisoned")
+    }
+
+    /// Keep `source` as the one to use until reset, or forget it for `None`.
+    fn cache(&self, source: Option<Source>) {
+        *self
+            .cached_source
+            .lock()
+            .expect("cached source lock poisoned") = source;
+    }
+
     fn reset_cached_source(&self) {
-        self.cached_source.store(SOURCE_NONE, Ordering::Relaxed);
+        self.cache(None);
     }
 
     /// POST to the Entra ID v2.0 token endpoint and parse the response.
@@ -387,8 +421,8 @@ impl AzureCredentialChain {
         let client_secret =
             std::env::var("AZURE_CLIENT_SECRET").map_err(|_| CredentialError::NotConfigured)?;
 
-        let url = format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority);
-        let scope = format!("{resource}/.default", resource = self.resource);
+        let url = self.cloud.token_url(&tenant);
+        let scope = self.cloud.scope();
         let form = [
             ("client_id", client_id.as_str()),
             ("client_secret", client_secret.as_str()),
@@ -414,8 +448,8 @@ impl AzureCredentialChain {
             )
         })?;
 
-        let url = format!("https://{}/{tenant}/oauth2/v2.0/token", self.authority);
-        let scope = format!("{resource}/.default", resource = self.resource);
+        let url = self.cloud.token_url(&tenant);
+        let scope = self.cloud.scope();
         let form = [
             ("client_id", client_id.as_str()),
             ("client_assertion", assertion.trim()),
@@ -431,9 +465,9 @@ impl AzureCredentialChain {
     }
 
     async fn try_managed_identity(&self) -> Result<String, CredentialError> {
-        // `resource` is one of `azure_endpoints()`'s constants, none holding
+        // `resource` is one of `AzureCloud::resource()`'s constants, none holding
         // `&` or `#`, so it needs no encoding.
-        let resource = self.resource;
+        let resource = self.cloud.resource();
         let url = format!(
             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2019-08-01&resource={resource}"
         );
@@ -486,7 +520,7 @@ impl AzureCredentialChain {
                 "account",
                 "get-access-token",
                 "--resource",
-                self.resource,
+                self.cloud.resource(),
                 "-o",
                 "json",
             ])
@@ -514,23 +548,12 @@ impl AzureCredentialChain {
         cli_access_token(&output.stdout)
     }
 
-    async fn try_source(&self, index: usize) -> Result<String, CredentialError> {
-        match index {
-            SOURCE_CLIENT_SECRET => self.try_client_secret().await,
-            SOURCE_WORKLOAD_IDENTITY => self.try_workload_identity().await,
-            SOURCE_MANAGED_IDENTITY => self.try_managed_identity().await,
-            SOURCE_AZURE_CLI => self.try_azure_cli().await,
-            _ => unreachable!("invalid source index"),
-        }
-    }
-
-    fn source_name(index: usize) -> &'static str {
-        match index {
-            SOURCE_CLIENT_SECRET => "ClientSecret",
-            SOURCE_WORKLOAD_IDENTITY => "WorkloadIdentity",
-            SOURCE_MANAGED_IDENTITY => "ManagedIdentity",
-            SOURCE_AZURE_CLI => "AzureCli",
-            _ => "Unknown",
+    async fn try_source(&self, source: Source) -> Result<String, CredentialError> {
+        match source {
+            Source::ClientSecret => self.try_client_secret().await,
+            Source::WorkloadIdentity => self.try_workload_identity().await,
+            Source::ManagedIdentity => self.try_managed_identity().await,
+            Source::AzureCli => self.try_azure_cli().await,
         }
     }
 }
@@ -542,10 +565,7 @@ impl AzureTokenSource for AzureCredentialChain {
 
     fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
         Box::pin(async move {
-            let cached = self.cached_source.load(Ordering::Relaxed);
-
-            if cached != SOURCE_NONE {
-                let name = Self::source_name(cached);
+            if let Some(cached) = self.cached() {
                 return self.try_source(cached).await.map_err(|e| {
                     let (failure, reason) = match e {
                         CredentialError::NotConfigured => {
@@ -556,32 +576,26 @@ impl AzureTokenSource for AzureCredentialChain {
                     Error::cloud_credentials(
                         "ACR",
                         failure,
-                        format_args!("{name} credential failed: {reason}"),
+                        format_args!("{cached:?} credential failed: {reason}"),
                     )
                 });
             }
 
             let mut errors = Vec::new();
             let mut failures = Vec::new();
-            for index in [
-                SOURCE_CLIENT_SECRET,
-                SOURCE_WORKLOAD_IDENTITY,
-                SOURCE_MANAGED_IDENTITY,
-                SOURCE_AZURE_CLI,
-            ] {
-                let name = Self::source_name(index);
-                match self.try_source(index).await {
+            for source in Source::CHAIN {
+                match self.try_source(source).await {
                     Ok(token) => {
-                        tracing::debug!(source = name, "Azure credential acquired");
-                        self.cached_source.store(index, Ordering::Relaxed);
+                        tracing::debug!(?source, "Azure credential acquired");
+                        self.cache(Some(source));
                         return Ok(token);
                     }
                     Err(CredentialError::NotConfigured) => {
-                        tracing::debug!(source = name, "not configured, skipping");
+                        tracing::debug!(?source, "not configured, skipping");
                     }
                     Err(CredentialError::Failed(failure, reason)) => {
-                        tracing::warn!(source = name, "credential failed");
-                        errors.push(format!("{name}: {reason}"));
+                        tracing::warn!(?source, "credential failed");
+                        errors.push(format!("{source:?}: {reason}"));
                         failures.push(failure);
                     }
                 }
@@ -642,8 +656,7 @@ impl AcrAuth {
     /// its client uses.
     pub async fn new(registry: &url::Url) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
-        let (authority, resource) = azure_endpoints(&hostname);
-        let api = Box::new(AzureCredentialChain::new(authority, resource));
+        let api = Box::new(AzureCredentialChain::new(AzureCloud::of_host(&hostname)));
         Ok(Self {
             base_url: registry_origin(registry),
             service: hostname,
@@ -793,6 +806,8 @@ impl AuthProvider for AcrAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// A chain is refused when any source refused, whichever failed first,
@@ -907,25 +922,40 @@ mod tests {
         assert!(err.to_string().contains("not valid JSON"));
     }
 
+    /// Each cloud signs in at its own Entra ID authority for its own
+    /// container registry resource. Breaks if two clouds share either, or
+    /// the token URL or scope is built from the wrong one.
     #[test]
-    fn azure_endpoints_public() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.io");
-        assert_eq!(authority, "login.microsoftonline.com");
-        assert_eq!(resource, "https://containerregistry.azure.net");
-    }
-
-    #[test]
-    fn azure_endpoints_china() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.cn");
-        assert_eq!(authority, "login.chinacloudapi.cn");
-        assert_eq!(resource, "https://containerregistry.azure.cn");
-    }
-
-    #[test]
-    fn azure_endpoints_usgov() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.us");
-        assert_eq!(authority, "login.microsoftonline.us");
-        assert_eq!(resource, "https://containerregistry.azure.us");
+    fn azure_cloud_authority_and_resource_table() {
+        let cases = [
+            (
+                AzureCloud::Public,
+                "login.microsoftonline.com",
+                "https://containerregistry.azure.net",
+                "https://login.microsoftonline.com/tenant-1/oauth2/v2.0/token",
+                "https://containerregistry.azure.net/.default",
+            ),
+            (
+                AzureCloud::China,
+                "login.chinacloudapi.cn",
+                "https://containerregistry.azure.cn",
+                "https://login.chinacloudapi.cn/tenant-1/oauth2/v2.0/token",
+                "https://containerregistry.azure.cn/.default",
+            ),
+            (
+                AzureCloud::UsGov,
+                "login.microsoftonline.us",
+                "https://containerregistry.azure.us",
+                "https://login.microsoftonline.us/tenant-1/oauth2/v2.0/token",
+                "https://containerregistry.azure.us/.default",
+            ),
+        ];
+        for (cloud, authority, resource, token_url, scope) in cases {
+            assert_eq!(cloud.authority(), authority, "{cloud:?}");
+            assert_eq!(cloud.resource(), resource, "{cloud:?}");
+            assert_eq!(cloud.token_url("tenant-1"), token_url, "{cloud:?}");
+            assert_eq!(cloud.scope(), scope, "{cloud:?}");
+        }
     }
 
     /// Mock Azure token source that returns pre-configured access token strings.

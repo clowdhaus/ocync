@@ -1,5 +1,6 @@
 //! HTTP client for a single OCI registry endpoint.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,7 +14,7 @@ use crate::auth::{AuthProvider, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 50;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: NonZeroUsize = NonZeroUsize::new(50).unwrap();
 const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
 /// Build a no-redirect HTTP client for token-bearing requests.
@@ -50,14 +51,14 @@ pub(crate) fn no_redirect_builder() -> reqwest::ClientBuilder {
 /// auth refresh) on every registry we've probed. Without this cap, a
 /// `max_concurrent_transfers * BLOB_CONCURRENCY` above the budget
 /// overshoots it and the connection stalls indefinitely.
-const DEFAULT_BLOB_UPLOAD_CONCURRENCY: usize = 64;
+const DEFAULT_BLOB_UPLOAD_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 /// Default cap on concurrent blob downloads per registry. Each is its own
 /// HTTP/1.1 connection while its body is open, so the cap bounds the
 /// connections and TLS handshakes one sync opens to a source. Every upload
 /// reads one download, so a lower cap would hold uploads below their own
 /// cap, and a higher one would only open more bodies waiting on uploads.
-const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
+const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: NonZeroUsize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
@@ -67,12 +68,11 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY
 /// (common for CUDA/ML images) would hold ~64 GB resident. 512 MB is ~32x a typical 16 MB
 /// layer, so modest layers do not serialise, while a single oversized layer
 /// (e.g. 2 GB GPU runtime) runs alone.
-const DEFAULT_BUFFERED_BLOB_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_BUFFERED_BLOB_BYTES: NonZeroUsize = NonZeroUsize::new(512 * 1024 * 1024).unwrap();
 
 /// Fallback acquisition size when a fallback upload has no `known_size`
-/// hint. Equals `blob::MAX_BUFFER_PREALLOC`, the buffer's own initial
-/// allocation cap.
-const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u32 = 16 * 1024 * 1024;
+/// hint: the buffer's own initial allocation cap.
+const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u64 = crate::blob::MAX_BUFFER_PREALLOC as u64;
 
 /// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
 /// rate-limit header has been observed yet.
@@ -84,10 +84,10 @@ use crate::auth::AuthScheme;
 pub struct RegistryClientBuilder {
     url: Url,
     auth: Option<Box<dyn AuthProvider>>,
-    max_concurrent: usize,
-    blob_upload_concurrency: usize,
-    blob_download_concurrency: usize,
-    buffered_blob_bytes: usize,
+    max_concurrent: NonZeroUsize,
+    blob_upload_concurrency: NonZeroUsize,
+    blob_download_concurrency: NonZeroUsize,
+    buffered_blob_bytes: NonZeroUsize,
     dns_overrides: Vec<(String, std::net::SocketAddr)>,
     accept_invalid_certs: bool,
     force_http1: bool,
@@ -127,27 +127,28 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Set the maximum number of concurrent requests. `0` is clamped to `1`
-    /// so the semaphore always makes progress.
-    pub fn max_concurrent(mut self, n: usize) -> Self {
-        self.max_concurrent = n.max(1);
+    /// Set the maximum number of concurrent requests. Non-zero, as a
+    /// zero-permit semaphore never admits a request.
+    pub fn max_concurrent(mut self, n: NonZeroUsize) -> Self {
+        self.max_concurrent = n;
         self
     }
 
     /// Set the cap on concurrent blob uploads. Each upload holds an HTTP/2
     /// stream open on the one connection per origin, so the cap must stay
     /// under the server's `SETTINGS_MAX_CONCURRENT_STREAMS` less headroom for
-    /// manifest, mount and auth requests. Default: 64.
-    pub fn blob_upload_concurrency(mut self, n: usize) -> Self {
-        self.blob_upload_concurrency = n.max(1);
+    /// manifest, mount and auth requests. Default: `DEFAULT_BLOB_UPLOAD_CONCURRENCY`
+    /// (64).
+    pub fn blob_upload_concurrency(mut self, n: NonZeroUsize) -> Self {
+        self.blob_upload_concurrency = n;
         self
     }
 
     /// Set the cap on concurrent blob downloads. Default:
-    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    /// `DEFAULT_BLOB_DOWNLOAD_CONCURRENCY` (64).
     #[cfg(test)]
-    pub(crate) fn blob_download_concurrency(mut self, n: usize) -> Self {
-        self.blob_download_concurrency = n.max(1);
+    pub(crate) fn blob_download_concurrency(mut self, n: NonZeroUsize) -> Self {
+        self.blob_download_concurrency = n;
         self
     }
 
@@ -155,13 +156,12 @@ impl RegistryClientBuilder {
     /// fallback upload paths (GHCR / ACR); the streaming PUT path does not
     /// buffer and is unaffected. Uploads that would exceed the budget queue.
     ///
-    /// `n` is clamped to at least 1. A budget below the 16 MB an
-    /// unknown-size upload requests still admits it, since each request is
-    /// capped at the budget.
+    /// A budget below the 16 MB an unknown-size upload requests still admits
+    /// it, since each request is capped at the budget.
     ///
-    /// Default: 512 MB.
-    pub fn buffered_blob_bytes(mut self, n: usize) -> Self {
-        self.buffered_blob_bytes = n.max(1);
+    /// Default: `DEFAULT_BUFFERED_BLOB_BYTES` (512 MB).
+    pub fn buffered_blob_bytes(mut self, n: NonZeroUsize) -> Self {
+        self.buffered_blob_bytes = n;
         self
     }
 
@@ -239,10 +239,10 @@ impl RegistryClientBuilder {
             blob_download_http,
             auth: self.auth,
             aimd,
-            blob_upload_sem: Arc::new(Semaphore::new(self.blob_upload_concurrency)),
-            blob_download_sem: Arc::new(Semaphore::new(self.blob_download_concurrency)),
-            buffered_blob_bytes_sem: Arc::new(Semaphore::new(self.buffered_blob_bytes)),
-            buffered_blob_bytes_budget: self.buffered_blob_bytes,
+            blob_upload_sem: Arc::new(Semaphore::new(self.blob_upload_concurrency.get())),
+            blob_download_sem: Arc::new(Semaphore::new(self.blob_download_concurrency.get())),
+            buffered_blob_bytes_sem: Arc::new(Semaphore::new(self.buffered_blob_bytes.get())),
+            buffered_blob_bytes_budget: self.buffered_blob_bytes.get(),
             rate_limit_remaining: AtomicU64::new(RATE_LIMIT_UNKNOWN),
         })
     }
@@ -329,13 +329,14 @@ impl RegistryClient {
     ///   empty blob still counts against the budget. An oversized blob
     ///   takes the whole budget and others queue until it completes, though
     ///   its memory exceeds the budget.
-    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`]. The blob
-    ///   may buffer more; the upload count cap still bounds how many.
+    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`], also
+    ///   capped at the budget. The blob may buffer more; the upload count
+    ///   cap still bounds how many.
     pub(crate) async fn acquire_buffered_bytes_permit(
         &self,
         expected: Option<u64>,
     ) -> OwnedSemaphorePermit {
-        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE as u64);
+        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE);
         let budget = self.buffered_blob_bytes_budget as u64;
         // Above the budget the semaphore could never grant the request.
         // `acquire_many_owned` takes a u32.
@@ -784,7 +785,7 @@ mod tests {
     #[test]
     fn builder_custom_concurrency() {
         let client = RegistryClient::builder(test_base_url())
-            .max_concurrent(4)
+            .max_concurrent(NonZeroUsize::new(4).unwrap())
             .build()
             .unwrap();
         // The AIMD controller initialises per-action windows lazily. Before any
@@ -847,7 +848,7 @@ mod tests {
 
         let client = RegistryClient::builder(base_url)
             .auth(StubAuth)
-            .max_concurrent(50)
+            .max_concurrent(NonZeroUsize::new(50).unwrap())
             .build()
             .unwrap();
 
@@ -890,7 +891,7 @@ mod tests {
 
         let client = RegistryClient::builder(base_url)
             .auth(StubAuth)
-            .max_concurrent(50)
+            .max_concurrent(NonZeroUsize::new(50).unwrap())
             .build()
             .unwrap();
 
@@ -950,7 +951,7 @@ mod tests {
 
         let client = RegistryClient::builder(base_url)
             .auth(StubAuth)
-            .max_concurrent(50)
+            .max_concurrent(NonZeroUsize::new(50).unwrap())
             .build()
             .unwrap();
 

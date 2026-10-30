@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ocync_distribution::RepositoryName;
 use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_sync::cache::TransferStateCache;
@@ -74,8 +73,7 @@ pub(crate) async fn run(
     };
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
-        let checker = BatchChecker::from_hostname(dst_hostname, profile, &credentials.aws)
-            .map_err(|e| CliError::Input(format!("ECR batch checker for '{dst_hostname}': {e}")))?;
+        let checker = BatchChecker::from_hostname(dst_hostname, profile, &credentials.aws)?;
         Some(Rc::new(checker))
     } else {
         None
@@ -96,8 +94,8 @@ pub(crate) async fn run(
     let mapping = ResolvedMapping {
         source_authority,
         source_client,
-        source_repo: RepositoryName::new(args.source.repository())?,
-        target_repo: RepositoryName::new(args.destination.repository())?,
+        source_repo: args.source.repository().clone(),
+        target_repo: args.destination.repository().clone(),
         targets: vec![TargetEntry {
             name: RegistryAlias::new(dst_hostname),
             client: target_client,

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
 use crate::error::Error;
+use crate::spec::RepositoryName;
 
 const DOCKER_HUB_REGISTRY: &str = "docker.io";
 const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
@@ -20,7 +21,7 @@ const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
 #[derive(Debug, Clone, Eq)]
 pub struct Reference {
     registry: String,
-    repository: String,
+    repository: RepositoryName,
     tag: Option<String>,
     digest: Option<Digest>,
 }
@@ -29,13 +30,13 @@ impl Reference {
     /// Build a reference from already-validated parts.
     pub fn from_parts(
         registry: impl Into<String>,
-        repository: impl Into<String>,
+        repository: RepositoryName,
         tag: Option<String>,
         digest: Option<Digest>,
     ) -> Self {
         Self {
             registry: registry.into(),
-            repository: repository.into(),
+            repository,
             tag,
             digest,
         }
@@ -47,7 +48,7 @@ impl Reference {
     }
 
     /// The repository path (e.g. `library/nginx`, `clowdhaus/ocync`).
-    pub fn repository(&self) -> &str {
+    pub fn repository(&self) -> &RepositoryName {
         &self.repository
     }
 
@@ -115,27 +116,9 @@ impl FromStr for Reference {
             )
         };
 
-        if repository.is_empty() {
-            return Err(Error::InvalidReference {
-                input: s.into(),
-                reason: "empty repository".into(),
-            });
-        }
-
-        // Reject characters that would corrupt a URL path segment. More
-        // permissive than the OCI spec, which requires lowercase.
-        if let Some(bad) = repository
-            .chars()
-            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
-        {
-            return Err(Error::InvalidReference {
-                input: s.into(),
-                reason: format!(
-                    "repository name contains invalid character '{bad}'; \
-                     allowed: [a-zA-Z0-9._/-]"
-                ),
-            });
-        }
+        // The character rule lives in `RepositoryName`; the error names the
+        // whole reference.
+        let repository = RepositoryName::within(repository, s)?;
 
         // Validate tag: must be 1-128 chars and match [a-zA-Z0-9_.-].
         if let Some(ref t) = tag {
@@ -243,7 +226,7 @@ mod tests {
         let input = format!("ghcr.io/clowdhaus/ocync@{TEST_DIGEST}");
         let r: Reference = input.parse().unwrap();
         assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
+        assert_eq!(r.repository().as_str(), "clowdhaus/ocync");
         assert!(r.tag().is_none());
         assert_eq!(r.digest().unwrap().to_string(), TEST_DIGEST);
     }
@@ -273,9 +256,14 @@ mod tests {
     #[test]
     fn from_parts() {
         let d: Digest = TEST_DIGEST.parse().unwrap();
-        let r = Reference::from_parts("ghcr.io", "clowdhaus/ocync", Some("v1.0".into()), Some(d));
+        let r = Reference::from_parts(
+            "ghcr.io",
+            RepositoryName::new("clowdhaus/ocync").unwrap(),
+            Some("v1.0".into()),
+            Some(d),
+        );
         assert_eq!(r.registry(), "ghcr.io");
-        assert_eq!(r.repository(), "clowdhaus/ocync");
+        assert_eq!(r.repository().as_str(), "clowdhaus/ocync");
         assert_eq!(r.tag(), Some("v1.0"));
         assert!(r.digest().is_some());
     }
@@ -362,7 +350,7 @@ mod tests {
         for (input, registry, repository, tag) in cases {
             let r: Reference = input.parse().unwrap();
             assert_eq!(r.registry(), registry, "{input}");
-            assert_eq!(r.repository(), repository, "{input}");
+            assert_eq!(r.repository().as_str(), repository, "{input}");
             assert_eq!(r.tag(), tag, "{input}");
             assert!(r.digest().is_none(), "{input}");
         }
@@ -376,6 +364,7 @@ mod tests {
         let long = format!("ghcr.io/repo:{}", "a".repeat(129));
         let cases = [
             ("", "empty string"),
+            ("ghcr.io/", "repository name must be non-empty"),
             (
                 "ghcr.io/repo?evil:tag",
                 "repository name contains invalid character '?'",
@@ -401,6 +390,7 @@ mod tests {
         for (input, needle) in cases {
             let err = input.parse::<Reference>().unwrap_err().to_string();
             assert!(err.contains(needle), "{input:?}: {err}");
+            assert!(err.contains(&format!("'{input}'")), "{input:?}: {err}");
         }
     }
 }

@@ -564,7 +564,8 @@ async fn discovery_head_timeout_falls_through() {
     );
 
     // Use a 1-second discovery HEAD timeout so the 3-second delay triggers timeout.
-    let engine = SyncEngine::new(fast_retry(), 10).with_source_head_timeout(Duration::from_secs(1));
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
+        .with_source_head_timeout(Duration::from_secs(1));
     let report = engine
         .run(
             vec![mapping],
@@ -2633,7 +2634,7 @@ async fn head_first_all_targets_match_skips_source_get() {
     );
 
     // Empty cache -- no discovery cache entry.
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -2730,7 +2731,7 @@ async fn head_first_mismatch_falls_through_to_get() {
         None,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -2816,7 +2817,7 @@ async fn head_first_source_head_failure_falls_through() {
         None,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -2931,7 +2932,7 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
         None,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -3074,7 +3075,7 @@ async fn head_first_bypassed_with_platform_filter() {
         Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]),
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -3175,7 +3176,7 @@ async fn head_first_target_head_error_degrades_to_sync() {
         None,
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],
@@ -3265,7 +3266,7 @@ async fn head_first_warm_cache_uses_standard_cache_hit() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping],

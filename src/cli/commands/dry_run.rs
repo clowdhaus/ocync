@@ -518,7 +518,7 @@ mod tests {
             }],
             dropped: vec![DropReason {
                 kind: DropKind::Semver {
-                    range: ">=2.0".into(),
+                    range: ocync_sync::Range::parse(">=2.0").unwrap(),
                 },
                 count: 8,
                 samples: (0..8).map(|i| format!("1.{i}.0")).collect(),

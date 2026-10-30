@@ -114,7 +114,7 @@ async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: 
         })
         .collect::<Vec<_>>();
 
-    let engine = SyncEngine::new(fast_retry(), workers);
+    let engine = SyncEngine::new(fast_retry(), concurrency(workers));
 
     eprintln!("[profile] PROFILE BEGIN {label} workers={workers}");
     let sync_start = Instant::now();

@@ -300,13 +300,13 @@ async fn blob_push_monolithic_and_exists() {
 
     assert_eq!(digest, test_digest(data));
 
-    // Verify the blob exists with correct size.
-    let size = client
-        .blob_exists(&repo, &digest)
-        .await
-        .expect("blob_exists failed")
-        .expect("blob should exist after push");
-    assert_eq!(size, data.len() as u64);
+    assert!(
+        client
+            .blob_exists(&repo, &digest)
+            .await
+            .expect("blob_exists failed"),
+        "blob should exist after push"
+    );
 }
 
 /// Push a blob via the streaming upload path.
@@ -329,17 +329,18 @@ async fn blob_push_stream_chunked() {
 
     assert_eq!(digest, expected_digest);
 
-    let size = client
-        .blob_exists(&repo, &digest)
-        .await
-        .expect("blob_exists failed")
-        .expect("blob should exist after stream push");
-    assert_eq!(size, data_len);
+    assert!(
+        client
+            .blob_exists(&repo, &digest)
+            .await
+            .expect("blob_exists failed"),
+        "blob should exist after stream push"
+    );
 }
 
-/// Verify `blob_exists` returns `None` for a nonexistent blob.
+/// Verify `blob_exists` returns `false` for a nonexistent blob.
 #[tokio::test]
-async fn blob_exists_returns_none_for_missing() {
+async fn blob_exists_returns_false_for_missing() {
     let (_container, url) = start_registry().await;
     let client = local_client(url);
     let repo = RepositoryName::new("test/missing").unwrap();
@@ -353,7 +354,7 @@ async fn blob_exists_returns_none_for_missing() {
         .blob_exists(&repo, &fake_digest)
         .await
         .expect("blob_exists should not error for missing blob");
-    assert!(result.is_none());
+    assert!(!result);
 }
 
 /// Full round-trip: push config blob, push layer blob, push manifest, then
@@ -393,13 +394,13 @@ async fn full_image_roundtrip() {
         .await
         .expect("manifest push failed");
 
-    // 4. HEAD the manifest by tag -- verify digest and media type.
+    // 4. HEAD the manifest by tag: verify the digest.
     let head = client
         .manifest_head(&repo, tag)
         .await
         .expect("manifest HEAD failed")
         .expect("manifest HEAD should return Some for existing tag");
-    assert_eq!(head.digest, manifest_digest);
+    assert_eq!(head, manifest_digest);
 
     // 5. Pull the manifest by digest -- verify raw bytes match.
     let pulled = client

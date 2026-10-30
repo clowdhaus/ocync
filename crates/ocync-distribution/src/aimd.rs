@@ -9,6 +9,7 @@
 //! ceilings are also paced by a `TokenBucket`.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -171,7 +172,7 @@ pub enum RegistryAction {
 /// Identifies a per-action AIMD window within an [`AimdController`], at
 /// each provider's own rate-limit granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WindowKey {
+pub(crate) enum WindowKey {
     /// ECR private: every API action has an independent per-region TPS cap.
     Ecr(RegistryAction),
     /// ECR Public: same per-action enforcement model but caps are 10x lower
@@ -196,7 +197,7 @@ pub enum WindowKey {
 /// write action gets its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)] // Variants are self-describing.
-pub enum EcrPublicGroup {
+pub(crate) enum EcrPublicGroup {
     /// Manifest reads/heads, blob reads/heads, and tag list.
     ///
     /// Paced from the 10 TPS authenticated pull quota. AWS publishes no TPS
@@ -211,7 +212,7 @@ pub enum EcrPublicGroup {
 
 /// Action grouping for Docker Hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DockerHubGroup {
+pub(crate) enum DockerHubGroup {
     /// Manifest and blob HEADs -- unmetered.
     Heads,
     /// Manifest GETs -- counted against the 100/6h pull quota.
@@ -222,7 +223,7 @@ pub enum DockerHubGroup {
 
 /// Action grouping for ACR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AcrGroup {
+pub(crate) enum AcrGroup {
     /// Reads + heads + tag list (`ReadOps`).
     Read,
     /// Manifest writes + blob upload phases (`WriteOps`).
@@ -232,7 +233,7 @@ pub enum AcrGroup {
 /// Coarse action grouping for registries without a documented per-action cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)] // Variants are self-describing.
-pub enum UnknownGroup {
+pub(crate) enum UnknownGroup {
     Heads,
     Reads,
     Uploads,
@@ -240,10 +241,10 @@ pub enum UnknownGroup {
     TagList,
 }
 
-/// Map a registry host and action to its AIMD window key.
-pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
+/// Map a registry's detected provider and an action to its AIMD window key.
+fn window_key_for_provider(provider: Option<ProviderKind>, action: RegistryAction) -> WindowKey {
     use RegistryAction::*;
-    match detect_provider_kind(host) {
+    match provider {
         Some(ProviderKind::Ecr) => WindowKey::Ecr(action),
         Some(ProviderKind::EcrPublic) => WindowKey::EcrPublic(match action {
             ManifestHead | ManifestRead | BlobHead | BlobRead | TagList => EcrPublicGroup::Read,
@@ -419,6 +420,8 @@ impl std::fmt::Debug for WindowState {
 #[derive(Debug)]
 pub struct AimdController {
     host: String,
+    /// Detected once from `host`, so a request does not re-parse it.
+    provider: Option<ProviderKind>,
     aggregate: Arc<Semaphore>,
     windows: Mutex<HashMap<WindowKey, WindowState>>,
     max_concurrent: usize,
@@ -426,19 +429,26 @@ pub struct AimdController {
 
 impl AimdController {
     /// A controller for `host` with `max_concurrent` as the aggregate limit.
-    pub fn new(host: &str, max_concurrent: usize) -> Self {
+    pub fn new(host: &str, max_concurrent: NonZeroUsize) -> Self {
+        let max_concurrent = max_concurrent.get();
         Self {
             host: host.to_owned(),
+            provider: detect_provider_kind(host),
             aggregate: Arc::new(Semaphore::new(max_concurrent)),
             windows: Mutex::new(HashMap::new()),
             max_concurrent,
         }
     }
 
+    /// The provider detected from the controller's host.
+    pub(crate) fn provider(&self) -> Option<ProviderKind> {
+        self.provider
+    }
+
     /// Acquire the window's rate token, if paced, then its window and
     /// aggregate permits.
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
-        let key = window_key_for_registry(&self.host, op);
+        let key = window_key_for_provider(self.provider, op);
 
         let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
@@ -478,7 +488,7 @@ impl AimdController {
 
     /// Current window limit for `op`, the initial value before its first use.
     pub fn window_limit(&self, op: RegistryAction) -> usize {
-        let key = window_key_for_registry(&self.host, op);
+        let key = window_key_for_provider(self.provider, op);
         let map = self.windows.lock().expect("aimd lock poisoned");
         map.get(&key).map(|s| s.window.limit()).unwrap_or_else(|| {
             let initial = DEFAULT_INITIAL_WINDOW.min(self.max_concurrent as f64);
@@ -798,7 +808,7 @@ mod tests {
         for (action, keys) in rows {
             for (host, key) in hosts.into_iter().zip(keys) {
                 assert_eq!(
-                    window_key_for_registry(host, action),
+                    window_key_for_provider(detect_provider_kind(host), action),
                     key,
                     "{host} {action:?}"
                 );
@@ -930,7 +940,7 @@ mod tests {
         // Acquire 100 permits in series; total elapsed should be at least
         // (100 - 20) / 80 = 1.0 sec because of bucket pacing past burst.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
         let start = tokio::time::Instant::now();
         for _ in 0..100 {
             let permit = ctrl.acquire(RegistryAction::BlobUploadInit).await;
@@ -947,7 +957,7 @@ mod tests {
     async fn controller_does_not_pace_unconfigured_window() {
         // ECR_MANIFEST_HEAD has no bucket -- acquires should be near-instant.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
         let start = tokio::time::Instant::now();
         for _ in 0..100 {
             let permit = ctrl.acquire(RegistryAction::ManifestHead).await;
@@ -969,7 +979,7 @@ mod tests {
         // restore burst tokens and re-enable over-cap traffic exactly when the
         // registry has signalled it cannot handle current load.
         let host = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
-        let ctrl = AimdController::new(host, 100);
+        let ctrl = AimdController::new(host, NonZeroUsize::new(100).unwrap());
 
         // Drain the bucket: 20 burst + a small post-burst sample.
         for _ in 0..21 {
@@ -994,7 +1004,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn waiters_queued_before_a_halving_are_still_admitted() {
         // ECR manifest HEADs have no token bucket, so only the window gates.
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(100).unwrap(),
+        );
         let op = RegistryAction::ManifestHead;
         let admitted = Duration::from_secs(1);
 
@@ -1042,7 +1055,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_on_a_full_window_holds_no_aggregate_permit() {
         // Aggregate cap of 2; manifest and blob HEADs are separate ECR windows.
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 2);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(2).unwrap(),
+        );
         let holder = ctrl.acquire(RegistryAction::ManifestHead).await;
         let mut waiter = Box::pin(ctrl.acquire(RegistryAction::ManifestHead));
         assert!(
@@ -1060,7 +1076,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn halving_holds_new_requests_until_in_flight_drops_below_limit() {
-        let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 100);
+        let ctrl = AimdController::new(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            NonZeroUsize::new(100).unwrap(),
+        );
         let op = RegistryAction::ManifestHead;
         for _ in 0..4 {
             ctrl.acquire(op).await.success();

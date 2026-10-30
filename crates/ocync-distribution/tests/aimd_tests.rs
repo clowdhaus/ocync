@@ -5,6 +5,7 @@
 //! method), as does the registry key mapping. This file covers controller
 //! behaviour observable through `window_limit()`.
 
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use ocync_distribution::aimd::{AimdController, RegistryAction};
@@ -15,7 +16,7 @@ use ocync_distribution::aimd::{AimdController, RegistryAction};
 
 #[tokio::test]
 async fn controller_window_limit_before_any_acquire() {
-    let ctrl = AimdController::new("ghcr.io", 16);
+    let ctrl = AimdController::new("ghcr.io", NonZeroUsize::new(16).unwrap());
     let limit = ctrl.window_limit(RegistryAction::ManifestRead);
     assert!(limit > 0);
     assert!(limit <= 16);
@@ -23,7 +24,7 @@ async fn controller_window_limit_before_any_acquire() {
 
 #[tokio::test]
 async fn controller_acquire_success_increases_limit() {
-    let ctrl = AimdController::new("ghcr.io", 64);
+    let ctrl = AimdController::new("ghcr.io", NonZeroUsize::new(64).unwrap());
     let before = ctrl.window_limit(RegistryAction::BlobUploadChunk);
 
     let permit = ctrl.acquire(RegistryAction::BlobUploadChunk).await;
@@ -36,7 +37,10 @@ async fn controller_acquire_success_increases_limit() {
 
 #[tokio::test]
 async fn controller_acquire_throttle_decreases_limit() {
-    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
+    let ctrl = AimdController::new(
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+        NonZeroUsize::new(64).unwrap(),
+    );
 
     // Warm up the window so it has room to decrease.
     for _ in 0..20 {
@@ -64,7 +68,7 @@ async fn controller_acquire_throttle_decreases_limit() {
 
 #[tokio::test]
 async fn controller_drop_without_report_treated_as_success() {
-    let ctrl = AimdController::new("ghcr.io", 64);
+    let ctrl = AimdController::new("ghcr.io", NonZeroUsize::new(64).unwrap());
 
     for _ in 0..10 {
         let p = ctrl.acquire(RegistryAction::ManifestRead).await;
@@ -86,7 +90,10 @@ async fn controller_drop_without_report_treated_as_success() {
 
 #[tokio::test]
 async fn controller_multiple_throttles_across_epochs() {
-    let ctrl = AimdController::new("123456789012.dkr.ecr.us-east-1.amazonaws.com", 64);
+    let ctrl = AimdController::new(
+        "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+        NonZeroUsize::new(64).unwrap(),
+    );
     let op = RegistryAction::BlobUploadChunk;
 
     // Warm up to grow the window.

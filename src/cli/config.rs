@@ -1,7 +1,9 @@
 //! Configuration file schema types and YAML deserialization.
 
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,9 +28,6 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
 
     // Structural validation.
-    if let Some(ref global) = config.global {
-        validate_global(global)?;
-    }
     for (name, registry) in &config.registries {
         validate_registry(name, registry)?;
     }
@@ -138,8 +137,11 @@ pub(crate) struct GlobalConfig {
     /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
     /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
     /// across major container registries).
-    #[serde(default = "default_max_concurrent_transfers")]
-    pub max_concurrent_transfers: usize,
+    #[serde(
+        default = "default_max_concurrent_transfers",
+        deserialize_with = "transfers_at_least_one"
+    )]
+    pub max_concurrent_transfers: NonZeroUsize,
 
     /// Cache directory for persistent cache and blob staging.
     ///
@@ -150,16 +152,45 @@ pub(crate) struct GlobalConfig {
     ///
     /// `"0"` disables TTL-based expiry (cache never expires by age; lazy
     /// invalidation only). Defaults to `"12h"` when not specified.
-    pub cache_ttl: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub cache_ttl: Option<CacheTtl>,
 
     /// Disk staging size limit as a human-readable size (e.g. "2GB", "500MB").
     ///
     /// Uses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.
     /// `0` disables disk staging. When absent, no eviction is performed.
-    pub staging_size_limit: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub staging_size_limit: Option<StagingLimit>,
 }
 
-fn default_max_concurrent_transfers() -> usize {
+/// A count that must be at least 1, so a 0 reads as the rule it broke,
+/// naming `field`, rather than as a type mismatch.
+fn nonzero<E: serde::de::Error>(field: &str, n: usize) -> Result<NonZeroUsize, E> {
+    NonZeroUsize::new(n).ok_or_else(|| E::custom(format!("{field} must be at least 1")))
+}
+
+/// Reads `max_concurrent_transfers` through [`nonzero`].
+fn transfers_at_least_one<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    nonzero(
+        "max_concurrent_transfers",
+        usize::deserialize(deserializer)?,
+    )
+}
+
+/// Reads a registry's optional `max_concurrent` through [`nonzero`].
+fn registry_cap_at_least_one<'de, D>(deserializer: D) -> Result<Option<NonZeroUsize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer)?
+        .map(|n| nonzero("max_concurrent", n))
+        .transpose()
+}
+
+fn default_max_concurrent_transfers() -> NonZeroUsize {
     // Mirror the engine's DEFAULT_MAX_CONCURRENT_TRANSFERS. The previous
     // value of 50 multiplied by BLOB_CONCURRENCY=6 (= 300 streams) blew
     // past the per-connection HTTP/2 stream budget on every major
@@ -224,7 +255,8 @@ pub(crate) struct RegistryConfig {
     /// Limits the total number of simultaneous in-flight HTTP requests to this
     /// registry across all action types. This is independent of the global
     /// `max_concurrent_transfers` (which caps image-level parallelism).
-    pub max_concurrent: Option<usize>,
+    #[serde(default, deserialize_with = "registry_cap_at_least_one")]
+    pub max_concurrent: Option<NonZeroUsize>,
 
     /// Credentials for Basic auth (`auth_type: basic`).
     #[serde(default)]
@@ -422,7 +454,8 @@ pub(crate) struct TagsConfig {
 
     /// Include tags matching a semver range (e.g. `>=1.0, <2.0`).
     #[serde(default)]
-    pub semver: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub semver: Option<Range>,
 
     /// Always-include patterns. Behavior depends on pattern shape: literals
     /// (no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim
@@ -506,6 +539,7 @@ pub(crate) enum GlobOrList {
     List(Vec<String>),
 }
 
+use ocync_sync::Range;
 use ocync_sync::filter::{SortOrder, is_literal_pattern};
 
 /// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
@@ -639,43 +673,133 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 }
 
 // ---------------------------------------------------------------------------
+// Duration and size values
+// ---------------------------------------------------------------------------
+
+/// `digits` as a `u64` times `unit`, or `None` if it holds anything but ASCII
+/// digits (`u64::parse` alone would accept a leading `+`) or overflows.
+fn scaled(digits: &str, unit: u64) -> Option<u64> {
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit))
+}
+
+/// The warm cache TTL, parsed when the config is read so an out-of-range
+/// value is a config error rather than a failure at use.
+///
+/// Accepts an unsigned integer with an optional unit suffix: `s`, `m`, `h`
+/// or `d`. A bare integer is seconds and `"0"` disables TTL expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct CacheTtl(Duration);
+
+impl CacheTtl {
+    /// The TTL as a [`Duration`].
+    pub(crate) fn get(self) -> Duration {
+        self.0
+    }
+}
+
+/// TTL suffixes and their seconds, largest first, so serializing picks the
+/// largest whole unit.
+const TTL_UNITS: [(char, u64); 4] = [('d', 86_400), ('h', 3_600), ('m', 60), ('s', 1)];
+
+impl TryFrom<String> for CacheTtl {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let invalid =
+            || format!("cache_ttl '{text}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")");
+        // A bare integer is seconds.
+        let (digits, seconds_per_unit) = TTL_UNITS
+            .into_iter()
+            .find_map(|(unit, secs)| text.strip_suffix(unit).map(|digits| (digits, secs)))
+            .unwrap_or((text.as_str(), 1));
+        scaled(digits, seconds_per_unit)
+            .map(|secs| Self(Duration::from_secs(secs)))
+            .ok_or_else(invalid)
+    }
+}
+
+/// Written in the largest whole unit (`d`, `h`, `m`, else `s`), and zero as
+/// `"0"`, so a TTL written as `12h` reads back as `12h`.
+impl From<CacheTtl> for String {
+    fn from(ttl: CacheTtl) -> String {
+        let secs = ttl.0.as_secs();
+        if secs == 0 {
+            return "0".to_owned();
+        }
+        // `s` is last, so every non-zero TTL finds a unit.
+        TTL_UNITS
+            .into_iter()
+            .find(|(_, per_unit)| secs.is_multiple_of(*per_unit))
+            .map_or_else(
+                || format!("{secs}s"),
+                |(unit, per_unit)| format!("{}{unit}", secs / per_unit),
+            )
+    }
+}
+
+/// A byte count, parsed when the config is read so an out-of-range value is
+/// a config error rather than a failure at use.
+///
+/// Accepts `"0"` or an unsigned integer with a suffix `B`, `KB`, `MB`, `GB`
+/// or `TB`, using SI decimal prefixes. Any size of zero turns staging off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum StagingLimit {
+    /// Disk staging is off.
+    Disabled,
+    /// Staged blobs are evicted down to this many bytes.
+    Bytes(NonZeroU64),
+}
+
+impl TryFrom<String> for StagingLimit {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let invalid = || {
+            format!(
+                "staging_size_limit '{text}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
+            )
+        };
+        if text == "0" {
+            return Ok(Self::Disabled);
+        }
+        // Longest suffix first, as "B" ends every other one.
+        let (digits, bytes_per_unit) = [
+            ("TB", 1_000_000_000_000u64),
+            ("GB", 1_000_000_000),
+            ("MB", 1_000_000),
+            ("KB", 1_000),
+            ("B", 1),
+        ]
+        .into_iter()
+        .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|digits| (digits, unit)))
+        .ok_or_else(invalid)?;
+        let bytes = scaled(digits, bytes_per_unit).ok_or_else(invalid)?;
+        Ok(NonZeroU64::new(bytes).map_or(Self::Disabled, Self::Bytes))
+    }
+}
+
+impl From<StagingLimit> for String {
+    fn from(limit: StagingLimit) -> String {
+        match limit {
+            StagingLimit::Disabled => "0".into(),
+            StagingLimit::Bytes(bytes) => format!("{bytes}B"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-/// Validate the global config section.
-fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
-    if global.max_concurrent_transfers < 1 {
-        return Err(ConfigError::Validation(
-            "global.max_concurrent_transfers must be >= 1".to_string(),
-        ));
-    }
-    if let Some(ref ttl) = global.cache_ttl {
-        if !is_valid_duration(ttl) {
-            return Err(ConfigError::Validation(format!(
-                "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
-            )));
-        }
-    }
-    if let Some(ref size) = global.staging_size_limit {
-        if !is_valid_size(size) {
-            return Err(ConfigError::Validation(format!(
-                "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
-    if let Some(max) = registry.max_concurrent {
-        if max < 1 {
-            return Err(ConfigError::Validation(format!(
-                "registries.{name}.max_concurrent must be >= 1"
-            )));
-        }
-    }
-
     if let Some(ref auth_type) = registry.auth_type {
         match auth_type {
             AuthType::Basic => {
@@ -720,43 +844,6 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
     }
 
     Ok(())
-}
-
-/// Check whether a string is a valid human-readable duration.
-///
-/// Accepts an unsigned integer optionally followed by a unit suffix:
-/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days). A bare
-/// integer with no suffix is treated as seconds. `"0"` means disabled.
-fn is_valid_duration(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Bare integer (including "0") - treated as seconds.
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    let (digits, suffix) = s.split_at(s.len() - 1);
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    matches!(suffix, "s" | "m" | "h" | "d")
-}
-
-/// Check whether a string is a valid human-readable byte size.
-///
-/// Accepts an unsigned integer optionally followed by a unit suffix:
-/// `B`, `KB`, `MB`, `GB`, `TB`. A bare `0` is accepted to mean
-/// "disabled".
-fn is_valid_size(s: &str) -> bool {
-    if s == "0" {
-        return true;
-    }
-    for suffix in &["TB", "GB", "MB", "KB", "B"] {
-        if let Some(digits) = s.strip_suffix(suffix) {
-            return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
-        }
-    }
-    false
 }
 
 /// Validate artifact sync configuration.
@@ -1133,6 +1220,9 @@ mappings:
     #[test]
     fn serialize_roundtrip() {
         let yaml = r#"
+global:
+  cache_ttl: 6h
+  staging_size_limit: 1GB
 registries:
   ecr:
     url: 123456789012.dkr.ecr.us-east-1.amazonaws.com
@@ -1142,6 +1232,7 @@ mappings:
     tags:
       glob: "*"
       sort: semver
+      semver: ">=1.0, <2.0"
       latest: 5
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -1152,6 +1243,23 @@ mappings:
             roundtripped.registries["ecr"].auth_type,
             Some(AuthType::Ecr)
         );
+        let global = roundtripped.global.as_ref().unwrap();
+        assert_eq!(
+            global.cache_ttl.map(CacheTtl::get),
+            Some(Duration::from_secs(21_600))
+        );
+        assert_eq!(
+            global.staging_size_limit,
+            Some(StagingLimit::Bytes(NonZeroU64::new(1_000_000_000).unwrap()))
+        );
+        let semver = roundtripped.mappings[0]
+            .tags
+            .as_ref()
+            .unwrap()
+            .semver
+            .as_ref()
+            .unwrap();
+        assert_eq!(semver.to_string(), ">=1.0, <2.0");
     }
 
     #[test]
@@ -1575,10 +1683,16 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let global = config.global.as_ref().unwrap();
-        assert_eq!(global.max_concurrent_transfers, 20);
+        assert_eq!(global.max_concurrent_transfers.get(), 20);
         assert_eq!(global.cache_dir.as_deref(), Some("/tmp/ocync-cache"));
-        assert_eq!(global.cache_ttl.as_deref(), Some("6h"));
-        assert_eq!(global.staging_size_limit.as_deref(), Some("1GB"));
+        assert_eq!(
+            global.cache_ttl.map(CacheTtl::get),
+            Some(Duration::from_secs(6 * 3600))
+        );
+        assert_eq!(
+            global.staging_size_limit,
+            Some(StagingLimit::Bytes(NonZeroU64::new(1_000_000_000).unwrap()))
+        );
     }
 
     #[test]
@@ -1621,64 +1735,123 @@ mappings:
     }
 
     #[test]
-    fn global_max_concurrent_transfers_zero_is_invalid() {
-        let global = GlobalConfig {
-            max_concurrent_transfers: 0,
-            ..Default::default()
+    fn global_max_concurrent_transfers_zero_is_refused() {
+        let yaml = r#"
+global:
+  max_concurrent_transfers: 0
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_concurrent_transfers"), "{err}");
+        assert!(err.contains("must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn semver_range_is_parsed_when_config_is_read() {
+        let yaml = |range: &str| {
+            format!("mappings:\n  - from: nginx\n    tags:\n      semver: \"{range}\"\n")
         };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("max_concurrent_transfers")),
-            other => panic!("wrong error: {other}"),
+        let config: Config = serde_yaml::from_str(&yaml(">=1.0, <2.0")).unwrap();
+        let tags = config.mappings[0].tags.as_ref().unwrap();
+        assert_eq!(tags.semver.as_ref().unwrap().to_string(), ">=1.0, <2.0");
+
+        let err = serde_yaml::from_str::<Config>(&yaml("not_valid"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid version range 'not_valid'"), "{err}");
+    }
+
+    /// A TTL or size that is malformed, empty or too large for 64 bits is
+    /// refused when the config is read, and that read is a config error
+    /// (exit 3). Breaks if a value passes the read and fails at use, or an
+    /// overflow wraps.
+    #[test]
+    fn unusable_ttl_and_size_are_config_errors_at_load() {
+        let cases = [
+            ("cache_ttl", "not-a-duration"),
+            ("cache_ttl", ""),
+            ("cache_ttl", "12hours"),
+            ("cache_ttl", "99999999999999999999"),
+            ("cache_ttl", "1000000000000000d"),
+            ("cache_ttl", "+5m"),
+            ("staging_size_limit", "2gigabytes"),
+            ("staging_size_limit", ""),
+            ("staging_size_limit", "99999999999999999999B"),
+            ("staging_size_limit", "99999999999TB"),
+            ("staging_size_limit", "+5MB"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (field, value) in cases {
+            let path = dir.path().join("config.yaml");
+            std::fs::write(
+                &path,
+                format!(
+                    "global:\n  {field}: \"{value}\"\nmappings:\n  - from: nginx\n    tags:\n      glob: \"*\"\n"
+                ),
+            )
+            .unwrap();
+            let err = load_config(&path).unwrap_err();
+            assert!(err.to_string().contains(field), "{field} {value}: {err}");
+            assert_eq!(
+                crate::cli::CliError::from(err).exit_code(),
+                crate::cli::ExitCode::ConfigError,
+                "{field} {value}"
+            );
+        }
+    }
+
+    /// Each TTL form parses to its seconds and serializes in the largest
+    /// whole unit, so what the user wrote comes back. Breaks if a unit is
+    /// misread or a TTL is written back in seconds only.
+    #[test]
+    fn valid_ttl_forms_parse_to_their_durations() {
+        // (text, seconds, serialized)
+        let cases = [
+            ("0", 0, "0"),
+            ("0s", 0, "0"),
+            ("60", 60, "1m"),
+            ("1s", 1, "1s"),
+            ("90s", 90, "90s"),
+            ("30m", 1_800, "30m"),
+            ("12h", 43_200, "12h"),
+            ("7d", 604_800, "7d"),
+            ("36h", 129_600, "36h"),
+        ];
+        for (text, secs, serialized) in cases {
+            let ttl = CacheTtl::try_from(text.to_string()).unwrap();
+            assert_eq!(ttl.get(), Duration::from_secs(secs), "{text}");
+            assert_eq!(String::from(ttl), serialized, "{text}");
+            assert_eq!(
+                CacheTtl::try_from(serialized.to_string()).unwrap(),
+                ttl,
+                "{text}: the serialized form reads back"
+            );
         }
     }
 
     #[test]
-    fn global_invalid_cache_ttl() {
-        let global = GlobalConfig {
-            cache_ttl: Some("not-a-duration".to_string()),
-            ..Default::default()
-        };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("cache_ttl")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn global_valid_cache_ttl_forms() {
-        for ttl in &["0", "60", "1s", "30m", "12h", "7d"] {
-            let global = GlobalConfig {
-                cache_ttl: Some((*ttl).to_string()),
-                ..Default::default()
-            };
-            validate_global(&global).unwrap_or_else(|e| panic!("expected valid ttl '{ttl}': {e}"));
-        }
-    }
-
-    #[test]
-    fn global_invalid_staging_size_limit() {
-        let global = GlobalConfig {
-            staging_size_limit: Some("2gigabytes".to_string()),
-            ..Default::default()
-        };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("staging_size_limit")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn global_valid_staging_size_limit_forms() {
-        for size in &["0", "512B", "500KB", "500MB", "2GB", "1TB"] {
-            let global = GlobalConfig {
-                staging_size_limit: Some((*size).to_string()),
-                ..Default::default()
-            };
-            validate_global(&global)
-                .unwrap_or_else(|e| panic!("expected valid size '{size}': {e}"));
+    fn valid_size_forms_parse_to_their_bytes() {
+        let cases = [
+            ("0", 0),
+            ("0B", 0),
+            ("512B", 512),
+            ("500KB", 500_000),
+            ("500MB", 500_000_000),
+            ("2GB", 2_000_000_000),
+            ("1TB", 1_000_000_000_000),
+        ];
+        for (text, bytes) in cases {
+            let want = NonZeroU64::new(bytes).map_or(StagingLimit::Disabled, StagingLimit::Bytes);
+            assert_eq!(
+                StagingLimit::try_from(text.to_string()).unwrap(),
+                want,
+                "{text}"
+            );
         }
     }
 
@@ -1698,7 +1871,7 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let reg = &config.registries["chainguard"];
-        assert_eq!(reg.max_concurrent, Some(10));
+        assert_eq!(reg.max_concurrent.map(NonZeroUsize::get), Some(10));
     }
 
     #[test]
@@ -1717,38 +1890,22 @@ mappings:
     }
 
     #[test]
-    fn registry_max_concurrent_zero_is_invalid() {
-        let registry = RegistryConfig {
-            url: "example.com".to_string(),
-            auth_type: None,
-            max_concurrent: Some(0),
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: None,
-        };
-        let err = validate_registry("example", &registry).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => {
-                assert!(msg.contains("example"));
-                assert!(msg.contains("max_concurrent"));
-            }
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn registry_max_concurrent_valid_passes() {
-        let registry = RegistryConfig {
-            url: "example.com".to_string(),
-            auth_type: None,
-            max_concurrent: Some(25),
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: None,
-        };
-        validate_registry("example", &registry).unwrap();
+    fn registry_max_concurrent_zero_is_refused() {
+        let yaml = r#"
+registries:
+  example:
+    url: example.com
+    max_concurrent: 0
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_concurrent"), "{err}");
+        assert!(err.contains("must be at least 1"), "{err}");
     }
 
     // - Auth-type validation -------------------------------------------------
@@ -2036,7 +2193,7 @@ mappings:
     fn exact_tags_with_semver_returns_none() {
         let tags = TagsConfig {
             glob: Some(GlobOrList::Single("latest".into())),
-            semver: Some(">=1.0".into()),
+            semver: Some(Range::parse(">=1.0").unwrap()),
             ..Default::default()
         };
         assert!(tags.exact_tags().is_none());

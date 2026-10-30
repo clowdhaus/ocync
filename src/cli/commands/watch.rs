@@ -31,7 +31,7 @@ pub(crate) async fn run(
     // re-resolved each cycle so that config file changes take effect.
     let config = load_config(&args.config)?;
     let (_cache_dir, cache_path) = synchronize::resolve_cache_path(&config, &args.config);
-    let cache_ttl = synchronize::resolve_cache_ttl(&config)?;
+    let cache_ttl = synchronize::resolve_cache_ttl(&config);
 
     // Bind the health listener early so bind errors surface before the
     // sync loop starts. This also avoids TOCTOU races with port allocation.
@@ -87,61 +87,58 @@ pub(crate) async fn run(
             const MAX_BACKOFF_SECS: u64 = 300; // 5 minutes
 
             let exit_code = loop {
-                // Re-resolve cache_dir and cache_ttl each cycle so that
-                // config file edits (e.g. changing cache_dir or cache_ttl)
-                // take effect without restarting watch mode.
-                if let Ok(cfg) = load_config(&args.config) {
-                    config_failures = 0;
-                    let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
-                    match synchronize::resolve_cache_ttl(&cfg) {
-                        Ok(ttl) => {
-                            // If the cache path changed, persist the old
-                            // cache and reload from the new location.
-                            if path != active_cache_path {
-                                if let Err(e) = cache.borrow().persist(&active_cache_path) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "failed to persist cache before path change"
-                                    );
-                                }
-                                *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
-                                active_cache_path = path;
+                // Re-resolve the cache path each cycle so a moved cache_dir
+                // takes effect without a restart. cache_ttl is read only when
+                // a cache file is loaded: the warm cache is persisted with a
+                // fresh timestamp every cycle, so an edited TTL applies at the
+                // next load, never to the cache in memory.
+                match load_config(&args.config) {
+                    Ok(cfg) => {
+                        config_failures = 0;
+                        let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
+                        // If the cache path changed, persist the old cache and
+                        // reload from the new location.
+                        if path != active_cache_path {
+                            if let Err(e) = cache.borrow().persist(&active_cache_path) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to persist cache before path change"
+                                );
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "invalid cache_ttl in reloaded config, using previous value"
-                            );
+                            let ttl = synchronize::resolve_cache_ttl(&cfg);
+                            *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
+                            active_cache_path = path;
                         }
                     }
-                } else {
-                    config_failures += 1;
-                    tracing::error!(
-                        consecutive_failures = config_failures,
-                        "failed to reload config for cache resolution, using previous value"
-                    );
-
-                    // After repeated failures, apply exponential backoff
-                    // before the next cycle to avoid log spam.
-                    if config_failures >= BACKOFF_THRESHOLD {
-                        let backoff_secs = interval
-                            .as_secs()
-                            .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
-                            .min(MAX_BACKOFF_SECS);
-                        let backoff = Duration::from_secs(backoff_secs);
-                        tracing::warn!(
-                            backoff_secs = backoff.as_secs(),
-                            "config reload failing repeatedly, applying backoff"
+                    Err(e) => {
+                        config_failures += 1;
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures = config_failures,
+                            "failed to reload config; keeping the current cache path"
                         );
-                        tokio::select! {
-                            () = tokio::time::sleep(backoff) => {}
-                            () = shutdown.notified() => {
-                                tracing::info!("shutdown signal received during backoff");
-                                break ExitCode::Success;
+
+                        // After repeated failures, apply exponential backoff
+                        // before the next cycle to avoid log spam.
+                        if config_failures >= BACKOFF_THRESHOLD {
+                            let backoff_secs = interval
+                                .as_secs()
+                                .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
+                                .min(MAX_BACKOFF_SECS);
+                            let backoff = Duration::from_secs(backoff_secs);
+                            tracing::warn!(
+                                backoff_secs = backoff.as_secs(),
+                                "config reload failing repeatedly, applying backoff"
+                            );
+                            tokio::select! {
+                                () = tokio::time::sleep(backoff) => {}
+                                () = shutdown.notified() => {
+                                    tracing::info!("shutdown signal received during backoff");
+                                    break ExitCode::Success;
+                                }
                             }
+                            continue;
                         }
-                        continue;
                     }
                 }
 

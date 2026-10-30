@@ -191,9 +191,8 @@ impl std::fmt::Debug for EcrAuth {
 }
 
 impl EcrAuth {
-    /// Create an ECR auth provider for the registry hostname. Fails when the
-    /// hostname names no region, or a configured endpoint URL is combined
-    /// with FIPS or dual-stack.
+    /// Create an ECR auth provider for the registry hostname. Fails under
+    /// the conditions listed on `BatchChecker::from_hostname`.
     ///
     /// `profile` scopes credential resolution to that named profile, `None`
     /// to the default chain. Credentials come from `aws_credentials`, shared
@@ -205,8 +204,7 @@ impl EcrAuth {
         aws_credentials: &crate::AwsCredentialProviders,
     ) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let client = crate::ecr::api_client(&hostname, profile, aws_credentials)
-            .map_err(|e| Error::cloud_credentials(&hostname, CredentialFailure::Failed, e))?;
+        let client = crate::ecr::api_client(&hostname, profile, aws_credentials)?;
         let registry = hostname.clone();
 
         Ok(Self {

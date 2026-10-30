@@ -579,7 +579,7 @@ async fn blob_head_does_not_send_manifest_accept_header() {
             .unwrap();
 
     let result = client.blob_exists(&repo, &digest).await.unwrap();
-    assert_eq!(result, Some(1024));
+    assert!(result);
 }
 
 // ---------------------------------------------------------------------------

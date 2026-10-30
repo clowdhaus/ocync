@@ -28,8 +28,8 @@ use serde::Serialize;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    AuthType, Config, GlobOrList, MappingConfig, RegistryConfig, TagsConfig, load_config,
-    resolve_target_names,
+    AuthType, CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, StagingLimit,
+    TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{
@@ -605,18 +605,52 @@ pub(crate) fn resolve_cache_path(config: &Config, config_file: &Path) -> (PathBu
     (cache_dir, cache_path)
 }
 
-/// Parse and return the cache TTL from config, defaulting to 12 hours.
-///
-/// Returns an error if the configured value cannot be parsed, rather than
-/// silently falling back to the default.
-pub(crate) fn resolve_cache_ttl(config: &Config) -> Result<Duration, CliError> {
-    match config.global.as_ref().and_then(|g| g.cache_ttl.as_deref()) {
-        Some(raw) => parse_duration(raw.trim()).ok_or_else(|| {
-            CliError::Input(format!(
-                "invalid cache_ttl '{raw}': accepted formats are \"0\", \"<N>s\", \"<N>m\", \"<N>h\", \"<N>d\", or \"<N>\" (seconds)"
-            ))
-        }),
-        None => Ok(DEFAULT_CACHE_TTL),
+/// The cache TTL from config, defaulting to 12 hours.
+pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
+    config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_ttl)
+        .map_or(DEFAULT_CACHE_TTL, CacheTtl::get)
+}
+
+/// Whether this run's mappings can reuse blobs staged on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingNeed {
+    /// Several targets or images may share a blob.
+    Needed,
+    /// Every blob goes to one place, so staging would only add disk I/O.
+    NotNeeded,
+}
+
+/// Disk staging rooted at `dir`, with stale blobs evicted down to `limit`.
+/// A disabled limit turns staging off, as the config documents, after
+/// removing what earlier runs staged there, whether or not this run needs
+/// staging. Any other limit leaves the directory alone when it is not needed.
+fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) -> BlobStage {
+    if need == StagingNeed::NotNeeded && limit != Some(StagingLimit::Disabled) {
+        return BlobStage::disabled();
+    }
+    let stage = BlobStage::new(dir);
+    if let Err(e) = stage.cleanup_tmp_files() {
+        tracing::warn!(error = %e, "failed to clean staging tmp files");
+    }
+    // Evict stale blobs from previous runs before starting new work.
+    let evict = |keep_bytes: u64| {
+        if let Err(e) = stage.evict(keep_bytes) {
+            tracing::warn!(error = %e, "failed to evict staged blobs");
+        }
+    };
+    match limit {
+        None => stage,
+        Some(StagingLimit::Bytes(bytes)) => {
+            evict(bytes.get());
+            stage
+        }
+        Some(StagingLimit::Disabled) => {
+            evict(0);
+            BlobStage::disabled()
+        }
     }
 }
 
@@ -688,7 +722,7 @@ pub(crate) async fn run(
     }
 
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
-    let cache_ttl = resolve_cache_ttl(&config)?;
+    let cache_ttl = resolve_cache_ttl(&config);
     let (cache, should_persist) = match external_cache {
         Some(ext) => (ext, false),
         None => {
@@ -709,34 +743,16 @@ pub(crate) async fn run(
     // disk round-trip per blob for zero benefit. Tighter detection would
     // require manifest data (unavailable pre-discovery). The overhead is
     // small (local I/O) relative to the network savings when blobs overlap.
-    let needs_staging = mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1;
-    let staging = if needs_staging {
-        let stage = BlobStage::new(cache_dir.join("blobs"));
-        if let Err(e) = stage.cleanup_tmp_files() {
-            tracing::warn!(error = %e, "failed to clean staging tmp files");
-        }
-        // Evict stale blobs from previous runs before starting new work.
-        let staging_limit = match config
-            .global
-            .as_ref()
-            .and_then(|g| g.staging_size_limit.as_deref())
-        {
-            Some(raw) => Some(parse_size(raw.trim()).ok_or_else(|| {
-                CliError::Input(format!(
-                    "invalid staging_size_limit '{raw}': accepted formats are \"0\", \"<N>B\", \"<N>KB\", \"<N>MB\", \"<N>GB\", \"<N>TB\""
-                ))
-            })?),
-            None => None,
-        };
-        if let Some(limit) = staging_limit {
-            if let Err(e) = stage.evict(limit) {
-                tracing::warn!(error = %e, "failed to evict staged blobs");
-            }
-        }
-        stage
+    let need = if mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1 {
+        StagingNeed::Needed
     } else {
-        BlobStage::disabled()
+        StagingNeed::NotNeeded
     };
+    let staging = open_staging(
+        cache_dir.join("blobs"),
+        config.global.as_ref().and_then(|g| g.staging_size_limit),
+        need,
+    );
 
     let max_concurrent = config
         .global
@@ -1077,64 +1093,6 @@ fn format_cycle_tail(
         format_bytes(s.bytes_transferred),
         format_duration(report.duration),
     )
-}
-
-/// Parse a human-readable duration string into a [`Duration`].
-///
-/// Accepts:
-/// - `"0"` - [`Duration::ZERO`]
-/// - `"<N>s"` - N seconds
-/// - `"<N>m"` - N minutes
-/// - `"<N>h"` - N hours
-/// - `"<N>d"` - N days
-/// - `"<N>"` (no suffix) - N seconds
-///
-/// Returns `None` for unrecognised strings - callers must decide how to
-/// handle invalid input rather than silently receiving a default.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s == "0" {
-        return Some(Duration::ZERO);
-    }
-    if s.is_empty() {
-        return None;
-    }
-    let last = &s[s.len() - 1..];
-    let (digits, multiplier) = match last {
-        "s" => (&s[..s.len() - 1], 1u64),
-        "m" => (&s[..s.len() - 1], 60),
-        "h" => (&s[..s.len() - 1], 3600),
-        "d" => (&s[..s.len() - 1], 86400),
-        _ if s.chars().all(|c| c.is_ascii_digit()) => (s, 1),
-        _ => return None,
-    };
-    digits
-        .parse::<u64>()
-        .ok()
-        .map(|n| Duration::from_secs(n * multiplier))
-}
-
-/// Parse a human-readable size string into bytes.
-///
-/// Accepts `"0"`, `"<N>B"`, `"<N>KB"`, `"<N>MB"`, `"<N>GB"`, `"<N>TB"`.
-/// Returns `None` for unrecognised strings.
-fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s == "0" {
-        return Some(0);
-    }
-    for (suffix, multiplier) in &[
-        ("TB", 1_000_000_000_000u64),
-        ("GB", 1_000_000_000),
-        ("MB", 1_000_000),
-        ("KB", 1_000),
-        ("B", 1),
-    ] {
-        if let Some(digits) = s.strip_suffix(suffix) {
-            return digits.parse::<u64>().ok().map(|n| n * multiplier);
-        }
-    }
-    None
 }
 
 /// Build a `RegistryClient` for each registry at least one mapping references,
@@ -2023,70 +1981,81 @@ fn write_output(
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_duration_zero() {
-        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
+    /// A filter's semver range as written, for comparing against a literal.
+    fn semver_text(filter: &FilterConfig) -> Option<String> {
+        filter.semver.as_ref().map(ToString::to_string)
     }
 
-    #[test]
-    fn parse_duration_seconds_suffix() {
-        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+    /// A parsed version range, for filters built in the tests below.
+    fn range(text: &str) -> ocync_sync::Range {
+        ocync_sync::Range::parse(text).unwrap()
     }
 
+    /// A staging size limit of 0 disables staging and removes what earlier
+    /// runs staged, whether or not this run needs staging. A positive limit
+    /// or none keeps staging on when needed and leaves the directory alone
+    /// when not. Breaks if `0` only evicts and leaves staging enabled, `0`
+    /// skips the removal when staging is not needed, or a positive limit
+    /// disables staging or evicts when it is not needed.
     #[test]
-    fn parse_duration_minutes_suffix() {
-        assert_eq!(parse_duration("30m"), Some(Duration::from_secs(30 * 60)));
-    }
+    fn a_zero_staging_limit_disables_staging() {
+        let digest: ocync_distribution::Digest =
+            format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        let above = Some(StagingLimit::Bytes(
+            std::num::NonZeroU64::new(1_000_000_000).unwrap(),
+        ));
+        let one_byte = Some(StagingLimit::Bytes(std::num::NonZeroU64::new(1).unwrap()));
+        // want: (staging enabled, an earlier run's blob kept)
+        let cases = [
+            (
+                "disabled, staging needed",
+                Some(StagingLimit::Disabled),
+                StagingNeed::Needed,
+                (false, false),
+            ),
+            (
+                "disabled, staging not needed",
+                Some(StagingLimit::Disabled),
+                StagingNeed::NotNeeded,
+                (false, false),
+            ),
+            (
+                "a limit above the staged size, needed",
+                above,
+                StagingNeed::Needed,
+                (true, true),
+            ),
+            (
+                "a limit of one byte, needed",
+                one_byte,
+                StagingNeed::Needed,
+                (true, false),
+            ),
+            (
+                "a limit of one byte, not needed",
+                one_byte,
+                StagingNeed::NotNeeded,
+                (false, true),
+            ),
+            ("no limit, needed", None, StagingNeed::Needed, (true, true)),
+            (
+                "no limit, not needed",
+                None,
+                StagingNeed::NotNeeded,
+                (false, true),
+            ),
+        ];
+        for (name, limit, need, want) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let earlier = BlobStage::new(dir.path().to_path_buf());
+            let mut writer = earlier.begin_write(&digest).unwrap();
+            writer.write_chunk(b"staged by an earlier run").unwrap();
+            writer.finish().unwrap();
 
-    #[test]
-    fn parse_duration_hours_suffix() {
-        assert_eq!(parse_duration("12h"), Some(Duration::from_secs(12 * 3600)));
-    }
-
-    #[test]
-    fn parse_duration_days_suffix() {
-        assert_eq!(parse_duration("7d"), Some(Duration::from_secs(7 * 86400)));
-    }
-
-    #[test]
-    fn parse_duration_no_suffix_treated_as_seconds() {
-        assert_eq!(parse_duration("60"), Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn parse_duration_invalid_returns_none() {
-        assert_eq!(parse_duration("invalid"), None);
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("12hours"), None);
-    }
-
-    #[test]
-    fn parse_duration_trims_whitespace() {
-        assert_eq!(
-            parse_duration("  12h  "),
-            Some(Duration::from_secs(12 * 3600))
-        );
-        assert_eq!(parse_duration(" 30m "), Some(Duration::from_secs(30 * 60)));
-    }
-
-    #[test]
-    fn resolve_cache_ttl_returns_error_for_invalid() {
-        use crate::cli::config::{Config, GlobalConfig};
-
-        let config = Config {
-            global: Some(GlobalConfig {
-                cache_ttl: Some("bogus".into()),
-                ..Default::default()
-            }),
-            registries: Default::default(),
-            target_groups: Default::default(),
-            defaults: None,
-            mappings: Vec::new(),
-        };
-        let result = resolve_cache_ttl(&config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid cache_ttl"), "got: {err_msg}");
+            let stage = open_staging(dir.path().to_path_buf(), limit, need);
+            let got = (stage.is_enabled(), earlier.exists(&digest));
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
@@ -2100,7 +2069,7 @@ mod tests {
             defaults: None,
             mappings: Vec::new(),
         };
-        assert_eq!(resolve_cache_ttl(&config).unwrap(), DEFAULT_CACHE_TTL);
+        assert_eq!(resolve_cache_ttl(&config), DEFAULT_CACHE_TTL);
     }
 
     #[test]
@@ -2121,7 +2090,7 @@ mod tests {
     #[test]
     fn build_filter_defaults_exclude_reaches_mapping_with_own_tags() {
         let mapping = TagsConfig {
-            semver: Some(">=1.0".into()),
+            semver: Some(range(">=1.0")),
             ..Default::default()
         };
         let defaults = TagsConfig {
@@ -2129,7 +2098,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_filter(Some(&mapping), Some(&defaults));
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0"));
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
         assert!(filter.exclude.is_empty(), "mapping had no exclude");
     }
@@ -2157,12 +2126,12 @@ mod tests {
     #[test]
     fn build_filter_inherits_defaults_when_mapping_unset() {
         let defaults = TagsConfig {
-            semver: Some(">=2.0".into()),
+            semver: Some(range(">=2.0")),
             exclude: Some(GlobOrList::Single("*-dev".into())),
             ..Default::default()
         };
         let filter = build_filter(None, Some(&defaults));
-        assert_eq!(filter.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=2.0"));
         assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
         assert!(filter.exclude.is_empty());
     }
@@ -2204,7 +2173,7 @@ mod tests {
         let tags = TagsConfig {
             include: Some(GlobOrList::List(vec!["latest".into()])),
             glob: Some(GlobOrList::Single("*".into())),
-            semver: Some(">=1.0.0".into()),
+            semver: Some(range(">=1.0.0")),
             exclude: Some(GlobOrList::Single("*-alpine".into())),
             sort: Some(SortOrder::Semver),
             latest: Some(5),
@@ -2215,7 +2184,7 @@ mod tests {
         let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0.0"));
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0.0"));
         assert_eq!(filter.exclude, vec!["*-alpine"]);
         assert_eq!(filter.sort, Some(SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
@@ -2282,7 +2251,7 @@ latest: 5
         let defaults = TagsConfig {
             include: Some(GlobOrList::Single("latest".into())),
             glob: Some(GlobOrList::Single("v*".into())),
-            semver: Some(">=1.0".into()),
+            semver: Some(range(">=1.0")),
             sort: Some(SortOrder::Semver),
             latest: Some(10),
             min_tags: Some(2),
@@ -2295,7 +2264,7 @@ latest: 5
         let inherited = build_filter(Some(&empty_mapping), Some(&defaults));
         assert_eq!(inherited.include, vec!["latest"]);
         assert_eq!(inherited.glob, vec!["v*"]);
-        assert_eq!(inherited.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(semver_text(&inherited).as_deref(), Some(">=1.0"));
         assert_eq!(inherited.sort, Some(SortOrder::Semver));
         assert_eq!(inherited.latest, Some(10));
         assert_eq!(inherited.min_tags, Some(2));
@@ -2308,7 +2277,7 @@ latest: 5
         let override_mapping = TagsConfig {
             include: Some(GlobOrList::Single("override".into())),
             glob: Some(GlobOrList::Single("override*".into())),
-            semver: Some(">=2.0".into()),
+            semver: Some(range(">=2.0")),
             sort: Some(SortOrder::Alpha),
             latest: Some(3),
             min_tags: Some(1),
@@ -2318,7 +2287,7 @@ latest: 5
         let overridden = build_filter(Some(&override_mapping), Some(&defaults));
         assert_eq!(overridden.include, vec!["override"]);
         assert_eq!(overridden.glob, vec!["override*"]);
-        assert_eq!(overridden.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(semver_text(&overridden).as_deref(), Some(">=2.0"));
         assert_eq!(overridden.sort, Some(SortOrder::Alpha));
         assert_eq!(overridden.latest, Some(3));
         assert_eq!(overridden.min_tags, Some(1));
@@ -2511,7 +2480,7 @@ exclude: ["*-slim"]
         // mapping.exclude is the hard tier, separate from defaults.
         assert_eq!(filter.exclude, vec!["*-slim"]);
         // mapping fields override; unset fields inherit from defaults.
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0"));
         assert_eq!(filter.sort, Some(ocync_sync::filter::SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
 
@@ -2547,7 +2516,7 @@ include: ["*-dev"]
         // in the soft tier; semver/sort/latest inherit from defaults.
         assert_eq!(filter.include, vec!["*-dev"]);
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
-        assert_eq!(filter.semver.as_deref(), Some(">=8.0.0, <9.0.0"));
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=8.0.0, <9.0.0"));
         assert_eq!(filter.latest, Some(10));
 
         let tags = vec![
@@ -2621,55 +2590,10 @@ include: ["1.25.0-rc1"]
         assert_eq!(glob_or_list_to_vec_owned(&g), vec!["a", "b"]);
     }
 
-    // - parse_size -----------------------------------------------------------
-
-    #[test]
-    fn parse_size_zero() {
-        assert_eq!(parse_size("0"), Some(0));
-    }
-
-    #[test]
-    fn parse_size_bytes() {
-        assert_eq!(parse_size("512B"), Some(512));
-    }
-
-    #[test]
-    fn parse_size_kilobytes() {
-        assert_eq!(parse_size("500KB"), Some(500_000));
-    }
-
-    #[test]
-    fn parse_size_megabytes() {
-        assert_eq!(parse_size("500MB"), Some(500_000_000));
-    }
-
-    #[test]
-    fn parse_size_gigabytes() {
-        assert_eq!(parse_size("2GB"), Some(2_000_000_000));
-    }
-
-    #[test]
-    fn parse_size_terabytes() {
-        assert_eq!(parse_size("1TB"), Some(1_000_000_000_000));
-    }
-
-    #[test]
-    fn parse_size_invalid_returns_none() {
-        assert_eq!(parse_size("2gigabytes"), None);
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("abc"), None);
-    }
-
-    #[test]
-    fn parse_size_trims_whitespace() {
-        assert_eq!(parse_size("  500MB  "), Some(500_000_000));
-        assert_eq!(parse_size(" 2GB "), Some(2_000_000_000));
-    }
-
     #[test]
     fn describe_filter_combines_semver_and_latest() {
         let tags = TagsConfig {
-            semver: Some(">=1.0.0".into()),
+            semver: Some(range(">=1.0.0")),
             latest: Some(5),
             ..TagsConfig::default()
         };
@@ -3053,7 +2977,7 @@ include: ["1.25.0-rc1"]
 
         let tags_config = TagsConfig {
             include: Some(GlobOrList::List(vec!["latest".into()])),
-            semver: Some(">=1.0".into()),
+            semver: Some(range(">=1.0")),
             sort: Some(SortOrder::Semver),
             latest: Some(2),
             min_tags: Some(5),
@@ -4078,7 +4002,7 @@ mappings:
         use std::collections::HashSet as Set;
 
         let tags_config = TagsConfig {
-            semver: Some(">=2.0".into()),
+            semver: Some(range(">=2.0")),
             min_tags: Some(5),
             ..Default::default()
         };

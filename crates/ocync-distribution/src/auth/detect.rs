@@ -64,15 +64,51 @@ static GAR_RE: LazyLock<Regex> =
 static ACR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9]+\.azurecr\.(?:io|cn|us)$").unwrap());
 
+/// The Azure cloud an ACR host belongs to, which fixes the Entra ID
+/// authority and the container registry resource its tokens are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AzureCloud {
+    /// Azure public cloud, and the cloud of any host not under a
+    /// sovereign suffix, so an explicit `auth_type: acr` on another host
+    /// still gets a token.
+    Public,
+    /// Azure China (`.azurecr.cn`).
+    China,
+    /// Azure US Government (`.azurecr.us`).
+    UsGov,
+}
+
+impl AzureCloud {
+    /// The cloud of `host`, compared by the same normal form provider
+    /// detection uses.
+    pub(crate) fn of_host(host: &str) -> Self {
+        let host = normalize_host(host);
+        if host.ends_with(".azurecr.cn") {
+            Self::China
+        } else if host.ends_with(".azurecr.us") {
+            Self::UsGov
+        } else {
+            Self::Public
+        }
+    }
+}
+
 /// The ECR Public registry hostname.
 pub(crate) const ECR_PUBLIC_HOST: &str = "public.ecr.aws";
+
+/// A hostname with its case, port and trailing dot removed, the form every
+/// host comparison is made against.
+fn normalize_host(hostname: &str) -> String {
+    let hostname = hostname.to_ascii_lowercase();
+    let hostname = hostname.split(':').next().unwrap();
+    hostname.trim_end_matches('.').to_owned()
+}
 
 /// Detect the registry provider kind from a hostname, ignoring case, port
 /// and a trailing dot. `None` for an unrecognized host.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
-    let hostname = hostname.to_ascii_lowercase();
-    let hostname = hostname.split(':').next().unwrap();
-    let hostname = hostname.trim_end_matches('.');
+    let hostname = normalize_host(hostname);
+    let hostname = hostname.as_str();
 
     match hostname {
         ECR_PUBLIC_HOST => Some(ProviderKind::EcrPublic),
@@ -199,6 +235,27 @@ mod tests {
         ];
         for (host, expected) in cases {
             assert_eq!(detect_provider_kind(host), expected, "{host}");
+        }
+    }
+
+    /// A host maps to its cloud whatever its case, port or trailing dot, and
+    /// a host under no sovereign suffix (an explicit `auth_type: acr`) gets
+    /// the public cloud. Breaks if the match is made on the raw host.
+    #[test]
+    fn azure_cloud_of_host_table() {
+        let cases = [
+            ("myregistry.azurecr.io", AzureCloud::Public),
+            ("registry.example.com", AzureCloud::Public),
+            ("myregistry.azurecr.cn", AzureCloud::China),
+            ("MyReg.AzureCR.cn", AzureCloud::China),
+            ("myreg.azurecr.cn.", AzureCloud::China),
+            ("myreg.azurecr.cn:443", AzureCloud::China),
+            ("myregistry.azurecr.us", AzureCloud::UsGov),
+            ("MyReg.AzureCR.us", AzureCloud::UsGov),
+            ("myreg.azurecr.us.", AzureCloud::UsGov),
+        ];
+        for (host, cloud) in cases {
+            assert_eq!(AzureCloud::of_host(host), cloud, "{host}");
         }
     }
 }

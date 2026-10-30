@@ -15,6 +15,7 @@ use anstyle::{Ansi256Color, Color, Style};
 use clap::builder::Styles;
 use clap::{Parser, Subcommand, ValueEnum};
 use ocync_distribution::{CRYPTO_BUILD, CryptoBuild, Reference, TlsFips};
+use ocync_sync::Range;
 use ocync_sync::progress::NullProgress;
 
 const PINK: Option<Color> = Some(Color::Ansi256(Ansi256Color(213)));
@@ -224,8 +225,9 @@ pub(crate) struct TagsArgs {
     #[arg(long)]
     pub(crate) glob: Vec<String>,
     /// Include tags matching a semver range (e.g., `>=1.0, <2.0`).
-    #[arg(long)]
-    pub(crate) semver: Option<String>,
+    // Parsed at argument time so a bad range is refused before any registry request.
+    #[arg(long, value_parser = Range::parse)]
+    pub(crate) semver: Option<Range>,
     /// Exclude tags matching a pattern (repeatable).
     #[arg(long)]
     pub(crate) exclude: Vec<String>,
@@ -551,5 +553,25 @@ mod tests {
         let result =
             Cli::try_parse_from(["ocync", "watch", "--config", "c.yaml", "--interval", "0"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tags_semver_range_is_parsed_at_the_argument_boundary() {
+        let parse = |range: &str| {
+            Cli::try_parse_from([
+                "ocync",
+                "tags",
+                "docker.io/library/nginx",
+                "--semver",
+                range,
+            ])
+        };
+        let Commands::Tags(args) = parse(">=1.0, <2.0").unwrap().command else {
+            panic!("expected Tags command");
+        };
+        assert_eq!(args.semver.unwrap().to_string(), ">=1.0, <2.0");
+        // Refused by clap itself, so no client is built and no request is made.
+        let err = parse("^1.0").unwrap_err().to_string();
+        assert!(err.contains("unsupported range syntax"), "{err}");
     }
 }

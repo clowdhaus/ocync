@@ -141,7 +141,7 @@ pub use client::{RegistryClient, RegistryClientBuilder};
 pub use digest::Digest;
 pub use ecr::{BatchBlobChecker, BlobExistence};
 pub use error::Error;
-pub use manifest::{ManifestHead, ManifestPull};
+pub use manifest::ManifestPull;
 pub use reference::Reference;
 pub use spec::{
     Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform, PlatformFilter,

@@ -35,6 +35,8 @@ use uuid::Uuid;
 
 pub use error::Error;
 pub use shutdown::ShutdownSignal;
+/// A parsed version range for filtering tags.
+pub use version::Range;
 
 /// Serde helper: skip serializing when value equals its type's default.
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {

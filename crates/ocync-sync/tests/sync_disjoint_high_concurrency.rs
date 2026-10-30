@@ -196,7 +196,7 @@ async fn run_engine_default(
     // deliberately oversubscribes at 50 to exercise the per-target
     // blob upload semaphore (cap 64) under a workload that would
     // otherwise demand 50 * BLOB_CONCURRENCY=6 = 300 concurrent streams.
-    let engine = SyncEngine::new(fast_retry(), 50);
+    let engine = SyncEngine::new(fast_retry(), concurrency(50));
     tokio::time::timeout(
         Duration::from_secs(30),
         engine.run(

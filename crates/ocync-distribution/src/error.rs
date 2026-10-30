@@ -215,6 +215,19 @@ pub enum Error {
         reason: String,
     },
 
+    /// The AWS configuration cannot build the ECR client for a registry: its
+    /// hostname names no region, or an endpoint URL is combined with FIPS or
+    /// dual-stack. Final, since asking again reads the same configuration,
+    /// and not an auth error: no credential was tried.
+    #[error("invalid ECR client configuration for registry '{registry}': {}", error_chain(&**source))]
+    EcrConfig {
+        /// The registry the client was for.
+        registry: String,
+        /// The configuration error. Shared, as it cannot be cloned.
+        #[source]
+        source: Arc<dyn std::error::Error + Send + Sync>,
+    },
+
     /// An HTTP header value could not be constructed.
     #[error("invalid {header} header value: {reason}")]
     InvalidHeaderValue {
@@ -720,6 +733,10 @@ mod tests {
             Error::EcrApi {
                 reason: "throttled".into(),
             },
+            Error::EcrConfig {
+                registry: "123456789012.dkr.ecr.us-east-1.amazonaws.com".into(),
+                source: Arc::new(std::io::Error::other("bad config")),
+            },
             Error::InvalidHeaderValue {
                 header: "Content-Type".into(),
                 reason: "bad chars".into(),
@@ -919,6 +936,10 @@ mod tests {
             },
             Error::EcrApi {
                 reason: "throttled".into(),
+            },
+            Error::EcrConfig {
+                registry: "123456789012.dkr.ecr.us-east-1.amazonaws.com".into(),
+                source: Arc::new(std::io::Error::other("bad config")),
             },
             Error::InvalidHeaderValue {
                 header: "Content-Type".into(),

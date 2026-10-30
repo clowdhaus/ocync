@@ -20,6 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -686,7 +687,7 @@ struct PromoteContext<'a> {
 /// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
 /// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
 /// value only helps workloads that mostly skip or mount, via config.
-pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 10;
+pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Maximum concurrent blob transfers within a single image (skopeo's default).
 /// Each `RegistryClient` separately caps uploads and downloads across images.
@@ -709,7 +710,7 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 #[derive(Debug)]
 pub struct SyncEngine {
     retry: RetryConfig,
-    max_concurrent: usize,
+    max_concurrent: NonZeroUsize,
     drain_deadline: Duration,
     source_head_timeout: Duration,
     mount_source_wait_deadline: Duration,
@@ -722,8 +723,9 @@ impl SyncEngine {
     /// Create a new sync engine with the given retry configuration and concurrency cap.
     ///
     /// `max_concurrent` bounds the in-flight image sync futures in the execute
-    /// phase (see [`DEFAULT_MAX_CONCURRENT_TRANSFERS`]).
-    pub fn new(retry: RetryConfig, max_concurrent: usize) -> Self {
+    /// phase (see [`DEFAULT_MAX_CONCURRENT_TRANSFERS`]). It is non-zero because
+    /// a zero-permit semaphore would never admit an image.
+    pub fn new(retry: RetryConfig, max_concurrent: NonZeroUsize) -> Self {
         Self {
             retry,
             max_concurrent,
@@ -822,7 +824,7 @@ impl SyncEngine {
         > = FuturesUnordered::new();
         let mut pending: VecDeque<TransferTask> = VecDeque::new();
         let mut freq_map = BlobFrequencyMap::new();
-        let global_sem = Rc::new(Semaphore::new(self.max_concurrent));
+        let global_sem = Rc::new(Semaphore::new(self.max_concurrent.get()));
         let staging = Rc::new(staging);
         let shared = Rc::new(PerRun::default());
         let mut results: Vec<ImageResult> = Vec::new();
@@ -1238,7 +1240,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     )
     .await
     {
-        Ok(Ok(Some(head))) => Some(head.digest),
+        Ok(Ok(Some(digest))) => Some(digest),
         Ok(Ok(None)) => {
             debug!(
                 repo = %source.repo, tag = %source.tag,
@@ -1427,7 +1429,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
-            Ok(Some(head)) if head.digest == *compare_digest => {
+            Ok(Some(digest)) if digest == *compare_digest => {
                 debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
@@ -1564,7 +1566,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
-            Ok(Some(head)) if head.digest == *source_digest => {
+            Ok(Some(digest)) if digest == *source_digest => {
                 debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
@@ -2436,12 +2438,12 @@ async fn transfer_claimed_blob(
     if !batch_checked.contains(digest) {
         let head_result = io.target_client.blob_exists(io.target_repo, digest).await;
         match head_result {
-            Ok(Some(_)) => {
+            Ok(true) => {
                 io.sink.exists(digest.clone(), io.target_repo.to_owned());
                 io.sink.release_claim(digest);
                 return BlobResult::Skipped;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => {
                 debug!(
                     %digest,
