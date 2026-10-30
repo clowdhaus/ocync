@@ -363,6 +363,22 @@ struct TargetBlobOutcome {
 }
 
 impl TargetBlobOutcome {
+    /// The image's result, carrying what its transfer moved and how long it took.
+    fn into_result(
+        self,
+        source: &ImageRef,
+        target: &ImageRef,
+        status: ImageStatus,
+        start: Instant,
+    ) -> ImageResult {
+        ImageResult {
+            bytes_transferred: self.bytes_transferred,
+            blob_stats: self.stats,
+            duration: start.elapsed(),
+            ..image_result(source, target, status)
+        }
+    }
+
     /// Fold in a refused manifest's repair. A blob the repair sent was
     /// skipped earlier on an earlier run's word, so it moves from skipped to
     /// sent; one the repair skipped is already counted.
@@ -1614,10 +1630,10 @@ async fn execute_item(
         batch_checker: item.batch_checker.as_ref(),
         mount_source_wait_deadline,
     };
-    let outcome =
+    let mut outcome =
         transfer_image_blobs(&ctx, blobs_from_manifest(&item.source_data), freq_counts).await;
 
-    if let Some(err) = outcome.error {
+    if let Some(err) = outcome.error.take() {
         warn!(target_name = %item.target_name, error = %err, "blob transfer failed");
         // Unblock followers waiting on this repo's manifest commit; they
         // fall through to HEAD+push.
@@ -1630,12 +1646,7 @@ async fn execute_item(
             retries: retries_made(),
             status_code: err.status_code().map(|s| s.as_u16()),
         };
-        return ImageResult {
-            bytes_transferred: outcome.bytes_transferred,
-            blob_stats: outcome.stats,
-            duration: start.elapsed(),
-            ..image_result(&item.source, &item.target, status)
-        };
+        return outcome.into_result(&item.source, &item.target, status, start);
     }
 
     let outcome = RefCell::new(outcome);
@@ -1669,12 +1680,7 @@ async fn execute_item(
                         retries,
                         status_code: None,
                     };
-                    return ImageResult {
-                        bytes_transferred: outcome.bytes_transferred,
-                        blob_stats: outcome.stats,
-                        duration: start.elapsed(),
-                        ..image_result(&item.source, &item.target, status)
-                    };
+                    return outcome.into_result(&item.source, &item.target, status, start);
                 }
             };
 
@@ -1695,11 +1701,8 @@ async fn execute_item(
                 "image synced"
             );
             ImageResult {
-                bytes_transferred: outcome.bytes_transferred,
-                blob_stats: outcome.stats,
-                duration: start.elapsed(),
                 artifacts_skipped,
-                ..image_result(&item.source, &item.target, ImageStatus::Synced)
+                ..outcome.into_result(&item.source, &item.target, ImageStatus::Synced, start)
             }
         }
         Err(err) => {
@@ -1715,12 +1718,10 @@ async fn execute_item(
                     target_tag = %item.target.tag,
                     "target tag is immutable, skipping"
                 );
-                ImageResult {
-                    bytes_transferred: outcome.bytes_transferred,
-                    blob_stats: outcome.stats,
-                    duration: start.elapsed(),
-                    ..skip_image_result(&item.source, &item.target, SkipReason::ImmutableTag)
-                }
+                let status = ImageStatus::Skipped {
+                    reason: SkipReason::ImmutableTag,
+                };
+                outcome.into_result(&item.source, &item.target, status, start)
             } else {
                 warn!(target_name = %item.target_name, error = %err, "manifest push failed");
                 let status = ImageStatus::Failed {
@@ -1734,12 +1735,7 @@ async fn execute_item(
                     retries: retries_made(),
                     status_code: err.status_code().map(|s| s.as_u16()),
                 };
-                ImageResult {
-                    bytes_transferred: outcome.bytes_transferred,
-                    blob_stats: outcome.stats,
-                    duration: start.elapsed(),
-                    ..image_result(&item.source, &item.target, status)
-                }
+                outcome.into_result(&item.source, &item.target, status, start)
             }
         }
     }
@@ -3057,6 +3053,43 @@ mod tests {
     use ocync_distribution::spec::{Descriptor, MediaType};
 
     use super::*;
+
+    /// A transferred image reports its own byte count, blob stats and elapsed
+    /// time, not the zeroed defaults of a skip.
+    #[test]
+    fn into_result_carries_transfer_counts_and_elapsed_time() {
+        let image = |repo: &str| ImageRef {
+            repo: repo.parse().unwrap(),
+            tag: "v1".into(),
+        };
+        let outcome = TargetBlobOutcome {
+            bytes_transferred: 42,
+            stats: BlobTransferStats {
+                transferred: 2,
+                skipped: 1,
+                mounted: 3,
+            },
+            error: None,
+        };
+        let start = Instant::now() - Duration::from_secs(5);
+
+        let result = outcome.into_result(&image("src"), &image("dst"), ImageStatus::Synced, start);
+
+        assert_eq!(result.bytes_transferred, 42);
+        assert_eq!(
+            (
+                result.blob_stats.transferred,
+                result.blob_stats.skipped,
+                result.blob_stats.mounted
+            ),
+            (2, 1, 3)
+        );
+        assert!(
+            result.duration >= Duration::from_secs(5),
+            "{:?}",
+            result.duration
+        );
+    }
 
     /// Build a valid sha256 digest from a short suffix, zero-padded to 64 hex chars.
     fn test_digest(suffix: &str) -> Digest {
