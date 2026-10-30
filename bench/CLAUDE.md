@@ -175,7 +175,7 @@ jq '[.response_bytes] | add' <tool>-<pass>-proxy.jsonl
 
 Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
 
-Each record includes: timestamp, git ref, machine metadata (provider, instance type, arch, vCPUs, memory, network, region), corpus size, and all 9 per-tool metrics per scenario.
+Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, and all 9 per-tool metrics per scenario.
 
 ## Competitor config gotchas
 

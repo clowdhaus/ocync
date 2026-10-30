@@ -143,142 +143,113 @@ fn format_metric_line(
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_regression_within_threshold() {
-        let baseline = Baseline {
-            wall_clock_secs: 100.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let current = Baseline {
-            wall_clock_secs: 115.0,
-            requests: 1100,
-            total_bytes: 1_100_000,
-        };
-        let result = compare(&current, &baseline, 20);
-        assert!(!result.regressed);
-        assert!((result.wall_clock_delta_pct - 15.0).abs() < 0.01);
-        assert!((result.requests_delta_pct - 10.0).abs() < 0.01);
+    fn baseline(wall_clock_secs: f64, requests: u64, total_bytes: u64) -> Baseline {
+        Baseline {
+            wall_clock_secs,
+            requests,
+            total_bytes,
+        }
     }
 
     #[test]
-    fn regression_detected_when_over_threshold() {
-        let baseline = Baseline {
-            wall_clock_secs: 100.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let current = Baseline {
-            wall_clock_secs: 125.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let result = compare(&current, &baseline, 20);
-        assert!(result.regressed);
-        assert!((result.wall_clock_delta_pct - 25.0).abs() < 0.01);
+    fn compare_flags_only_deltas_over_the_threshold() {
+        let stored = baseline(100.0, 1000, 1_000_000);
+        // (name, current, regressed, wall-clock, requests, bytes deltas in percent)
+        for (name, current, regressed, wall, requests, bytes) in [
+            (
+                "within threshold",
+                baseline(115.0, 1100, 1_100_000),
+                false,
+                15.0,
+                10.0,
+                10.0,
+            ),
+            (
+                "wall-clock over threshold",
+                baseline(125.0, 1000, 1_000_000),
+                true,
+                25.0,
+                0.0,
+                0.0,
+            ),
+            (
+                "improvement is a negative delta",
+                baseline(80.0, 800, 800_000),
+                false,
+                -20.0,
+                -20.0,
+                -20.0,
+            ),
+            (
+                "request count alone regresses",
+                baseline(105.0, 1250, 1_000_000),
+                true,
+                5.0,
+                25.0,
+                0.0,
+            ),
+            (
+                "a delta equal to the threshold is not a regression",
+                baseline(120.0, 1200, 1_200_000),
+                false,
+                20.0,
+                20.0,
+                20.0,
+            ),
+        ] {
+            let result = compare(&current, &stored, 20);
+            assert_eq!(result.regressed, regressed, "{name}");
+            assert!((result.wall_clock_delta_pct - wall).abs() < 0.01, "{name}");
+            assert!(
+                (result.requests_delta_pct - requests).abs() < 0.01,
+                "{name}"
+            );
+            assert!((result.bytes_delta_pct - bytes).abs() < 0.01, "{name}");
+        }
     }
 
     #[test]
-    fn improvement_is_negative_delta() {
-        let baseline = Baseline {
-            wall_clock_secs: 100.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let current = Baseline {
-            wall_clock_secs: 80.0,
-            requests: 800,
-            total_bytes: 800_000,
-        };
-        let result = compare(&current, &baseline, 20);
-        assert!(!result.regressed);
-        assert!((result.wall_clock_delta_pct - (-20.0)).abs() < 0.01);
-    }
-
-    #[test]
-    fn format_result_shows_regression_tag() {
-        let result = RegressionResult {
-            wall_clock_delta_pct: 25.0,
-            requests_delta_pct: 10.0,
-            bytes_delta_pct: 15.0,
-            regressed: true,
-        };
-        let output = format_result(&result, 20);
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines[0], "  wall-clock  +25.0% (threshold: 20%) REGRESSED");
-        assert_eq!(lines[1], "  requests    +10.0% (threshold: 20%)");
-        assert_eq!(lines[2], "  bytes       +15.0%");
-    }
-
-    #[test]
-    fn format_result_shows_improvement() {
-        let result = RegressionResult {
-            wall_clock_delta_pct: -15.0,
-            requests_delta_pct: -8.0,
-            bytes_delta_pct: -12.0,
-            regressed: false,
-        };
-        let output = format_result(&result, 20);
-        let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines[0], "  wall-clock  -15.0% (threshold: 20%)");
-        assert_eq!(lines[1], "  requests    -8.0% (threshold: 20%)");
-        assert_eq!(lines[2], "  bytes       -12.0%");
+    fn format_result_tags_regressions_and_shows_signed_deltas() {
+        for (name, regressed, deltas, expected) in [
+            (
+                "regression",
+                true,
+                (25.0, 10.0, 15.0),
+                [
+                    "  wall-clock  +25.0% (threshold: 20%) REGRESSED",
+                    "  requests    +10.0% (threshold: 20%)",
+                    "  bytes       +15.0%",
+                ],
+            ),
+            (
+                "improvement",
+                false,
+                (-15.0, -8.0, -12.0),
+                [
+                    "  wall-clock  -15.0% (threshold: 20%)",
+                    "  requests    -8.0% (threshold: 20%)",
+                    "  bytes       -12.0%",
+                ],
+            ),
+        ] {
+            let result = RegressionResult {
+                wall_clock_delta_pct: deltas.0,
+                requests_delta_pct: deltas.1,
+                bytes_delta_pct: deltas.2,
+                regressed,
+            };
+            let output = format_result(&result, 20);
+            assert_eq!(output.lines().collect::<Vec<_>>(), expected, "{name}");
+        }
     }
 
     #[test]
     fn zero_baseline_returns_zero_delta() {
-        let baseline = Baseline {
-            wall_clock_secs: 0.0,
-            requests: 0,
-            total_bytes: 0,
-        };
-        let current = Baseline {
-            wall_clock_secs: 50.0,
-            requests: 500,
-            total_bytes: 1_000_000,
-        };
-        let result = compare(&current, &baseline, 20);
+        let result = compare(&baseline(50.0, 500, 1_000_000), &baseline(0.0, 0, 0), 20);
         assert!(!result.regressed);
         assert_eq!(result.wall_clock_delta_pct, 0.0);
         assert_eq!(result.requests_delta_pct, 0.0);
         assert_eq!(result.bytes_delta_pct, 0.0);
-    }
-
-    #[test]
-    fn regression_triggered_by_request_count_only() {
-        let baseline = Baseline {
-            wall_clock_secs: 100.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let current = Baseline {
-            wall_clock_secs: 105.0, // 5% -- within threshold
-            requests: 1250,         // 25% -- exceeds threshold
-            total_bytes: 1_000_000,
-        };
-        let result = compare(&current, &baseline, 20);
-        assert!(result.regressed);
-        assert!((result.wall_clock_delta_pct - 5.0).abs() < 0.01);
-        assert!((result.requests_delta_pct - 25.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn threshold_boundary_is_exclusive() {
-        // Delta exactly equal to threshold should NOT trigger regression.
-        let baseline = Baseline {
-            wall_clock_secs: 100.0,
-            requests: 1000,
-            total_bytes: 1_000_000,
-        };
-        let current = Baseline {
-            wall_clock_secs: 120.0, // exactly 20%
-            requests: 1200,         // exactly 20%
-            total_bytes: 1_200_000,
-        };
-        let result = compare(&current, &baseline, 20);
-        assert!(!result.regressed);
-        assert!((result.wall_clock_delta_pct - 20.0).abs() < 0.01);
-        assert!((result.requests_delta_pct - 20.0).abs() < 0.01);
     }
 
     #[test]

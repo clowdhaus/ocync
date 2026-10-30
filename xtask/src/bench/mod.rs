@@ -13,14 +13,29 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
 use regression::Baseline;
 use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
 use runner::Tool;
+
+/// Which tools a benchmark runs, shared by `bench` and `bench-remote`.
+#[derive(Args)]
+pub(crate) struct ToolSelection {
+    /// Comma-separated list of tools to benchmark.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        ignore_case = true,
+        default_value = "ocync"
+    )]
+    pub(crate) tools: Vec<Tool>,
+}
 
 /// Arguments for the bench subcommand.
 #[derive(Args)]
@@ -28,9 +43,8 @@ pub(crate) struct BenchArgs {
     #[command(subcommand)]
     pub(crate) scenario: Scenario,
 
-    /// Comma-separated list of tools to benchmark.
-    #[arg(long, value_delimiter = ',', default_value = "ocync")]
-    pub(crate) tools: Vec<String>,
+    #[command(flatten)]
+    pub(crate) tool_selection: ToolSelection,
 
     /// Path to corpus YAML file.
     #[arg(long, default_value = "bench/corpus.yaml")]
@@ -98,8 +112,8 @@ pub(crate) struct BenchArgs {
     pub(crate) no_proxy: bool,
 }
 
-/// Benchmark scenario to run (CLI subcommand).
-#[derive(Subcommand, Debug, Clone, Copy)]
+/// Benchmark scenario to run.
+#[derive(Subcommand, ValueEnum, Debug, Clone, Copy)]
 pub(crate) enum Scenario {
     /// Full sync (cold) then immediate re-sync (warm).
     Sync,
@@ -113,31 +127,27 @@ pub(crate) enum Scenario {
     All,
 }
 
+/// The trimmed stdout of `command`, or `None` when it cannot be run, exits
+/// non-zero, prints non-UTF-8, or prints nothing.
+pub(crate) fn command_stdout(command: &mut std::process::Command) -> Option<String> {
+    let output = command.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 /// Read an SSM parameter by name, returning `None` on any failure.
 fn read_ssm_parameter(name: &str) -> Option<String> {
-    std::process::Command::new("aws")
-        .args([
-            "ssm",
-            "get-parameter",
-            "--name",
-            name,
-            "--with-decryption",
-            "--query",
-            "Parameter.Value",
-            "--output",
-            "text",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    command_stdout(std::process::Command::new("aws").args([
+        "ssm",
+        "get-parameter",
+        "--name",
+        name,
+        "--with-decryption",
+        "--query",
+        "Parameter.Value",
+        "--output",
+        "text",
+    ]))
 }
 
 /// Read Docker Hub credentials from environment variables.
@@ -209,21 +219,90 @@ fn reject_tmpfs_tmpdir() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Derives the registry key from a target registry hostname.
-///
-/// Used to choose the JSON archive filename (`ecr.json`, `gcr.json`, etc.).
-fn registry_key(target_registry: &str) -> &'static str {
-    if target_registry.contains(".ecr.") && target_registry.contains(".amazonaws.com") {
-        "ecr"
-    } else if target_registry == "gcr.io"
-        || target_registry.ends_with(".gcr.io")
-        || target_registry.ends_with("-docker.pkg.dev")
-    {
-        "gcr"
-    } else if target_registry.ends_with(".azurecr.io") {
-        "acr"
-    } else {
-        "other"
+/// The spelling clap accepts for `value`.
+pub(crate) fn value_name<T: ValueEnum>(value: &T) -> String {
+    value
+        .to_possible_value()
+        .expect("no variant is skipped")
+        .get_name()
+        .to_owned()
+}
+
+/// A cloud: the one a bench stack is deployed in, or the one a registry
+/// belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Provider {
+    /// Amazon Web Services.
+    Aws,
+    /// Google Cloud.
+    Gcp,
+    /// Microsoft Azure.
+    Azure,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&value_name(self))
+    }
+}
+
+/// The registry service a run's target registry hostname belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryKind {
+    /// Amazon ECR.
+    Ecr,
+    /// Google Container Registry or Artifact Registry.
+    Gcr,
+    /// Azure Container Registry.
+    Acr,
+    /// Any other registry.
+    Other,
+}
+
+impl RegistryKind {
+    /// Classifies a target registry hostname.
+    fn of(target_registry: &str) -> Self {
+        let host = target_registry.to_ascii_lowercase();
+        let is_ecr = [".dkr.ecr.", ".dkr.ecr-fips."]
+            .iter()
+            .any(|infix| host.contains(infix))
+            && [".amazonaws.com", ".amazonaws.com.cn"]
+                .iter()
+                .any(|suffix| host.ends_with(suffix));
+        if is_ecr {
+            Self::Ecr
+        } else if host == "gcr.io" || host.ends_with(".gcr.io") || host.ends_with("-docker.pkg.dev")
+        {
+            Self::Gcr
+        } else if [".azurecr.io", ".azurecr.us", ".azurecr.cn"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        {
+            Self::Acr
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Stem of the JSON archive file that holds this registry's runs.
+    fn archive_stem(self) -> &'static str {
+        match self {
+            Self::Ecr => "ecr",
+            Self::Gcr => "gcr",
+            Self::Acr => "acr",
+            Self::Other => "other",
+        }
+    }
+
+    /// The cloud that hosts this registry, if it is one of the three.
+    fn provider(self) -> Option<Provider> {
+        match self {
+            Self::Ecr => Some(Provider::Aws),
+            Self::Gcr => Some(Provider::Gcp),
+            Self::Acr => Some(Provider::Azure),
+            Self::Other => None,
+        }
     }
 }
 
@@ -234,39 +313,18 @@ fn registry_key(target_registry: &str) -> &'static str {
 /// `unknown`. The run log is streamed to the operator and never persisted, so
 /// this warning is the only chance to notice.
 fn git_ref() -> String {
-    let resolved = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string());
-
-    resolved.unwrap_or_else(|| {
-        eprintln!(
-            "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
+    command_stdout(std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]))
+        .unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
              Recording the git ref as \"unknown\"."
-        );
-        "unknown".into()
-    })
-}
-
-/// Derives the cloud provider name from a registry key.
-fn provider_for_registry(key: &str) -> &'static str {
-    match key {
-        "ecr" => "aws",
-        "gcr" => "gcp",
-        "acr" => "azure",
-        _ => "other",
-    }
+            );
+            "unknown".into()
+        })
 }
 
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // Guard: refuse to run if TMPDIR resolves to tmpfs. Staging writes
-    // multi-GB blobs and tmpfs is RAM-backed, causing OOM/ENOSPC.
-    // The bench-remote xtask sets TMPDIR=$HOME/ocync/bench/.tmp (on EBS).
-    //
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
     // Applying the guard to it would refuse the one scenario cheap enough to
@@ -275,7 +333,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         reject_tmpfs_tmpdir()?;
     }
 
-    // 1. Parse corpus (apply skip-registries filter, then limit).
     let loaded = corpus::load(&args.corpus)?;
     let filtered = if args.skip_registries.is_empty() {
         loaded
@@ -295,8 +352,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // Inject Docker Hub auth from env vars (cloud-init) or SSM (local dev).
-    // Note: SSM fallback requires IAM permissions not in the current Terraform
-    // (removed when migrating to SSH). Kept for local dev with personal creds.
+    // The SSM fallback needs IAM permissions the bench instance's Terraform
+    // does not grant; it serves local dev with personal credentials.
     if let Some(auth) = docker_hub_auth_from_env() {
         eprintln!(
             "bench: Docker Hub auth configured (username={})",
@@ -312,22 +369,16 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: Docker Hub auth not available, using anonymous pulls");
     };
 
-    // 2. Parse tools from args.
-    let tools: Vec<Tool> = args
-        .tools
-        .iter()
-        .map(|s| Tool::parse(s))
-        .collect::<Result<Vec<_>, _>>()?;
+    let tools = &args.tool_selection.tools;
 
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
-        args.scenario,
-        args.tools.join(","),
+        value_name(&args.scenario),
+        runner::join_tools(tools),
         corpus.images.len(),
         corpus.total_tags(),
     );
 
-    // 3. Validate prerequisites.
     let ecr_client = ecr::client().await;
     ecr::validate_credentials(&ecr_client).await?;
 
@@ -343,7 +394,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // relays its transfers through, whose version moves that tool's numbers.
     let mut tool_versions: BTreeMap<Tool, String> = BTreeMap::new();
     let mut relay_versions: BTreeMap<String, String> = BTreeMap::new();
-    for &tool in &tools {
+    for &tool in tools {
         let version = runner::check_tool(tool, workspace_root).await?;
         eprintln!("  {}: {version}", tool);
         tool_versions.insert(tool, version);
@@ -351,19 +402,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // Relays are shared between tools, so they are resolved once over the whole
     // set rather than per tool.
-    for (binary, version) in runner::check_relays(&tools).await? {
+    for (binary, version) in runner::check_relays(tools).await? {
         eprintln!("  {binary} (relay): {version}");
         relay_versions.insert(binary, version);
     }
 
-    // 4. Determine output directory.
     let timestamp = utc_timestamp();
     let output_dir = match &args.output {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(format!("bench/results/{timestamp}")),
     };
 
-    // 5. Create report.
     let instance = report::InstanceInfo::collect();
     eprintln!(
         "bench: instance={} cpu={} vcpus={} mem={}MiB net={} region={}",
@@ -385,7 +434,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         scenarios: Vec::new(),
     };
 
-    // 6. Expand All into individual scenarios, then dispatch each.
     let scenarios: Vec<Scenario> = match args.scenario {
         Scenario::All => vec![
             Scenario::Sync,
@@ -414,7 +462,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     for scenario in scenarios {
         // Randomize tool execution order to prevent systematic bias from
         // CDN warming, network burst credit depletion, etc.
-        let mut shuffled = tools.clone();
+        let mut shuffled = tools.to_vec();
         let seed = shuffle_tools(&mut shuffled);
         let tool_order: Vec<String> = shuffled.iter().map(ToString::to_string).collect();
         eprintln!(
@@ -474,19 +522,18 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    // 7. Write report.
     report::write_report(&output_dir, &report)?;
     eprintln!("bench: summary written to {}", output_dir.display());
 
-    // 8. Append compact run record to per-registry JSON archive.
     let target_registry = &corpus.settings.target_registry;
-    let reg_key = registry_key(target_registry);
+    let registry = RegistryKind::of(target_registry);
+    let reg_key = registry.archive_stem();
     let git_ref = git_ref();
     let record = report::RunRecord {
         timestamp: report.timestamp.clone(),
         git_ref,
         machine: report::MachineInfo {
-            provider: provider_for_registry(reg_key).into(),
+            provider: registry.provider(),
             instance_type: report.instance.instance_type.clone(),
             arch: report.instance.arch.clone(),
             vcpus: report.instance.vcpus,
@@ -504,7 +551,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .scenarios
             .iter()
             .map(|s| report::ScenarioRecord {
-                name: s.kind.label().to_string(),
+                name: s.kind.label(),
                 shuffle_seed: s.shuffle_seed,
                 tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
                 tools: s
@@ -543,7 +590,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: run record appended to bench/results/{reg_key}.json");
     }
 
-    // 9. Handle regression mode.
     if args.regression {
         check_regression(&report, args.threshold_pct)?;
     }
@@ -618,7 +664,7 @@ impl std::fmt::Display for Pass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Prime => f.write_str("prime"),
-            Self::Measured(kind) => write!(f, "{}", kind.slug()),
+            Self::Measured(kind) => f.write_str(&kind.slug()),
         }
     }
 }
@@ -633,27 +679,19 @@ async fn run_single_tool(
     pass: Pass,
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    // 1. Generate config.
     let config_content = match tool {
         Tool::Ocync => config_gen::ocync_config(corpus),
         Tool::Dregsy => config_gen::dregsy_config(corpus),
         Tool::Regsync => config_gen::regsync_config(corpus),
     };
 
-    // 2. Write config to disk.
     let config_path = config_dir.join(format!("{}.yaml", tool));
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
 
-    // 3. Start bench-proxy (unless --no-proxy).
-    //
-    // The proxy binary, CA cert, and CA private key are configured via the
-    // `--proxy-binary`, `--proxy-ca`, and `--proxy-ca-key` CLI flags, which
-    // default to paths populated by the instance bootstrap (user-data.sh).
-    //
-    // The log lives under `output_dir` (not the auto-cleaned tempdir) so
-    // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly
-    // which API calls the tool issued.
+    // The proxy log lives under `output_dir`, not the auto-cleaned tempdir, so
+    // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly which
+    // API calls the tool issued.
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
     let (proxy_handle, proxy_url) = if !args.no_proxy {
@@ -673,8 +711,6 @@ async fn run_single_tool(
         (None, None)
     };
 
-    // 4. Run the tool.
-    //
     // The bench-proxy CA must be installed in the system trust store (via
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
@@ -688,8 +724,6 @@ async fn run_single_tool(
     )
     .await?;
 
-    // 6. Stop proxy, parse log, aggregate metrics. Abort on source
-    //    registry errors that indicate tainted benchmark data.
     let proxy_metrics = if let Some(handle) = proxy_handle {
         let entries = proxy::stop(handle).await?;
         check_source_errors(&entries, &corpus.settings.target_registry)?;
@@ -704,12 +738,10 @@ async fn run_single_tool(
         .unwrap_or_else(|| "n/a".into());
     if let Some(ref metrics) = proxy_metrics {
         eprintln!(
-            "  {}: wall_clock={:.1}s exit={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
+            "  {}: wall_clock={:.1}s status={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
             tool,
             result.wall_clock.as_secs_f64(),
-            result
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            result.exit_status,
             rss_display,
             metrics.requests,
             report::format_bytes(metrics.response_bytes),
@@ -720,12 +752,10 @@ async fn run_single_tool(
         );
     } else {
         eprintln!(
-            "  {}: wall_clock={:.1}s exit={} rss={}",
+            "  {}: wall_clock={:.1}s status={} rss={}",
             tool,
             result.wall_clock.as_secs_f64(),
-            result
-                .exit_code
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            result.exit_status,
             rss_display,
         );
     }
@@ -737,14 +767,29 @@ async fn run_single_tool(
         BTreeMap::new()
     };
 
+    // Checked last so a source-registry error, which names the cause, is
+    // reported first.
+    ensure_exited_zero(tool, pass, result.exit_status)?;
+
     Ok(ToolRun {
         tool,
         wall_clock_secs: result.wall_clock.as_secs_f64(),
-        exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
         proxy_metrics,
         phase_timing_ms,
     })
+}
+
+/// Fails unless a tool pass exited 0. A pass that failed did less work, so its
+/// numbers cannot be compared; for `--dry-run` that includes a mapping that
+/// could not be resolved.
+fn ensure_exited_zero(tool: Tool, pass: Pass, status: ExitStatus) -> Result<(), String> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{tool} {pass} failed ({status}); aborting, a failed run cannot be compared"
+    ))
 }
 
 /// Abort on source registry errors (status >= 400) that indicate tainted
@@ -805,9 +850,6 @@ async fn run_sync(
     let mut warm_runs = Vec::new();
 
     for &tool in tools {
-        // Clean slate before every tool (including the first).
-        // Drop page cache so no tool benefits from a previous tool's
-        // source pulls cached in RAM. Clean staging tmpdir.
         prepare_clean_slate();
 
         // Delete repos first to guarantee a truly empty target, then recreate.
@@ -821,7 +863,6 @@ async fn run_sync(
         // sees a fully populated cache.
         let config_dir = tempfile::tempdir()?;
 
-        // Cold run.
         progress(&format!("  cold: {tool}"));
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             let cold = run_single_tool(
@@ -834,25 +875,15 @@ async fn run_sync(
                 false,
             )
             .await?;
-            if cold.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} cold sync failed (exit {:?}); aborting -- \
-                     tainted data cannot be compared",
-                    cold.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  cold: {tool} complete ({:.1}s)",
                 cold.wall_clock_secs
             ));
             cold_runs.push(cold);
 
-            // Verify cold sync: every expected tag must exist at target.
             let tool_name = tool.to_string();
             ecr::verify_sync(ecr_client, corpus, &tool_name, "cold").await?;
 
-            // Warm run: target still populated, same config_dir.
             progress(&format!("  warm: {tool}"));
             let warm = run_single_tool(
                 args,
@@ -864,21 +895,12 @@ async fn run_sync(
                 false,
             )
             .await?;
-            if warm.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} warm sync failed (exit {:?}); aborting -- \
-                     tainted data cannot be compared",
-                    warm.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  warm: {tool} complete ({:.1}s)",
                 warm.wall_clock_secs
             ));
             warm_runs.push(warm);
 
-            // Verify warm sync: tags should still all be present.
             ecr::verify_sync(ecr_client, corpus, &tool_name, "warm").await?;
 
             Ok(())
@@ -931,7 +953,7 @@ async fn run_partial(
             // Prime with base corpus (unmeasured). Reuse the same
             // config_dir so ocync's TransferStateCache persists.
             let config_dir = tempfile::tempdir()?;
-            let prime = run_single_tool(
+            run_single_tool(
                 args,
                 tool,
                 base_corpus,
@@ -941,16 +963,8 @@ async fn run_partial(
                 false,
             )
             .await?;
-            if prime.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} partial prime failed (exit {:?}); aborting",
-                    prime.exit_code
-                )
-                .into());
-            }
             progress(&format!("  partial: {} measuring", tool));
 
-            // Measured run with partial corpus (same config_dir).
             let run = run_single_tool(
                 args,
                 tool,
@@ -961,13 +975,6 @@ async fn run_partial(
                 false,
             )
             .await?;
-            if run.exit_code != Some(0) {
-                return Err(format!(
-                    "{tool} partial sync failed (exit {:?}); aborting",
-                    run.exit_code
-                )
-                .into());
-            }
             progress(&format!(
                 "  partial: {} complete ({:.1}s)",
                 tool, run.wall_clock_secs
@@ -1035,13 +1042,6 @@ async fn run_scale(
                     false,
                 )
                 .await?;
-                if run.exit_code != Some(0) {
-                    return Err(format!(
-                        "{tool} scale sync failed at {size} images (exit {:?}); aborting",
-                        run.exit_code
-                    )
-                    .into());
-                }
                 runs.push(run);
                 Ok(())
             }
@@ -1103,25 +1103,12 @@ async fn run_prepare(
     )
     .await?;
 
-    // `--dry-run` exits non-zero when a mapping could not be resolved. That is
-    // the measurement failing, not a finding: a run that skipped mappings did
-    // less work and its wall clock means nothing.
-    if run.exit_code != Some(0) {
-        return Err(format!(
-            "ocync prepare dry-run failed (exit {:?}); the timing would not be comparable",
-            run.exit_code
-        )
-        .into());
-    }
-
     Ok(ScenarioResult::unshuffled(ScenarioKind::Prepare, vec![run]))
 }
 
-/// Sleep for 30 seconds between benchmark runs to let rate limits recover.
-/// Ensure a verified clean slate before each tool run.
-///
-/// Runs before every tool (including the first) to guarantee no tool
-/// benefits from a previous tool's cached data or leftover state.
+/// Drops the page cache and clears the staging tmpdir, before every tool
+/// including the first, so none benefits from a previous tool's source pulls
+/// cached in RAM or leftover state.
 fn prepare_clean_slate() {
     drop_page_cache();
     clean_staging_tmpdir();
@@ -1230,7 +1217,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
         .build()
         .unwrap();
 
-    // Group images by registry so we can reuse tokens per scope.
     let mut hits = 0u64;
     let mut misses = 0u64;
     let mut errors = 0u64;
@@ -1467,7 +1453,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
                                     .errors += 1;
                                 break;
                             }
-                            // Wait for backoff before retry.
                             let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
                             if let Some(d) = delay {
                                 tokio::time::sleep(d).await;
@@ -1529,7 +1514,6 @@ async fn cdn_prewarm(corpus: &Corpus) {
         .collect();
     futures_util::future::join_all(futs).await;
 
-    // Log per-registry stats with discovered rates.
     let (total_hits, total_misses, total_errors) = {
         let stats = per_registry_stats.borrow();
         let mut hits_sum = 0u64;
@@ -1763,6 +1747,7 @@ fn parse_timing_file(path: &Path) -> BTreeMap<String, u64> {
     map
 }
 
+/// Sleeps between benchmark runs to let rate limits recover.
 async fn cooldown() {
     eprintln!("bench: cooling down for 10s...");
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1870,16 +1855,19 @@ fn days_to_civil(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
-impl std::fmt::Display for Scenario {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Scenario::Sync => f.write_str("sync"),
-            Scenario::Partial => f.write_str("partial"),
-            Scenario::Scale => f.write_str("scale"),
-            Scenario::Prepare => f.write_str("prepare"),
-            Scenario::All => f.write_str("all"),
-        }
+/// Parses `argv` (without the program name) as the `bench` subcommand's
+/// arguments, the way the command line does.
+#[cfg(test)]
+pub(crate) fn parse_bench(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: BenchArgs,
     }
+
+    Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied())).map(|cli| cli.args)
 }
 
 #[cfg(test)]
@@ -1892,34 +1880,20 @@ mod tests {
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn days_to_civil_unix_epoch() {
-        // Day 0 = 1970-01-01.
-        assert_eq!(days_to_civil(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_civil_known_date() {
-        // 2026-04-15 = day 20558 since epoch.
-        // (date -d '2026-04-15' +%s) / 86400 = 20558
-        assert_eq!(days_to_civil(20558), (2026, 4, 15));
-    }
-
-    #[test]
-    fn days_to_civil_leap_year_boundary() {
-        // 2000-02-29 = day 11016.
-        assert_eq!(days_to_civil(11016), (2000, 2, 29));
-        // 2000-03-01 = day 11017.
-        assert_eq!(days_to_civil(11017), (2000, 3, 1));
-    }
-
-    #[test]
-    fn days_to_civil_non_leap_century() {
-        // 1900 is not a leap year (divisible by 100 but not 400).
-        // 1900-02-28 is valid, 1900-03-01 follows.
-        // 1900-03-01 = day -25567 ... negative days not supported (u64).
-        // Use 2100-02-28 instead: day 47540, 2100-03-01 = day 47541.
-        assert_eq!(days_to_civil(47540), (2100, 2, 28));
-        assert_eq!(days_to_civil(47541), (2100, 3, 1));
+    fn days_to_civil_known_dates() {
+        // Day counts are `date -d <date> +%s` / 86400.
+        for (days, expected) in [
+            (0, (1970, 1, 1)),
+            (20558, (2026, 4, 15)),
+            // 2000 is a leap year (divisible by 400).
+            (11016, (2000, 2, 29)),
+            (11017, (2000, 3, 1)),
+            // 2100 is not (divisible by 100 but not 400).
+            (47540, (2100, 2, 28)),
+            (47541, (2100, 3, 1)),
+        ] {
+            assert_eq!(days_to_civil(days), expected, "day {days}");
+        }
     }
 
     #[test]
@@ -1933,51 +1907,130 @@ mod tests {
     }
 
     #[test]
-    fn scenario_display() {
-        assert_eq!(Scenario::Sync.to_string(), "sync");
-        assert_eq!(Scenario::Partial.to_string(), "partial");
-        assert_eq!(Scenario::Scale.to_string(), "scale");
-        assert_eq!(Scenario::All.to_string(), "all");
-    }
+    #[cfg(unix)]
+    fn a_pass_that_does_not_exit_zero_aborts_the_run() {
+        use std::os::unix::process::ExitStatusExt;
 
-    #[test]
-    fn provider_for_registry_mapping() {
-        assert_eq!(provider_for_registry("ecr"), "aws");
-        assert_eq!(provider_for_registry("gcr"), "gcp");
-        assert_eq!(provider_for_registry("acr"), "azure");
-        assert_eq!(provider_for_registry("other"), "other");
-        assert_eq!(provider_for_registry("unknown"), "other");
-    }
-
-    #[test]
-    fn registry_key_ecr() {
+        let pass = Pass::Measured(ScenarioKind::Scale { images: 10 });
         assert_eq!(
-            registry_key("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
-            "ecr"
+            ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(0)),
+            Ok(())
         );
+        for (name, raw_status, expected) in [
+            (
+                "non-zero",
+                1 << 8,
+                "ocync scale-10 failed (exit status: 1); aborting, a failed run cannot be compared",
+            ),
+            (
+                "killed by a signal",
+                9,
+                "ocync scale-10 failed (signal: 9 (SIGKILL)); aborting, a failed run cannot be compared",
+            ),
+        ] {
+            assert_eq!(
+                ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(raw_status)),
+                Err(expected.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_stdout_is_trimmed_text_from_a_successful_command() {
+        use std::process::Command;
+        let run = |program: &str, args: &[&str]| command_stdout(Command::new(program).args(args));
+
+        assert_eq!(run("printf", &["  hi\n"]).as_deref(), Some("hi"));
+        assert_eq!(run("printf", &[" \n"]), None, "blank output");
+        assert_eq!(run("false", &[]), None, "non-zero exit");
+        assert_eq!(run("/nonexistent/program", &[]), None, "cannot spawn");
+    }
+
+    #[test]
+    fn value_name_is_the_spelling_the_command_line_accepts() {
+        for (scenario, expected) in [
+            (Scenario::Sync, "sync"),
+            (Scenario::Partial, "partial"),
+            (Scenario::Scale, "scale"),
+            (Scenario::Prepare, "prepare"),
+            (Scenario::All, "all"),
+        ] {
+            assert_eq!(value_name(&scenario), expected);
+        }
+    }
+
+    #[test]
+    fn registry_kind_names_archive_and_provider() {
+        for (host, stem, provider) in [
+            (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "111111111111.dkr.ecr.eu-west-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            ("gcr.io", "gcr", Some(Provider::Gcp)),
+            ("us-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
+            ("europe-west1-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
+            ("myregistry.azurecr.io", "acr", Some(Provider::Azure)),
+            (
+                "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            (
+                "123456789012.DKR.ECR.US-EAST-1.AMAZONAWS.COM",
+                "ecr",
+                Some(Provider::Aws),
+            ),
+            ("myreg.azurecr.us", "acr", Some(Provider::Azure)),
+            ("myreg.azurecr.cn", "acr", Some(Provider::Azure)),
+            ("MyReg.AzureCR.io", "acr", Some(Provider::Azure)),
+            ("ecr.example.com", "other", None),
+            ("public.ecr.aws", "other", None),
+            ("ghcr.io", "other", None),
+            ("docker.io", "other", None),
+            ("quay.io", "other", None),
+        ] {
+            let kind = RegistryKind::of(host);
+            assert_eq!(kind.archive_stem(), stem, "{host}");
+            assert_eq!(kind.provider(), provider, "{host}");
+        }
+    }
+
+    #[test]
+    fn bench_args_parse_closed_sets_and_refuse_anything_else() {
+        use clap::error::ErrorKind;
+
+        let ok = parse_bench(&["--tools", "Ocync,DREGSY,regsync", "prepare"]).unwrap();
         assert_eq!(
-            registry_key("111111111111.dkr.ecr.eu-west-1.amazonaws.com"),
-            "ecr"
+            ok.tool_selection.tools,
+            [Tool::Ocync, Tool::Dregsy, Tool::Regsync]
         );
-    }
+        assert!(matches!(ok.scenario, Scenario::Prepare));
 
-    #[test]
-    fn registry_key_gcr() {
-        assert_eq!(registry_key("gcr.io"), "gcr");
-        assert_eq!(registry_key("us-docker.pkg.dev"), "gcr");
-        assert_eq!(registry_key("europe-west1-docker.pkg.dev"), "gcr");
-    }
-
-    #[test]
-    fn registry_key_acr() {
-        assert_eq!(registry_key("myregistry.azurecr.io"), "acr");
-    }
-
-    #[test]
-    fn registry_key_other() {
-        assert_eq!(registry_key("ghcr.io"), "other");
-        assert_eq!(registry_key("docker.io"), "other");
-        assert_eq!(registry_key("quay.io"), "other");
+        for (name, argv, kind) in [
+            (
+                "tool",
+                &["--tools", "ocync,skopeo", "sync"][..],
+                ErrorKind::InvalidValue,
+            ),
+            ("scenario", &["cold"][..], ErrorKind::InvalidSubcommand),
+        ] {
+            let err = parse_bench(argv)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: accepted"));
+            assert_eq!(err.kind(), kind, "{name}");
+        }
     }
 
     #[test]
@@ -2029,7 +2082,6 @@ mod tests {
         ToolRun {
             tool,
             wall_clock_secs,
-            exit_code: Some(0),
             peak_rss_kb: None,
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),

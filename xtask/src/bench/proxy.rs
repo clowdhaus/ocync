@@ -1,11 +1,9 @@
 //! `bench-proxy` lifecycle management and log parsing for benchmark
 //! HTTP traffic capture.
 //!
-//! The benchmark used to spawn `mitmdump` (Python, single-threaded TLS)
-//! here. That capped throughput at ~250 Mbps regardless of instance
-//! size, which made multi-GB corpora painful to iterate on. We now
-//! spawn our own `bench-proxy` binary (pure-Rust, tokio + rustls) that
-//! scales with CPU cores and writes the same JSONL schema.
+//! Spawns our own `bench-proxy` binary (pure-Rust, tokio + rustls), which
+//! scales with CPU cores; a single-threaded Python TLS proxy capped
+//! throughput near 250 Mbps whatever the instance size.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -179,7 +177,6 @@ pub(crate) async fn start(
 pub(crate) async fn stop(
     mut handle: ProxyHandle,
 ) -> Result<Vec<ProxyEntry>, Box<dyn std::error::Error>> {
-    // Send SIGTERM so the proxy can flush its log and exit cleanly.
     if let Some(pid) = handle.child.id() {
         let _ = std::process::Command::new("kill")
             .args(["-TERM", &pid.to_string()])
@@ -188,7 +185,6 @@ pub(crate) async fn stop(
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    // If still running after SIGTERM, fall back to SIGKILL.
     match handle.child.try_wait()? {
         Some(_) => {} // Exited gracefully.
         None => {
@@ -270,7 +266,6 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
     let mut auth_token_requests = 0u64;
     let mut referrer_calls = 0u64;
 
-    // Track GET requests to blob URLs for duplicate detection.
     let mut blob_get_counts: HashMap<String, u64> = HashMap::new();
 
     for entry in entries {
@@ -325,7 +320,6 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
             }
         }
 
-        // Auth request tracking.
         if entry.method == "GET" {
             if entry.url == "/v2/" {
                 auth_v2_pings += 1;
@@ -460,27 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_counts_requests() {
+    fn aggregate_totals_the_sample_entries() {
         let metrics = aggregate(&sample_entries(), "ecr.aws");
         assert_eq!(metrics.requests, 4);
-    }
-
-    #[test]
-    fn aggregate_counts_429s() {
-        assert_eq!(aggregate(&sample_entries(), "ecr.aws").rate_limit_429s, 1);
-    }
-
-    #[test]
-    fn aggregate_detects_duplicate_blob_gets() {
-        assert_eq!(
-            aggregate(&sample_entries(), "ecr.aws").duplicate_blob_gets,
-            1
-        );
-    }
-
-    #[test]
-    fn aggregate_sums_response_bytes() {
-        let metrics = aggregate(&sample_entries(), "ecr.aws");
+        assert_eq!(metrics.rate_limit_429s, 1);
+        assert_eq!(metrics.duplicate_blob_gets, 1);
         assert_eq!(metrics.response_bytes, 10100);
     }
 
@@ -528,66 +506,117 @@ mod tests {
     }
 
     #[test]
-    fn parse_log_malformed_json_returns_error() {
-        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmpfile, "not valid json").unwrap();
-        tmpfile.flush().unwrap();
-
-        assert!(parse_log(tmpfile.path()).is_err());
+    fn aggregate_counts_duplicate_blob_gets_and_referrer_calls() {
+        for (name, entries, target, expected) in [
+            (
+                "HEAD on a blob url is not a duplicate GET",
+                vec![
+                    entry(
+                        "GET",
+                        "ecr.aws",
+                        "/v2/bench/nginx/blobs/sha256:abc123",
+                        50,
+                        5000,
+                        200,
+                        100,
+                    ),
+                    entry(
+                        "HEAD",
+                        "ecr.aws",
+                        "/v2/bench/nginx/blobs/sha256:abc123",
+                        50,
+                        0,
+                        200,
+                        10,
+                    ),
+                ],
+                "ecr.aws",
+                (0, 0),
+            ),
+            (
+                "unique blobs are not duplicates",
+                vec![
+                    entry(
+                        "GET",
+                        "ecr.aws",
+                        "/v2/bench/nginx/blobs/sha256:aaa",
+                        50,
+                        5000,
+                        200,
+                        100,
+                    ),
+                    entry(
+                        "GET",
+                        "ecr.aws",
+                        "/v2/bench/nginx/blobs/sha256:bbb",
+                        50,
+                        3000,
+                        200,
+                        80,
+                    ),
+                ],
+                "ecr.aws",
+                (0, 0),
+            ),
+            (
+                "referrers urls are counted",
+                vec![
+                    entry(
+                        "GET",
+                        "public.ecr.aws",
+                        "/v2/foo/bar/referrers/sha256:abc",
+                        0,
+                        376,
+                        200,
+                        12,
+                    ),
+                    entry(
+                        "GET",
+                        "public.ecr.aws",
+                        "/v2/foo/bar/referrers/sha256:def",
+                        0,
+                        412,
+                        200,
+                        10,
+                    ),
+                ],
+                "ecr.us-east-2.amazonaws.com",
+                (0, 2),
+            ),
+            (
+                "manifests and blobs are not referrers",
+                vec![
+                    entry(
+                        "GET",
+                        "public.ecr.aws",
+                        "/v2/foo/bar/manifests/sha256:abc",
+                        0,
+                        1024,
+                        200,
+                        12,
+                    ),
+                    entry(
+                        "GET",
+                        "public.ecr.aws",
+                        "/v2/foo/bar/blobs/sha256:def",
+                        0,
+                        2048,
+                        200,
+                        10,
+                    ),
+                ],
+                "ecr.us-east-2.amazonaws.com",
+                (0, 0),
+            ),
+        ] {
+            let metrics = aggregate(&entries, target);
+            assert_eq!(
+                (metrics.duplicate_blob_gets, metrics.referrer_calls),
+                expected,
+                "{name}"
+            );
+        }
     }
-
-    #[test]
-    fn aggregate_head_on_blob_url_not_counted_as_duplicate() {
-        let entries = vec![
-            entry(
-                "GET",
-                "ecr.aws",
-                "/v2/bench/nginx/blobs/sha256:abc123",
-                50,
-                5000,
-                200,
-                100,
-            ),
-            entry(
-                "HEAD",
-                "ecr.aws",
-                "/v2/bench/nginx/blobs/sha256:abc123",
-                50,
-                0,
-                200,
-                10,
-            ),
-        ];
-        let metrics = aggregate(&entries, "ecr.aws");
-        assert_eq!(metrics.duplicate_blob_gets, 0);
-    }
-
-    #[test]
-    fn aggregate_no_duplicates_with_unique_blobs() {
-        let entries = vec![
-            entry(
-                "GET",
-                "ecr.aws",
-                "/v2/bench/nginx/blobs/sha256:aaa",
-                50,
-                5000,
-                200,
-                100,
-            ),
-            entry(
-                "GET",
-                "ecr.aws",
-                "/v2/bench/nginx/blobs/sha256:bbb",
-                50,
-                3000,
-                200,
-                80,
-            ),
-        ];
-        let metrics = aggregate(&entries, "ecr.aws");
-        assert_eq!(metrics.duplicate_blob_gets, 0);
-    }
-
     #[test]
     fn aggregate_source_blob_gets() {
         let entries = vec![
@@ -794,66 +823,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_log_missing_required_field_returns_error() {
-        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        // Valid JSON but missing required fields (e.g. no `method`).
-        writeln!(tmpfile, r#"{{"host":"ecr.aws","url":"/v2/","request_bytes":0,"response_bytes":0,"status":200,"duration_ms":10}}"#).unwrap();
-        tmpfile.flush().unwrap();
+    fn parse_log_rejects_malformed_lines() {
+        for (name, line) in [
+            ("not json", "not valid json"),
+            (
+                "valid json without `method`",
+                r#"{"host":"ecr.aws","url":"/v2/","request_bytes":0,"response_bytes":0,"status":200,"duration_ms":10}"#,
+            ),
+        ] {
+            let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+            writeln!(tmpfile, "{line}").unwrap();
+            tmpfile.flush().unwrap();
 
-        assert!(parse_log(tmpfile.path()).is_err());
-    }
-
-    #[test]
-    fn aggregate_counts_referrer_calls() {
-        let entries = vec![
-            entry(
-                "GET",
-                "public.ecr.aws",
-                "/v2/foo/bar/referrers/sha256:abc",
-                0,
-                376,
-                200,
-                12,
-            ),
-            entry(
-                "GET",
-                "public.ecr.aws",
-                "/v2/foo/bar/referrers/sha256:def",
-                0,
-                412,
-                200,
-                10,
-            ),
-        ];
-        let metrics = aggregate(&entries, "ecr.us-east-2.amazonaws.com");
-        assert_eq!(metrics.referrer_calls, 2);
-    }
-
-    #[test]
-    fn aggregate_does_not_count_manifests_or_blobs_as_referrers() {
-        // Same hostname and shape -- only the path segment differs. Catches
-        // a lazy `contains("ref")` or wrong substring.
-        let entries = vec![
-            entry(
-                "GET",
-                "public.ecr.aws",
-                "/v2/foo/bar/manifests/sha256:abc",
-                0,
-                1024,
-                200,
-                12,
-            ),
-            entry(
-                "GET",
-                "public.ecr.aws",
-                "/v2/foo/bar/blobs/sha256:def",
-                0,
-                2048,
-                200,
-                10,
-            ),
-        ];
-        let metrics = aggregate(&entries, "ecr.us-east-2.amazonaws.com");
-        assert_eq!(metrics.referrer_calls, 0);
+            assert!(parse_log(tmpfile.path()).is_err(), "{name}");
+        }
     }
 }

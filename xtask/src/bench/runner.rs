@@ -2,14 +2,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Benchmark tool variant. Declaration order is the order of columns in the
 /// reports, so ocync leads.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 pub(crate) enum Tool {
     /// The ocync OCI sync tool.
     Ocync,
@@ -28,18 +28,6 @@ impl Tool {
             Tool::Regsync => "regsync",
         }
     }
-
-    /// Parses a tool name case-insensitively.
-    pub(crate) fn parse(s: &str) -> Result<Tool, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "ocync" => Ok(Tool::Ocync),
-            "dregsy" => Ok(Tool::Dregsy),
-            "regsync" => Ok(Tool::Regsync),
-            other => Err(format!(
-                "unknown tool: {other:?}; expected one of: ocync, dregsy, regsync"
-            )),
-        }
-    }
 }
 
 impl std::fmt::Display for Tool {
@@ -48,13 +36,22 @@ impl std::fmt::Display for Tool {
     }
 }
 
+/// The tools as a comma-separated list in the spelling `--tools` parses.
+pub(crate) fn join_tools(tools: &[Tool]) -> String {
+    tools
+        .iter()
+        .map(super::value_name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The result of running a benchmark tool once.
 #[derive(Debug)]
 pub(crate) struct RunResult {
     /// Wall-clock time from process spawn to exit.
     pub(crate) wall_clock: Duration,
-    /// Exit code, or `None` if the process was killed by a signal.
-    pub(crate) exit_code: Option<i32>,
+    /// How the process ended, including a kill by signal.
+    pub(crate) exit_status: ExitStatus,
     /// Peak resident set size in KB (from `/usr/bin/time -v`), if available.
     pub(crate) peak_rss_kb: Option<u64>,
     /// Path to ocync's timing JSONL file (only set for ocync runs).
@@ -412,12 +409,7 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
     if status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "cargo build --release exited with status {}",
-            status
-                .code()
-                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-        ))
+        Err(format!("cargo build --release failed ({status})"))
     }
 }
 
@@ -588,7 +580,7 @@ pub(crate) async fn run_tool(
 
     Ok(RunResult {
         wall_clock,
-        exit_code: status.code(),
+        exit_status: status,
         peak_rss_kb,
         timing_path,
     })
@@ -645,14 +637,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_parse_case_insensitive() {
-        assert_eq!(Tool::parse("Ocync").unwrap(), Tool::Ocync);
-        assert_eq!(Tool::parse("DREGSY").unwrap(), Tool::Dregsy);
-        assert_eq!(Tool::parse("regsync").unwrap(), Tool::Regsync);
-        assert_eq!(
-            Tool::parse("unknown").unwrap_err(),
-            "unknown tool: \"unknown\"; expected one of: ocync, dregsy, regsync"
-        );
+    fn join_tools_is_the_form_tools_flag_parses() {
+        let tools = [Tool::Regsync, Tool::Ocync, Tool::Dregsy];
+        let joined = join_tools(&tools);
+        assert_eq!(joined, "regsync,ocync,dregsy");
+        let parsed = crate::bench::parse_bench(&["--tools", &joined, "prepare"]).unwrap();
+        assert_eq!(parsed.tool_selection.tools, tools);
     }
 
     #[test]
@@ -714,21 +704,6 @@ mod tests {
                 "unhelpful error for {tool}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn module_version_is_read_from_build_info() {
-        // Real `go version -m` output. The mod line carries the main module,
-        // and every dep line after it must be ignored.
-        let output = "/usr/local/bin/dregsy: go1.26.2\n\
-             \tpath\tgithub.com/xelalexv/dregsy/cmd/dregsy\n\
-             \tmod\tgithub.com/xelalexv/dregsy\tv0.0.0-20250317074629-e92e79a50145\th1:abc=\n\
-             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
-
-        assert_eq!(
-            module_version_from_build_info(output),
-            Some("v0.0.0-20250317074629-e92e79a50145")
-        );
     }
 
     #[test]
@@ -851,28 +826,40 @@ mod tests {
     }
 
     #[test]
-    fn locally_built_binary_reports_no_module_version() {
-        // Go stamps (devel) for a build from a working tree. It names no
-        // released artifact, so recording it would give a run's provenance the
-        // same authority as a real version.
-        let devel = "/usr/local/bin/dregsy: go1.26.2\n\
-             \tmod\tgithub.com/xelalexv/dregsy\t(devel)\t\n";
-
-        assert_eq!(module_version_from_build_info(devel), None);
-    }
-
-    #[test]
-    fn module_version_absent_without_a_mod_line() {
+    fn module_version_comes_only_from_the_main_module_line() {
         // `go version -m` writes nothing to stdout for a non-Go binary, and
-        // go_module_version discards stderr, so an empty input is the only
-        // shape the parser sees in that case.
-        assert_eq!(module_version_from_build_info(""), None);
-
-        // A Go binary whose build info carries no main module still lists its
-        // dependencies, which must not be mistaken for the module version.
-        let deps_only = "/usr/local/bin/x: go1.26.2\n\
-             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
-        assert_eq!(module_version_from_build_info(deps_only), None);
+        // go_module_version discards stderr, so empty input is the only shape
+        // the parser sees then.
+        for (name, output, expected) in [
+            (
+                // Real output: every dep line after the mod line is ignored.
+                "main module line",
+                "/usr/local/bin/dregsy: go1.26.2\n\
+                 \tpath\tgithub.com/xelalexv/dregsy/cmd/dregsy\n\
+                 \tmod\tgithub.com/xelalexv/dregsy\tv0.0.0-20250317074629-e92e79a50145\th1:abc=\n\
+                 \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n",
+                Some("v0.0.0-20250317074629-e92e79a50145"),
+            ),
+            (
+                // Go stamps (devel) for a working-tree build. It names no
+                // released artifact, so recording it would give a run's
+                // provenance the same authority as a real version.
+                "locally built binary",
+                "/usr/local/bin/dregsy: go1.26.2\n\
+                 \tmod\tgithub.com/xelalexv/dregsy\t(devel)\t\n",
+                None,
+            ),
+            ("empty output", "", None),
+            (
+                // Dependencies must not be mistaken for the module version.
+                "dependencies only",
+                "/usr/local/bin/x: go1.26.2\n\
+                 \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n",
+                None,
+            ),
+        ] {
+            assert_eq!(module_version_from_build_info(output), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1012,21 +999,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_gnu_time_rss_extracts_value() {
-        let stderr = "\tCommand being timed: \"./target/release/ocync\"\n\
-                      \tMaximum resident set size (kbytes): 59468\n\
-                      \tExit status: 0\n";
-        assert_eq!(parse_gnu_time_rss(stderr), Some(59468));
-    }
-
-    #[test]
-    fn parse_gnu_time_rss_missing_returns_none() {
-        let stderr = "error: some tool output\nno time info here\n";
-        assert_eq!(parse_gnu_time_rss(stderr), None);
-    }
-
-    #[test]
-    fn parse_gnu_time_rss_empty_returns_none() {
-        assert_eq!(parse_gnu_time_rss(""), None);
+    fn parse_gnu_time_rss_reads_the_maximum_resident_set_line() {
+        for (name, stderr, expected) in [
+            (
+                "gnu time -v output",
+                "\tCommand being timed: \"./target/release/ocync\"\n\
+                 \tMaximum resident set size (kbytes): 59468\n\
+                 \tExit status: 0\n",
+                Some(59468),
+            ),
+            (
+                "no time info",
+                "error: some tool output\nno time info here\n",
+                None,
+            ),
+            ("empty", "", None),
+        ] {
+            assert_eq!(parse_gnu_time_rss(stderr), expected, "{name}");
+        }
     }
 }

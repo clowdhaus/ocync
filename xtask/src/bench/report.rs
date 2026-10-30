@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::runner::Tool;
+use crate::bench::{Provider, command_stdout};
 
 /// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
 fn is_zero(v: &u64) -> bool {
@@ -46,8 +47,10 @@ pub(crate) struct RunRecord {
 /// Machine metadata for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MachineInfo {
-    /// Cloud provider: `"aws"`, `"gcp"`, `"azure"`, or `"other"`.
-    pub(crate) provider: String,
+    /// Cloud of the target registry, absent when the registry belongs to none
+    /// of the three clouds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<Provider>,
     /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
     pub(crate) instance_type: String,
     /// CPU architecture (e.g. `x86_64`, `aarch64`).
@@ -145,8 +148,6 @@ pub(crate) struct ToolRun {
     pub(crate) tool: Tool,
     /// Wall-clock time in seconds.
     pub(crate) wall_clock_secs: f64,
-    /// Process exit code, if captured.
-    pub(crate) exit_code: Option<i32>,
     /// Peak resident set size in KB (from `/usr/bin/time -v`).
     pub(crate) peak_rss_kb: Option<u64>,
     /// HTTP proxy metrics, if a proxy was attached.
@@ -177,42 +178,24 @@ pub(crate) enum ScenarioKind {
 impl ScenarioKind {
     /// Human-readable scenario name, the heading of its report section and
     /// its name in the JSON archive (e.g. `"Cold sync"`).
-    pub(crate) fn label(self) -> impl std::fmt::Display {
-        Label(self)
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Cold => "Cold sync".into(),
+            Self::Warm => "Warm sync (no-op)".into(),
+            Self::Partial => "Partial sync (~5% changed)".into(),
+            Self::Scale { images } => format!("Scale ({images} images)"),
+            Self::Prepare => "Prepare (dry-run)".into(),
+        }
     }
 
     /// File-name stem for this scenario's measured runs (e.g. `"scale-10"`).
-    pub(crate) fn slug(self) -> impl std::fmt::Display {
-        Slug(self)
-    }
-}
-
-/// Writes [`ScenarioKind::label`].
-struct Label(ScenarioKind);
-
-impl std::fmt::Display for Label {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            ScenarioKind::Cold => f.write_str("Cold sync"),
-            ScenarioKind::Warm => f.write_str("Warm sync (no-op)"),
-            ScenarioKind::Partial => f.write_str("Partial sync (~5% changed)"),
-            ScenarioKind::Scale { images } => write!(f, "Scale ({images} images)"),
-            ScenarioKind::Prepare => f.write_str("Prepare (dry-run)"),
-        }
-    }
-}
-
-/// Writes [`ScenarioKind::slug`].
-struct Slug(ScenarioKind);
-
-impl std::fmt::Display for Slug {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            ScenarioKind::Cold => f.write_str("cold"),
-            ScenarioKind::Warm => f.write_str("warm"),
-            ScenarioKind::Partial => f.write_str("partial"),
-            ScenarioKind::Scale { images } => write!(f, "scale-{images}"),
-            ScenarioKind::Prepare => f.write_str("prepare"),
+    pub(crate) fn slug(self) -> String {
+        match self {
+            Self::Cold => "cold".into(),
+            Self::Warm => "warm".into(),
+            Self::Partial => "partial".into(),
+            Self::Scale { images } => format!("scale-{images}"),
+            Self::Prepare => "prepare".into(),
         }
     }
 }
@@ -331,11 +314,10 @@ impl InstanceInfo {
 /// Returns `(arch, cpu_manufacturer, vcpus, memory_mib, network_performance)`.
 #[expect(
     clippy::disallowed_methods,
-    reason = "reads the AWS CLI's instance type answer, which holds no credential"
+    reason = "parses the AWS CLI's instance type answer, which holds no credential"
 )]
 fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize, u64, String)> {
-    let output = std::process::Command::new("aws")
-        .args([
+    let output = command_stdout(std::process::Command::new("aws").args([
             "ec2",
             "describe-instance-types",
             "--instance-types",
@@ -344,12 +326,9 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
             "InstanceTypes[0].{Arch:ProcessorInfo.SupportedArchitectures[0],Cpu:ProcessorInfo.Manufacturer,Vcpus:VCpuInfo.DefaultVCpus,Mem:MemoryInfo.SizeInMiB,Net:NetworkInfo.NetworkPerformance}",
             "--output",
             "json",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+        ]))?;
 
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&output).ok()?;
 
     let arch = json["Arch"].as_str().unwrap_or_default().to_string();
     let cpu_manufacturer = json["Cpu"].as_str().unwrap_or_default().to_string();
@@ -368,41 +347,28 @@ fn describe_instance_type(instance_type: &str) -> Option<(String, String, usize,
 
 /// Read a value from the EC2 Instance Metadata Service (`IMDSv2`).
 fn read_imds(path: &str) -> Option<String> {
-    // IMDSv2: get a session token first, then use it.
-    let token = std::process::Command::new("curl")
-        .args([
-            "-s",
-            "-f",
-            "--connect-timeout",
-            "1",
-            "-X",
-            "PUT",
-            "http://169.254.169.254/latest/api/token",
-            "-H",
-            "X-aws-ec2-metadata-token-ttl-seconds: 10",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())?;
+    let token = command_stdout(std::process::Command::new("curl").args([
+        "-s",
+        "-f",
+        "--connect-timeout",
+        "1",
+        "-X",
+        "PUT",
+        "http://169.254.169.254/latest/api/token",
+        "-H",
+        "X-aws-ec2-metadata-token-ttl-seconds: 10",
+    ]))?;
 
     let url = format!("http://169.254.169.254/latest/meta-data/{path}");
-    std::process::Command::new("curl")
-        .args([
-            "-s",
-            "-f",
-            "--connect-timeout",
-            "1",
-            "-H",
-            &format!("X-aws-ec2-metadata-token: {}", token.trim()),
-            &url,
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    command_stdout(std::process::Command::new("curl").args([
+        "-s",
+        "-f",
+        "--connect-timeout",
+        "1",
+        "-H",
+        &format!("X-aws-ec2-metadata-token: {token}"),
+        &url,
+    ]))
 }
 
 /// Full benchmark report.
@@ -508,7 +474,6 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push_str("# Benchmark Results\n\n");
     out.push_str(&format!("Run: {}\n\n", report.timestamp));
 
-    // Instance metadata.
     let inst = &report.instance;
     out.push_str("## Instance\n\n");
     out.push_str(&format!("- **Type**: {}\n", inst.instance_type));
@@ -529,12 +494,11 @@ fn summary_markdown(report: &BenchReport) -> String {
         report.corpus_size, report.total_tags
     ));
 
-    // Tool versions section.
     out.push_str("## Tool Versions\n\n");
     for (tool, version) in &report.tool_versions {
         out.push_str(&format!("- **{tool}**: {version}\n"));
     }
-    // The marker leads, since a version can now carry a parenthesised reason
+    // The marker leads, since a version can carry a parenthesised reason
     // and a trailing "(relay)" would read as part of it.
     for (binary, version) in &report.relay_versions {
         out.push_str(&format!("- **{binary}** (relay): {version}\n"));
@@ -545,7 +509,6 @@ fn summary_markdown(report: &BenchReport) -> String {
     // scenario keeps only the tools that ran in it.
     let columns = tool_columns(report);
 
-    // Per-scenario detailed tables.
     for scenario in &report.scenarios {
         out.push_str(&format!("## {}\n\n", scenario.kind.label()));
 
@@ -758,7 +721,6 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
 
-    // summary.md
     let md = summary_markdown(report);
     let md_path = output_dir.join("summary.md");
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
@@ -871,7 +833,6 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
 
     let mut updated = false;
 
-    // Cold scenario.
     if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Cold) {
         let snippet = scenario_markdown(report, scenario, "Cold sync");
         match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
@@ -888,7 +849,6 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
         }
     }
 
-    // Warm scenario.
     if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Warm) {
         let snippet = scenario_markdown(report, scenario, "Warm sync (no changes)");
         match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {
@@ -984,7 +944,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 47.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -992,7 +951,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 521.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(131072),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1003,58 +961,33 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_seconds() {
-        assert_eq!(format_duration(Duration::from_secs(47)), "47s");
+    fn format_duration_shows_minutes_only_when_there_are_some() {
+        for (secs, expected) in [(0, "0s"), (47, "47s"), (192, "3m 12s"), (120, "2m")] {
+            assert_eq!(
+                format_duration(Duration::from_secs(secs)),
+                expected,
+                "{secs}s"
+            );
+        }
     }
 
     #[test]
-    fn format_duration_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(192)), "3m 12s");
-    }
-
-    #[test]
-    fn format_duration_exact_minutes() {
-        assert_eq!(format_duration(Duration::from_secs(120)), "2m");
-    }
-
-    #[test]
-    fn format_bytes_gb() {
-        assert_eq!(format_bytes(2_100_000_000), "2.1 GB");
-    }
-
-    #[test]
-    fn format_bytes_mb() {
-        assert_eq!(format_bytes(450_000_000), "450.0 MB");
-    }
-
-    #[test]
-    fn format_duration_zero() {
-        assert_eq!(format_duration(Duration::ZERO), "0s");
-    }
-
-    #[test]
-    fn format_bytes_exact_boundaries() {
-        assert_eq!(format_bytes(999), "999 B");
-        assert_eq!(format_bytes(1_000), "1.0 KB");
-        assert_eq!(format_bytes(999_999), "1000.0 KB");
-        assert_eq!(format_bytes(1_000_000), "1.0 MB");
-        assert_eq!(format_bytes(999_999_999), "1000.0 MB");
-        assert_eq!(format_bytes(1_000_000_000), "1.0 GB");
-    }
-
-    #[test]
-    fn format_bytes_kb() {
-        assert_eq!(format_bytes(1_500), "1.5 KB");
-    }
-
-    #[test]
-    fn format_bytes_small() {
-        assert_eq!(format_bytes(42), "42 B");
-    }
-
-    #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
+    fn format_bytes_scales_to_the_decimal_unit() {
+        for (bytes, expected) in [
+            (0, "0 B"),
+            (42, "42 B"),
+            (999, "999 B"),
+            (1_000, "1.0 KB"),
+            (1_500, "1.5 KB"),
+            (999_999, "1000.0 KB"),
+            (1_000_000, "1.0 MB"),
+            (450_000_000, "450.0 MB"),
+            (999_999_999, "1000.0 MB"),
+            (1_000_000_000, "1.0 GB"),
+            (2_100_000_000, "2.1 GB"),
+        ] {
+            assert_eq!(format_bytes(bytes), expected, "{bytes}");
+        }
     }
 
     #[test]
@@ -1096,7 +1029,7 @@ mod tests {
         let md_content = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert_eq!(md_content, summary_markdown(&report));
 
-        // Per-scenario JSON files are no longer generated.
+        // No per-scenario JSON file is written.
         assert!(!dir.path().join("cold_sync__median_.json").exists());
     }
 
@@ -1144,7 +1077,6 @@ mod tests {
         let run = |tool| ToolRun {
             tool,
             wall_clock_secs: 47.0,
-            exit_code: Some(0),
             peak_rss_kb: Some(65536),
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
@@ -1181,7 +1113,7 @@ mod tests {
             timestamp: "2026-04-18-021040".into(),
             git_ref: "d121864".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
@@ -1221,7 +1153,7 @@ mod tests {
         let parsed: RunRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.timestamp, "2026-04-18-021040");
         assert_eq!(parsed.git_ref, "d121864");
-        assert_eq!(parsed.machine.provider, "aws");
+        assert_eq!(parsed.machine.provider, Some(Provider::Aws));
         assert_eq!(parsed.machine.memory_gib, 32.0);
         assert_eq!(parsed.corpus.images, 42);
         assert_eq!(parsed.scenarios[0].tools[0].metrics.requests, 4131);
@@ -1234,7 +1166,7 @@ mod tests {
             timestamp: "2026-04-18-100000".into(),
             git_ref: "abc1234".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c6in.4xlarge".into(),
                 arch: "x86_64".into(),
                 vcpus: 16,
@@ -1270,7 +1202,7 @@ mod tests {
             timestamp: "2026-04-18-110000".into(),
             git_ref: "def5678".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "c7g.xlarge".into(),
                 arch: "aarch64".into(),
                 vcpus: 4,
@@ -1301,7 +1233,7 @@ mod tests {
             timestamp: "2026-04-18-120000".into(),
             git_ref: "aaa1111".into(),
             machine: MachineInfo {
-                provider: "aws".into(),
+                provider: Some(Provider::Aws),
                 instance_type: "unknown".into(),
                 arch: "unknown".into(),
                 vcpus: 0,
@@ -1331,7 +1263,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 47.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1374,7 +1305,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 2.5,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(51200),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1397,7 +1327,7 @@ mod tests {
 
         let cold = find_scenario(&report.scenarios, ScenarioKind::Cold).unwrap();
 
-        assert_eq!(cold.kind.label().to_string(), "Cold sync");
+        assert_eq!(cold.kind.label(), "Cold sync");
         assert!(find_scenario(&report.scenarios, ScenarioKind::Warm).is_none());
         assert!(find_scenario(&report.scenarios, ScenarioKind::Scale { images: 25 }).is_none());
     }
@@ -1431,7 +1361,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let report = sample_report();
-        // Missing markers now warn instead of failing (both are optional).
+        // Missing markers warn instead of failing: both are optional.
         update_performance_page(&path, &report).unwrap();
         // File should be unchanged.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -1455,7 +1385,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 4131,
@@ -1471,7 +1400,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(304500),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 11190,
@@ -1548,7 +1476,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(59468),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 4131,
@@ -1564,7 +1491,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(304500),
                         // dregsy has no proxy metrics in this test.
                         proxy_metrics: None,
@@ -1605,7 +1531,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 120.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(65536),
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 1000,
@@ -1615,8 +1540,7 @@ mod tests {
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
-                        wall_clock_secs: 120.0, // same wall clock
-                        exit_code: Some(0),
+                        wall_clock_secs: 120.0,   // same wall clock
                         peak_rss_kb: Some(65536), // same RSS
                         proxy_metrics: Some(ProxyMetrics {
                             requests: 2000, // different requests
@@ -1682,7 +1606,6 @@ mod tests {
                     vec![ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 429.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(51200),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1693,7 +1616,6 @@ mod tests {
                     vec![ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 2.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(40960),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
@@ -1736,7 +1658,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 3.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(40960),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
@@ -1772,7 +1693,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Ocync,
                         wall_clock_secs: 250.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(60_000),
                         proxy_metrics: Some(ProxyMetrics {
                             referrer_calls: 79,
@@ -1783,7 +1703,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Dregsy,
                         wall_clock_secs: 2000.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(300_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
@@ -1791,7 +1710,6 @@ mod tests {
                     ToolRun {
                         tool: Tool::Regsync,
                         wall_clock_secs: 2200.0,
-                        exit_code: Some(0),
                         peak_rss_kb: Some(280_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
@@ -1823,7 +1741,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Dregsy,
                     wall_clock_secs: 2000.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(300_000),
                     proxy_metrics: Some(ProxyMetrics::default()),
                     phase_timing_ms: BTreeMap::new(),
@@ -1854,7 +1771,6 @@ mod tests {
                 vec![ToolRun {
                     tool: Tool::Ocync,
                     wall_clock_secs: 250.0,
-                    exit_code: Some(0),
                     peak_rss_kb: Some(60_000),
                     proxy_metrics: Some(ProxyMetrics {
                         referrer_calls: 79,

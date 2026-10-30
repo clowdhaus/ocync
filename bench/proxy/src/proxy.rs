@@ -10,12 +10,14 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use http::header::{
     CONNECTION, CONTENT_LENGTH, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
     TRANSFER_ENCODING, UPGRADE,
@@ -31,7 +33,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::Serialize;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
@@ -170,7 +172,7 @@ pub(crate) async fn serve(
                 let log = log.clone();
                 let upstream = upstream.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, ca, log, upstream).await {
+                    if let Err(e) = handle_connection(stream, ca, log, upstream).await {
                         debug!(%peer, error = %e, "connection closed with error");
                     }
                 });
@@ -204,7 +206,6 @@ async fn shutdown_signal() {
 /// other methods are rejected with 405.
 async fn handle_connection(
     stream: TcpStream,
-    _peer: SocketAddr,
     ca: Arc<CaSigner>,
     log: Arc<LogWriter>,
     upstream: reqwest::Client,
@@ -284,9 +285,8 @@ async fn handle_connection(
 /// bytes had been consumed into the internal buffer but not yet returned
 /// through `AsyncRead`.
 fn into_parts(reader: BufReader<TcpStream>) -> (TcpStream, Vec<u8>) {
-    // tokio::io::BufReader exposes `buffer()` for the already-buffered
-    // (unread) portion. We capture those bytes before dropping the
-    // wrapper so TLS can see the client's ClientHello.
+    // The buffered bytes are the client's ClientHello; they must be replayed
+    // to the TLS acceptor or the handshake breaks.
     let buffered = reader.buffer().to_vec();
     let inner = reader.into_inner();
     (inner, buffered)
@@ -409,7 +409,6 @@ async fn handle_request(
     let status = upstream_resp.status();
     let resp_headers = forward_headers(upstream_resp.headers());
 
-    // Extract CDN cache headers before consuming the response.
     let x_cache = upstream_resp
         .headers()
         .get("x-cache")
@@ -437,39 +436,21 @@ async fn handle_request(
         })
         .map_err(|e| BodyError(e.to_string()))
     });
-    // Attach a final future that fires after the stream drains.
     let request_counter_for_log = request_counter.clone();
-    let logging_stream = LogOnDrop {
-        inner: stream,
-        logged: false,
-        on_drop: Some(Box::new(move || {
-            let entry_bytes = byte_counter.load(Ordering::Relaxed);
-            let req_bytes = request_counter_for_log.load(Ordering::Relaxed);
-            let elapsed = start.elapsed();
-            let log = log_for_stream.clone();
-            let method = method_for_log.clone();
-            let host = host_for_log.clone();
-            let url = url_for_log.clone();
-            let status_code = status.as_u16();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let entry = ProxyEntry {
-                        timestamp: now_iso8601(),
-                        method: &method,
-                        host: &host,
-                        url: &url,
-                        request_bytes: req_bytes,
-                        response_bytes: entry_bytes,
-                        status: status_code,
-                        duration_ms: elapsed.as_millis() as u64,
-                        x_cache: x_cache.as_deref(),
-                        age,
-                    };
-                    log.write_entry(&entry).await;
-                });
-            }
-        })),
-    };
+    let logging_stream = LogOnDrop::new(stream, move || {
+        FinishedResponse {
+            method: method_for_log,
+            host: host_for_log,
+            url: url_for_log,
+            request_bytes: request_counter_for_log.load(Ordering::Relaxed),
+            response_bytes: byte_counter.load(Ordering::Relaxed),
+            status: status.as_u16(),
+            duration_ms: start.elapsed().as_millis() as u64,
+            x_cache,
+            age,
+        }
+        .spawn_log(log_for_stream);
+    });
     let body = StreamBody::new(logging_stream).boxed_unsync();
 
     let mut out = Response::builder().status(status);
@@ -536,41 +517,78 @@ fn forward_request_headers(incoming: &http::HeaderMap, target_host: &str) -> htt
     out
 }
 
-/// Current UTC time formatted as ISO-8601 with second precision,
-/// matching the mitmproxy addon's format for backward compatibility.
+/// Current UTC time formatted as ISO-8601.
 fn now_iso8601() -> String {
     let now = time::OffsetDateTime::now_utc();
     now.format(&time::format_description::well_known::Iso8601::DEFAULT)
         .unwrap_or_else(|_| String::new())
 }
 
-// ---------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------
+/// A response whose body has finished streaming, owned so it can move to the
+/// task that logs it.
+struct FinishedResponse {
+    method: String,
+    host: String,
+    url: String,
+    request_bytes: u64,
+    response_bytes: u64,
+    status: u16,
+    duration_ms: u64,
+    x_cache: Option<String>,
+    age: Option<u64>,
+}
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
+impl FinishedResponse {
+    /// Writes this response's entry on a spawned task, so the stream's drop
+    /// path never blocks. Nothing is written outside a runtime.
+    fn spawn_log(self, log: Arc<LogWriter>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let entry = ProxyEntry {
+                timestamp: now_iso8601(),
+                method: &self.method,
+                host: &self.host,
+                url: &self.url,
+                request_bytes: self.request_bytes,
+                response_bytes: self.response_bytes,
+                status: self.status,
+                duration_ms: self.duration_ms,
+                x_cache: self.x_cache.as_deref(),
+                age: self.age,
+            };
+            log.write_entry(&entry).await;
+        });
+    }
+}
 
-use futures_util::Stream;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-/// A `Stream` wrapper that fires `on_drop` when the inner stream ends
-/// (yields `None`) or the value is dropped - whichever comes first.
-/// Used to log a proxy entry exactly once after the response body has
-/// fully drained.
+/// A `Stream` wrapper that fires `on_drop` once, when the inner stream ends
+/// (yields `None`) or the value is dropped, whichever comes first. Logs a
+/// proxy entry exactly once after the response body has drained.
 struct LogOnDrop<S> {
     inner: S,
-    logged: bool,
     on_drop: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl<S> LogOnDrop<S> {
+    fn new(inner: S, on_drop: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            on_drop: Some(Box::new(on_drop)),
+        }
+    }
+
+    fn fire(&mut self) {
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
 }
 
 impl<S> Drop for LogOnDrop<S> {
     fn drop(&mut self) {
-        if !self.logged {
-            if let Some(f) = self.on_drop.take() {
-                f();
-            }
-        }
+        self.fire();
     }
 }
 
@@ -583,12 +601,7 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.inner).poll_next(cx);
         if let Poll::Ready(None) = &item {
-            if !self.logged {
-                if let Some(f) = self.on_drop.take() {
-                    self.logged = true;
-                    f();
-                }
-            }
+            self.fire();
         }
         item
     }
@@ -651,7 +664,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use futures_util::StreamExt;
@@ -660,10 +673,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-
-    // -----------------------------------------------------------------
-    // forward_headers
-    // -----------------------------------------------------------------
 
     #[test]
     fn forward_headers_strips_hop_by_hop() {
@@ -722,10 +731,6 @@ mod tests {
         assert!(out.contains_key("accept"));
     }
 
-    // -----------------------------------------------------------------
-    // PrefixedStream
-    // -----------------------------------------------------------------
-
     #[tokio::test]
     async fn prefixed_stream_emits_prefix_then_inner() {
         let prefix = b"hello".to_vec();
@@ -761,17 +766,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefixed_stream_read_to_end() {
-        let prefix = b"pre-".to_vec();
-        let inner = Cursor::new(b"data");
-        let mut stream = PrefixedStream::new(prefix, inner);
-
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"pre-data");
-    }
-
-    #[tokio::test]
     async fn prefixed_stream_eof_after_drain() {
         let prefix = b"ab".to_vec();
         let inner = Cursor::new(b"cd");
@@ -802,119 +796,74 @@ mod tests {
         assert_eq!(received, b"hello");
     }
 
-    // -----------------------------------------------------------------
-    // LogOnDrop
-    // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn log_on_drop_fires_callback_when_stream_ends() {
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_clone = fired.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2)];
-        let inner = stream::iter(items);
-
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                fired_clone.store(true, Ordering::SeqCst);
-            })),
-        };
-
-        assert_eq!(wrapper.next().await, Some(Ok(1)));
-        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
-        assert_eq!(wrapper.next().await, Some(Ok(2)));
-        assert!(!fired.load(Ordering::SeqCst), "should not fire mid-stream");
-        assert_eq!(wrapper.next().await, None);
-        assert!(fired.load(Ordering::SeqCst), "should fire when stream ends");
+    /// A stream of `items` wrapped to count how often its callback fires.
+    fn counting_stream(
+        items: i32,
+    ) -> (
+        LogOnDrop<stream::Iter<std::vec::IntoIter<i32>>>,
+        Arc<AtomicU64>,
+    ) {
+        let fired = Arc::new(AtomicU64::new(0));
+        let fired_in_callback = fired.clone();
+        let wrapper = LogOnDrop::new(stream::iter((1..=items).collect::<Vec<_>>()), move || {
+            fired_in_callback.fetch_add(1, Ordering::SeqCst);
+        });
+        (wrapper, fired)
     }
 
     #[tokio::test]
-    async fn log_on_drop_fires_callback_on_early_drop() {
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_clone = fired.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1), Ok(2), Ok(3)];
-        let inner = stream::iter(items);
+    async fn log_on_drop_fires_when_stream_ends_and_not_before() {
+        let (mut wrapper, fired) = counting_stream(2);
 
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                fired_clone.store(true, Ordering::SeqCst);
-            })),
-        };
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(wrapper.next().await, Some(2));
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "fired mid-stream");
+        assert_eq!(wrapper.next().await, None);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "not fired at the end");
+    }
 
-        assert_eq!(wrapper.next().await, Some(Ok(1)));
-        assert!(!fired.load(Ordering::SeqCst));
+    #[tokio::test]
+    async fn log_on_drop_fires_on_early_drop() {
+        let (mut wrapper, fired) = counting_stream(3);
+
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
         drop(wrapper);
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "should fire on drop when stream not drained"
-        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "not fired on drop");
     }
 
     #[tokio::test]
     async fn log_on_drop_does_not_double_fire() {
-        let count = Arc::new(AtomicU64::new(0));
-        let count_clone = count.clone();
-        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
-        let inner = stream::iter(items);
+        let (mut wrapper, fired) = counting_stream(1);
 
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                count_clone.fetch_add(1, Ordering::SeqCst);
-            })),
-        };
-
-        let _ = wrapper.next().await;
-        let _ = wrapper.next().await; // None - fires callback
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(wrapper.next().await, Some(1));
+        assert_eq!(wrapper.next().await, None);
         drop(wrapper);
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "callback must fire exactly once"
-        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "callback must fire once");
     }
 
-    /// The production callback calls `Handle::try_current()` + `spawn`
-    /// to write a log entry asynchronously. This test exercises that
-    /// exact pattern to verify the spawned task actually completes.
+    /// A finished response written through the production path lands in the
+    /// log as one JSONL entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn log_on_drop_spawns_async_log_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spawn.jsonl");
         let log = Arc::new(LogWriter::create(&path).await.unwrap());
-        let log_for_cb = log.clone();
 
-        let items: Vec<Result<i32, &str>> = vec![Ok(1)];
-        let inner = stream::iter(items);
-
-        let mut wrapper = LogOnDrop {
-            inner,
-            logged: false,
-            on_drop: Some(Box::new(move || {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let entry = ProxyEntry {
-                            timestamp: String::new(),
-                            method: "GET",
-                            host: "registry.test",
-                            url: "/v2/",
-                            request_bytes: 0,
-                            response_bytes: 42,
-                            status: 200,
-                            duration_ms: 1,
-                            x_cache: None,
-                            age: None,
-                        };
-                        log_for_cb.write_entry(&entry).await;
-                    });
-                }
-            })),
-        };
+        let mut wrapper = LogOnDrop::new(stream::iter([1]), move || {
+            FinishedResponse {
+                method: "GET".to_owned(),
+                host: "registry.test".to_owned(),
+                url: "/v2/".to_owned(),
+                request_bytes: 0,
+                response_bytes: 7,
+                status: 200,
+                duration_ms: 1,
+                x_cache: None,
+                age: None,
+            }
+            .spawn_log(log);
+        });
 
         let _ = wrapper.next().await;
         let _ = wrapper.next().await; // None - fires callback
@@ -932,46 +881,11 @@ mod tests {
         })
         .await
         .expect("spawned task never wrote its entry");
-        assert_eq!(
-            content.lines().count(),
-            1,
-            "spawned task should write one JSONL entry"
-        );
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "spawned task should write one JSONL entry");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["response_bytes"], 7);
     }
-
-    // -----------------------------------------------------------------
-    // Streaming body counter
-    // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn streaming_body_counter_accurate() {
-        let chunks: Vec<Result<Bytes, String>> = vec![
-            Ok(Bytes::from_static(b"hello ")),
-            Ok(Bytes::from_static(b"world")),
-            Ok(Bytes::from_static(b"!")),
-        ];
-        let counter = Arc::new(AtomicU64::new(0));
-        let counter_clone = counter.clone();
-
-        let stream = stream::iter(chunks).map(move |chunk| {
-            chunk.inspect(|b| {
-                counter_clone.fetch_add(b.len() as u64, Ordering::Relaxed);
-            })
-        });
-
-        // Drain the stream to trigger counting.
-        let mut total = 0usize;
-        tokio::pin!(stream);
-        while let Some(Ok(chunk)) = stream.next().await {
-            total += chunk.len();
-        }
-        assert_eq!(total, 12);
-        assert_eq!(counter.load(Ordering::Relaxed), 12);
-    }
-
-    // -----------------------------------------------------------------
-    // LogWriter
-    // -----------------------------------------------------------------
 
     /// Build a [`ProxyEntry`] with sensible defaults for tests.
     fn test_entry(method: &str, status: u16) -> ProxyEntry<'_> {

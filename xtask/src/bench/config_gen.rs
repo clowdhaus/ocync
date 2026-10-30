@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
@@ -62,7 +63,7 @@ fn source_path(source: &str) -> &str {
 /// `cgr.dev` → `cgr-dev`
 /// `123456.dkr.ecr.us-east-1.amazonaws.com` → `ecr`
 fn registry_key(hostname: &str) -> String {
-    if hostname.contains(".dkr.ecr.") {
+    if RegistryKind::of(hostname) == RegistryKind::Ecr {
         "ecr".to_string()
     } else {
         hostname.replace('.', "-")
@@ -78,7 +79,6 @@ fn registry_key(hostname: &str) -> String {
 pub(crate) fn ocync_config(corpus: &Corpus) -> String {
     let mut out = String::new();
 
-    // Collect unique source registries in deterministic order.
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()
@@ -196,7 +196,6 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
 /// gcr.io, nvcr.io -- see regclient issue #1060) and `credHelper: docker-credential-ecr-login`
 /// for the ECR target, followed by a flat `sync:` list.
 pub(crate) fn regsync_config(corpus: &Corpus) -> String {
-    // Collect unique source registries in deterministic order.
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()
@@ -279,9 +278,21 @@ images:
     }
 
     #[test]
-    fn ocync_config_exact_output() {
-        let config = ocync_config(&test_corpus());
-        let expected = "\
+    fn generated_configs_match_exactly() {
+        use crate::bench::corpus::DockerHubAuth;
+
+        let plain = test_corpus();
+        let mut with_auth = test_corpus();
+        with_auth.dockerhub_auth = Some(DockerHubAuth {
+            username: "ocync-bench".to_string(),
+            token: "dkr_pat_abc123".to_string(),
+        });
+
+        for (name, config, expected) in [
+            (
+                "ocync_config_exact_output",
+                ocync_config(&plain),
+                "\
 registries:
   cgr-dev:
     url: cgr.dev
@@ -307,14 +318,12 @@ mappings:
       glob:
         - \"3.20\"
         - \"latest\"
-";
-        assert_eq!(config, expected);
-    }
-
-    #[test]
-    fn dregsy_config_exact_output() {
-        let config = dregsy_config(&test_corpus());
-        let expected = "\
+",
+            ),
+            (
+                "dregsy_config_exact_output",
+                dregsy_config(&plain),
+                "\
 relay: skopeo
 
 tasks:
@@ -343,14 +352,12 @@ tasks:
         tags:
           - \"3.20\"
           - \"latest\"
-";
-        assert_eq!(config, expected);
-    }
-
-    #[test]
-    fn regsync_config_exact_output() {
-        let config = regsync_config(&test_corpus());
-        let expected = "\
+",
+            ),
+            (
+                "regsync_config_exact_output",
+                regsync_config(&plain),
+                "\
 version: 1
 
 creds:
@@ -386,24 +393,12 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-";
-        assert_eq!(config, expected);
-    }
-
-    fn test_corpus_with_dockerhub_auth() -> Corpus {
-        use crate::bench::corpus::DockerHubAuth;
-        let mut corpus = test_corpus();
-        corpus.dockerhub_auth = Some(DockerHubAuth {
-            username: "ocync-bench".to_string(),
-            token: "dkr_pat_abc123".to_string(),
-        });
-        corpus
-    }
-
-    #[test]
-    fn ocync_config_with_dockerhub_auth() {
-        let config = ocync_config(&test_corpus_with_dockerhub_auth());
-        let expected = "\
+",
+            ),
+            (
+                "ocync_config_with_dockerhub_auth",
+                ocync_config(&with_auth),
+                "\
 registries:
   cgr-dev:
     url: cgr.dev
@@ -433,14 +428,12 @@ mappings:
       glob:
         - \"3.20\"
         - \"latest\"
-";
-        assert_eq!(config, expected);
-    }
-
-    #[test]
-    fn dregsy_config_with_dockerhub_auth() {
-        let config = dregsy_config(&test_corpus_with_dockerhub_auth());
-        let expected = "\
+",
+            ),
+            (
+                "dregsy_config_with_dockerhub_auth",
+                dregsy_config(&with_auth),
+                "\
 relay: skopeo
 
 tasks:
@@ -470,14 +463,12 @@ tasks:
         tags:
           - \"3.20\"
           - \"latest\"
-";
-        assert_eq!(config, expected);
-    }
-
-    #[test]
-    fn regsync_config_with_dockerhub_auth() {
-        let config = regsync_config(&test_corpus_with_dockerhub_auth());
-        let expected = "\
+",
+            ),
+            (
+                "regsync_config_with_dockerhub_auth",
+                regsync_config(&with_auth),
+                "\
 version: 1
 
 creds:
@@ -515,8 +506,11 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-";
-        assert_eq!(config, expected);
+",
+            ),
+        ] {
+            assert_eq!(config, expected, "{name}");
+        }
     }
 
     #[test]
@@ -541,17 +535,14 @@ sync:
     }
 
     #[test]
-    fn registry_key_ecr_shortens() {
-        assert_eq!(
-            registry_key("111111111111.dkr.ecr.us-east-1.amazonaws.com"),
-            "ecr"
-        );
-    }
-
-    #[test]
-    fn registry_key_non_ecr_replaces_dots() {
-        assert_eq!(registry_key("cgr.dev"), "cgr-dev");
-        assert_eq!(registry_key("docker.io"), "docker-io");
-        assert_eq!(registry_key("public.ecr.aws"), "public-ecr-aws");
+    fn registry_key_shortens_ecr_and_replaces_dots() {
+        for (host, key) in [
+            ("111111111111.dkr.ecr.us-east-1.amazonaws.com", "ecr"),
+            ("cgr.dev", "cgr-dev"),
+            ("docker.io", "docker-io"),
+            ("public.ecr.aws", "public-ecr-aws"),
+        ] {
+            assert_eq!(registry_key(host), key, "{host}");
+        }
     }
 }

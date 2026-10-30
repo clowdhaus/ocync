@@ -126,7 +126,6 @@ impl Corpus {
                 img.tags.clone_from(&ovr.tags);
             }
         }
-        // dockerhub_auth is carried forward via clone.
         result
     }
 }
@@ -201,7 +200,6 @@ fn expand_env_vars(input: &str) -> Result<String, String> {
                     .map_err(|_| format!("environment variable {var_name} is not set"))?;
                 result.push_str(&val);
             } else {
-                // Unclosed brace -- emit literally.
                 result.push_str("${");
                 result.push_str(&var_name);
             }
@@ -264,17 +262,12 @@ images:
     }
 
     #[test]
-    fn target_ref_includes_registry() {
+    fn target_ref_includes_registry_and_bare_name_gets_prefix() {
         let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
         assert_eq!(
             corpus.target_ref("cgr.dev/chainguard/static"),
             "123456789.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static"
         );
-    }
-
-    #[test]
-    fn target_repo_bare_name_no_slash() {
-        let corpus: Corpus = serde_yaml::from_str(sample_yaml()).unwrap();
         assert_eq!(corpus.target_repo("nginx"), "bench/nginx");
     }
 
@@ -309,64 +302,58 @@ images:
     // -- Validation tests --
 
     #[test]
-    fn validate_rejects_empty_target_registry() {
-        let yaml = r#"
+    fn validate_rejects_each_malformed_corpus() {
+        for (name, yaml, expected) in [
+            (
+                "empty target_registry",
+                r#"
 corpus:
   target_registry: ""
   target_prefix: "bench"
 images:
   - source: "cgr.dev/chainguard/static"
     tags: ["latest"]
-"#;
-        let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
-        let err = validate(&corpus).unwrap_err();
-        assert_eq!(err, "corpus target_registry must not be empty");
-    }
-
-    #[test]
-    fn validate_rejects_empty_target_prefix() {
-        let yaml = r#"
+"#,
+                "corpus target_registry must not be empty",
+            ),
+            (
+                "empty target_prefix",
+                r#"
 corpus:
   target_registry: "123.dkr.ecr.us-east-1.amazonaws.com"
   target_prefix: ""
 images:
   - source: "cgr.dev/chainguard/static"
     tags: ["latest"]
-"#;
-        let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
-        let err = validate(&corpus).unwrap_err();
-        assert_eq!(err, "corpus target_prefix must not be empty");
-    }
-
-    #[test]
-    fn validate_rejects_empty_images() {
-        let yaml = r#"
+"#,
+                "corpus target_prefix must not be empty",
+            ),
+            (
+                "no images",
+                r#"
 corpus:
   target_registry: "123.dkr.ecr.us-east-1.amazonaws.com"
   target_prefix: "bench"
 images: []
-"#;
-        let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
-        let err = validate(&corpus).unwrap_err();
-        assert_eq!(err, "corpus has no images");
-    }
-
-    #[test]
-    fn validate_rejects_image_with_no_tags() {
-        let yaml = r#"
+"#,
+                "corpus has no images",
+            ),
+            (
+                "image without tags",
+                r#"
 corpus:
   target_registry: "123.dkr.ecr.us-east-1.amazonaws.com"
   target_prefix: "bench"
 images:
   - source: "cgr.dev/chainguard/static"
     tags: []
-"#;
-        let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
-        let err = validate(&corpus).unwrap_err();
-        assert_eq!(
-            err,
-            "corpus image 0 (cgr.dev/chainguard/static) has no tags"
-        );
+"#,
+                "corpus image 0 (cgr.dev/chainguard/static) has no tags",
+            ),
+        ] {
+            let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(validate(&corpus).unwrap_err(), expected, "{name}");
+        }
     }
 
     // -- Env var expansion tests --
@@ -389,15 +376,10 @@ images:
     }
 
     #[test]
-    fn expand_env_vars_leaves_bare_dollar_alone() {
-        let result = expand_env_vars("$PATH stays").unwrap();
-        assert_eq!(result, "$PATH stays");
-    }
-
-    #[test]
-    fn expand_env_vars_unclosed_brace_emitted_literally() {
-        let result = expand_env_vars("${UNCLOSED").unwrap();
-        assert_eq!(result, "${UNCLOSED");
+    fn expand_env_vars_leaves_non_references_alone() {
+        for (input, expected) in [("$PATH stays", "$PATH stays"), ("${UNCLOSED", "${UNCLOSED")] {
+            assert_eq!(expand_env_vars(input).unwrap(), expected, "{input}");
+        }
     }
 
     #[test]

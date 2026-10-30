@@ -14,6 +14,9 @@ use std::process::{Command, Stdio};
 use clap::Args;
 use serde::Deserialize;
 
+use super::runner::join_tools;
+use super::{Provider, Scenario, ToolSelection, value_name};
+
 /// Common SSH options for all remote connections.
 ///
 /// `accept-new` trusts the host key on first connect (the instance is
@@ -42,10 +45,10 @@ fn ssh_args(config: &BenchConfig) -> Vec<&str> {
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
-    /// Cloud provider (aws, gcp, azure). Reads connection details from
+    /// Cloud provider. Reads connection details from
     /// `bench/terraform/<provider>/bench.json`.
     #[arg(long)]
-    pub(crate) provider: String,
+    pub(crate) provider: Provider,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -75,13 +78,12 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
-    /// Tools to benchmark (passed through to `cargo xtask bench`).
-    #[arg(long, default_value = "ocync")]
-    pub(crate) tools: String,
+    #[command(flatten)]
+    pub(crate) tool_selection: ToolSelection,
 
     /// Scenario to run (passed through to `cargo xtask bench`).
-    #[arg(long, default_value = "all")]
-    pub(crate) scenario: String,
+    #[arg(long, value_enum, default_value = "all")]
+    pub(crate) scenario: Scenario,
 
     /// Use first N images only (passed through to `cargo xtask bench`).
     #[arg(long)]
@@ -108,7 +110,6 @@ pub(crate) struct BenchRemoteArgs {
 /// Connection details written by Terraform.
 #[derive(Debug, Deserialize)]
 struct BenchConfig {
-    provider: String,
     host: String,
     user: String,
     /// Absolute path to the Terraform-generated SSH private key for this
@@ -117,7 +118,7 @@ struct BenchConfig {
 }
 
 /// Returns the path to bench.json for a given provider.
-fn config_path(provider: &str) -> PathBuf {
+fn config_path(provider: Provider) -> PathBuf {
     PathBuf::from(format!("bench/terraform/{provider}/bench.json"))
 }
 
@@ -126,24 +127,7 @@ fn config_path(provider: &str) -> PathBuf {
     clippy::disallowed_methods,
     reason = "reads the bench's own configuration"
 )]
-fn read_config(provider: &str) -> Result<BenchConfig, Box<dyn std::error::Error>> {
-    // Validate the provider directory exists before reading config.
-    let provider_dir = PathBuf::from(format!("bench/terraform/{provider}"));
-    if !provider_dir.is_dir() {
-        let available = std::fs::read_dir("bench/terraform")
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        return Err(format!("unknown provider '{provider}'. Available: {available}").into());
-    }
-
+fn read_config(provider: Provider) -> Result<BenchConfig, Box<dyn std::error::Error>> {
     let path = config_path(provider);
     let content = std::fs::read_to_string(&path).map_err(|e| {
         format!(
@@ -151,24 +135,26 @@ fn read_config(provider: &str) -> Result<BenchConfig, Box<dyn std::error::Error>
             path.display()
         )
     })?;
-    let config: BenchConfig = serde_json::from_str(&content)?;
-    Ok(config)
+    Ok(serde_json::from_str(&content)?)
 }
 
 /// Run the remote benchmark workflow.
 pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = read_config(&args.provider)?;
+    let config = read_config(args.provider)?;
 
     if args.fetch {
         return fetch_results(&config, &args.output);
     }
+
+    // Decided before the push, so a provider with no setup is refused before
+    // anything leaves this machine.
+    let registry_env = registry_env(args.provider)?;
 
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
         None => current_branch()?,
     };
 
-    // Push current branch so the instance can pull it.
     eprintln!("bench-remote: pushing {git_ref}...");
     let push = Command::new("git")
         .args(["push", "origin", &git_ref])
@@ -177,15 +163,17 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         return Err("git push failed".into());
     }
 
-    // Resolve to exact SHA after pushing. The remote script checks out this
-    // SHA, not the branch name. This makes the build immune to force-pushes
-    // that land between our push and the instance's fetch -- the SHA is
-    // immutable even if the branch ref moves.
+    // The remote script checks out this SHA, not the branch name, so a
+    // force-push landing between our push and the instance's fetch cannot
+    // change what is built.
     let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // The benchmark's arguments, unquoted: `remote_script` quotes each one.
-    let mut bench_args = vec!["--tools".to_string(), args.tools.clone()];
+    let mut bench_args = vec![
+        "--tools".to_string(),
+        join_tools(&args.tool_selection.tools),
+    ];
     if let Some(limit) = args.limit {
         bench_args.extend(["--limit".to_string(), limit.to_string()]);
     }
@@ -198,27 +186,13 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     if args.no_proxy {
         bench_args.push("--no-proxy".to_string());
     }
-    bench_args.push(args.scenario.clone());
-
-    // Determine the target registry from the provider.
-    let registry_env = match config.provider.as_str() {
-        "aws" => {
-            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com".to_string()
-        }
-        _ => {
-            return Err(format!(
-                "provider '{}' not yet supported. Add registry env setup for this provider.",
-                config.provider
-            )
-            .into());
-        }
-    };
+    bench_args.push(value_name(&args.scenario));
 
     let script = remote_script(
         &git_ref,
         &git_sha,
         &bench_args,
-        &registry_env,
+        registry_env,
         ExistingRun::from_force(args.force),
     );
 
@@ -255,6 +229,19 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     fetch_results(&config, &args.output)?;
     Ok(())
+}
+
+/// The shell that points the benchmark at `provider`'s registry on the
+/// instance, or the reason there is none yet.
+fn registry_env(provider: Provider) -> Result<&'static str, String> {
+    match provider {
+        Provider::Aws => Ok(
+            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com",
+        ),
+        Provider::Gcp | Provider::Azure => Err(format!(
+            "provider '{provider}' not yet supported. Add registry env setup for this provider."
+        )),
+    }
 }
 
 /// A line the remote script prints that says how far it got.
@@ -327,12 +314,12 @@ fn ssh_stream(
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Write script to stdin, then close to signal EOF.
+    // `stdin` drops at the end of this block, which closes it so the remote
+    // `bash -s` sees end of input; hoisting it out would hang the run.
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(script.as_bytes())?;
     }
 
-    // Stream stdout line by line for real-time progress.
     let mut sentinel = None;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
@@ -352,7 +339,6 @@ fn fetch_results(
     config: &BenchConfig,
     local_output: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Find the most recent results directory.
     let ls_output = ssh_run(
         config,
         "ls -td ~/ocync/bench/results/2* 2>/dev/null | head -1",
@@ -378,7 +364,6 @@ fn fetch_results(
         std::fs::remove_dir_all(&local_dir)?;
     }
 
-    // SCP the results directory (no trailing slash on source).
     eprintln!(
         "bench-remote: copying {remote_dir} to {}",
         local_dir.display()
@@ -394,7 +379,6 @@ fn fetch_results(
         return Err("scp failed".into());
     }
 
-    // Also fetch all per-registry JSON archives (excluding baseline.json).
     let json_files = ssh_run(
         config,
         "ls ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline",
@@ -439,7 +423,6 @@ fn fetch_results(
         }
     }
 
-    // Print the summary.
     let summary = ssh_run(
         config,
         &format!("cat {remote_dir}/summary.md 2>/dev/null || true"),
@@ -786,21 +769,17 @@ mod tests {
     fn parse_bench_config() {
         let json = r#"{"provider":"aws","host":"54.123.45.67","user":"ec2-user","ssh_key_path":"/tmp/.ssh-key"}"#;
         let config: BenchConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.provider, "aws");
         assert_eq!(config.host, "54.123.45.67");
         assert_eq!(config.user, "ec2-user");
         assert_eq!(config.ssh_key_path, "/tmp/.ssh-key");
     }
 
     #[test]
-    fn read_config_missing_provider_dir() {
-        // A provider with no terraform directory should produce a
-        // helpful error listing available providers.
-        let err = read_config("nonexistent").unwrap_err();
-        let msg = err.to_string();
+    fn read_config_without_bench_json_says_to_apply_terraform() {
+        let msg = read_config(Provider::Azure).unwrap_err().to_string();
         assert!(
-            msg.contains("unknown provider 'nonexistent'"),
-            "expected provider error, got: {msg}"
+            msg.contains("bench/terraform/azure/bench.json") && msg.contains("terraform apply"),
+            "got: {msg}"
         );
     }
 
@@ -821,14 +800,13 @@ mod tests {
 
     #[test]
     fn config_path_uses_provider() {
-        assert_eq!(
-            config_path("aws"),
-            PathBuf::from("bench/terraform/aws/bench.json")
-        );
-        assert_eq!(
-            config_path("gcp"),
-            PathBuf::from("bench/terraform/gcp/bench.json")
-        );
+        for (provider, expected) in [
+            (Provider::Aws, "bench/terraform/aws/bench.json"),
+            (Provider::Gcp, "bench/terraform/gcp/bench.json"),
+            (Provider::Azure, "bench/terraform/azure/bench.json"),
+        ] {
+            assert_eq!(config_path(provider), PathBuf::from(expected), "{provider}");
+        }
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -894,7 +872,7 @@ mod tests {
             &["--force"][..],
             &["--git-ref", "main"][..],
             &["--tools", "ocync"][..],
-            &["--scenario", "cold"][..],
+            &["--scenario", "sync"][..],
             &["--limit", "3"][..],
             &["--skip-registries", "docker.io"][..],
             &["--skip-prewarm"][..],
@@ -915,6 +893,47 @@ mod tests {
             Cli::try_parse_from(["xtask", "--provider", "aws", "--fetch", "--output", "out"])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn closed_set_options_parse_to_types_and_refuse_anything_else() {
+        use clap::Parser;
+        let run = Cli::try_parse_from(["xtask", "--provider", "gcp", "--scenario", "prepare"])
+            .unwrap()
+            .args;
+        assert_eq!(run.provider, Provider::Gcp);
+        assert!(matches!(run.scenario, Scenario::Prepare));
+
+        for (name, argv) in [
+            ("provider", &["--provider", "digitalocean"][..]),
+            ("scenario", &["--provider", "aws", "--scenario", "cold"][..]),
+        ] {
+            let err = Cli::try_parse_from(["xtask"].into_iter().chain(argv.iter().copied()))
+                .err()
+                .unwrap_or_else(|| panic!("{name}: accepted"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_provider_without_registry_setup_is_refused_by_name() {
+        assert!(
+            registry_env(Provider::Aws)
+                .unwrap()
+                .contains("BENCH_TARGET_REGISTRY")
+        );
+        for (provider, expected) in [
+            (
+                Provider::Gcp,
+                "provider 'gcp' not yet supported. Add registry env setup for this provider.",
+            ),
+            (
+                Provider::Azure,
+                "provider 'azure' not yet supported. Add registry env setup for this provider.",
+            ),
+        ] {
+            assert_eq!(registry_env(provider), Err(expected.to_string()));
+        }
     }
 
     #[test]
