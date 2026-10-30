@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,9 +28,6 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
 
     // Structural validation.
-    if let Some(ref global) = config.global {
-        validate_global(global)?;
-    }
     for (name, registry) in &config.registries {
         validate_registry(name, registry)?;
     }
@@ -154,13 +152,15 @@ pub(crate) struct GlobalConfig {
     ///
     /// `"0"` disables TTL-based expiry (cache never expires by age; lazy
     /// invalidation only). Defaults to `"12h"` when not specified.
-    pub cache_ttl: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub cache_ttl: Option<CacheTtl>,
 
     /// Disk staging size limit as a human-readable size (e.g. "2GB", "500MB").
     ///
     /// Uses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.
     /// `0` disables disk staging. When absent, no eviction is performed.
-    pub staging_size_limit: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub staging_size_limit: Option<ByteSize>,
 }
 
 /// A count that must be at least 1, so a 0 reads as the rule it broke,
@@ -673,27 +673,114 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 }
 
 // ---------------------------------------------------------------------------
-// Validation helpers
+// Duration and size values
 // ---------------------------------------------------------------------------
 
-/// Validate the global config section.
-fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
-    if let Some(ref ttl) = global.cache_ttl {
-        if !is_valid_duration(ttl) {
-            return Err(ConfigError::Validation(format!(
-                "global.cache_ttl '{ttl}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")"
-            )));
-        }
+/// The warm cache TTL, parsed when the config is read so an out-of-range
+/// value is a config error rather than a failure at use.
+///
+/// Accepts an unsigned integer with an optional unit suffix: `s`, `m`, `h`
+/// or `d`. A bare integer is seconds and `"0"` disables TTL expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct CacheTtl(Duration);
+
+impl CacheTtl {
+    /// The TTL as a [`Duration`].
+    pub(crate) fn get(self) -> Duration {
+        self.0
     }
-    if let Some(ref size) = global.staging_size_limit {
-        if !is_valid_size(size) {
-            return Err(ConfigError::Validation(format!(
-                "global.staging_size_limit '{size}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
-            )));
-        }
-    }
-    Ok(())
 }
+
+impl TryFrom<String> for CacheTtl {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let invalid =
+            || format!("cache_ttl '{text}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")");
+        let (digits, seconds_per_unit) = match text.chars().last() {
+            Some('s') => (&text[..text.len() - 1], 1u64),
+            Some('m') => (&text[..text.len() - 1], 60),
+            Some('h') => (&text[..text.len() - 1], 3600),
+            Some('d') => (&text[..text.len() - 1], 86400),
+            _ => (text.as_str(), 1),
+        };
+        digits
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+            .and_then(|n| n.checked_mul(seconds_per_unit))
+            .map(|secs| Self(Duration::from_secs(secs)))
+            .ok_or_else(invalid)
+    }
+}
+
+impl From<CacheTtl> for String {
+    fn from(ttl: CacheTtl) -> String {
+        format!("{}s", ttl.0.as_secs())
+    }
+}
+
+/// A byte count, parsed when the config is read so an out-of-range value is
+/// a config error rather than a failure at use.
+///
+/// Accepts `"0"` or an unsigned integer with a suffix `B`, `KB`, `MB`, `GB`
+/// or `TB`, using SI decimal prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) struct ByteSize(u64);
+
+impl ByteSize {
+    /// The size in bytes.
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<String> for ByteSize {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        let invalid = || {
+            format!(
+                "staging_size_limit '{text}' is not a valid size (e.g. \"2GB\", \"500MB\", \"0\")"
+            )
+        };
+        if text == "0" {
+            return Ok(Self(0));
+        }
+        // Longest suffix first, as "B" ends every other one.
+        let (digits, bytes_per_unit) = [
+            ("TB", 1_000_000_000_000u64),
+            ("GB", 1_000_000_000),
+            ("MB", 1_000_000),
+            ("KB", 1_000),
+            ("B", 1),
+        ]
+        .into_iter()
+        .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|digits| (digits, unit)))
+        .ok_or_else(invalid)?;
+        digits
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+            .and_then(|n| n.checked_mul(bytes_per_unit))
+            .map(Self)
+            .ok_or_else(invalid)
+    }
+}
+
+impl From<ByteSize> for String {
+    fn from(size: ByteSize) -> String {
+        format!("{}B", size.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
 
 /// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
@@ -741,43 +828,6 @@ fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), Config
     }
 
     Ok(())
-}
-
-/// Check whether a string is a valid human-readable duration.
-///
-/// Accepts an unsigned integer optionally followed by a unit suffix:
-/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days). A bare
-/// integer with no suffix is treated as seconds. `"0"` means disabled.
-fn is_valid_duration(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Bare integer (including "0") - treated as seconds.
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    let (digits, suffix) = s.split_at(s.len() - 1);
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    matches!(suffix, "s" | "m" | "h" | "d")
-}
-
-/// Check whether a string is a valid human-readable byte size.
-///
-/// Accepts an unsigned integer optionally followed by a unit suffix:
-/// `B`, `KB`, `MB`, `GB`, `TB`. A bare `0` is accepted to mean
-/// "disabled".
-fn is_valid_size(s: &str) -> bool {
-    if s == "0" {
-        return true;
-    }
-    for suffix in &["TB", "GB", "MB", "KB", "B"] {
-        if let Some(digits) = s.strip_suffix(suffix) {
-            return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
-        }
-    }
-    false
 }
 
 /// Validate artifact sync configuration.
@@ -1598,8 +1648,14 @@ mappings:
         let global = config.global.as_ref().unwrap();
         assert_eq!(global.max_concurrent_transfers.get(), 20);
         assert_eq!(global.cache_dir.as_deref(), Some("/tmp/ocync-cache"));
-        assert_eq!(global.cache_ttl.as_deref(), Some("6h"));
-        assert_eq!(global.staging_size_limit.as_deref(), Some("1GB"));
+        assert_eq!(
+            global.cache_ttl.map(CacheTtl::get),
+            Some(Duration::from_secs(6 * 3600))
+        );
+        assert_eq!(
+            global.staging_size_limit.map(ByteSize::get),
+            Some(1_000_000_000)
+        );
     }
 
     #[test]
@@ -1673,52 +1729,74 @@ mappings:
         assert!(err.contains("invalid version range 'not_valid'"), "{err}");
     }
 
+    /// A TTL or size that is malformed, empty or too large for 64 bits is
+    /// refused when the config is read, and that read is a config error
+    /// (exit 3). Breaks if a value passes the read and fails at use, or an
+    /// overflow wraps.
     #[test]
-    fn global_invalid_cache_ttl() {
-        let global = GlobalConfig {
-            cache_ttl: Some("not-a-duration".to_string()),
-            ..Default::default()
-        };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("cache_ttl")),
-            other => panic!("wrong error: {other}"),
+    fn unusable_ttl_and_size_are_config_errors_at_load() {
+        let cases = [
+            ("cache_ttl", "not-a-duration"),
+            ("cache_ttl", ""),
+            ("cache_ttl", "12hours"),
+            ("cache_ttl", "99999999999999999999"),
+            ("cache_ttl", "1000000000000000d"),
+            ("staging_size_limit", "2gigabytes"),
+            ("staging_size_limit", ""),
+            ("staging_size_limit", "99999999999999999999B"),
+            ("staging_size_limit", "99999999999TB"),
+        ];
+        for (field, value) in cases {
+            let path = std::env::temp_dir().join("ocync_config_unusable_ttl_and_size.yaml");
+            std::fs::write(
+                &path,
+                format!(
+                    "global:\n  {field}: \"{value}\"\nmappings:\n  - from: nginx\n    tags:\n      glob: \"*\"\n"
+                ),
+            )
+            .unwrap();
+            let err = load_config(&path).unwrap_err();
+            assert!(err.to_string().contains(field), "{field} {value}: {err}");
+            assert_eq!(
+                crate::cli::CliError::from(err).exit_code(),
+                crate::cli::ExitCode::ConfigError,
+                "{field} {value}"
+            );
         }
     }
 
     #[test]
-    fn global_valid_cache_ttl_forms() {
-        for ttl in &["0", "60", "1s", "30m", "12h", "7d"] {
-            let global = GlobalConfig {
-                cache_ttl: Some((*ttl).to_string()),
-                ..Default::default()
-            };
-            validate_global(&global).unwrap_or_else(|e| panic!("expected valid ttl '{ttl}': {e}"));
+    fn valid_ttl_forms_parse_to_their_durations() {
+        let cases = [
+            ("0", 0),
+            ("60", 60),
+            ("1s", 1),
+            ("30m", 1_800),
+            ("12h", 43_200),
+            ("7d", 604_800),
+        ];
+        for (text, secs) in cases {
+            let ttl = CacheTtl::try_from(text.to_string()).unwrap();
+            assert_eq!(ttl.get(), Duration::from_secs(secs), "{text}");
         }
     }
 
     #[test]
-    fn global_invalid_staging_size_limit() {
-        let global = GlobalConfig {
-            staging_size_limit: Some("2gigabytes".to_string()),
-            ..Default::default()
-        };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("staging_size_limit")),
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn global_valid_staging_size_limit_forms() {
-        for size in &["0", "512B", "500KB", "500MB", "2GB", "1TB"] {
-            let global = GlobalConfig {
-                staging_size_limit: Some((*size).to_string()),
-                ..Default::default()
-            };
-            validate_global(&global)
-                .unwrap_or_else(|e| panic!("expected valid size '{size}': {e}"));
+    fn valid_size_forms_parse_to_their_bytes() {
+        let cases = [
+            ("0", 0),
+            ("512B", 512),
+            ("500KB", 500_000),
+            ("500MB", 500_000_000),
+            ("2GB", 2_000_000_000),
+            ("1TB", 1_000_000_000_000),
+        ];
+        for (text, bytes) in cases {
+            assert_eq!(
+                ByteSize::try_from(text.to_string()).unwrap().get(),
+                bytes,
+                "{text}"
+            );
         }
     }
 

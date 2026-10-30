@@ -28,8 +28,8 @@ use serde::Serialize;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    AuthType, Config, GlobOrList, MappingConfig, RegistryConfig, TagsConfig, load_config,
-    resolve_target_names,
+    AuthType, ByteSize, CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, TagsConfig,
+    load_config, resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{
@@ -605,19 +605,13 @@ pub(crate) fn resolve_cache_path(config: &Config, config_file: &Path) -> (PathBu
     (cache_dir, cache_path)
 }
 
-/// Parse and return the cache TTL from config, defaulting to 12 hours.
-///
-/// Returns an error if the configured value cannot be parsed, rather than
-/// silently falling back to the default.
-pub(crate) fn resolve_cache_ttl(config: &Config) -> Result<Duration, CliError> {
-    match config.global.as_ref().and_then(|g| g.cache_ttl.as_deref()) {
-        Some(raw) => parse_duration(raw.trim()).ok_or_else(|| {
-            CliError::Input(format!(
-                "invalid cache_ttl '{raw}': accepted formats are \"0\", \"<N>s\", \"<N>m\", \"<N>h\", \"<N>d\", or \"<N>\" (seconds)"
-            ))
-        }),
-        None => Ok(DEFAULT_CACHE_TTL),
-    }
+/// The cache TTL from config, defaulting to 12 hours.
+pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
+    config
+        .global
+        .as_ref()
+        .and_then(|g| g.cache_ttl)
+        .map_or(DEFAULT_CACHE_TTL, CacheTtl::get)
 }
 
 /// Run the sync command: load config, resolve mappings, and execute.
@@ -688,7 +682,7 @@ pub(crate) async fn run(
     }
 
     let (cache_dir, cache_path) = resolve_cache_path(&config, &args.config);
-    let cache_ttl = resolve_cache_ttl(&config)?;
+    let cache_ttl = resolve_cache_ttl(&config);
     let (cache, should_persist) = match external_cache {
         Some(ext) => (ext, false),
         None => {
@@ -716,18 +710,11 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "failed to clean staging tmp files");
         }
         // Evict stale blobs from previous runs before starting new work.
-        let staging_limit = match config
+        let staging_limit = config
             .global
             .as_ref()
-            .and_then(|g| g.staging_size_limit.as_deref())
-        {
-            Some(raw) => Some(parse_size(raw.trim()).ok_or_else(|| {
-                CliError::Input(format!(
-                    "invalid staging_size_limit '{raw}': accepted formats are \"0\", \"<N>B\", \"<N>KB\", \"<N>MB\", \"<N>GB\", \"<N>TB\""
-                ))
-            })?),
-            None => None,
-        };
+            .and_then(|g| g.staging_size_limit)
+            .map(ByteSize::get);
         if let Some(limit) = staging_limit {
             if let Err(e) = stage.evict(limit) {
                 tracing::warn!(error = %e, "failed to evict staged blobs");
@@ -1077,64 +1064,6 @@ fn format_cycle_tail(
         format_bytes(s.bytes_transferred),
         format_duration(report.duration),
     )
-}
-
-/// Parse a human-readable duration string into a [`Duration`].
-///
-/// Accepts:
-/// - `"0"` - [`Duration::ZERO`]
-/// - `"<N>s"` - N seconds
-/// - `"<N>m"` - N minutes
-/// - `"<N>h"` - N hours
-/// - `"<N>d"` - N days
-/// - `"<N>"` (no suffix) - N seconds
-///
-/// Returns `None` for unrecognised strings - callers must decide how to
-/// handle invalid input rather than silently receiving a default.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s == "0" {
-        return Some(Duration::ZERO);
-    }
-    if s.is_empty() {
-        return None;
-    }
-    let last = &s[s.len() - 1..];
-    let (digits, multiplier) = match last {
-        "s" => (&s[..s.len() - 1], 1u64),
-        "m" => (&s[..s.len() - 1], 60),
-        "h" => (&s[..s.len() - 1], 3600),
-        "d" => (&s[..s.len() - 1], 86400),
-        _ if s.chars().all(|c| c.is_ascii_digit()) => (s, 1),
-        _ => return None,
-    };
-    digits
-        .parse::<u64>()
-        .ok()
-        .map(|n| Duration::from_secs(n * multiplier))
-}
-
-/// Parse a human-readable size string into bytes.
-///
-/// Accepts `"0"`, `"<N>B"`, `"<N>KB"`, `"<N>MB"`, `"<N>GB"`, `"<N>TB"`.
-/// Returns `None` for unrecognised strings.
-fn parse_size(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s == "0" {
-        return Some(0);
-    }
-    for (suffix, multiplier) in &[
-        ("TB", 1_000_000_000_000u64),
-        ("GB", 1_000_000_000),
-        ("MB", 1_000_000),
-        ("KB", 1_000),
-        ("B", 1),
-    ] {
-        if let Some(digits) = s.strip_suffix(suffix) {
-            return digits.parse::<u64>().ok().map(|n| n * multiplier);
-        }
-    }
-    None
 }
 
 /// Build a `RegistryClient` for each registry at least one mapping references,
@@ -2029,72 +1958,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_zero() {
-        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
-    }
-
-    #[test]
-    fn parse_duration_seconds_suffix() {
-        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn parse_duration_minutes_suffix() {
-        assert_eq!(parse_duration("30m"), Some(Duration::from_secs(30 * 60)));
-    }
-
-    #[test]
-    fn parse_duration_hours_suffix() {
-        assert_eq!(parse_duration("12h"), Some(Duration::from_secs(12 * 3600)));
-    }
-
-    #[test]
-    fn parse_duration_days_suffix() {
-        assert_eq!(parse_duration("7d"), Some(Duration::from_secs(7 * 86400)));
-    }
-
-    #[test]
-    fn parse_duration_no_suffix_treated_as_seconds() {
-        assert_eq!(parse_duration("60"), Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn parse_duration_invalid_returns_none() {
-        assert_eq!(parse_duration("invalid"), None);
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("12hours"), None);
-    }
-
-    #[test]
-    fn parse_duration_trims_whitespace() {
-        assert_eq!(
-            parse_duration("  12h  "),
-            Some(Duration::from_secs(12 * 3600))
-        );
-        assert_eq!(parse_duration(" 30m "), Some(Duration::from_secs(30 * 60)));
-    }
-
-    #[test]
-    fn resolve_cache_ttl_returns_error_for_invalid() {
-        use crate::cli::config::{Config, GlobalConfig};
-
-        let config = Config {
-            global: Some(GlobalConfig {
-                cache_ttl: Some("bogus".into()),
-                ..Default::default()
-            }),
-            registries: Default::default(),
-            target_groups: Default::default(),
-            defaults: None,
-            mappings: Vec::new(),
-        };
-        let result = resolve_cache_ttl(&config);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid cache_ttl"), "got: {err_msg}");
-    }
-
-    #[test]
     fn resolve_cache_ttl_returns_default_when_absent() {
         use crate::cli::config::Config;
 
@@ -2105,7 +1968,7 @@ mod tests {
             defaults: None,
             mappings: Vec::new(),
         };
-        assert_eq!(resolve_cache_ttl(&config).unwrap(), DEFAULT_CACHE_TTL);
+        assert_eq!(resolve_cache_ttl(&config), DEFAULT_CACHE_TTL);
     }
 
     #[test]
@@ -2624,51 +2487,6 @@ include: ["1.25.0-rc1"]
     fn glob_or_list_to_vec_owned_list() {
         let g = GlobOrList::List(vec!["a".into(), "b".into()]);
         assert_eq!(glob_or_list_to_vec_owned(&g), vec!["a", "b"]);
-    }
-
-    // - parse_size -----------------------------------------------------------
-
-    #[test]
-    fn parse_size_zero() {
-        assert_eq!(parse_size("0"), Some(0));
-    }
-
-    #[test]
-    fn parse_size_bytes() {
-        assert_eq!(parse_size("512B"), Some(512));
-    }
-
-    #[test]
-    fn parse_size_kilobytes() {
-        assert_eq!(parse_size("500KB"), Some(500_000));
-    }
-
-    #[test]
-    fn parse_size_megabytes() {
-        assert_eq!(parse_size("500MB"), Some(500_000_000));
-    }
-
-    #[test]
-    fn parse_size_gigabytes() {
-        assert_eq!(parse_size("2GB"), Some(2_000_000_000));
-    }
-
-    #[test]
-    fn parse_size_terabytes() {
-        assert_eq!(parse_size("1TB"), Some(1_000_000_000_000));
-    }
-
-    #[test]
-    fn parse_size_invalid_returns_none() {
-        assert_eq!(parse_size("2gigabytes"), None);
-        assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("abc"), None);
-    }
-
-    #[test]
-    fn parse_size_trims_whitespace() {
-        assert_eq!(parse_size("  500MB  "), Some(500_000_000));
-        assert_eq!(parse_size(" 2GB "), Some(2_000_000_000));
     }
 
     #[test]

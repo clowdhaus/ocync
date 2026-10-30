@@ -31,7 +31,7 @@ pub(crate) async fn run(
     // re-resolved each cycle so that config file changes take effect.
     let config = load_config(&args.config)?;
     let (_cache_dir, cache_path) = synchronize::resolve_cache_path(&config, &args.config);
-    let cache_ttl = synchronize::resolve_cache_ttl(&config)?;
+    let cache_ttl = synchronize::resolve_cache_ttl(&config);
 
     // Bind the health listener early so bind errors surface before the
     // sync loop starts. This also avoids TOCTOU races with port allocation.
@@ -93,27 +93,18 @@ pub(crate) async fn run(
                 if let Ok(cfg) = load_config(&args.config) {
                     config_failures = 0;
                     let (_dir, path) = synchronize::resolve_cache_path(&cfg, &args.config);
-                    match synchronize::resolve_cache_ttl(&cfg) {
-                        Ok(ttl) => {
-                            // If the cache path changed, persist the old
-                            // cache and reload from the new location.
-                            if path != active_cache_path {
-                                if let Err(e) = cache.borrow().persist(&active_cache_path) {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "failed to persist cache before path change"
-                                    );
-                                }
-                                *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
-                                active_cache_path = path;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
+                    let ttl = synchronize::resolve_cache_ttl(&cfg);
+                    // If the cache path changed, persist the old cache and
+                    // reload from the new location.
+                    if path != active_cache_path {
+                        if let Err(e) = cache.borrow().persist(&active_cache_path) {
+                            tracing::warn!(
                                 error = %e,
-                                "invalid cache_ttl in reloaded config, using previous value"
+                                "failed to persist cache before path change"
                             );
                         }
+                        *cache.borrow_mut() = TransferStateCache::load(&path, ttl);
+                        active_cache_path = path;
                     }
                 } else {
                     config_failures += 1;
