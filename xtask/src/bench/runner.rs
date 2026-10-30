@@ -711,21 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn module_version_is_read_from_build_info() {
-        // Real `go version -m` output. The mod line carries the main module,
-        // and every dep line after it must be ignored.
-        let output = "/usr/local/bin/dregsy: go1.26.2\n\
-             \tpath\tgithub.com/xelalexv/dregsy/cmd/dregsy\n\
-             \tmod\tgithub.com/xelalexv/dregsy\tv0.0.0-20250317074629-e92e79a50145\th1:abc=\n\
-             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
-
-        assert_eq!(
-            module_version_from_build_info(output),
-            Some("v0.0.0-20250317074629-e92e79a50145")
-        );
-    }
-
-    #[test]
     fn an_unknown_version_records_why() {
         // The archive outlives the instance and the run log is never
         // persisted, so a bare "unknown" would leave a lost-provenance run
@@ -845,28 +830,40 @@ mod tests {
     }
 
     #[test]
-    fn locally_built_binary_reports_no_module_version() {
-        // Go stamps (devel) for a build from a working tree. It names no
-        // released artifact, so recording it would give a run's provenance the
-        // same authority as a real version.
-        let devel = "/usr/local/bin/dregsy: go1.26.2\n\
-             \tmod\tgithub.com/xelalexv/dregsy\t(devel)\t\n";
-
-        assert_eq!(module_version_from_build_info(devel), None);
-    }
-
-    #[test]
-    fn module_version_absent_without_a_mod_line() {
+    fn module_version_comes_only_from_the_main_module_line() {
         // `go version -m` writes nothing to stdout for a non-Go binary, and
-        // go_module_version discards stderr, so an empty input is the only
-        // shape the parser sees in that case.
-        assert_eq!(module_version_from_build_info(""), None);
-
-        // A Go binary whose build info carries no main module still lists its
-        // dependencies, which must not be mistaken for the module version.
-        let deps_only = "/usr/local/bin/x: go1.26.2\n\
-             \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n";
-        assert_eq!(module_version_from_build_info(deps_only), None);
+        // go_module_version discards stderr, so empty input is the only shape
+        // the parser sees then.
+        for (name, output, expected) in [
+            (
+                // Real output: every dep line after the mod line is ignored.
+                "main module line",
+                "/usr/local/bin/dregsy: go1.26.2\n\
+                 \tpath\tgithub.com/xelalexv/dregsy/cmd/dregsy\n\
+                 \tmod\tgithub.com/xelalexv/dregsy\tv0.0.0-20250317074629-e92e79a50145\th1:abc=\n\
+                 \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n",
+                Some("v0.0.0-20250317074629-e92e79a50145"),
+            ),
+            (
+                // Go stamps (devel) for a working-tree build. It names no
+                // released artifact, so recording it would give a run's
+                // provenance the same authority as a real version.
+                "locally built binary",
+                "/usr/local/bin/dregsy: go1.26.2\n\
+                 \tmod\tgithub.com/xelalexv/dregsy\t(devel)\t\n",
+                None,
+            ),
+            ("empty output", "", None),
+            (
+                // Dependencies must not be mistaken for the module version.
+                "dependencies only",
+                "/usr/local/bin/x: go1.26.2\n\
+                 \tdep\tgithub.com/sirupsen/logrus\tv1.9.3\th1:def=\n",
+                None,
+            ),
+        ] {
+            assert_eq!(module_version_from_build_info(output), expected, "{name}");
+        }
     }
 
     #[test]
@@ -1006,21 +1003,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_gnu_time_rss_extracts_value() {
-        let stderr = "\tCommand being timed: \"./target/release/ocync\"\n\
-                      \tMaximum resident set size (kbytes): 59468\n\
-                      \tExit status: 0\n";
-        assert_eq!(parse_gnu_time_rss(stderr), Some(59468));
-    }
-
-    #[test]
-    fn parse_gnu_time_rss_missing_returns_none() {
-        let stderr = "error: some tool output\nno time info here\n";
-        assert_eq!(parse_gnu_time_rss(stderr), None);
-    }
-
-    #[test]
-    fn parse_gnu_time_rss_empty_returns_none() {
-        assert_eq!(parse_gnu_time_rss(""), None);
+    fn parse_gnu_time_rss_reads_the_maximum_resident_set_line() {
+        for (name, stderr, expected) in [
+            (
+                "gnu time -v output",
+                "\tCommand being timed: \"./target/release/ocync\"\n\
+                 \tMaximum resident set size (kbytes): 59468\n\
+                 \tExit status: 0\n",
+                Some(59468),
+            ),
+            (
+                "no time info",
+                "error: some tool output\nno time info here\n",
+                None,
+            ),
+            ("empty", "", None),
+        ] {
+            assert_eq!(parse_gnu_time_rss(stderr), expected, "{name}");
+        }
     }
 }
