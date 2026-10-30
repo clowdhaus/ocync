@@ -78,17 +78,25 @@ pub struct ManifestParts {
 }
 
 impl ManifestParts {
+    /// The config and then every layer, as digest and data.
+    fn blobs(&self) -> impl Iterator<Item = (&Digest, &[u8])> {
+        std::iter::once((&self.config_desc.digest, self.config_data.as_slice())).chain(
+            self.layer_descs
+                .iter()
+                .map(|d| &d.digest)
+                .zip(self.layers_data.iter().map(Vec::as_slice)),
+        )
+    }
+
     /// Digests of the config and every layer.
     pub fn blob_digests(&self) -> impl Iterator<Item = Digest> + '_ {
-        std::iter::once(self.config_desc.digest.clone())
-            .chain(self.layer_descs.iter().map(|d| d.digest.clone()))
+        self.blobs().map(|(digest, _)| digest.clone())
     }
 
     /// Mount the source blob GETs (config and layers).
     pub async fn mount_blob_pulls(&self, server: &MockServer, repo: &str) {
-        mount_blob_pull(server, repo, &self.config_desc.digest, &self.config_data).await;
-        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
-            mount_blob_pull(server, repo, &desc.digest, data).await;
+        for (digest, data) in self.blobs() {
+            mount_blob_pull(server, repo, digest, data).await;
         }
     }
 
@@ -108,45 +116,45 @@ impl ManifestParts {
         delay: Duration,
     ) {
         mount_source_manifest(server, repo, reference, &self.bytes).await;
-        mount_blob_pull_delayed(
-            server,
-            repo,
-            &self.config_desc.digest,
-            &self.config_data,
-            delay,
-        )
-        .await;
-        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
-            mount_blob_pull_delayed(server, repo, &desc.digest, data, delay).await;
+        for (digest, data) in self.blobs() {
+            mount_blob_pull_delayed(server, repo, digest, data, delay).await;
         }
     }
 
     /// As [`mount_source`](Self::mount_source), but the manifest and each blob
     /// must be requested exactly `pulls` times (`0` asserts it is never touched).
+    /// `row` names the table row in a failed expectation.
     pub async fn mount_source_expecting(
         &self,
         server: &MockServer,
         repo: &str,
         reference: &str,
         pulls: u64,
+        row: &str,
     ) {
         source_manifest_mock(repo, reference, &self.bytes, MediaType::OciManifest)
             .expect(pulls)
+            .named(format!("{row}: manifest GET {reference}"))
             .mount(server)
             .await;
-        self.mount_blob_pulls_expecting(server, repo, pulls).await;
+        self.mount_blob_pulls_expecting(server, repo, pulls, row)
+            .await;
     }
 
     /// As [`mount_blob_pulls`](Self::mount_blob_pulls), but each blob must be
-    /// requested exactly `pulls` times.
-    pub async fn mount_blob_pulls_expecting(&self, server: &MockServer, repo: &str, pulls: u64) {
-        blob_pull_mock(repo, &self.config_desc.digest, &self.config_data)
-            .expect(pulls)
-            .mount(server)
-            .await;
-        for (data, desc) in self.layers_data.iter().zip(self.layer_descs.iter()) {
-            blob_pull_mock(repo, &desc.digest, data)
+    /// requested exactly `pulls` times. `row` names the table row in a failed
+    /// expectation.
+    pub async fn mount_blob_pulls_expecting(
+        &self,
+        server: &MockServer,
+        repo: &str,
+        pulls: u64,
+        row: &str,
+    ) {
+        for (digest, data) in self.blobs() {
+            blob_pull_mock(repo, digest, data)
                 .expect(pulls)
+                .named(format!("{row}: blob GET {digest}"))
                 .mount(server)
                 .await;
         }
@@ -154,9 +162,8 @@ impl ManifestParts {
 
     /// Mount blob HEAD 404s for the config and every layer.
     pub async fn mount_target_blob_misses(&self, server: &MockServer, repo: &str) {
-        mount_blob_not_found(server, repo, &self.config_desc.digest).await;
-        for desc in &self.layer_descs {
-            mount_blob_not_found(server, repo, &desc.digest).await;
+        for (digest, _) in self.blobs() {
+            mount_blob_not_found(server, repo, digest).await;
         }
     }
 
@@ -358,21 +365,28 @@ impl IndexParts {
 
     /// As [`mount_source`](Self::mount_source), but the index must be pulled
     /// exactly once and child `i` (manifest and blobs) `child_pulls[i]` times.
+    /// `row` names the table row in a failed expectation.
     pub async fn mount_source_expecting(
         &self,
         server: &MockServer,
         repo: &str,
         tag: &str,
         child_pulls: &[u64],
+        row: &str,
     ) {
-        assert_eq!(child_pulls.len(), self.children.len());
+        assert_eq!(
+            child_pulls.len(),
+            self.children.len(),
+            "{row}: one pull count per child"
+        );
         source_manifest_mock(repo, tag, &self.bytes, MediaType::OciIndex)
             .expect(1)
+            .named(format!("{row}: index GET {tag}"))
             .mount(server)
             .await;
         for (child, pulls) in self.children.iter().zip(child_pulls) {
             child
-                .mount_source_expecting(server, repo, &child.digest.to_string(), *pulls)
+                .mount_source_expecting(server, repo, &child.digest.to_string(), *pulls, row)
                 .await;
         }
     }

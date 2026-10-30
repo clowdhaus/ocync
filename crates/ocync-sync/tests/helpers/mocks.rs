@@ -1,14 +1,24 @@
-//! Functions that mount wiremock endpoints, for tests where the mock topology is the subject.
+//! Functions that mount wiremock endpoints, for tests where the mock topology is
+//! the subject, and the mock batch checkers.
 
 #![allow(dead_code, unused_imports, unreachable_pub)]
 
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use ocync_distribution::Digest;
-use ocync_distribution::spec::MediaType;
+use ocync_distribution::spec::{MediaType, RepositoryName};
+use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
+use ocync_sync::engine::TargetEntry;
 use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
+
+use super::fixtures::target_entry;
 
 /// A manifest GET on `reference` returning `bytes` as `content_type`, not yet
 /// mounted so a caller can add `.expect(n)`.
@@ -34,19 +44,6 @@ pub async fn mount_source_manifest(server: &MockServer, repo: &str, tag: &str, b
         .await;
 }
 
-/// Mount a source manifest GET with an explicit content type (for indexes).
-pub async fn mount_source_manifest_with_content_type(
-    server: &MockServer,
-    repo: &str,
-    reference: &str,
-    bytes: &[u8],
-    content_type: MediaType,
-) {
-    source_manifest_mock(repo, reference, bytes, content_type)
-        .mount(server)
-        .await;
-}
-
 /// Mount the referrers API response for `parent_digest`.
 pub async fn mount_referrers(server: &MockServer, repo: &str, parent_digest: &Digest, body: &[u8]) {
     Mock::given(method("GET"))
@@ -66,11 +63,13 @@ fn blob_pull_response(data: &[u8]) -> ResponseTemplate {
         .insert_header("content-length", data.len().to_string())
 }
 
+fn blob_get(repo: &str, digest: &Digest) -> MockBuilder {
+    Mock::given(method("GET")).and(path(format!("/v2/{repo}/blobs/{digest}")))
+}
+
 /// A blob GET returning `data`, not yet mounted so a caller can add `.expect(n)`.
 pub fn blob_pull_mock(repo: &str, digest: &Digest, data: &[u8]) -> Mock {
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/{repo}/blobs/{digest}")))
-        .respond_with(blob_pull_response(data))
+    blob_get(repo, digest).respond_with(blob_pull_response(data))
 }
 
 /// Mount a blob GET.
@@ -86,8 +85,7 @@ pub async fn mount_blob_pull_delayed(
     data: &[u8],
     delay: Duration,
 ) {
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/{repo}/blobs/{digest}")))
+    blob_get(repo, digest)
         .respond_with(blob_pull_response(data).set_delay(delay))
         .mount(server)
         .await;
@@ -120,7 +118,7 @@ pub async fn mount_blob_push(server: &MockServer, repo: &str) {
 }
 
 /// As [`mount_blob_push`], but the POST and the PUT must each be hit exactly
-/// `uploads` times (`0` asserts nothing is uploaded); PATCH is unconstrained.
+/// `uploads` times (`0` asserts nothing is uploaded) and the PATCH never.
 /// `row` names the table row in a failed expectation.
 pub async fn mount_blob_push_expecting(server: &MockServer, repo: &str, uploads: u64, row: &str) {
     mount_uploads(server, repo, Some((uploads, row))).await;
@@ -140,11 +138,15 @@ async fn mount_uploads(server: &MockServer, repo: &str, expected: Option<(u64, &
     )
     .mount(server)
     .await;
-    Mock::given(method("PATCH"))
+    let patch = Mock::given(method("PATCH"))
         .and(path(session.as_str()))
-        .respond_with(ResponseTemplate::new(202).insert_header("location", session.as_str()))
-        .mount(server)
-        .await;
+        .respond_with(ResponseTemplate::new(202).insert_header("location", session.as_str()));
+    match expected {
+        Some((_, row)) => patch.expect(0).named(format!("{row}: upload PATCH")),
+        None => patch,
+    }
+    .mount(server)
+    .await;
     counted(
         Mock::given(method("PUT"))
             .and(path(session.as_str()))
@@ -155,17 +157,20 @@ async fn mount_uploads(server: &MockServer, repo: &str, expected: Option<(u64, &
     .await;
 }
 
-/// Mount a 201 for a cross-repo mount of `digest` into `repo`. Priority 1 so
-/// it wins over the generic upload POST (default priority 5), which also
-/// matches mount requests.
-pub async fn mount_blob_mount_accepted(server: &MockServer, repo: &str, digest: &Digest) {
+/// A cross-repo mount POST of `digest` into `repo` answering `status`, not yet
+/// mounted so a caller can add `.expect(n)`. Priority 1 so it wins over the
+/// generic upload POST (default priority 5), which also matches mount requests.
+pub fn blob_mount_mock(repo: &str, digest: &Digest, status: u16) -> Mock {
     Mock::given(method("POST"))
         .and(path(format!("/v2/{repo}/blobs/uploads/")))
         .and(query_param("mount", digest.to_string()))
-        .respond_with(ResponseTemplate::new(201))
+        .respond_with(ResponseTemplate::new(status))
         .with_priority(1)
-        .mount(server)
-        .await;
+}
+
+/// Mount a 201 for a cross-repo mount of `digest` into `repo`.
+pub async fn mount_blob_mount_accepted(server: &MockServer, repo: &str, digest: &Digest) {
+    blob_mount_mock(repo, digest, 201).mount(server).await;
 }
 
 /// A 200 manifest response naming `digest`, as a HEAD or GET on it would answer.
@@ -234,8 +239,11 @@ pub async fn mount_target_fresh(
 /// Which request paths [`count_requests`] counts.
 #[derive(Clone, Copy)]
 pub enum PathMatch<'a> {
+    /// Every path.
     Any,
+    /// The path equal to this string.
     Exact(&'a str),
+    /// Paths containing this substring.
     Contains(&'a str),
 }
 
@@ -264,6 +272,22 @@ pub async fn count_requests(
         .count()
 }
 
+/// Cross-repo mount POSTs (blob upload initiations carrying a `mount` query)
+/// that `server` received.
+pub async fn count_mount_posts(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.method == Method::POST
+                && r.url.path().ends_with("/blobs/uploads/")
+                && r.url.query_pairs().any(|(k, _)| k == "mount")
+        })
+        .count()
+}
+
 /// Blob upload finalizations (PUT) of `digest` that `server` received on a
 /// path satisfying `path`. The query carries the digest URL-encoded, so it is
 /// matched on its hex.
@@ -283,4 +307,163 @@ pub async fn count_blob_uploads(
                 && r.url.query().is_some_and(|q| q.contains(digest.hex()))
         })
         .count()
+}
+
+/// How many times a checker was asked, shared with the test.
+#[derive(Clone, Default)]
+pub struct Calls {
+    /// Calls to `check_blob_existence`.
+    pub checks: Rc<Cell<usize>>,
+    /// Calls to `wait_for_blobs_available`, made only by the manifest-commit
+    /// gate and counted only by a [`WaitTrackingChecker`].
+    pub waits: Rc<Cell<usize>>,
+}
+
+/// What a [`MockChecker`] does when asked.
+enum Mode {
+    /// Answers the call.
+    Answers {
+        /// Digests reported present.
+        existing: HashSet<Digest>,
+        /// Digests a partial failure leaves out of the answer (neither present nor missing).
+        unknown: HashSet<Digest>,
+    },
+    /// Fails every `check_blob_existence` call.
+    Fails,
+}
+
+/// Mock batch checker. It asserts the engine passes the target repo (a wrong
+/// repo would otherwise go unnoticed) and counts its calls.
+pub struct MockChecker {
+    expected_repo: String,
+    mode: Mode,
+    calls: Calls,
+}
+
+impl MockChecker {
+    /// A checker reporting `existing` present and every other digest missing.
+    pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
+        let calls = Calls::default();
+        (
+            Self {
+                expected_repo: expected_repo.to_owned(),
+                mode: Mode::Answers {
+                    existing,
+                    unknown: HashSet::new(),
+                },
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+
+    /// Leave `unknown` out of the answer. Panics on a failing checker, which
+    /// has no answer to leave them out of.
+    pub fn unknown(mut self, unknown: HashSet<Digest>) -> Self {
+        match &mut self.mode {
+            Mode::Answers {
+                unknown: left_out, ..
+            } => *left_out = unknown,
+            Mode::Fails => panic!("a failing checker has no answer to leave digests out of"),
+        }
+        self
+    }
+
+    /// Fail every `check_blob_existence` call.
+    pub fn failing(self) -> Self {
+        Self {
+            mode: Mode::Fails,
+            ..self
+        }
+    }
+
+    fn assert_repo(&self, repo: &RepositoryName) {
+        assert_eq!(
+            repo.as_str(),
+            self.expected_repo,
+            "mock: batch checker called with wrong repo"
+        );
+    }
+}
+
+impl BatchBlobChecker for MockChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
+        self.assert_repo(repo);
+        Box::pin(async move {
+            self.calls.checks.set(self.calls.checks.get() + 1);
+            let Mode::Answers { existing, unknown } = &self.mode else {
+                return Err(ocync_distribution::Error::EcrApi {
+                    reason: "batch API unavailable".into(),
+                });
+            };
+            let checked: Vec<Digest> = digests
+                .iter()
+                .filter(|d| !unknown.contains(d))
+                .cloned()
+                .collect();
+            Ok(BlobExistence::new(&checked, existing))
+        })
+    }
+}
+
+/// A [`MockChecker`] that also overrides `wait_for_blobs_available` to count
+/// the manifest-commit gate's calls apart from the pre-discovery
+/// `check_blob_existence` calls. Every other checker keeps the trait default.
+pub struct WaitTrackingChecker(MockChecker);
+
+impl WaitTrackingChecker {
+    /// A checker reporting `existing` present and every other digest missing.
+    pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
+        let (checker, calls) = MockChecker::new(expected_repo, existing);
+        (Self(checker), calls)
+    }
+}
+
+impl BatchBlobChecker for WaitTrackingChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
+        self.0.check_blob_existence(repo, digests)
+    }
+
+    fn wait_for_blobs_available<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+        _deadline: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
+        self.0.assert_repo(repo);
+        let Mode::Answers { existing, .. } = &self.0.mode else {
+            unreachable!("a wait-tracking checker always answers");
+        };
+        let all_known = digests.iter().all(|d| existing.contains(d));
+        Box::pin(async move {
+            self.0.calls.waits.set(self.0.calls.waits.get() + 1);
+            if all_known {
+                Ok(())
+            } else {
+                Err(ocync_distribution::Error::EcrApi {
+                    reason: "test: some digests still missing".into(),
+                })
+            }
+        })
+    }
+}
+
+/// A target entry on `client` whose existence checks go through `checker`.
+pub fn batch_target(
+    name: &str,
+    client: Arc<ocync_distribution::RegistryClient>,
+    checker: impl BatchBlobChecker + 'static,
+) -> TargetEntry {
+    TargetEntry {
+        batch_checker: Some(Rc::new(checker)),
+        ..target_entry(name, client)
+    }
 }

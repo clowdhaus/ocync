@@ -4,17 +4,15 @@
 
 mod helpers;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ocync_distribution::spec::{MediaType, RepositoryName};
-use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
+use ocync_distribution::Digest;
+use ocync_distribution::spec::MediaType;
 use ocync_sync::cache::TransferStateCache;
-use ocync_sync::engine::{SyncEngine, TagPair, TargetEntry};
+use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::retry::RetryConfig;
 use ocync_sync::staging::BlobStage;
@@ -24,153 +22,6 @@ use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
-
-/// How many times a checker was asked, shared with the test.
-#[derive(Clone, Default)]
-struct Calls {
-    /// Calls to `check_blob_existence`.
-    checks: Rc<Cell<usize>>,
-    /// Calls to `wait_for_blobs_available`, made only by the manifest-commit
-    /// gate and counted only by a [`WaitTrackingChecker`].
-    waits: Rc<Cell<usize>>,
-}
-
-/// Mock batch checker. It asserts the engine passes the target repo (a wrong
-/// repo would otherwise go unnoticed) and counts its calls.
-struct MockChecker {
-    expected_repo: String,
-    /// Digests reported present.
-    existing: HashSet<Digest>,
-    /// Digests a partial failure leaves out of the answer (neither present nor missing).
-    unknown: HashSet<Digest>,
-    /// Fail every `check_blob_existence` call.
-    fails: bool,
-    calls: Calls,
-}
-
-impl MockChecker {
-    fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
-        let calls = Calls::default();
-        (
-            Self {
-                expected_repo: expected_repo.to_owned(),
-                existing,
-                unknown: HashSet::new(),
-                fails: false,
-                calls: calls.clone(),
-            },
-            calls,
-        )
-    }
-
-    fn unknown(self, unknown: HashSet<Digest>) -> Self {
-        Self { unknown, ..self }
-    }
-
-    fn failing(self) -> Self {
-        Self {
-            fails: true,
-            ..self
-        }
-    }
-}
-
-impl BatchBlobChecker for MockChecker {
-    fn check_blob_existence<'a>(
-        &'a self,
-        repo: &'a RepositoryName,
-        digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
-        assert_eq!(
-            repo.as_str(),
-            self.expected_repo,
-            "mock: batch checker called with wrong repo"
-        );
-        Box::pin(async move {
-            self.calls.checks.set(self.calls.checks.get() + 1);
-            if self.fails {
-                return Err(ocync_distribution::Error::EcrApi {
-                    reason: "batch API unavailable".into(),
-                });
-            }
-            let checked: Vec<Digest> = digests
-                .iter()
-                .filter(|d| !self.unknown.contains(d))
-                .cloned()
-                .collect();
-            Ok(BlobExistence::new(&checked, &self.existing))
-        })
-    }
-}
-
-/// A [`MockChecker`] that also overrides `wait_for_blobs_available` to count
-/// the manifest-commit gate's calls apart from the pre-discovery
-/// `check_blob_existence` calls. Every other checker keeps the trait default.
-struct WaitTrackingChecker(MockChecker);
-
-impl WaitTrackingChecker {
-    fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
-        let (checker, calls) = MockChecker::new(expected_repo, existing);
-        (Self(checker), calls)
-    }
-}
-
-impl BatchBlobChecker for WaitTrackingChecker {
-    fn check_blob_existence<'a>(
-        &'a self,
-        repo: &'a RepositoryName,
-        digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
-        self.0.check_blob_existence(repo, digests)
-    }
-
-    fn wait_for_blobs_available<'a>(
-        &'a self,
-        repo: &'a RepositoryName,
-        digests: &'a [Digest],
-        _deadline: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
-        assert_eq!(repo.as_str(), self.0.expected_repo);
-        let all_known = digests.iter().all(|d| self.0.existing.contains(d));
-        Box::pin(async move {
-            self.0.calls.waits.set(self.0.calls.waits.get() + 1);
-            if all_known {
-                Ok(())
-            } else {
-                Err(ocync_distribution::Error::EcrApi {
-                    reason: "test: some digests still missing".into(),
-                })
-            }
-        })
-    }
-}
-
-/// A target entry whose existence checks go through `checker`.
-fn batch_target(
-    name: &str,
-    server: &MockServer,
-    checker: impl BatchBlobChecker + 'static,
-) -> TargetEntry {
-    TargetEntry {
-        batch_checker: Some(Rc::new(checker)),
-        ..target_entry(name, mock_client(server))
-    }
-}
-
-/// A cache holding each of `digests` as completed at `repo_name` on `target`.
-fn cache_with(
-    target: &str,
-    repo_name: &str,
-    digests: &[&Digest],
-) -> Rc<RefCell<TransferStateCache>> {
-    let cache = empty_cache();
-    for digest in digests {
-        cache
-            .borrow_mut()
-            .set_blob_completed(target, (*digest).clone(), repo(repo_name));
-    }
-    cache
-}
 
 /// The cache an earlier run left, as watch mode keeps it between cycles:
 /// each of `digests` present at `repo` on target `target`.
@@ -550,10 +401,7 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
 
     // Mount attempts fail with 404.
     for digest in [&parts.config_desc.digest, &parts.layer_descs[0].digest] {
-        Mock::given(method("POST"))
-            .and(path("/v2/repo/blobs/uploads/"))
-            .and(query_param("mount", digest.to_string()))
-            .respond_with(ResponseTemplate::new(404))
+        blob_mount_mock("repo", digest, 404)
             .mount(&target_server)
             .await;
     }
@@ -648,7 +496,7 @@ enum Answer {
     /// Reported absent: copied without a HEAD.
     Missing,
     /// Left out of the answer: gets its own HEAD, which finds it.
-    Unchecked,
+    Unknown,
 }
 
 /// The existence check a target has.
@@ -690,7 +538,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         transferred: u64,
         bytes: u64,
     }
-    use Answer::{Exists, Missing, Unchecked};
+    use Answer::{Exists, Missing, Unknown};
     let single = Case {
         name: "",
         check: Check::Answers([Exists; 3]),
@@ -726,8 +574,8 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             ..single
         },
         Case {
-            name: "unchecked layer gets its own HEAD, the missing one none",
-            check: Check::Answers([Exists, Missing, Unchecked]),
+            name: "unknown layer gets its own HEAD, the missing one none",
+            check: Check::Answers([Exists, Missing, Unknown]),
             skipped: 2,
             transferred: 1,
             bytes: 14,
@@ -768,9 +616,11 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         ];
         // Unequal repo names show the engine passes the target repo to the checker.
         let (src, tgt) = ("src/nginx", "tgt/nginx");
+        // Mock counts are per image, like the stats checks below.
+        let images = case.tags.len() as u64;
         let answers = match case.check {
             Check::Answers(answers) => answers,
-            Check::Absent | Check::Fails => [Unchecked; 3],
+            Check::Absent | Check::Fails => [Unknown; 3],
         };
 
         for tag in case.tags {
@@ -790,20 +640,20 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             let (pulls, heads) = match answer {
                 Exists => (0, 0),
                 Missing => (1, 0),
-                Unchecked => (0, 1),
+                Unknown => (0, 1),
             };
             blob_pull_mock(src, digest, data)
-                .expect(pulls)
+                .expect(pulls * images)
                 .named(format!("{name}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
             blob_head_mock(tgt, digest, 200)
-                .expect(heads)
+                .expect(heads * images)
                 .named(format!("{name}: blob HEAD {digest}"))
                 .mount(&target_server)
                 .await;
         }
-        mount_blob_push_expecting(&target_server, tgt, case.transferred, name).await;
+        mount_blob_push_expecting(&target_server, tgt, case.transferred * images, name).await;
 
         let (target, calls) = match case.check {
             Check::Absent => (
@@ -813,7 +663,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             Check::Fails => {
                 let (checker, calls) = MockChecker::new(tgt, HashSet::new());
                 (
-                    batch_target("target", &target_server, checker.failing()),
+                    batch_target("target", mock_client(&target_server), checker.failing()),
                     calls,
                 )
             }
@@ -828,7 +678,11 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                 };
                 let (checker, calls) = MockChecker::new(tgt, pick(Exists));
                 (
-                    batch_target("target", &target_server, checker.unknown(pick(Unchecked))),
+                    batch_target(
+                        "target",
+                        mock_client(&target_server),
+                        checker.unknown(pick(Unknown)),
+                    ),
                     calls,
                 )
             }
@@ -849,7 +703,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
 
         let report = run_sync_with_cache(vec![mapping], cache).await;
 
-        let images = case.tags.len() as u64;
         assert_eq!(calls.checks.get(), case.batch_calls, "{name}: batch calls");
         assert_eq!(report.images.len(), case.tags.len(), "{name}");
         for (i, image) in report.images.iter().enumerate() {
@@ -927,8 +780,8 @@ async fn sync_batch_checker_multi_target_independent_checkers() {
         "repo",
         "repo",
         vec![
-            batch_target("target-a", &target_a_server, checker_a),
-            batch_target("target-b", &target_b_server, checker_b),
+            batch_target("target-a", mock_client(&target_a_server), checker_a),
+            batch_target("target-b", mock_client(&target_b_server), checker_b),
         ],
         vec![TagPair::same("v1")],
     );
@@ -987,7 +840,7 @@ enum BatchAnswer {
     /// Left unknown by a partial failure.
     Unknown,
     /// The whole call failed.
-    Failed,
+    Fails,
 }
 
 /// An earlier run's cache says both blobs are at the target, but the
@@ -1002,7 +855,7 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
     for answer in [
         BatchAnswer::Missing,
         BatchAnswer::Unknown,
-        BatchAnswer::Failed,
+        BatchAnswer::Fails,
     ] {
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
@@ -1020,7 +873,7 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
                 .await;
             let heads = match answer {
                 BatchAnswer::Missing => 0,
-                BatchAnswer::Unknown | BatchAnswer::Failed => 1,
+                BatchAnswer::Unknown | BatchAnswer::Fails => 1,
             };
             blob_head_mock("repo", digest, 404)
                 .expect(heads)
@@ -1036,13 +889,13 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         let checker = match answer {
             BatchAnswer::Missing => checker,
             BatchAnswer::Unknown => checker.unknown(digests.into_iter().cloned().collect()),
-            BatchAnswer::Failed => checker.failing(),
+            BatchAnswer::Fails => checker.failing(),
         };
         let mapping = resolved_mapping(
             mock_client(&source_server),
             "repo",
             "repo",
-            vec![batch_target("target", &target_server, checker)],
+            vec![batch_target("target", mock_client(&target_server), checker)],
             vec![TagPair::same("v1")],
         );
         let report = run_sync_with_cache(vec![mapping], earlier_run_cache(&digests)).await;
@@ -1094,6 +947,7 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
     const DENIED: &str = r#"{"errors":[{"code":"DENIED","message":"denied"}]}"#;
     /// One refusal scenario and what the run must do.
     struct Case {
+        name: &'static str,
         cache: CacheAtStart,
         status: u16,
         body: &'static str,
@@ -1103,7 +957,8 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
         manifest_puts: usize,
         blobs_sent: u64,
     }
-    let repaired = |cache, body| Case {
+    let repaired = |name, cache, body| Case {
+        name,
         cache,
         status: 400,
         body,
@@ -1114,13 +969,29 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
         blobs_sent: 2,
     };
     let cases = [
-        repaired(CacheAtStart::EarlierRun, MANIFEST_BLOB_UNKNOWN),
-        repaired(CacheAtStart::EarlierRun, MANIFEST_INVALID),
-        repaired(CacheAtStart::LayerOnly, MANIFEST_BLOB_UNKNOWN),
+        repaired(
+            "400 blob unknown is repaired",
+            CacheAtStart::EarlierRun,
+            MANIFEST_BLOB_UNKNOWN,
+        ),
+        repaired(
+            "400 manifest invalid is repaired",
+            CacheAtStart::EarlierRun,
+            MANIFEST_INVALID,
+        ),
+        repaired(
+            "400 blob unknown with only the layer cached is repaired",
+            CacheAtStart::LayerOnly,
+            MANIFEST_BLOB_UNKNOWN,
+        ),
         Case {
             refusals: Refusals::Always,
             synced: false,
-            ..repaired(CacheAtStart::EarlierRun, MANIFEST_BLOB_UNKNOWN)
+            ..repaired(
+                "a refusal repeated after the repair fails the image",
+                CacheAtStart::EarlierRun,
+                MANIFEST_BLOB_UNKNOWN,
+            )
         },
         Case {
             status: 403,
@@ -1128,16 +999,25 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
             blob_heads: 0,
             manifest_puts: 1,
             blobs_sent: 0,
-            ..repaired(CacheAtStart::EarlierRun, DENIED)
+            ..repaired(
+                "403 denied is not repaired",
+                CacheAtStart::EarlierRun,
+                DENIED,
+            )
         },
         Case {
             refusals: Refusals::Always,
             synced: false,
             manifest_puts: 1,
-            ..repaired(CacheAtStart::Empty, MANIFEST_BLOB_UNKNOWN)
+            ..repaired(
+                "a refusal that dropped nothing from the cache is not repaired",
+                CacheAtStart::Empty,
+                MANIFEST_BLOB_UNKNOWN,
+            )
         },
     ];
     for Case {
+        name: case,
         cache: cache_at_start,
         status,
         body,
@@ -1148,7 +1028,6 @@ async fn sync_refused_manifest_repairs_an_earlier_runs_cache_in_the_same_run() {
         blobs_sent: sent,
     } in cases
     {
-        let case = format!("{cache_at_start:?} {status} {refusals:?}");
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
         let config_data = b"config-refused";
@@ -1466,7 +1345,7 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
         "repo",
         "repo",
         vec![
-            batch_target("target-a", &target_a_server, checker),
+            batch_target("target-a", mock_client(&target_a_server), checker),
             target_entry("target-b", mock_client(&target_b_server)),
         ],
         vec![TagPair::same("v1")],
@@ -1556,7 +1435,7 @@ async fn sync_batch_checker_index_manifest_all_exist() {
         mock_client(&source_server),
         "repo",
         "repo",
-        vec![batch_target("target", &target_server, checker)],
+        vec![batch_target("target", mock_client(&target_server), checker)],
         vec![TagPair::same("latest")],
     );
 
@@ -1603,7 +1482,7 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
             mock_client(&source_server),
             "src/repo",
             "tgt/repo",
-            vec![batch_target("target", &target_server, checker)],
+            vec![batch_target("target", mock_client(&target_server), checker)],
             vec![TagPair::same("v1")],
         );
 
@@ -1659,7 +1538,7 @@ async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
         mock_client(&source_server),
         "repo",
         "repo",
-        vec![batch_target("target", &target_server, checker)],
+        vec![batch_target("target", mock_client(&target_server), checker)],
         same_tags(&SHARED_TAGS),
     );
     let report = run_engine(
@@ -1718,7 +1597,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
         mock_client(&source_server),
         "repo",
         "repo",
-        vec![batch_target("target", &target_server, checker)],
+        vec![batch_target("target", mock_client(&target_server), checker)],
         vec![TagPair::same("x"), TagPair::same("y")],
     );
     let report = run_engine(

@@ -34,7 +34,13 @@ async fn sync_index_manifest_platform_filter() {
 
     // The index and amd64 are pulled once each; arm64 and windows never.
     index
-        .mount_source_expecting(&source_server, "repo", "latest", &[1, 0, 0])
+        .mount_source_expecting(
+            &source_server,
+            "repo",
+            "latest",
+            &[1, 0, 0],
+            "platform filter",
+        )
         .await;
 
     // Pushes of the filtered-out children have no mock, so they would 404 and fail the sync.
@@ -55,7 +61,7 @@ async fn sync_index_manifest_platform_filter() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(matches!(report.images[0].status, ImageStatus::Synced));
+    assert_status!(report, 0, ImageStatus::Synced);
     // The amd64 config and layer only.
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(report.images[0].blob_stats.skipped, 0);
@@ -90,21 +96,16 @@ async fn sync_nested_index_manifest_returns_error() {
     };
     let parent_bytes = serde_json::to_vec(&parent_index).unwrap();
 
-    mount_source_manifest_with_content_type(
-        &source_server,
-        "repo",
-        "v1",
-        &parent_bytes,
-        MediaType::OciIndex,
-    )
-    .await;
-    mount_source_manifest_with_content_type(
-        &source_server,
+    source_manifest_mock("repo", "v1", &parent_bytes, MediaType::OciIndex)
+        .mount(&source_server)
+        .await;
+    source_manifest_mock(
         "repo",
         &child_digest.to_string(),
         &child_bytes,
         MediaType::OciIndex,
     )
+    .mount(&source_server)
     .await;
     mount_manifest_head_not_found(&target_server, "repo", "v1").await;
 

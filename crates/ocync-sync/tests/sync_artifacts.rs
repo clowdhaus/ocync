@@ -6,7 +6,7 @@ mod helpers;
 use std::rc::Rc;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
+use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
 use ocync_sync::{ErrorKind, ImageStatus};
 use wiremock::http::Method;
@@ -29,11 +29,11 @@ fn artifact_mapping(
     }
 }
 
-/// Mount a referrers API that answers `parent_digest` with a 500.
-async fn mount_referrers_error(server: &MockServer, parent_digest: &Digest) {
+/// Mount a referrers API that answers `parent_digest` with `status`.
+async fn mount_referrers_error(server: &MockServer, parent_digest: &Digest, status: u16) {
     Mock::given(method("GET"))
         .and(path(format!("/v2/repo/referrers/{parent_digest}")))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(status))
         .mount(server)
         .await;
 }
@@ -138,24 +138,20 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
     let sig_digest_str = sig_digest.to_string();
 
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/repo/referrers/{}", parent.digest)))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&source_server)
-        .await;
+    mount_referrers_error(&source_server, &parent.digest, 404).await;
     let referrers = ReferrersIndexBuilder::new()
         .descriptor(Descriptor {
             artifact_type: Some(COSIGN_SIGNATURE.into()),
             ..blob_descriptor(&sig_bytes, MediaType::OciManifest)
         })
         .build();
-    mount_source_manifest_with_content_type(
-        &source_server,
+    source_manifest_mock(
         "repo",
         &parent.digest.tag_fallback(),
         &referrers,
         MediaType::OciIndex,
     )
+    .mount(&source_server)
     .await;
     mount_source_manifest(&source_server, "repo", &sig_digest_str, &sig_bytes).await;
     mount_blob_pull(
@@ -365,7 +361,7 @@ async fn artifact_transient_error_sets_artifacts_skipped() {
 
         let parent = ManifestBuilder::new(b"err-cfg").layer(b"err-layer").build();
         parent.mount_source(&source_server, "repo", "v1.0.0").await;
-        mount_referrers_error(&source_server, &parent.digest).await;
+        mount_referrers_error(&source_server, &parent.digest, 500).await;
         parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
         let mapping = artifact_mapping(
@@ -507,14 +503,8 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     parent.mount_target(&target_server, "repo", "v1.0.0").await;
     sig.mount_target(&target_server, "repo").await;
 
-    let repo = RepositoryName::new("repo").unwrap();
     let sig_blobs = [&sig.config_desc.digest, &sig.layer_desc.digest];
-    let cache = empty_cache();
-    for digest in sig_blobs {
-        cache
-            .borrow_mut()
-            .set_blob_completed("target", digest.clone(), repo.clone());
-    }
+    let cache = cache_with("target", "repo", &sig_blobs);
     let mapping = artifact_mapping(&source_server, &target_server, ResolvedArtifacts::default());
     let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
 
@@ -554,7 +544,7 @@ async fn artifact_transient_error_propagates_to_all_targets() {
 
     let parent = ManifestBuilder::new(b"mt-cfg").layer(b"mt-layer").build();
     parent.mount_source(&source_server, "repo", "v1.0.0").await;
-    mount_referrers_error(&source_server, &parent.digest).await;
+    mount_referrers_error(&source_server, &parent.digest, 500).await;
     for target in [&target_a, &target_b] {
         parent.mount_target(target, "repo", "v1.0.0").await;
     }
@@ -568,14 +558,7 @@ async fn artifact_transient_error_propagates_to_all_targets() {
 
     let report = run_sync(vec![mapping]).await;
 
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .all(|r| matches!(r.status, ImageStatus::Synced)),
-        "both targets should sync successfully"
-    );
+    assert_all_synced(&report, 2, "both targets should sync successfully");
     assert!(
         report.images.iter().all(|r| r.artifacts_skipped),
         "both targets must report artifacts_skipped (cache propagation)"

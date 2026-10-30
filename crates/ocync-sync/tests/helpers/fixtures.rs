@@ -17,6 +17,8 @@ use ocync_sync::retry::RetryConfig;
 use url::Url;
 use wiremock::MockServer;
 
+use super::digests::repo;
+
 /// The base URL of `server`.
 pub fn mock_url(server: &MockServer) -> Url {
     Url::parse(&server.uri()).unwrap()
@@ -73,6 +75,21 @@ pub fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
     Rc::new(RefCell::new(TransferStateCache::new()))
 }
 
+/// A cache holding each of `digests` as completed at `repo_name` on `target`.
+pub fn cache_with(
+    target: &str,
+    repo_name: &str,
+    digests: &[&Digest],
+) -> Rc<RefCell<TransferStateCache>> {
+    let cache = empty_cache();
+    for digest in digests {
+        cache
+            .borrow_mut()
+            .set_blob_completed(target, (*digest).clone(), repo(repo_name));
+    }
+    cache
+}
+
 /// A [`SnapshotKey`] under the standard test authority.
 pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(
@@ -92,7 +109,8 @@ pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>)
     }
 }
 
-/// A `ResolvedMapping` with no platform filter, artifacts or immutable glob.
+/// A `ResolvedMapping` with no platform filter or immutable glob and the
+/// default artifacts config (enabled, no type filters).
 pub fn resolved_mapping(
     source_client: Arc<ocync_distribution::RegistryClient>,
     source_repo: &str,
@@ -169,10 +187,10 @@ pub fn same_tags(tags: &[&str]) -> Vec<TagPair> {
 
 /// One `v1` mapping per `(source_repo, target_repo)` pair, all sharing one
 /// source client and one target client (alias `target`).
-pub fn v1_mappings(
+pub fn v1_mappings<S: AsRef<str>>(
     source: &MockServer,
     target: &MockServer,
-    repos: &[(&str, &str)],
+    repos: &[(S, S)],
 ) -> Vec<ResolvedMapping> {
     let source_client = mock_client(source);
     let target_client = mock_client(target);
@@ -181,8 +199,8 @@ pub fn v1_mappings(
         .map(|(src, tgt)| {
             resolved_mapping(
                 Arc::clone(&source_client),
-                src,
-                tgt,
+                src.as_ref(),
+                tgt.as_ref(),
                 vec![target_entry("target", Arc::clone(&target_client))],
                 same_tags(&["v1"]),
             )

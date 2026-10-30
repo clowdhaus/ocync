@@ -49,10 +49,16 @@ async fn sync_platform_filter_multi_target() {
     .mount(&source_server)
     .await;
     amd64
-        .mount_blob_pulls_expecting(&source_server, "repo", 2)
+        .mount_blob_pulls_expecting(&source_server, "repo", 2, "amd64 blobs")
         .await;
     arm64
-        .mount_source_expecting(&source_server, "repo", &arm64.digest.to_string(), 0)
+        .mount_source_expecting(
+            &source_server,
+            "repo",
+            &arm64.digest.to_string(),
+            0,
+            "arm64 filtered out",
+        )
         .await;
 
     // Only amd64 is pushed. An arm64 push has no mock, so it would 404 and fail the sync.
@@ -74,14 +80,7 @@ async fn sync_platform_filter_multi_target() {
 
     let report = run_sync(vec![mapping]).await;
 
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .all(|r| matches!(r.status, ImageStatus::Synced)),
-        "both targets must be Synced"
-    );
+    assert_all_synced(&report, 2, "both targets");
     let expected_blob_bytes = (amd64.config_data.len() + amd64.layers_data[0].len()) as u64;
     for result in &report.images {
         assert_eq!(
@@ -91,7 +90,6 @@ async fn sync_platform_filter_multi_target() {
         assert_eq!(result.blob_stats.skipped, 0);
         assert_eq!(result.bytes_transferred, expected_blob_bytes);
     }
-    assert_eq!(report.stats.images_synced, 2);
     assert_eq!(report.stats.blobs_transferred, 4);
     assert_eq!(report.stats.bytes_transferred, expected_blob_bytes * 2);
 }
@@ -108,40 +106,21 @@ async fn sync_with_manifest_put_400(put_body: &str) -> (SyncReport, ManifestPart
         .layer(b"layer-400")
         .build();
     parts
-        .mount_source_expecting(&source_server, "src/nginx", "v1.0", 1)
+        .mount_source_expecting(&source_server, "src/nginx", "v1.0", 1, "source")
         .await;
 
-    Mock::given(method("HEAD"))
-        .and(path("/v2/tgt/nginx/manifests/v1.0"))
-        .respond_with(ResponseTemplate::new(404))
+    manifest_head_mock("tgt/nginx", "v1.0", ResponseTemplate::new(404))
         .expect(1)
         .mount(&target_server)
         .await;
     for digest in parts.blob_digests() {
-        Mock::given(method("HEAD"))
-            .and(path(format!("/v2/tgt/nginx/blobs/{digest}")))
-            .respond_with(ResponseTemplate::new(404))
+        blob_head_mock("tgt/nginx", &digest, 404)
             .expect(1)
             .mount(&target_server)
             .await;
     }
-    // Small blobs upload monolithically (POST then PUT). No PATCH is mounted,
-    // so one would 404 and fail the sync.
-    Mock::given(method("POST"))
-        .and(path("/v2/tgt/nginx/blobs/uploads/"))
-        .respond_with(
-            ResponseTemplate::new(202)
-                .insert_header("location", "/v2/tgt/nginx/blobs/uploads/mono-id"),
-        )
-        .expect(2)
-        .mount(&target_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/v2/tgt/nginx/blobs/uploads/mono-id"))
-        .respond_with(ResponseTemplate::new(201))
-        .expect(2)
-        .mount(&target_server)
-        .await;
+    // Small blobs upload monolithically: one POST and one PUT each, no PATCH.
+    mount_blob_push_expecting(&target_server, "tgt/nginx", 2, "blob upload").await;
     Mock::given(method("PUT"))
         .and(path("/v2/tgt/nginx/manifests/v1.0"))
         .respond_with(ResponseTemplate::new(400).set_body_string(put_body))
@@ -170,15 +149,12 @@ async fn sync_immutable_tag_skips_instead_of_failing() {
     .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(
-            report.images[0].status,
-            ImageStatus::Skipped {
-                reason: SkipReason::ImmutableTag,
-            }
-        ),
-        "expected Skipped/ImmutableTag, got: {:?}",
-        report.images[0].status
+    assert_status!(
+        report,
+        0,
+        ImageStatus::Skipped {
+            reason: SkipReason::ImmutableTag,
+        }
     );
     assert_eq!(report.images[0].blob_stats.transferred, 2);
     assert_eq!(
@@ -202,16 +178,13 @@ async fn sync_non_immutable_400_still_fails() {
     .await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(
-            report.images[0].status,
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPush,
-                ..
-            }
-        ),
-        "expected Failed/ManifestPush, got: {:?}",
-        report.images[0].status
+    assert_status!(
+        report,
+        0,
+        ImageStatus::Failed {
+            kind: ErrorKind::ManifestPush,
+            ..
+        }
     );
     assert_eq!(report.stats.images_failed, 1);
     assert_eq!(report.stats.images_skipped, 0);

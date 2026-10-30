@@ -3,11 +3,14 @@
 
 mod helpers;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::{MediaType, RepositoryName};
+use ocync_distribution::spec::MediaType;
+use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::shutdown::ShutdownSignal;
@@ -18,6 +21,24 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use helpers::*;
+
+/// Run with `max_concurrent`, `stage`, no cache and a live (untriggered)
+/// shutdown signal.
+async fn run_sync_with_concurrency(
+    mappings: Vec<ResolvedMapping>,
+    max_concurrent: usize,
+    stage: BlobStage,
+) -> SyncReport {
+    run_engine(
+        mappings,
+        fast_retry(),
+        max_concurrent,
+        empty_cache(),
+        stage,
+        Some(&ShutdownSignal::new()),
+    )
+    .await
+}
 
 /// An index whose second child manifest pull returns 500 fails the whole image.
 #[tokio::test]
@@ -47,14 +68,9 @@ async fn sync_index_manifest_child_pull_failure() {
     };
     let index_bytes = serde_json::to_vec(&index).unwrap();
 
-    mount_source_manifest_with_content_type(
-        &source_server,
-        "repo",
-        "latest",
-        &index_bytes,
-        MediaType::OciIndex,
-    )
-    .await;
+    source_manifest_mock("repo", "latest", &index_bytes, MediaType::OciIndex)
+        .mount(&source_server)
+        .await;
     mount_source_manifest(
         &source_server,
         "repo",
@@ -163,37 +179,18 @@ async fn sync_concurrent_dedup_at_real_concurrency() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let config_data = b"dedup-config-concurrent";
-    let layer_data = b"dedup-layer-concurrent";
-    let parts = ManifestBuilder::new(config_data).layer(layer_data).build();
+    let parts = ManifestBuilder::new(b"dedup-config-concurrent")
+        .layer(b"dedup-layer-concurrent")
+        .build();
 
     // expect(1) on each tag: every manifest is pulled once.
     for tag in ["v1", "v2"] {
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/repo/manifests/{tag}")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(parts.bytes.clone())
-                    .insert_header("content-type", MediaType::OciManifest.as_str()),
-            )
+        source_manifest_mock("repo", tag, &parts.bytes, MediaType::OciManifest)
             .expect(1)
             .mount(&source_server)
             .await;
     }
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &parts.config_desc.digest,
-        config_data,
-    )
-    .await;
-    mount_blob_pull(
-        &source_server,
-        "repo",
-        &parts.layer_descs[0].digest,
-        layer_data,
-    )
-    .await;
+    parts.mount_blob_pulls(&source_server, "repo").await;
 
     parts.mount_target(&target_server, "repo", "v1").await;
     mount_manifest_head_not_found(&target_server, "repo", "v2").await;
@@ -1124,7 +1121,7 @@ struct CaseImage {
 struct DeadlockCase {
     name: &'static str,
     images: &'static [CaseImage],
-    timeout_secs: u64,
+    timeout: Duration,
     /// Mounts the run must show. 0 where the second leader may legitimately
     /// fall through to a push when no committed source appears in time.
     min_mounted: u64,
@@ -1162,7 +1159,7 @@ const DEADLOCK_CASES: &[DeadlockCase] = &[
                 ],
             },
         ],
-        timeout_secs: 5,
+        timeout: Duration::from_secs(5),
         min_mounted: 1,
     },
     DeadlockCase {
@@ -1177,7 +1174,7 @@ const DEADLOCK_CASES: &[DeadlockCase] = &[
                 layers: &[b"two-leaders-shared-1", b"two-leaders-shared-2"],
             },
         ],
-        timeout_secs: 10,
+        timeout: Duration::from_secs(10),
         min_mounted: 0,
     },
 ];
@@ -1215,15 +1212,11 @@ async fn overlapping_shared_blobs_complete_without_deadlock() {
                 mount_blob_mount_accepted(&target_server, tgt, &layer.digest).await;
             }
         }
-        let repo_refs: Vec<(&str, &str)> = repos
-            .iter()
-            .map(|(src, tgt)| (src.as_str(), tgt.as_str()))
-            .collect();
 
         let report = tokio::time::timeout(
-            Duration::from_secs(case.timeout_secs),
+            case.timeout,
             run_sync_with_concurrency(
-                v1_mappings(&source_server, &target_server, &repo_refs),
+                v1_mappings(&source_server, &target_server, &repos),
                 10,
                 BlobStage::disabled(),
             ),
@@ -1327,16 +1320,10 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
         .await;
 
     let target_name = "target";
-    let cache = empty_cache();
-    {
-        let mut c = cache.borrow_mut();
-        c.set_blob_completed(
-            target_name,
-            parts_a.layer_descs[0].digest.clone(),
-            RepositoryName::new("tgt-a").unwrap(),
-        );
-        c.mark_repo_committed(target_name, &RepositoryName::new("tgt-a").unwrap());
-    }
+    let cache = cache_with(target_name, "tgt-a", &[&parts_a.layer_descs[0].digest]);
+    cache
+        .borrow_mut()
+        .mark_repo_committed(target_name, &repo("tgt-a"));
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -1377,14 +1364,7 @@ async fn mount_slow_commit_pair(
     for (repo, parts) in [("tgt-a", &parts_a), ("tgt-b", &parts_b)] {
         mount_manifest_head_not_found(target, repo, "v1").await;
         parts.mount_target_blob_misses(target, repo).await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v2/{repo}/blobs/uploads/")))
-            .and(query_param(
-                "mount",
-                parts.layer_descs[0].digest.to_string(),
-            ))
-            .respond_with(ResponseTemplate::new(201))
-            .with_priority(1)
+        blob_mount_mock(repo, &parts.layer_descs[0].digest, 201)
             .expect(0)
             .named(format!("{repo}: no mount is fulfilled"))
             .mount(target)
@@ -1452,25 +1432,35 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         mount_slow_commit_pair(&source_server, &target_server, Duration::from_secs(30)).await;
 
     let shutdown = ShutdownSignal::new();
-    // Past the instant uploads, well inside the commit and the wait.
-    trigger_shutdown_after(&shutdown, Duration::from_secs(1));
     let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_drain_deadline(Duration::from_millis(100))
         .with_mount_source_wait_deadline(Duration::from_secs(60));
+    let shared = &parts.layer_descs[0].digest;
+    let shared_uploads = async || {
+        count_blob_uploads(
+            &target_server,
+            PathMatch::Contains("/blobs/uploads/"),
+            shared,
+        )
+        .await
+    };
 
     let started = std::time::Instant::now();
-    let report = tokio::time::timeout(
-        Duration::from_secs(10),
-        engine.run(
-            slow_commit_mappings(&source_server, &target_server),
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
+    // Triggered once the shared layer is uploaded: inside the commit and the wait.
+    let (report, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.run(
+                slow_commit_mappings(&source_server, &target_server),
+                empty_cache(),
+                BlobStage::disabled(),
+                &NullProgress,
+                Some(&shutdown),
+            ),
         ),
-    )
-    .await
-    .expect("engine must drain on shutdown during the resolver wait");
+        trigger_shutdown_at(&shutdown, 1, &shared_uploads),
+    );
+    let report = report.expect("engine must drain on shutdown during the resolver wait");
 
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -1478,14 +1468,9 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         started.elapsed()
     );
     assert_eq!(report.stats.images_synced, 0, "no image commits in time");
-    let shared_uploads = count_blob_uploads(
-        &target_server,
-        PathMatch::Contains("/blobs/uploads/"),
-        &parts.layer_descs[0].digest,
-    )
-    .await;
     assert_eq!(
-        shared_uploads, 1,
+        shared_uploads().await,
+        1,
         "the shared layer is uploaded once; its waiter had not pushed it"
     );
 }
@@ -1588,28 +1573,50 @@ async fn mount_waits_for_committed_source() {
         mount_blob_mount_accepted(&target_server, repo, &leader_img.layer_descs[0].digest).await;
     }
 
-    let mappings = vec![
-        mapping_from_servers(
-            &source_server,
-            &target_server,
-            "leader",
-            vec![TagPair::same("v1")],
-        ),
-        mapping_from_servers(
-            &source_server,
-            &target_server,
-            "follower",
-            vec![TagPair::same("v1")],
-        ),
-    ];
+    let mappings =
+        mappings_with_own_clients(&source_server, &target_server, ["leader", "follower"]);
     let report = run_sync(mappings).await;
 
     assert_all_synced(&report, 2, "both images should sync");
     let total_mounts: u64 = report.images.iter().map(|r| r.blob_stats.mounted).sum();
-    assert!(
-        total_mounts >= 1,
-        "shared layer should have been mounted (committed-source invariant): mounted={total_mounts}"
+    assert_eq!(
+        total_mounts, 1,
+        "the shared layer is mounted once, by the follower (committed-source invariant)"
     );
+}
+
+/// One `v1` mapping per repo (the same name at source and target), each with
+/// its own clients so no AIMD window is shared between them.
+fn mappings_with_own_clients(
+    source: &MockServer,
+    target: &MockServer,
+    repos: [&str; 2],
+) -> Vec<ResolvedMapping> {
+    repos
+        .map(|repo| mapping_from_servers(source, target, repo, same_tags(&["v1"])))
+        .into()
+}
+
+/// Run `mappings` against a 10ms mount-source wait deadline, failing the test
+/// if the run outlives its 10s guard.
+async fn run_with_short_mount_wait(
+    mappings: Vec<ResolvedMapping>,
+    cache: Rc<RefCell<TransferStateCache>>,
+) -> SyncReport {
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
+        .with_mount_source_wait_deadline(Duration::from_millis(10));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        engine.run(
+            mappings,
+            cache,
+            BlobStage::disabled(),
+            &NullProgress,
+            Some(&ShutdownSignal::new()),
+        ),
+    )
+    .await
+    .expect("the mount-source wait deadline did not bound the run")
 }
 
 /// When the leader's manifest commit never arrives before the per-blob
@@ -1638,54 +1645,37 @@ async fn mount_resolver_timeout_falls_back_to_push() {
         .mount_source(&source_server, "follower", "v1")
         .await;
 
+    let blobs = [
+        &leader_img.config_desc.digest,
+        &follower_img.config_desc.digest,
+        &leader_img.layer_descs[0].digest,
+    ];
     for repo in ["leader", "follower"] {
-        mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        mount_blob_not_found(&target_server, repo, &leader_img.config_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &follower_img.config_desc.digest).await;
-        mount_blob_not_found(&target_server, repo, &leader_img.layer_descs[0].digest).await;
-        mount_blob_push(&target_server, repo).await;
+        mount_target_fresh(&target_server, repo, "v1", &blobs).await;
     }
     // The leader fails, and its watch fires via notify_repo_failed.
     Mock::given(method("PUT"))
         .and(path("/v2/leader/manifests/v1"))
         .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
         .mount(&target_server)
         .await;
-    mount_manifest_push(&target_server, "follower", "v1").await;
 
-    let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_mount_source_wait_deadline(Duration::from_millis(10));
-    let report = tokio::time::timeout(
-        Duration::from_secs(10),
-        engine.run(
-            // One client pair per mapping, so no AIMD window is shared between them.
-            ["leader", "follower"]
-                .map(|repo| {
-                    mapping_from_servers(
-                        &source_server,
-                        &target_server,
-                        repo,
-                        vec![TagPair::same("v1")],
-                    )
-                })
-                .into(),
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&ShutdownSignal::new()),
-        ),
+    let report = run_with_short_mount_wait(
+        mappings_with_own_clients(&source_server, &target_server, ["leader", "follower"]),
+        empty_cache(),
     )
-    .await
-    .expect("engine should not hang after deadline fallback");
+    .await;
 
     let synced = report
         .images
         .iter()
         .filter(|r| matches!(r.status, ImageStatus::Synced))
         .count();
-    assert!(
-        synced >= 1,
-        "at least follower should sync via push fallback after deadline: {:#?}",
+    assert_eq!(
+        synced,
+        1,
+        "only the follower syncs, via push fallback after deadline: {:#?}",
         report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
     );
     assert_eq!(
@@ -1724,42 +1714,17 @@ async fn prior_run_cycle_breaks_via_deadline() {
         mount_target_fresh(&target_server, repo, "v1", &blobs).await;
     }
 
-    let cache = empty_cache();
-    {
-        let mut c = cache.borrow_mut();
-        for repo in ["repo-b", "repo-a"] {
-            c.set_blob_completed(
-                "target",
-                img_a.layer_descs[0].digest.clone(),
-                RepositoryName::new(repo).unwrap(),
-            );
-        }
-    }
+    let layer = &img_a.layer_descs[0].digest;
+    let cache = cache_with("target", "repo-b", &[layer]);
+    cache
+        .borrow_mut()
+        .set_blob_completed("target", layer.clone(), repo("repo-a"));
 
-    let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_mount_source_wait_deadline(Duration::from_millis(10));
-    let report = tokio::time::timeout(
-        Duration::from_secs(10),
-        engine.run(
-            // One client pair per mapping, so no AIMD window is shared between them.
-            ["repo-a", "repo-b"]
-                .map(|repo| {
-                    mapping_from_servers(
-                        &source_server,
-                        &target_server,
-                        repo,
-                        vec![TagPair::same("v1")],
-                    )
-                })
-                .into(),
-            cache,
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&ShutdownSignal::new()),
-        ),
+    let report = run_with_short_mount_wait(
+        mappings_with_own_clients(&source_server, &target_server, ["repo-a", "repo-b"]),
+        cache,
     )
-    .await
-    .expect("engine must not hang on prior-run cycle");
+    .await;
 
     assert_all_synced(
         &report,
@@ -1783,29 +1748,17 @@ async fn resolver_retries_mount_after_source_marked_stale() {
         .build();
     img.mount_source(&source_server, "tgt-b", "v1").await;
 
-    mount_manifest_head_not_found(&target_server, "tgt-b", "v1").await;
-    mount_blob_not_found(&target_server, "tgt-b", &img.config_desc.digest).await;
-    mount_blob_not_found(&target_server, "tgt-b", &img.layer_descs[0].digest).await;
-    mount_manifest_push(&target_server, "tgt-b", "v1").await;
-    mount_blob_mount_accepted(&target_server, "tgt-b", &img.layer_descs[0].digest).await;
     // The config blob is not in the cache, so it uploads.
-    mount_blob_push(&target_server, "tgt-b").await;
+    img.mount_target(&target_server, "tgt-b", "v1").await;
+    mount_blob_mount_accepted(&target_server, "tgt-b", &img.layer_descs[0].digest).await;
 
     // tgt-a is committed and valid; stale-src was rejected earlier and must be excluded.
-    let cache = empty_cache();
+    let layer = &img.layer_descs[0].digest;
+    let cache = cache_with("target", "tgt-a", &[layer]);
     {
         let mut c = cache.borrow_mut();
-        c.set_blob_completed(
-            "target",
-            img.layer_descs[0].digest.clone(),
-            RepositoryName::new("tgt-a").unwrap(),
-        );
-        c.mark_repo_committed("target", &RepositoryName::new("tgt-a").unwrap());
-        c.mark_blob_repo_stale(
-            "target",
-            &img.layer_descs[0].digest,
-            &RepositoryName::new("stale-src").unwrap(),
-        );
+        c.mark_repo_committed("target", &repo("tgt-a"));
+        c.mark_blob_repo_stale("target", layer, &repo("stale-src"));
     }
 
     let mapping = mapping_from_servers(

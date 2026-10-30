@@ -56,16 +56,13 @@ async fn immutable_tag_skip_when_present_at_target() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 2);
-    for image in &report.images {
-        assert!(
-            matches!(
-                image.status,
-                ImageStatus::Skipped {
-                    reason: SkipReason::ImmutableTag,
-                }
-            ),
-            "expected ImmutableTag skip, got {:?}",
-            image.status,
+    for (i, image) in report.images.iter().enumerate() {
+        assert_status!(
+            report,
+            i,
+            ImageStatus::Skipped {
+                reason: SkipReason::ImmutableTag,
+            }
         );
         assert_eq!(image.bytes_transferred, 0);
     }
@@ -118,11 +115,7 @@ async fn immutable_tag_not_skipped_when_absent_from_target() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(report.images[0].status, ImageStatus::Synced),
-        "new immutable tag should sync, got {:?}",
-        report.images[0].status,
-    );
+    assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.stats.immutable_tag_skips, 0);
 }
 
@@ -155,15 +148,12 @@ async fn non_matching_tag_falls_through_to_head_check() {
     let report = run_sync(vec![mapping]).await;
 
     assert_eq!(report.images.len(), 1);
-    assert!(
-        matches!(
-            report.images[0].status,
-            ImageStatus::Skipped {
-                reason: SkipReason::DigestMatch,
-            }
-        ),
-        "non-matching tag should use digest compare, got {:?}",
-        report.images[0].status,
+    assert_status!(
+        report,
+        0,
+        ImageStatus::Skipped {
+            reason: SkipReason::DigestMatch,
+        }
     );
     assert_eq!(
         report.stats.immutable_tag_skips, 0,
@@ -199,14 +189,7 @@ async fn immutable_tag_not_skipped_when_missing_from_one_target() {
 
     let report = run_sync(vec![mapping]).await;
 
-    assert_eq!(report.images.len(), 2);
-    for image in &report.images {
-        assert!(
-            matches!(image.status, ImageStatus::Synced),
-            "expected Synced when one target is missing the tag, got {:?}",
-            image.status,
-        );
-    }
+    assert_all_synced(&report, 2, "one image per target");
     assert_eq!(
         report.stats.immutable_tag_skips, 0,
         "must not skip when any target is missing the tag",

@@ -1,32 +1,19 @@
-//! High-concurrency, mostly-disjoint mapping reproducer.
-//!
-//! Mirrors the production failure mode: 10 mappings to one target registry,
-//! mostly disjoint blob sets, `max_concurrent_transfers=50`. One pair shares a
-//! single layer so `elect_leaders` picks exactly one leader (the
-//! `total_leaders=1 images=10` seen against ECR).
-//!
-//! The engine reports `Synced` only when the blob loop and manifest push both
-//! succeed. If it silently short-circuits a blob push (`Skipped`/`Mounted` for
-//! a blob never transferred), the target's request counts fall below the
-//! per-image stats and the assertions fire. The variants:
-//! - no shared blobs: no leader
-//! - one shared blob: one leader, the follower mounts
-//! - one shared blob plus a `BatchBlobChecker` returning `existing=[]` for
-//!   every repo (the ECR cache pre-population path)
+//! Ten mappings to one target registry at `max_concurrent_transfers=50` with
+//! mostly disjoint blob sets: every image syncs and the report's blob stats
+//! match the PUT and mount POST counts the target actually received, so a blob
+//! push is never reported as `Skipped` or `Mounted` without a request behind it.
+//! Variants: no shared blobs (no leader), one blob shared by one pair (one
+//! leader, the follower mounts), and that plus a batch checker that reports
+//! every blob missing.
 
 mod helpers;
 
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocync_distribution::spec::RepositoryName;
-use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::ImageStatus;
-use ocync_sync::engine::{TagPair, TargetEntry};
+use ocync_sync::engine::TagPair;
 use wiremock::MockServer;
 
 use helpers::*;
@@ -35,8 +22,8 @@ use helpers::*;
 /// server's actual PUT and mount POST counts.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
-    let fixture = build_ten_image_fixture(/* shared_pair = */ true).await;
-    let report = run_engine_default(&fixture, /* with_batch_checker = */ false).await;
+    let fixture = build_ten_image_fixture(Sharing::OnePair).await;
+    let report = run_engine_default(&fixture, Checking::HeadPerBlob).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
 }
 
@@ -44,19 +31,37 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
 /// target: cache pre-population must not produce a false `Skipped` or `Mounted`.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
-    let fixture = build_ten_image_fixture(/* shared_pair = */ true).await;
-    let report = run_engine_default(&fixture, /* with_batch_checker = */ true).await;
+    let fixture = build_ten_image_fixture(Sharing::OnePair).await;
+    let report = run_engine_default(&fixture, Checking::BatchChecker).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
 }
 
 /// Baseline with zero shared blobs: no leader, every image independent.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_fully_disjoint_mappings_high_concurrency() {
-    let fixture = build_ten_image_fixture(/* shared_pair = */ false).await;
-    let report = run_engine_default(&fixture, /* with_batch_checker = */ false).await;
+    let fixture = build_ten_image_fixture(Sharing::Disjoint).await;
+    let report = run_engine_default(&fixture, Checking::HeadPerBlob).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
     // No shared blobs -> no mount candidates -> no mount POSTs at all.
     assert_eq!(report.stats.blobs_mounted, 0);
+}
+
+/// Which images share a blob.
+#[derive(Clone, Copy)]
+enum Sharing {
+    /// Images 0 and 1 share one layer.
+    OnePair,
+    /// No image shares a blob.
+    Disjoint,
+}
+
+/// How the target's blob existence is checked.
+#[derive(Clone, Copy)]
+enum Checking {
+    /// No batch checker: a HEAD per blob.
+    HeadPerBlob,
+    /// A batch checker that reports every blob missing.
+    BatchChecker,
 }
 
 struct TenImageFixture {
@@ -70,7 +75,7 @@ struct TenImageFixture {
     repos: Vec<(String, String)>,
 }
 
-async fn build_ten_image_fixture(shared_pair: bool) -> TenImageFixture {
+async fn build_ten_image_fixture(sharing: Sharing) -> TenImageFixture {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -85,7 +90,7 @@ async fn build_ten_image_fixture(shared_pair: bool) -> TenImageFixture {
         let mut builder = ManifestBuilder::new(&config)
             .layer(&layer_a)
             .layer(&layer_b);
-        if shared_pair && i < 2 {
+        if matches!(sharing, Sharing::OnePair) && i < 2 {
             builder = builder.layer(&shared_layer);
         }
         images.push(builder.build());
@@ -128,20 +133,19 @@ async fn build_ten_image_fixture(shared_pair: bool) -> TenImageFixture {
 
 async fn run_engine_default(
     fixture: &TenImageFixture,
-    with_batch_checker: bool,
+    checking: Checking,
 ) -> ocync_sync::SyncReport {
     let mappings: Vec<_> = fixture
         .repos
         .iter()
         .map(|(src, tgt)| {
-            let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if with_batch_checker {
-                Some(Rc::new(EmptyExistingChecker::new(tgt)))
-            } else {
-                None
-            };
-            let entry = TargetEntry {
-                batch_checker,
-                ..target_entry("target", Arc::clone(&fixture.target_client))
+            let client = Arc::clone(&fixture.target_client);
+            let entry = match checking {
+                Checking::HeadPerBlob => target_entry("target", client),
+                Checking::BatchChecker => {
+                    let (checker, _) = MockChecker::new(tgt, HashSet::new());
+                    batch_target("target", client, checker)
+                }
             };
             resolved_mapping(
                 Arc::clone(&fixture.source_client),
@@ -199,14 +203,7 @@ async fn assert_report_matches_target_receipts(
             r.method == wiremock::http::Method::PUT && r.url.path().contains("/blobs/uploads/")
         })
         .count() as u64;
-    let blob_mounts: u64 = target_requests
-        .iter()
-        .filter(|r| {
-            r.method == wiremock::http::Method::POST
-                && r.url.path().ends_with("/blobs/uploads/")
-                && r.url.query_pairs().any(|(k, _)| k == "mount")
-        })
-        .count() as u64;
+    let blob_mounts = count_mount_posts(&fixture.target_server).await as u64;
     let manifest_puts: u64 = target_requests
         .iter()
         .filter(|r| r.method == wiremock::http::Method::PUT && r.url.path().contains("/manifests/"))
@@ -252,33 +249,4 @@ fn parse_image_index(source: &str) -> usize {
         .and_then(|s| s.strip_suffix(":latest"))
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("source did not match src/img-<N>:latest: {source}"))
-}
-
-/// Mirrors ECR's `BatchCheckLayerAvailability` against an empty target, and
-/// asserts it is called for the expected repo.
-struct EmptyExistingChecker {
-    expected_repo: String,
-}
-
-impl EmptyExistingChecker {
-    fn new(expected_repo: &str) -> Self {
-        Self {
-            expected_repo: expected_repo.to_owned(),
-        }
-    }
-}
-
-impl BatchBlobChecker for EmptyExistingChecker {
-    fn check_blob_existence<'a>(
-        &'a self,
-        repo: &'a RepositoryName,
-        digests: &'a [Digest],
-    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
-        assert_eq!(
-            repo.as_str(),
-            self.expected_repo,
-            "batch checker called with wrong repo",
-        );
-        Box::pin(async { Ok(BlobExistence::new(digests, &HashSet::new())) })
-    }
 }

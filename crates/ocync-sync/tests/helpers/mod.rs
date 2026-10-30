@@ -4,9 +4,10 @@
 //!   `ReferrersIndexBuilder` own fixture data with real digests; their
 //!   `*Parts` mount the common case (fresh target, every blob missing).
 //! - `mocks.rs`: free functions for tests where the mock topology is the
-//!   subject (partial existence, rate limits, `expect(N)` push counts).
-//! - `fixtures.rs`: mapping constructors, clients and retry config.
-//!   `simple_image_manifest` is for HEAD-check tests over fake digests.
+//!   subject (partial existence, rate limits, `expect(N)` push counts), and
+//!   the mock batch checkers.
+//! - `fixtures.rs`: mapping constructors, clients, retry config and seeded
+//!   caches. `simple_image_manifest` is for HEAD-check tests over fake digests.
 //! - `digests.rs`: digest and repository fixtures with no wiremock dependency;
 //!   filesystem-only test binaries include it alone through `#[path]`.
 //! - `registry2.rs`: real `registry:2` containers and a corpus to fill them.
@@ -80,33 +81,6 @@ pub async fn run_sync_sequential(mappings: Vec<ResolvedMapping>) -> SyncReport {
     .await
 }
 
-/// Run sequentially with `stage`, so the first target stages blobs before the
-/// next one reads them.
-pub async fn run_sync_sequential_with_staging(
-    mappings: Vec<ResolvedMapping>,
-    stage: BlobStage,
-) -> SyncReport {
-    run_engine(mappings, fast_retry(), 1, empty_cache(), stage, None).await
-}
-
-/// Run with `max_concurrent`, `stage`, no cache and a live (untriggered)
-/// shutdown signal.
-pub async fn run_sync_with_concurrency(
-    mappings: Vec<ResolvedMapping>,
-    max_concurrent: usize,
-    stage: BlobStage,
-) -> SyncReport {
-    run_engine(
-        mappings,
-        fast_retry(),
-        max_concurrent,
-        empty_cache(),
-        stage,
-        Some(&ShutdownSignal::new()),
-    )
-    .await
-}
-
 /// Run with a caller-provided cache.
 pub async fn run_sync_with_cache(
     mappings: Vec<ResolvedMapping>,
@@ -139,14 +113,23 @@ pub async fn run_sync_with_shutdown(
     .await
 }
 
-/// Trigger `shutdown` from a real thread after `delay`. A thread, not a
-/// tokio timer, so it fires on wall-clock time even under `start_paused`.
-pub fn trigger_shutdown_after(shutdown: &ShutdownSignal, delay: std::time::Duration) {
-    let signal = shutdown.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
-        signal.trigger();
-    });
+/// Trigger `shutdown` once `received` counts `want` requests, so it lands
+/// mid-transfer however slow the host is. Run it joined with the engine.
+/// Panics after 10s of wall-clock time, which also bounds `start_paused` runs.
+pub async fn trigger_shutdown_at(
+    shutdown: &ShutdownSignal,
+    want: usize,
+    received: impl AsyncFn() -> usize,
+) {
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while received().await < want {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "the server never received {want} requests to trigger shutdown on"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    shutdown.trigger();
 }
 
 /// Assert the report holds exactly `want` images, all `Synced`; `name` labels a failure.

@@ -45,8 +45,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ocync_distribution::{RegistryClient, RegistryClientBuilder};
-use ocync_sync::engine::{SyncEngine, TagPair};
-use ocync_sync::progress::NullProgress;
+use ocync_sync::engine::TagPair;
 use ocync_sync::staging::BlobStage;
 use url::Url;
 
@@ -107,35 +106,25 @@ async fn run_profile(src: Arc<RegistryClient>, dst: Arc<RegistryClient>, label: 
         })
         .collect::<Vec<_>>();
 
-    let engine = SyncEngine::new(fast_retry(), concurrency(workers));
-
     eprintln!("[profile] PROFILE BEGIN {label} workers={workers}");
     let sync_start = Instant::now();
-    let report = engine
-        .run(
-            mappings,
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    let report = run_engine(
+        mappings,
+        fast_retry(),
+        workers,
+        empty_cache(),
+        BlobStage::disabled(),
+        None,
+    )
+    .await;
     let sync_elapsed = sync_start.elapsed();
     eprintln!("[profile] PROFILE END {label} elapsed={sync_elapsed:?}");
 
-    let synced = report
-        .images
-        .iter()
-        .filter(|r| matches!(r.status, ocync_sync::ImageStatus::Synced))
-        .count();
     eprintln!(
-        "[profile] {label}: images={n_images} synced={synced} blobs_transferred={} bytes={}",
-        report.stats.blobs_transferred, report.stats.bytes_transferred,
+        "[profile] {label}: images={n_images} synced={} blobs_transferred={} bytes={}",
+        report.stats.images_synced, report.stats.blobs_transferred, report.stats.bytes_transferred,
     );
-    assert_eq!(
-        synced, n_images,
-        "expected all {n_images} images to sync; got {synced}",
-    );
+    assert_all_synced(&report, n_images, label);
 }
 
 #[tokio::test(flavor = "current_thread")]

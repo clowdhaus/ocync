@@ -54,14 +54,34 @@ fn discovery(report: &SyncReport) -> Discovery {
     }
 }
 
-fn manifest_path(repo: &str, reference: &str) -> String {
-    format!("/v2/{repo}/manifests/{reference}")
-}
-
 fn get_mock(repo: &str, reference: &str, response: ResponseTemplate) -> Mock {
     Mock::given(method("GET"))
-        .and(path(manifest_path(repo, reference)))
+        .and(path(format!("/v2/{repo}/manifests/{reference}")))
         .respond_with(response)
+}
+
+/// What a manifest HEAD answers.
+enum Head<'a> {
+    /// 200 naming `digest` as an OCI image manifest.
+    Manifest(&'a Digest),
+    /// 200 naming `digest` as an OCI index.
+    Index(&'a Digest),
+    /// The given status with no digest.
+    Status(u16),
+}
+
+/// Mount a manifest HEAD on `repo`/`reference` answering `head` that must be
+/// requested exactly once.
+async fn mount_head_once(server: &MockServer, repo: &str, reference: &str, head: Head<'_>) {
+    let response = match head {
+        Head::Manifest(digest) => digest_response(digest, MediaType::OciManifest),
+        Head::Index(digest) => digest_response(digest, MediaType::OciIndex),
+        Head::Status(code) => ResponseTemplate::new(code),
+    };
+    manifest_head_mock(repo, reference, response)
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 /// A manifest GET the engine must never issue; `row` names the table row in a failure.
@@ -267,16 +287,14 @@ async fn discovery_skips_without_source_get() {
 
         assert_eq!(report.stats.images_skipped, 1, "{}", c.name);
         assert_eq!(report.stats.images_synced, 0, "{}", c.name);
-        assert!(
-            matches!(
-                report.images[0].status,
-                ImageStatus::Skipped {
-                    reason: SkipReason::DigestMatch
-                }
-            ),
-            "{}: got {:?}",
-            c.name,
-            report.images[0].status
+        assert_status!(
+            report,
+            0,
+            ImageStatus::Skipped {
+                reason: SkipReason::DigestMatch
+            },
+            "{}",
+            c.name
         );
         assert_eq!(report.images[0].bytes_transferred, 0, "{}", c.name);
         assert_eq!(discovery(&report), c.want, "{}", c.name);
@@ -423,13 +441,12 @@ async fn discovery_pull_failure_does_not_populate_cache() {
     let source = MockServer::start().await;
     let target = MockServer::start().await;
 
-    manifest_head_mock(
+    mount_head_once(
+        &source,
         "src/repo",
         "v1",
-        digest_response(&make_digest("aabb"), MediaType::OciManifest),
+        Head::Manifest(&make_digest("aabb")),
     )
-    .expect(1)
-    .mount(&source)
     .await;
     // No `.expect`: the engine retries the GET.
     get_mock("src/repo", "v1", ResponseTemplate::new(500))
@@ -475,14 +492,7 @@ async fn discovery_zero_platform_match_returns_error() {
     let index = IndexBuilder::new()
         .manifest(&image("s390x"), Some(linux("s390x")))
         .build();
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&index.digest, MediaType::OciIndex),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Index(&index.digest)).await;
     source_manifest_mock("src/repo", "v1", &index.bytes, MediaType::OciIndex)
         .expect(1)
         .mount(&source)
@@ -526,23 +536,9 @@ async fn discovery_mixed_fanout_one_match_one_stale() {
     let target_b = MockServer::start().await;
     let parts = image("fanout");
 
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&parts.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Manifest(&parts.digest)).await;
     mount_full_pull(&source, &target_b, &parts, "v1", "fanout").await;
-    manifest_head_mock(
-        "tgt/repo",
-        "v1",
-        digest_response(&parts.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&target_a)
-    .await;
+    mount_head_once(&target_a, "tgt/repo", "v1", Head::Manifest(&parts.digest)).await;
     // Discovery's cache validation and the pre-push check both HEAD target B.
     manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .expect(2)
@@ -609,49 +605,19 @@ async fn discovery_concurrent_mixed_outcomes() {
     let (a, b, c) = (image("a"), image("b"), image("c"));
 
     // tag-a: snapshot hit.
-    manifest_head_mock(
-        "src/repo",
-        "tag-a",
-        digest_response(&a.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "tag-a", Head::Manifest(&a.digest)).await;
     forbid_get(&source, "src/repo", "tag-a", "tag-a").await;
-    manifest_head_mock(
-        "tgt/repo",
-        "tag-a",
-        digest_response(&a.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&target)
-    .await;
+    mount_head_once(&target, "tgt/repo", "tag-a", Head::Manifest(&a.digest)).await;
 
     // tag-b: cold miss.
-    manifest_head_mock(
-        "src/repo",
-        "tag-b",
-        digest_response(&b.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "tag-b", Head::Manifest(&b.digest)).await;
     mount_full_pull(&source, &target, &b, "tag-b", "tag-b").await;
-    manifest_head_mock("tgt/repo", "tag-b", ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&target)
-        .await;
+    mount_head_once(&target, "tgt/repo", "tag-b", Head::Status(404)).await;
 
     // tag-c: source HEAD 500.
-    manifest_head_mock("src/repo", "tag-c", ResponseTemplate::new(500))
-        .expect(1)
-        .mount(&source)
-        .await;
+    mount_head_once(&source, "src/repo", "tag-c", Head::Status(500)).await;
     mount_full_pull(&source, &target, &c, "tag-c", "tag-c").await;
-    manifest_head_mock("tgt/repo", "tag-c", ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&target)
-        .await;
+    mount_head_once(&target, "tgt/repo", "tag-c", Head::Status(404)).await;
 
     let cache = empty_cache();
     seed_snapshot(&cache, "tag-a", &a.digest, &a.digest);
@@ -688,19 +654,9 @@ async fn discovery_source_change_across_cycles() {
     let cache = empty_cache();
     let (d1, d2) = (image("cycle-1"), image("cycle-2"));
 
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&d1.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Manifest(&d1.digest)).await;
     mount_full_pull(&source, &target, &d1, "v1", "cycle 1").await;
-    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&target)
-        .await;
+    mount_head_once(&target, "tgt/repo", "v1", Head::Status(404)).await;
 
     let report = run_sync_with_cache(
         vec![mapping(&source, &target, same_tags(&["v1"]))],
@@ -721,23 +677,9 @@ async fn discovery_source_change_across_cycles() {
     end_cycle(&source, &target).await;
 
     // The source moves to D2 while the target still holds D1.
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&d2.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Manifest(&d2.digest)).await;
     mount_full_pull(&source, &target, &d2, "v1", "cycle 2").await;
-    manifest_head_mock(
-        "tgt/repo",
-        "v1",
-        digest_response(&d1.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&target)
-    .await;
+    mount_head_once(&target, "tgt/repo", "v1", Head::Manifest(&d1.digest)).await;
 
     let report = run_sync_with_cache(
         vec![mapping(&source, &target, same_tags(&["v1"]))],
@@ -765,14 +707,7 @@ async fn mount_filtered_cycle(
     index: &IndexParts,
     child: &ManifestParts,
 ) {
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&index.digest, MediaType::OciIndex),
-    )
-    .expect(1)
-    .mount(source)
-    .await;
+    mount_head_once(source, "src/repo", "v1", Head::Index(&index.digest)).await;
     source_manifest_mock("src/repo", "v1", &index.bytes, MediaType::OciIndex)
         .expect(1)
         .mount(source)
@@ -788,10 +723,7 @@ async fn mount_filtered_cycle(
     .await;
     child.mount_blob_pulls(source, "src/repo").await;
 
-    manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
-        .expect(1)
-        .mount(target)
-        .await;
+    mount_head_once(target, "tgt/repo", "v1", Head::Status(404)).await;
     mount_target_blobs(target, "tgt/repo", child).await;
     mount_manifest_push(target, "tgt/repo", "v1").await;
     mount_manifest_push(target, "tgt/repo", &child.digest.to_string()).await;
@@ -860,19 +792,9 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
     let parts = image("prune");
 
     for tag in ["v1", "v2"] {
-        manifest_head_mock(
-            "src/repo",
-            tag,
-            digest_response(&parts.digest, MediaType::OciManifest),
-        )
-        .expect(1)
-        .mount(&source)
-        .await;
+        mount_head_once(&source, "src/repo", tag, Head::Manifest(&parts.digest)).await;
         mount_full_pull(&source, &target, &parts, tag, "cycle 1").await;
-        manifest_head_mock("tgt/repo", tag, ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&target)
-            .await;
+        mount_head_once(&target, "tgt/repo", tag, Head::Status(404)).await;
     }
 
     let report = run_sync_with_cache(
@@ -890,23 +812,9 @@ async fn discovery_snapshot_warms_across_cycles_and_prunes_deleted_tags() {
     end_cycle(&source, &target).await;
 
     // v2 is gone from the mapping.
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&parts.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Manifest(&parts.digest)).await;
     forbid_get(&source, "src/repo", "v1", "cycle 2").await;
-    manifest_head_mock(
-        "tgt/repo",
-        "v1",
-        digest_response(&parts.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&target)
-    .await;
+    mount_head_once(&target, "tgt/repo", "v1", Head::Manifest(&parts.digest)).await;
 
     let report = run_sync_with_cache(
         vec![mapping(&source, &target, same_tags(&["v1"]))],
@@ -1215,14 +1123,7 @@ async fn head_first_partial_target_match_syncs_only_mismatched() {
     let target_b = MockServer::start().await;
     let parts = image("hf-partial");
 
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&parts.digest, MediaType::OciManifest),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Manifest(&parts.digest)).await;
     mount_full_pull(&source, &target_b, &parts, "v1", "partial match").await;
     manifest_head_mock("tgt/repo", "v1", ResponseTemplate::new(404))
         .mount(&target_b)
@@ -1271,14 +1172,7 @@ async fn head_first_bypassed_with_platform_filter() {
         .manifest(&child, Some(linux("amd64")))
         .build();
 
-    manifest_head_mock(
-        "src/repo",
-        "v1",
-        digest_response(&index.digest, MediaType::OciIndex),
-    )
-    .expect(1)
-    .mount(&source)
-    .await;
+    mount_head_once(&source, "src/repo", "v1", Head::Index(&index.digest)).await;
     source_manifest_mock("src/repo", "v1", &index.bytes, MediaType::OciIndex)
         .expect(1)
         .mount(&source)

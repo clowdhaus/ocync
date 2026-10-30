@@ -18,46 +18,77 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
 
+/// What the target's manifest HEAD answers before the sync.
+#[derive(Clone, Copy, Debug)]
+enum TargetHead {
+    /// The tag does not exist.
+    Missing,
+    /// The tag exists at a digest other than the source's, so it is not skipped.
+    OtherDigest,
+}
+
 #[tokio::test]
 async fn sync_happy_path() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
+    for target_head in [TargetHead::Missing, TargetHead::OtherDigest] {
+        let source_server = MockServer::start().await;
+        let target_server = MockServer::start().await;
 
-    let parts = ManifestBuilder::new(b"config-data")
-        .layer(b"layer-data")
-        .build();
+        let parts = ManifestBuilder::new(b"config-data")
+            .layer(b"layer-data")
+            .build();
 
-    parts
-        .mount_source(&source_server, "library/nginx", "latest")
-        .await;
-    parts
-        .mount_target(&target_server, "mirror/nginx", "latest")
-        .await;
+        parts
+            .mount_source(&source_server, "library/nginx", "latest")
+            .await;
+        match target_head {
+            TargetHead::Missing => {
+                mount_manifest_head_not_found(&target_server, "mirror/nginx", "latest").await;
+            }
+            TargetHead::OtherDigest => {
+                mount_manifest_head_matching(
+                    &target_server,
+                    "mirror/nginx",
+                    "latest",
+                    &make_digest("5ca1e"),
+                )
+                .await;
+            }
+        }
+        parts
+            .mount_target_blob_misses(&target_server, "mirror/nginx")
+            .await;
+        mount_blob_push(&target_server, "mirror/nginx").await;
+        mount_manifest_push(&target_server, "mirror/nginx", "latest").await;
 
-    let mapping = mapping_with_distinct_repos(
-        &source_server,
-        &target_server,
-        "library/nginx",
-        "mirror/nginx",
-        vec![TagPair::same("latest")],
-    );
+        let mapping = mapping_with_distinct_repos(
+            &source_server,
+            &target_server,
+            "library/nginx",
+            "mirror/nginx",
+            vec![TagPair::same("latest")],
+        );
 
-    let report = run_sync(vec![mapping]).await;
+        let report = run_sync(vec![mapping]).await;
 
-    assert_eq!(report.images.len(), 1);
-    assert_status!(report, 0, ImageStatus::Synced);
-    assert_eq!(
-        report.images[0].bytes_transferred,
-        parts.config_data.len() as u64 + parts.layers_data[0].len() as u64,
-        "bytes_transferred must equal sum of blob sizes"
-    );
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    assert_eq!(report.images[0].blob_stats.skipped, 0);
-    assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(report.stats.images_failed, 0);
-    assert_eq!(report.stats.blobs_transferred, 2);
-    assert_eq!(report.stats.blobs_skipped, 0);
-    assert_eq!(report.outcome(), RunOutcome::Clean);
+        let bytes = parts.config_data.len() as u64 + parts.layers_data[0].len() as u64;
+        assert_eq!(report.images.len(), 1, "{target_head:?}");
+        assert_status!(report, 0, ImageStatus::Synced, "{target_head:?}");
+        assert_eq!(
+            report.images[0].bytes_transferred, bytes,
+            "{target_head:?}: bytes_transferred must equal sum of blob sizes"
+        );
+        assert_eq!(
+            report.images[0].blob_stats.transferred, 2,
+            "{target_head:?}"
+        );
+        assert_eq!(report.images[0].blob_stats.skipped, 0, "{target_head:?}");
+        assert_eq!(report.stats.images_synced, 1, "{target_head:?}");
+        assert_eq!(report.stats.images_failed, 0, "{target_head:?}");
+        assert_eq!(report.stats.blobs_transferred, 2, "{target_head:?}");
+        assert_eq!(report.stats.blobs_skipped, 0, "{target_head:?}");
+        assert_eq!(report.stats.bytes_transferred, bytes, "{target_head:?}");
+        assert_eq!(report.outcome(), RunOutcome::Clean, "{target_head:?}");
+    }
 }
 
 #[tokio::test]
@@ -327,14 +358,7 @@ async fn sync_multiple_targets() {
 
     let report = run_sync(vec![mapping]).await;
 
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .all(|r| matches!(r.status, ImageStatus::Synced))
-    );
-    assert_eq!(report.stats.images_synced, 2);
+    assert_all_synced(&report, 2, "one image per target");
     assert_eq!(
         report.stats.blobs_transferred, 4,
         "2 blobs per target x 2 targets"
@@ -454,41 +478,6 @@ async fn sync_index_manifest_multi_platform() {
 }
 
 #[tokio::test]
-async fn sync_head_different_digest_proceeds_with_sync() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
-    parts.mount_source(&source_server, "repo", "v1").await;
-
-    // The target's manifest HEAD returns a different digest, so the image is not skipped.
-    let stale_digest = make_digest("5ca1e");
-    mount_manifest_head_matching(&target_server, "repo", "v1", &stale_digest).await;
-    parts.mount_target_blob_misses(&target_server, "repo").await;
-    mount_blob_push(&target_server, "repo").await;
-    mount_manifest_push(&target_server, "repo", "v1").await;
-
-    let mapping = mapping_from_servers(
-        &source_server,
-        &target_server,
-        "repo",
-        vec![TagPair::same("v1")],
-    );
-
-    let report = run_sync(vec![mapping]).await;
-
-    assert_eq!(report.images.len(), 1);
-    assert_status!(report, 0, ImageStatus::Synced);
-    assert_eq!(report.images[0].blob_stats.transferred, 2);
-    assert_eq!(report.images[0].blob_stats.skipped, 0);
-    let expected_bytes = (parts.config_data.len() + parts.layers_data[0].len()) as u64;
-    assert_eq!(report.images[0].bytes_transferred, expected_bytes);
-    assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(report.stats.blobs_transferred, 2);
-    assert_eq!(report.stats.bytes_transferred, expected_bytes);
-}
-
-#[tokio::test]
 async fn sync_with_nothing_to_do_reports_clean() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
@@ -596,9 +585,10 @@ async fn sync_retry_exhaustion_returns_final_error() {
     assert_eq!(report.stats.images_failed, 1);
 }
 
-/// Syncs `repo-a` then `repo-b` through one source client and one target
-/// client, sequentially, so repo-a's blobs are known mount sources for repo-b.
-async fn sync_repo_a_then_repo_b(source: &MockServer, target: &MockServer) -> SyncReport {
+/// Syncs `repo-a` and `repo-b` through one source client and one target
+/// client, one image at a time, so the first image's blobs are known mount
+/// sources for the second.
+async fn sync_two_repos_one_at_a_time(source: &MockServer, target: &MockServer) -> SyncReport {
     let mappings = v1_mappings(
         source,
         target,
@@ -620,16 +610,9 @@ async fn sync_cross_repo_mount_success() {
             .await;
     }
 
-    let report = sync_repo_a_then_repo_b(&source_server, &target_server).await;
+    let report = sync_two_repos_one_at_a_time(&source_server, &target_server).await;
 
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .all(|r| matches!(r.status, ImageStatus::Synced)),
-        "both images should sync",
-    );
+    assert_all_synced(&report, 2, "both images should sync");
     // One image uploads its 2 blobs, the other mounts them (order-independent).
     assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 2);
@@ -643,47 +626,42 @@ async fn sync_cross_repo_mount_success() {
     );
 }
 
-/// A refused mount falls back to pull and push: repo-b ends with 0 mounted and
-/// 2 transferred.
+/// A refused mount falls back to pull and push: neither image ends with a
+/// mounted blob, and the follower makes exactly one mount attempt per blob
+/// before it transfers them.
 #[tokio::test]
 async fn sync_cross_repo_mount_falls_back_to_pull_push() {
-    // (row, status answering the mount attempts; `None` leaves the upload
-    // session's 202 Accepted to answer them, a "not fulfilled" mount).
-    let cases = [("202 not fulfilled", None), ("500 error", Some(500))];
+    // (row, status answering the mount attempts).
+    let cases = [("202 not fulfilled", 202), ("500 error", 500)];
     for (name, mount_status) in cases {
         let source_server = MockServer::start().await;
         let target_server = MockServer::start().await;
 
         let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
+        // Either repo may run second and so be the one that tries to mount, so
+        // both refuse.
         for repo in ["repo-a", "repo-b"] {
             parts.mount_source(&source_server, repo, "v1").await;
+            parts.mount_target(&target_server, repo, "v1").await;
+            for digest in parts.blob_digests() {
+                blob_mount_mock(repo, &digest, mount_status)
+                    .mount(&target_server)
+                    .await;
+            }
         }
-        parts.mount_target(&target_server, "repo-a", "v1").await;
 
-        mount_manifest_head_not_found(&target_server, "repo-b", "v1").await;
-        parts
-            .mount_target_blob_misses(&target_server, "repo-b")
-            .await;
-        if let Some(status) = mount_status {
-            // Mounted first so it answers the two mount POSTs before the
-            // generic upload mocks do.
-            Mock::given(method("POST"))
-                .and(path("/v2/repo-b/blobs/uploads/"))
-                .respond_with(ResponseTemplate::new(status))
-                .up_to_n_times(2)
-                .mount(&target_server)
-                .await;
-        }
-        mount_blob_push(&target_server, "repo-b").await;
-        mount_manifest_push(&target_server, "repo-b", "v1").await;
-
-        let report = sync_repo_a_then_repo_b(&source_server, &target_server).await;
+        let report = sync_two_repos_one_at_a_time(&source_server, &target_server).await;
 
         assert_eq!(report.images.len(), 2, "{name}");
         assert_status!(report, 0, ImageStatus::Synced, "{name}");
         assert_status!(report, 1, ImageStatus::Synced, "{name}");
         assert_eq!(report.images[1].blob_stats.mounted, 0, "{name}");
         assert_eq!(report.images[1].blob_stats.transferred, 2, "{name}");
+        assert_eq!(
+            count_mount_posts(&target_server).await,
+            2,
+            "{name}: one mount attempt per blob"
+        );
     }
 }
 
