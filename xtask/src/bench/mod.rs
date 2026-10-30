@@ -1178,8 +1178,9 @@ impl PrewarmRateController {
 
     /// Record a 429 throttle -- multiplicative decrease.
     ///
-    /// Doubles interval (cap [`MAX_INTERVAL`](Self::MAX_INTERVAL)). If a throttle already
-    /// occurred within the congestion epoch, this call is suppressed.
+    /// Doubles interval (cap [`MAX_INTERVAL`](Self::MAX_INTERVAL)). If a
+    /// throttle already occurred within the congestion epoch, this call is
+    /// suppressed.
     fn on_throttle(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_throttle) > self.epoch {

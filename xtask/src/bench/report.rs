@@ -117,8 +117,8 @@ pub(crate) struct ScenarioRecord {
 /// One tool's metrics in the compact run record.
 ///
 /// Proxy metrics are embedded via `#[serde(flatten)]` so that adding a
-/// new metric to [`ProxyMetrics`] automatically
-/// appears in the JSON archive -- no manual field mapping needed.
+/// new metric to [`ProxyMetrics`] automatically appears in the JSON archive
+/// -- no manual field mapping needed.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ToolRecord {
     /// Tool name (e.g. `"ocync"`).

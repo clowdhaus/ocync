@@ -106,7 +106,7 @@ The `helm` job depends on `docker-manifest`, so a failed image build short-circu
 Run the CI gate locally before tagging:
 
 ```
-cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked && cargo deny check
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked && cargo test --workspace --locked && cargo deny check
 ```
 
 For chart-only sanity:

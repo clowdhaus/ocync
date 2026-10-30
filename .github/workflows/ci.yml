@@ -70,17 +70,9 @@ jobs:
           components: clippy
       - if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  doc:
-    name: Doc
-    needs: changes
-    runs-on: ubuntu-latest
-    steps:
-      - if: needs.changes.outputs.rust == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - if: needs.changes.outputs.rust == 'true'
-        uses: ./.github/actions/setup-rust
-      # Private items too: most doc links point at crate-internal code.
+      # Here rather than its own job: it reuses the dependencies clippy just
+      # compiled, and Lint is a required check. Private items too, since most
+      # doc links point at crate-internal code.
       - if: needs.changes.outputs.rust == 'true'
         run: cargo doc --workspace --no-deps --document-private-items --locked
         env:
