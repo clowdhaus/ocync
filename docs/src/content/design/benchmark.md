@@ -30,7 +30,7 @@ It lives in `xtask/src/bench/` and runs on one instance through `cargo xtask ben
 
 ## Accuracy rules
 
-The harness is to enforce each rule. A rule marked Planned is not built yet, and a run's summary does not yet flag which rules it was made without.
+The harness is to enforce each rule. A rule marked Planned is not built yet. A run's summary flags a skipped or incomplete CDN pre-warm and nothing else yet.
 
 ### A fixed corpus
 
@@ -85,9 +85,7 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): the unique blobs of each image's first tag are fetched once.
-
-  > **Status: Planned.** Warming every tag the run syncs, so the first tool does not meet a colder CDN than the last, and warning, naming the registry, when any manifest or blob could not be warmed. Today the blobs of later versions of 11 images in the corpus are never warmed.
+- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): every blob of every tag the run syncs is fetched once, paced per registry. The blobs are the ones the corpus lock records for each tag, so the pre-warm reads no manifest. A registry with a blob that failed, or that was not sent before the 8-minute deadline, is named in a warning and in the run's summary and record as not warmed, and a skipped pre-warm is recorded the same way.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.

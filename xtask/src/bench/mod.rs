@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
 use ocync_distribution::Digest;
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
@@ -471,16 +470,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    report.prewarm = match &lock {
-        None => {
-            eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
-            None
-        }
-        Some(_) if args.skip_prewarm => {
-            eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
-            Some(Prewarm::Skipped)
-        }
-        Some(lock) => Some(cdn_prewarm(lock, &refs, auth, &http).await),
+    report.prewarm = if args.skip_prewarm {
+        eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+        lock.as_ref().map(|_| Prewarm::Skipped)
+    } else if let Some(lock) = &lock {
+        Some(cdn_prewarm(lock, &refs, auth, &http).await)
+    } else {
+        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
+        None
     };
 
     // A scenario after the first re-checks the sources, so a move during a long
@@ -596,52 +593,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let registry = RegistryKind::of(target_registry);
     let reg_key = registry.archive_stem();
     let git_ref = git_ref();
-    let record = report::RunRecord {
-        timestamp: report.timestamp.clone(),
+    let record = report::RunRecord::of(
+        &report,
         git_ref,
-        corpus_locked_at: corpus_locked_at.clone(),
-        machine: report::MachineInfo {
-            provider: registry.provider(),
-            instance_type: report.instance.instance_type.clone(),
-            arch: report.instance.arch.clone(),
-            vcpus: report.instance.vcpus,
-            memory_gib: report.instance.memory_mib as f64 / 1024.0,
-            network: report.instance.network_performance.clone(),
-            region: report.instance.region.clone(),
-            image_id: Some(report.instance.image_id.clone()),
-        },
-        relays: Some(report.relay_versions.clone()),
-        prewarm: report.prewarm.clone(),
-        corpus: report::CorpusInfo {
-            images: report.corpus_size,
-            tags: report.total_tags,
-        },
-        scenarios: report
-            .scenarios
-            .iter()
-            .map(|s| report::ScenarioRecord {
-                name: s.kind.label(),
-                shuffle_seed: s.shuffle_seed,
-                tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
-                tools: s
-                    .runs
-                    .iter()
-                    .map(|r| report::ToolRecord {
-                        tool: r.tool.to_string(),
-                        version: report
-                            .tool_versions
-                            .get(&r.tool)
-                            .cloned()
-                            .unwrap_or_default(),
-                        wall_clock_secs: r.wall_clock_secs,
-                        peak_rss_kb: r.peak_rss_kb,
-                        metrics: r.proxy_metrics.clone().unwrap_or_default(),
-                        phase_timing_ms: r.phase_timing_ms.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    };
+        registry.provider(),
+        corpus_locked_at.clone(),
+    );
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
@@ -1294,7 +1251,7 @@ fn prepare_clean_slate() {
 struct PrewarmRateController {
     /// Minimum delay between requests to this registry.
     interval: Duration,
-    /// Last time a request was issued to this registry.
+    /// When the latest send slot given out to this registry falls.
     last_request: Instant,
     /// Last time a throttle (429) was processed.
     last_throttle: Instant,
@@ -1321,19 +1278,14 @@ impl PrewarmRateController {
         }
     }
 
-    /// Returns how long to sleep before the next request, or `None` if ready.
-    fn delay(&self) -> Option<Duration> {
-        let elapsed = self.last_request.elapsed();
-        if elapsed < self.interval {
-            Some(self.interval - elapsed)
-        } else {
-            None
-        }
-    }
-
-    /// Mark that a request was just issued.
-    fn mark_sent(&mut self) {
-        self.last_request = Instant::now();
+    /// Claim the next send slot and return how long to wait for it. The slot
+    /// is taken now, so requests that ask together are spaced one interval
+    /// apart instead of all waiting for the same moment.
+    fn reserve(&mut self) -> Duration {
+        let now = Instant::now();
+        let slot = (self.last_request + self.interval).max(now);
+        self.last_request = slot;
+        slot - now
     }
 
     /// Record a successful response -- multiplicative increase.
@@ -1357,38 +1309,52 @@ impl PrewarmRateController {
     }
 }
 
+/// How one blob's pre-warm ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlobOutcome {
+    /// Served from the CDN cache.
+    Hit,
+    /// Served from the origin, which warms the cache.
+    Miss,
+    /// Refused, unreachable or still throttled after the retries.
+    Failed,
+    /// Not sent, because the deadline had passed.
+    PastDeadline,
+}
+
 /// Per-registry CDN pre-warm statistics.
 #[derive(Default)]
 struct PrewarmStats {
     hits: u64,
     misses: u64,
     /// Blobs that could not be warmed.
-    blob_errors: u64,
-    /// Manifests that could not be read, so their blobs are not warmed.
-    manifest_errors: u64,
-    /// Manifests and blobs not started because the deadline had passed.
-    skipped: u64,
+    failed: u64,
+    /// Blobs not sent because the deadline had passed.
+    past_deadline: u64,
 }
 
-/// What manifest reading collected.
-#[derive(Default)]
-struct Discovered {
-    /// (repository, digest) pairs, deduped so shared layers are fetched once.
-    blobs: HashSet<(registry::RepoKey, String)>,
-    /// Statistics by registry host.
-    stats: BTreeMap<String, PrewarmStats>,
+impl PrewarmStats {
+    /// Count one blob.
+    fn record(&mut self, outcome: BlobOutcome) {
+        let count = match outcome {
+            BlobOutcome::Hit => &mut self.hits,
+            BlobOutcome::Miss => &mut self.misses,
+            BlobOutcome::Failed => &mut self.failed,
+            BlobOutcome::PastDeadline => &mut self.past_deadline,
+        };
+        *count += 1;
+    }
 }
 
-/// The (repository, digest) of every manifest the pre-warm reads: each ref's
-/// index children, or the ref's own manifest when it has none. The lock names
-/// them, so every tag is covered and no index is read by tag. A ref the lock
-/// lacks or a source with no registry cannot reach here, since
-/// [`lock::ensure_unmoved`] has refused both.
-fn manifests_to_read(
+/// The (repository, digest) of every blob the pre-warm fetches: all those the
+/// lock records for the refs the run syncs, deduplicated, so every tag is
+/// covered. A ref the lock lacks or a source with no registry cannot reach
+/// here, since [`lock::ensure_unmoved`] has refused both.
+fn blobs_to_warm(
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
 ) -> HashSet<(registry::RepoKey, Digest)> {
-    let mut manifests = HashSet::new();
+    let mut blobs = HashSet::new();
     for image in refs {
         let (Some(repo), Some(entry)) = (
             registry::split_source(&image.source),
@@ -1397,56 +1363,53 @@ fn manifests_to_read(
             continue;
         };
         let repo = registry::RepoKey::from(&repo);
-        if entry.children.is_empty() {
-            manifests.insert((repo, entry.digest.clone()));
-        } else {
-            manifests.extend(entry.children.iter().map(|c| (repo.clone(), c.clone())));
-        }
+        blobs.extend(entry.blobs.iter().map(|b| (repo.clone(), b.clone())));
     }
-    manifests
+    blobs
 }
 
-/// Hosts with a manifest or blob that was not warmed.
+/// Hosts with a blob that was not warmed.
 fn unwarmed(stats: &BTreeMap<String, PrewarmStats>) -> Vec<String> {
     stats
         .iter()
-        .filter(|(_, s)| s.blob_errors + s.manifest_errors + s.skipped > 0)
+        .filter(|(_, s)| s.failed + s.past_deadline > 0)
         .map(|(host, _)| host.clone())
         .collect()
 }
 
-/// Seconds from the start of the pre-warm after which no manifest read or
-/// blob request is started.
-const PREWARM_DEADLINE_SECS: u64 = 480;
+/// How long from the start of the pre-warm before no blob request is started.
+const PREWARM_DEADLINE: Duration = Duration::from_secs(480);
+
+/// Concurrent blob requests.
+const PREWARM_CONCURRENCY: usize = 20;
+
+/// Attempts at one blob while its registry answers 429.
+const PREWARM_MAX_RETRIES: u32 = 3;
 
 /// Pull every unique source blob once to warm CDN edge caches.
 ///
 /// Runs before any tool so all tools see identically warm CDN. Uses
 /// OCI token exchange for authentication so requests succeed (2xx) and
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
-/// NOT cached by CDN and would warm nothing. The blobs come from the lock's
-/// manifests, read by digest, so every tag the run syncs is warmed.
+/// NOT cached by CDN and would warm nothing. The blobs come from the lock,
+/// so every tag the run syncs is warmed and no manifest is read.
 ///
-/// The outcome says which registries were left cold, for the run record.
+/// The outcome says which registries were not warmed, for the run record.
 async fn cdn_prewarm(
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
     auth: Option<&corpus::DockerHubAuth>,
     client: &reqwest::Client,
 ) -> Prewarm {
-    // Work not started by this time is skipped and counted. A request already
+    // A request not started by this time is counted and dropped. One already
     // started runs to its own timeout, and the CDN wait below follows, so the
     // pre-warm can end later than this.
-    let prewarm_deadline = Instant::now() + Duration::from_secs(PREWARM_DEADLINE_SECS);
-    let access = registry::Access {
-        client,
-        tokens: registry::Tokens::default(),
-        auth,
-    };
-    let manifests = manifests_to_read(lock, refs);
+    let deadline = Instant::now() + PREWARM_DEADLINE;
+    let access = registry::Access::new(client, auth);
+    let blobs: Vec<_> = blobs_to_warm(lock, refs).into_iter().collect();
     eprintln!(
-        "bench: reading {} manifests to find blobs; pre-warming blob CDN...",
-        manifests.len()
+        "bench: warming {} unique blobs ({PREWARM_CONCURRENCY} concurrent, per-registry paced)...",
+        blobs.len()
     );
 
     // Blob URLs are served via 302 redirects to CloudFront -- completely
@@ -1459,199 +1422,121 @@ async fn cdn_prewarm(
         .build()
         .unwrap();
 
-    let mut found = Discovered::default();
-    for (repo, digest) in &manifests {
-        if Instant::now() > prewarm_deadline {
-            found.stats.entry(repo.host.clone()).or_default().skipped += 1;
-        } else {
-            read_manifest(&access, repo, digest, &mut found).await;
-        }
-    }
-    let Discovered {
-        blobs: unique_blobs,
-        stats,
-    } = found;
+    // One controller per registry, so a slow registry does not throttle fast
+    // ones.
+    let rate_controllers: std::cell::RefCell<HashMap<&str, PrewarmRateController>> =
+        std::cell::RefCell::new(
+            blobs
+                .iter()
+                .map(|(key, _)| {
+                    (
+                        key.host.as_str(),
+                        PrewarmRateController::new(Duration::from_millis(500)),
+                    )
+                })
+                .collect(),
+        );
 
-    let blob_count = unique_blobs.len();
-    eprintln!(
-        "bench: warming {blob_count} unique blobs (20 concurrent, per-registry rate limited)..."
-    );
-
-    // Warm blobs concurrently (20 at a time) to avoid waiting 15-30 minutes
-    // on a sequential 55 GB download. Uses a semaphore to bound concurrency
-    // within a single-threaded tokio runtime.
-    let blobs_vec: Vec<_> = unique_blobs.into_iter().collect();
-
-    // Per-registry rate controllers and stats, initialized in a single pass.
-    let rate_controllers: std::cell::RefCell<HashMap<String, PrewarmRateController>> =
-        std::cell::RefCell::new(HashMap::new());
-    let per_registry_stats = std::cell::RefCell::new(stats);
-    for (key, _) in &blobs_vec {
-        rate_controllers
-            .borrow_mut()
-            .entry(key.host.clone())
-            .or_insert_with(|| PrewarmRateController::new(Duration::from_millis(500)));
-        per_registry_stats
-            .borrow_mut()
-            .entry(key.host.clone())
-            .or_default();
-    }
-
-    let sem = tokio::sync::Semaphore::new(20);
-    const MAX_RETRIES: u32 = 3;
-
-    let futs: Vec<_> = blobs_vec
-        .iter()
-        .map(|(key, digest)| {
-            let sem = &sem;
-            let blob_client = &blob_client;
-            let per_registry_stats = &per_registry_stats;
-            let rate_controllers = &rate_controllers;
-            let access = &access;
-            let registry = key.host.clone();
-            let digest = digest.clone();
-            async move {
-                // Rate limit: compute delay, drop borrow, sleep, re-borrow.
-                let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
+    // Bounded within a single-threaded runtime by a semaphore, to avoid
+    // waiting 15-30 minutes on a sequential 55 GB download.
+    let sem = tokio::sync::Semaphore::new(PREWARM_CONCURRENCY);
+    let outcomes = futures_util::future::join_all(blobs.iter().map(|(key, digest)| {
+        let (sem, access, blob_client, rate_controllers) =
+            (&sem, &access, &blob_client, &rate_controllers);
+        async move {
+            let host = key.host.as_str();
+            let _permit = sem.acquire().await.unwrap();
+            let url = format!("https://{host}/v2/{}/blobs/{digest}", key.path);
+            let mut retries = 0;
+            let outcome = loop {
+                // Paced after the permit, so the wait is measured from when
+                // this request can go. A blob waiting for a permit past the
+                // deadline is dropped without a wait.
+                if Instant::now() > deadline {
+                    break BlobOutcome::PastDeadline;
                 }
-                rate_controllers
+                let wait = rate_controllers
                     .borrow_mut()
-                    .get_mut(&registry)
+                    .get_mut(host)
                     .unwrap()
-                    .mark_sent();
-
-                // Acquire semaphore AFTER rate-controller wait.
-                let _permit = sem.acquire().await.unwrap();
-
-                let mut retries = 0u32;
-                loop {
-                    // Every task starts at once, so the deadline can only be
-                    // judged here: after the rate-limit wait, after the permit
-                    // and before each retry.
-                    if Instant::now() > prewarm_deadline {
-                        per_registry_stats
+                    .reserve();
+                tokio::time::sleep(wait).await;
+                if Instant::now() > deadline {
+                    break BlobOutcome::PastDeadline;
+                }
+                let sent = access
+                    .send(&key.repository(), None, |token| {
+                        blob_client.get(&url).bearer_auth(token)
+                    })
+                    .await;
+                match sent {
+                    Ok(r) if r.status().as_u16() == 429 => {
+                        rate_controllers
                             .borrow_mut()
-                            .entry(registry)
-                            .or_default()
-                            .skipped += 1;
-                        break;
+                            .get_mut(host)
+                            .unwrap()
+                            .on_throttle();
+                        retries += 1;
+                        if retries >= PREWARM_MAX_RETRIES {
+                            eprintln!("  blob pre-warm: {host} {digest}: max retries on 429");
+                            break BlobOutcome::Failed;
+                        }
                     }
-                    let url = format!("https://{}/v2/{}/blobs/{digest}", key.host, key.path);
-                    let resp = access
-                        .tokens
-                        .send(
-                            access.client,
-                            &key.repository(),
-                            access.auth,
-                            None,
-                            |token| blob_client.get(&url).bearer_auth(token),
-                        )
-                        .await;
-                    match resp {
-                        Ok(r) if r.status().as_u16() == 429 => {
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .on_throttle();
-                            retries += 1;
-                            if retries >= MAX_RETRIES {
-                                eprintln!(
-                                    "  blob pre-warm: {registry} {digest}: max retries on 429"
-                                );
-                                per_registry_stats
-                                    .borrow_mut()
-                                    .entry(registry.clone())
-                                    .or_default()
-                                    .blob_errors += 1;
-                                break;
-                            }
-                            let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
-                            if let Some(d) = delay {
-                                tokio::time::sleep(d).await;
-                            }
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .mark_sent();
-                            continue;
-                        }
-                        Ok(r) if r.status().is_success() || r.status().is_redirection() => {
-                            let x_cache = r
-                                .headers()
-                                .get("x-cache")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            {
-                                let mut stats = per_registry_stats.borrow_mut();
-                                let entry = stats.entry(registry.clone()).or_default();
-                                if x_cache.to_ascii_lowercase().contains("hit") {
-                                    entry.hits += 1;
-                                } else {
-                                    entry.misses += 1;
-                                }
-                            }
-                            // Consume body to complete the transfer.
-                            let _ = r.bytes().await;
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .on_success();
-                            break;
-                        }
-                        Ok(r) => {
-                            let status = r.status();
-                            eprintln!("  blob pre-warm: {registry} {digest}: {status}");
-                            per_registry_stats
-                                .borrow_mut()
-                                .entry(registry.clone())
-                                .or_default()
-                                .blob_errors += 1;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("  blob pre-warm: {registry} {digest}: {e}");
-                            per_registry_stats
-                                .borrow_mut()
-                                .entry(registry.clone())
-                                .or_default()
-                                .blob_errors += 1;
-                            break;
-                        }
+                    Ok(r) if r.status().is_success() || r.status().is_redirection() => {
+                        let hit = r
+                            .headers()
+                            .get("x-cache")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|v| v.to_ascii_lowercase().contains("hit"));
+                        // Consume body to complete the transfer.
+                        let _ = r.bytes().await;
+                        rate_controllers
+                            .borrow_mut()
+                            .get_mut(host)
+                            .unwrap()
+                            .on_success();
+                        break if hit {
+                            BlobOutcome::Hit
+                        } else {
+                            BlobOutcome::Miss
+                        };
+                    }
+                    Ok(r) => {
+                        eprintln!("  blob pre-warm: {host} {digest}: {}", r.status());
+                        break BlobOutcome::Failed;
+                    }
+                    Err(e) => {
+                        eprintln!("  blob pre-warm: {host} {digest}: {e}");
+                        break BlobOutcome::Failed;
                     }
                 }
-            }
-        })
-        .collect();
-    futures_util::future::join_all(futs).await;
+            };
+            (host, outcome)
+        }
+    }))
+    .await;
 
-    let stats = per_registry_stats.into_inner();
+    let mut stats: BTreeMap<String, PrewarmStats> = BTreeMap::new();
+    for (host, outcome) in outcomes {
+        stats.entry(host.to_owned()).or_default().record(outcome);
+    }
     for (registry, s) in &stats {
-        let rate = rate_controllers
-            .borrow()
-            .get(registry)
-            .map_or_else(String::new, |c| {
-                format!(", {}ms/req", c.interval.as_millis())
-            });
+        let interval = rate_controllers.borrow()[registry.as_str()].interval;
         eprintln!(
-            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} blobs failed, {} manifests failed, {} skipped at the deadline{rate}",
+            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline, {}ms/req",
             s.hits + s.misses,
             s.hits,
             s.misses,
-            s.blob_errors,
-            s.manifest_errors,
-            s.skipped
+            s.failed,
+            s.past_deadline,
+            interval.as_millis()
         );
     }
     eprintln!("bench: blob CDN pre-warm done");
     let unwarmed = unwarmed(&stats);
     if !unwarmed.is_empty() {
         eprintln!(
-            "WARNING: pre-warm incomplete for {}; those sources are not warm, so the tool that runs first may pay the CDN misses and tool order matters",
+            "WARNING: pre-warm: not warmed: {}; the tool that runs first may pay the CDN misses and tool order matters",
             unwarmed.join(", ")
         );
     }
@@ -1662,74 +1547,6 @@ async fn cdn_prewarm(
     eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
     Prewarm::Done { unwarmed }
-}
-
-/// Read the manifest `digest` of `repo` and collect its blobs into `found`.
-/// One that cannot be read, or holds no `layers` (a nested index, say), is
-/// counted and printed against its registry, never passed as warm.
-async fn read_manifest(
-    access: &registry::Access<'_>,
-    repo: &registry::RepoKey,
-    digest: &Digest,
-    found: &mut Discovered,
-) {
-    let read = async {
-        let response = access
-            .request_manifest(Method::GET, &repo.repository(), &digest.to_string())
-            .await
-            .map_err(|e| e.reason)?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| format!("body unreadable: {e}"))?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a public image manifest; the error is reported, not parsed further"
-        )]
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| format!("not JSON: {e}"))?;
-        collect_image_blobs(&manifest, repo, &mut found.blobs)
-            .then_some(())
-            .ok_or_else(|| "holds no layers".to_owned())
-    }
-    .await;
-    if let Err(why) = read {
-        eprintln!(
-            "  manifest pre-warm: {}/{}@{digest}: {why}",
-            repo.host, repo.path
-        );
-        found
-            .stats
-            .entry(repo.host.clone())
-            .or_default()
-            .manifest_errors += 1;
-    }
-}
-
-/// Extract layer and config digests from an image manifest JSON.
-///
-/// Returns `false` when the manifest has no `layers`, which the caller counts
-/// as an error.
-fn collect_image_blobs(
-    manifest: &serde_json::Value,
-    repo: &registry::RepoKey,
-    blobs: &mut HashSet<(registry::RepoKey, String)>,
-) -> bool {
-    let layers = match manifest.get("layers").and_then(|l| l.as_array()) {
-        Some(l) => l,
-        None => return false,
-    };
-    for layer in layers {
-        if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
-            blobs.insert((repo.clone(), digest.to_owned()));
-        }
-    }
-    if let Some(config) = manifest.get("config") {
-        if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
-            blobs.insert((repo.clone(), digest.to_owned()));
-        }
-    }
-    true
 }
 
 /// Parses an ocync timing JSONL file into a phase-name to milliseconds map.
@@ -2091,32 +1908,32 @@ images:
     }
 
     #[test]
-    fn the_pre_warm_reads_the_locked_manifests_of_every_tag() {
-        // Catches: warming only an image's first tag, or reading an index by
-        // tag, so a later tag's blobs are cold for the first tool.
-        let lock = lock::Lock {
-            locked_at: lock::fixtures::locked_at("2026-10-30-214340"),
-            images: [
-                // An index: its children, not its own digest.
-                (
-                    "docker.io/library/alpine:3",
-                    lock::fixtures::entry('a', &['b', 'c']),
-                ),
-                // A single manifest: its own digest.
-                ("quay.io/org/app:1", lock::fixtures::entry('d', &[])),
-                // The same digest under a second tag: one read.
-                ("quay.io/org/app:1.0", lock::fixtures::entry('d', &[])),
-                // A second tag naming other content: also read.
-                ("quay.io/org/app:2", lock::fixtures::entry('e', &[])),
-                // The same digest in another repository: its own read.
-                ("quay.io/org/other:1", lock::fixtures::entry('d', &[])),
-            ]
-            .into_iter()
-            .map(|(raw, entry)| (raw.to_owned().try_into().unwrap(), entry))
-            .collect(),
+    fn the_pre_warm_fetches_the_locked_blobs_of_every_tag_once_per_repository() {
+        use lock::fixtures::{digest, entry, lock_of};
+        let blobs = |fills: &str| fills.chars().map(digest).collect();
+        let with = |fills: &str| lock::Entry {
+            blobs: blobs(fills),
+            ..entry('a', &[])
         };
-        let refs = lock.images.keys().cloned().collect();
-        let mut got: Vec<(String, String)> = manifests_to_read(&lock, &refs)
+        let lock = lock_of(&[
+            ("docker.io/library/alpine:3", with("12")),
+            // A second tag naming other blobs: also fetched, so a first-tag-only
+            // pre-warm fails here.
+            ("docker.io/library/alpine:3.20", with("23")),
+            // Shared with the other tags of the image and with another image.
+            ("quay.io/org/app:1", with("12")),
+            ("quay.io/org/app:2", with("2")),
+            ("quay.io/org/other:1", with("4")),
+            // Not a ref the run syncs.
+            ("quay.io/org/unsynced:1", with("9")),
+        ]);
+        let refs = lock
+            .images
+            .keys()
+            .filter(|image| !image.source.ends_with("unsynced"))
+            .cloned()
+            .collect();
+        let mut got: Vec<(String, String)> = blobs_to_warm(&lock, &refs)
             .into_iter()
             .map(|(repo, digest)| {
                 (
@@ -2127,46 +1944,39 @@ images:
             .collect();
         got.sort();
         let want = [
-            ("quay.io/org/app", "d"),
-            ("quay.io/org/app", "e"),
-            ("quay.io/org/other", "d"),
-            ("registry-1.docker.io/library/alpine", "b"),
-            ("registry-1.docker.io/library/alpine", "c"),
+            ("quay.io/org/app", "1"),
+            ("quay.io/org/app", "2"),
+            ("quay.io/org/other", "4"),
+            ("registry-1.docker.io/library/alpine", "1"),
+            ("registry-1.docker.io/library/alpine", "2"),
+            ("registry-1.docker.io/library/alpine", "3"),
         ]
         .map(|(repo, digest)| (repo.to_owned(), digest.to_owned()));
         assert_eq!(got, want);
     }
 
     #[test]
-    fn the_pre_warm_names_the_registries_it_left_cold() {
-        // Catches: a failed blob or manifest passing as a warm source.
+    fn the_pre_warm_names_the_registries_it_did_not_warm() {
+        // Catches: a failed or dropped blob passing as a warm source.
+        let warm = PrewarmStats {
+            hits: 3,
+            misses: 2,
+            ..PrewarmStats::default()
+        };
         let mut stats = BTreeMap::new();
-        stats.insert("warm.example".to_owned(), PrewarmStats::default());
-        stats.insert(
-            "blob.example".to_owned(),
-            PrewarmStats {
-                blob_errors: 1,
-                ..PrewarmStats::default()
-            },
-        );
-        stats.insert(
-            "manifest.example".to_owned(),
-            PrewarmStats {
-                manifest_errors: 2,
-                ..PrewarmStats::default()
-            },
-        );
-        stats.insert(
-            "late.example".to_owned(),
-            PrewarmStats {
-                skipped: 1,
-                ..PrewarmStats::default()
-            },
-        );
-        assert_eq!(
-            unwarmed(&stats),
-            ["blob.example", "late.example", "manifest.example"]
-        );
+        stats.insert("warm.example".to_owned(), warm);
+        stats.insert("failed.example".to_owned(), {
+            let mut s = PrewarmStats::default();
+            s.record(BlobOutcome::Hit);
+            s.record(BlobOutcome::Failed);
+            s
+        });
+        stats.insert("late.example".to_owned(), {
+            let mut s = PrewarmStats::default();
+            s.record(BlobOutcome::PastDeadline);
+            s
+        });
+        assert_eq!(unwarmed(&stats), ["failed.example", "late.example"]);
     }
 
     #[test]
@@ -2369,6 +2179,17 @@ images:
         // 10 successes: 500 * 0.9^10 ~= 174ms
         assert!(ctrl.interval < initial);
         assert!(ctrl.interval > PrewarmRateController::MIN_INTERVAL);
+    }
+
+    #[test]
+    fn prewarm_rate_controller_spaces_requests_that_ask_together() {
+        // Catches: every request asking at once being told to wait for the same
+        // moment, so none is paced.
+        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
+        let waits: Vec<Duration> = (0..3).map(|_| ctrl.reserve()).collect();
+        assert_eq!(waits[0], Duration::ZERO);
+        assert!(waits[1] > Duration::from_millis(400), "{waits:?}");
+        assert!(waits[2] > Duration::from_millis(900), "{waits:?}");
     }
 
     #[test]

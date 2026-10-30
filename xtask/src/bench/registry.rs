@@ -168,7 +168,7 @@ impl RepoKey {
 /// authorized once. Shared by reference, because blob tasks run together; no
 /// borrow is held across an exchange.
 #[derive(Default)]
-pub(crate) struct Tokens {
+struct Tokens {
     /// Latest exchange for each repository; a failure is kept so it is
     /// reported for every tag and not retried at once.
     by_repository: RefCell<HashMap<RepoKey, Result<String, String>>>,
@@ -201,7 +201,7 @@ impl Tokens {
 
     /// Send, with the token for `repo`, the request `build` makes. With a
     /// `retrying` label a transient failure is retried by [`send_retrying`].
-    pub(crate) async fn send(
+    async fn send(
         &self,
         client: &reqwest::Client,
         repo: &Repository<'_>,
@@ -242,14 +242,36 @@ impl From<String> for FetchError {
 /// The client, token store and credentials manifest requests go through.
 pub(crate) struct Access<'a> {
     /// Client for every request.
-    pub(crate) client: &'a reqwest::Client,
+    client: &'a reqwest::Client,
     /// Bearer tokens, exchanged as each repository is first asked for.
-    pub(crate) tokens: Tokens,
+    tokens: Tokens,
     /// Docker Hub credentials for the token exchange, if any.
-    pub(crate) auth: Option<&'a DockerHubAuth>,
+    auth: Option<&'a DockerHubAuth>,
 }
 
-impl Access<'_> {
+impl<'a> Access<'a> {
+    /// Access through `client`, with Docker Hub credentials if given.
+    pub(crate) fn new(client: &'a reqwest::Client, auth: Option<&'a DockerHubAuth>) -> Self {
+        Self {
+            client,
+            tokens: Tokens::default(),
+            auth,
+        }
+    }
+
+    /// Send, with the token for `repo`, the request `build` makes. With a
+    /// `retrying` label a transient failure is retried by [`send_retrying`].
+    pub(crate) async fn send(
+        &self,
+        repo: &Repository<'_>,
+        retrying: Option<&str>,
+        build: impl Fn(&str) -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        self.tokens
+            .send(self.client, repo, self.auth, retrying, build)
+            .await
+    }
+
     /// Request a manifest, retrying what [`send_retrying`] retries and
     /// renewing an expired token once. Any other failing status is reported at
     /// once, with the status.
@@ -265,19 +287,12 @@ impl Access<'_> {
             repo.path
         );
         let response = self
-            .tokens
-            .send(
-                self.client,
-                repo,
-                self.auth,
-                Some(&format!("{repo}:{reference}")),
-                |token| {
-                    self.client
-                        .request(method.clone(), &url)
-                        .bearer_auth(token)
-                        .header("Accept", MANIFEST_ACCEPT)
-                },
-            )
+            .send(repo, Some(&format!("{repo}:{reference}")), |token| {
+                self.client
+                    .request(method.clone(), &url)
+                    .bearer_auth(token)
+                    .header("Accept", MANIFEST_ACCEPT)
+            })
             .await
             .map_err(|e| format!("manifest request {e}"))?;
         let status = response.status();

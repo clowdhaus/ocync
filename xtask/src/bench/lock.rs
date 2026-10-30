@@ -14,7 +14,7 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
-use crate::bench::registry::{self, Access, FetchError, Repository, Tokens};
+use crate::bench::registry::{self, Access, FetchError, Repository};
 
 /// The digest of `bytes`.
 fn digest_of(bytes: &[u8]) -> Digest {
@@ -149,6 +149,10 @@ pub(crate) struct Entry {
     pub(crate) digest: Digest,
     /// The index's child manifest digests in order; empty for a single manifest.
     pub(crate) children: Vec<Digest>,
+    /// Config and layer blob digests of the manifest, or of every child of the
+    /// index, deduplicated and sorted. Digests are content addresses, so they
+    /// stay right for as long as the ref's digest does.
+    pub(crate) blobs: Vec<Digest>,
 }
 
 /// The lock file: when it was written and what each ref resolved to.
@@ -330,11 +334,7 @@ pub(crate) async fn ensure_unmoved(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
-    let access = Access {
-        client,
-        tokens: Tokens::default(),
-        auth,
-    };
+    let access = Access::new(client, auth);
     let (resolved, failed) = access.resolve(refs, Access::fetch_digest).await;
     check_unmoved(lock, &resolved, &failed)
 }
@@ -415,11 +415,35 @@ struct ManifestBody {
     manifests: Vec<Child>,
 }
 
-/// One entry of an index's `manifests` array.
+/// A descriptor: one entry of an index's `manifests`, or a config or layer.
 #[derive(Deserialize)]
 struct Child {
-    /// Digest of the child manifest.
+    /// Digest of the manifest or blob it names.
     digest: Digest,
+}
+
+/// An image manifest body, read only for its blobs.
+#[derive(Deserialize)]
+struct ImageBody {
+    /// The image config.
+    config: Child,
+    /// The layers, in order.
+    layers: Vec<Child>,
+}
+
+/// The config and layer digests of an image manifest body, config first. An
+/// index body, or a config or layer without a valid digest, is an error.
+fn blob_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a public manifest holding no credential"
+    )]
+    let parsed: ImageBody =
+        serde_json::from_slice(body).map_err(|e| format!("image manifest is not valid: {e}"))?;
+    Ok(std::iter::once(parsed.config)
+        .chain(parsed.layers)
+        .map(|b| b.digest)
+        .collect())
 }
 
 /// The child manifest digests of an index body, in order; empty for a single
@@ -434,7 +458,7 @@ fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
     Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
 }
 
-/// What the lock reads and writes through [`Access`].
+/// What the lock reads through [`Access`].
 impl Access<'_> {
     /// Resolve every ref with `fetch`. Returns what resolved and each ref that
     /// did not, so the caller decides what an incomplete answer means.
@@ -486,15 +510,44 @@ impl Access<'_> {
         }
     }
 
-    /// The digest and children of a tag, from a GET of its exact bytes.
+    /// The digest, children and blobs of a tag, from a GET of its exact bytes
+    /// and of each child's, which must hash to the digest the index lists.
     async fn fetch_entry(&self, repo: &Repository<'_>, tag: &str) -> Result<Entry, FetchError> {
-        self.get_manifest(repo, tag, |digest, body| {
-            Ok(Entry {
-                digest,
-                children: child_digests(body)?,
+        let (digest, children, own_blobs) = self
+            .get_manifest(repo, tag, |digest, body| {
+                let children = child_digests(body)?;
+                let blobs = if children.is_empty() {
+                    blob_digests(body)?
+                } else {
+                    Vec::new()
+                };
+                Ok((digest, children, blobs))
             })
+            .await?;
+        let mut blobs = own_blobs;
+        for child in &children {
+            let listed = child.to_string();
+            let found = self
+                .get_manifest(repo, &listed, |actual, body| {
+                    if actual != *child {
+                        return Err(format!("body hashes to {actual}"));
+                    }
+                    blob_digests(body)
+                })
+                .await
+                .map_err(|e| FetchError {
+                    reason: format!("child {listed}: {}", e.reason),
+                    ..e
+                })?;
+            blobs.extend(found);
+        }
+        blobs.sort_by_cached_key(ToString::to_string);
+        blobs.dedup();
+        Ok(Entry {
+            digest,
+            children,
+            blobs,
         })
-        .await
     }
 }
 
@@ -549,11 +602,8 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
 
     let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
-    let access = Access {
-        client: &http_client()?,
-        tokens: Tokens::default(),
-        auth: auth.as_ref(),
-    };
+    let client = http_client()?;
+    let access = Access::new(&client, auth.as_ref());
     let (images, failed) = access.resolve(&refs, Access::fetch_entry).await;
     if !failed.is_empty() {
         return Err(unresolved(&failed).into());
@@ -591,18 +641,31 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
 /// check against a lock.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use super::{Digest, Entry, LockedAt, parse_digest};
+    use super::{Digest, Entry, ImageRef, Lock, LockedAt, parse_digest};
 
     /// A digest whose 64 hex characters are all `c`.
     pub(crate) fn digest(c: char) -> Digest {
         parse_digest(&format!("sha256:{}", c.to_string().repeat(64))).unwrap()
     }
 
-    /// An entry for `digest_fill` listing `children`, each named by its fill character.
+    /// An entry for `digest_fill` listing `children`, each named by its fill
+    /// character, with no blobs.
     pub(crate) fn entry(digest_fill: char, children: &[char]) -> Entry {
         Entry {
             digest: digest(digest_fill),
             children: children.iter().map(|c| digest(*c)).collect(),
+            blobs: Vec::new(),
+        }
+    }
+
+    /// A lock written at a fixed time holding `images`, each named `source:tag`.
+    pub(crate) fn lock_of(images: &[(&str, Entry)]) -> Lock {
+        Lock {
+            locked_at: locked_at("2026-10-30-120000"),
+            images: images
+                .iter()
+                .map(|(k, v)| (ImageRef::parse(k).unwrap(), v.clone()))
+                .collect(),
         }
     }
 
@@ -614,18 +677,11 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{digest as d, entry, locked_at};
+    use super::fixtures::{digest as d, entry, lock_of, locked_at};
     use super::*;
 
     fn image(raw: &str) -> ImageRef {
         ImageRef::parse(raw).unwrap()
-    }
-
-    fn lock_of(images: &[(&str, Entry)]) -> Lock {
-        Lock {
-            locked_at: locked_at("2026-10-30-120000"),
-            images: images.iter().map(|(k, v)| (image(k), v.clone())).collect(),
-        }
     }
 
     fn resolved_of(images: &[(&str, char)]) -> BTreeMap<ImageRef, Digest> {
@@ -738,10 +794,50 @@ mod tests {
     }
 
     #[test]
+    fn blob_digests_lists_config_then_layers_and_refuses_anything_else() {
+        let sha = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        let image = format!(
+            r#"{{"config":{{"digest":"{}"}},"layers":[{{"digest":"{}"}},{{"digest":"{}"}}]}}"#,
+            sha('c'),
+            sha('1'),
+            sha('2')
+        );
+        assert_eq!(
+            blob_digests(image.as_bytes()).unwrap(),
+            vec![d('c'), d('1'), d('2')]
+        );
+
+        let index = format!(r#"{{"manifests":[{{"digest":"{}"}}]}}"#, sha('a'));
+        let no_config = format!(r#"{{"layers":[{{"digest":"{}"}}]}}"#, sha('1'));
+        let no_layers = format!(r#"{{"config":{{"digest":"{}"}}}}"#, sha('c'));
+        let no_digest = format!(
+            r#"{{"config":{{}},"layers":[{{"digest":"{}"}}]}}"#,
+            sha('1')
+        );
+        let bad_digest = r#"{"config":{"digest":"sha256:xyz"},"layers":[]}"#;
+        for (name, body) in [
+            ("an index", index.as_str()),
+            ("no config", no_config.as_str()),
+            ("no layers", no_layers.as_str()),
+            ("a config with no digest", no_digest.as_str()),
+            ("a malformed digest", bad_digest),
+            ("not JSON", "<html>"),
+        ] {
+            assert!(blob_digests(body.as_bytes()).is_err(), "{name}");
+        }
+    }
+
+    #[test]
     fn lock_round_trips_with_sorted_keys_and_refuses_unknown_fields() {
         let lock = lock_of(&[
             ("quay.io/b:latest", entry('1', &['2', '3'])),
-            ("docker.io/a:1", entry('4', &[])),
+            (
+                "docker.io/a:1",
+                Entry {
+                    blobs: vec![d('5')],
+                    ..entry('4', &[])
+                },
+            ),
         ]);
         let text = lock.render().unwrap();
         assert!(

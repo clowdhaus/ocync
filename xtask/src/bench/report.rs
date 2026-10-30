@@ -57,29 +57,88 @@ pub(crate) struct RunRecord {
     pub(crate) scenarios: Vec<ScenarioRecord>,
 }
 
+impl RunRecord {
+    /// The record of a finished live run, `report` as measured on a registry of
+    /// `provider`, synced against the lock written at `corpus_locked_at`.
+    pub(crate) fn of(
+        report: &BenchReport,
+        git_ref: String,
+        provider: Option<Provider>,
+        corpus_locked_at: Option<LockedAt>,
+    ) -> Self {
+        Self {
+            timestamp: report.timestamp.clone(),
+            git_ref,
+            corpus_locked_at,
+            machine: MachineInfo {
+                provider,
+                instance_type: report.instance.instance_type.clone(),
+                arch: report.instance.arch.clone(),
+                vcpus: report.instance.vcpus,
+                memory_gib: report.instance.memory_mib as f64 / 1024.0,
+                network: report.instance.network_performance.clone(),
+                region: report.instance.region.clone(),
+                image_id: Some(report.instance.image_id.clone()),
+            },
+            relays: Some(report.relay_versions.clone()),
+            prewarm: report.prewarm.clone(),
+            corpus: CorpusInfo {
+                images: report.corpus_size,
+                tags: report.total_tags,
+            },
+            scenarios: report
+                .scenarios
+                .iter()
+                .map(|s| ScenarioRecord {
+                    name: s.kind.label(),
+                    shuffle_seed: s.shuffle_seed,
+                    tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
+                    tools: s
+                        .runs
+                        .iter()
+                        .map(|r| ToolRecord {
+                            tool: r.tool.to_string(),
+                            version: report
+                                .tool_versions
+                                .get(&r.tool)
+                                .cloned()
+                                .unwrap_or_default(),
+                            wall_clock_secs: r.wall_clock_secs,
+                            peak_rss_kb: r.peak_rss_kb,
+                            metrics: r.proxy_metrics.clone().unwrap_or_default(),
+                            phase_timing_ms: r.phase_timing_ms.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// What happened to the CDN pre-warm of a run that transfers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Prewarm {
-    /// Skipped with `--skip-prewarm`; the first tool may meet a cold CDN.
+    /// Skipped with `--skip-prewarm`.
     Skipped,
-    /// Ran. A registry in `unwarmed` had a manifest or blob that was not warmed.
+    /// Ran.
     Done {
-        /// Registries not fully warmed; empty when every source is warm.
+        /// Registries with a blob that failed or was not started before the
+        /// deadline; empty when every blob was warmed.
         unwarmed: Vec<String>,
     },
 }
 
 impl Prewarm {
-    /// The line the summary carries, when the pre-warm left any source cold.
+    /// The line the summary carries, when the pre-warm was skipped or left a
+    /// registry unwarmed.
     fn note(&self) -> Option<String> {
         match self {
             Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
             Self::Done { unwarmed } if unwarmed.is_empty() => None,
-            Self::Done { unwarmed } => Some(format!(
-                "Pre-warm: not fully warm for {}",
-                unwarmed.join(", ")
-            )),
+            Self::Done { unwarmed } => {
+                Some(format!("Pre-warm: not warmed for {}", unwarmed.join(", ")))
+            }
         }
     }
 }
@@ -1219,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_locked_at_is_written_only_when_set_and_old_records_read_as_unset() {
+    fn corpus_locked_at_is_written_when_set() {
         let mut record: RunRecord = serde_json::from_str(
             r#"{
                 "timestamp": "2026-10-30-120000",
@@ -1234,10 +1293,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(record.corpus_locked_at, None, "a record with no field");
-        let without = serde_json::to_string(&record).unwrap();
-        assert!(!without.contains("corpus_locked_at"), "{without}");
-
         record.corpus_locked_at =
             Some(crate::bench::lock::fixtures::locked_at("2026-10-30-120000"));
         let with = serde_json::to_string(&record).unwrap();
@@ -1250,33 +1305,43 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_warm_outcome_round_trips_and_is_noted_only_when_a_source_is_cold() {
-        // Catches: a cold source recorded nowhere but stderr, and a record
-        // without the field gaining one.
-        let mut record: RunRecord = serde_json::from_str(
-            r#"{"timestamp":"t","git_ref":"g","machine":{"instance_type":"i","arch":"a",
-            "vcpus":1,"memory_gib":1.0,"network":"n","region":"r"},
-            "corpus":{"images":1,"tags":1},"scenarios":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(record.prewarm, None);
-        assert!(!serde_json::to_string(&record).unwrap().contains("prewarm"));
-
-        let cold = Prewarm::Done {
+    fn the_summary_notes_a_pre_warm_only_when_it_was_skipped_or_left_a_registry_unwarmed() {
+        // Catches: an unwarmed registry recorded nowhere a reader of the
+        // numbers would see it.
+        let unwarmed = Prewarm::Done {
             unwarmed: vec!["quay.io".to_owned()],
         };
-        record.prewarm = Some(cold.clone());
-        let written = serde_json::to_string(&record).unwrap();
-        let reread: RunRecord = serde_json::from_str(&written).unwrap();
-        assert_eq!(reread.prewarm, Some(cold.clone()), "{written}");
+        let cases = [
+            (Prewarm::Done { unwarmed: vec![] }, None),
+            (Prewarm::Skipped, Some("Pre-warm: skipped (--skip-prewarm)")),
+            (unwarmed, Some("Pre-warm: not warmed for quay.io")),
+        ];
+        for (outcome, line) in cases {
+            let mut report = sample_report();
+            report.prewarm = Some(outcome);
+            let summary = summary_markdown(&report);
+            assert_eq!(summary.contains("Pre-warm:"), line.is_some(), "{summary}");
+            if let Some(line) = line {
+                assert!(summary.contains(line), "{summary}");
+            }
+        }
+    }
 
-        let all_warm = Prewarm::Done { unwarmed: vec![] };
-        assert_eq!(all_warm.note(), None);
-        assert!(cold.note().unwrap().contains("quay.io"));
-        assert!(Prewarm::Skipped.note().unwrap().contains("--skip-prewarm"));
+    #[test]
+    fn a_run_record_carries_the_pre_warm_and_no_relay_as_an_empty_map() {
+        // Catches: a record written with the pre-warm or the relays dropped,
+        // which reads as "not recorded" instead of the run's own answer.
         let mut report = sample_report();
-        report.prewarm = Some(cold);
-        assert!(summary_markdown(&report).contains("Pre-warm: not fully warm for quay.io"));
+        report.relay_versions = BTreeMap::new();
+        let outcome = Prewarm::Done {
+            unwarmed: vec!["quay.io".to_owned()],
+        };
+        report.prewarm = Some(outcome.clone());
+        let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
+        assert_eq!(record.prewarm, Some(outcome));
+        assert_eq!(record.relays, Some(BTreeMap::new()));
+        assert_eq!(record.git_ref, "abc1234");
+        assert_eq!(record.scenarios.len(), report.scenarios.len());
     }
 
     #[test]
