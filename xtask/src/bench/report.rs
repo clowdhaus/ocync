@@ -351,9 +351,7 @@ impl InstanceInfo {
     /// and network specs. Falls back to `"unknown"` / 0 outside EC2.
     pub(crate) fn collect() -> Self {
         // Announced rather than silently recorded: the image and instance type
-        // are what decide whether two runs are comparable, and a bare
-        // "unknown" in the archive is indistinguishable from an older record
-        // that predates the field.
+        // are what decide whether two runs are comparable.
         let instance_type = imds_or_unknown("instance-type");
         let region = imds_or_unknown("placement/region");
         let image_id = imds_or_unknown("ami-id");
@@ -1332,16 +1330,16 @@ mod tests {
         // Catches: a record written with the pre-warm or the relays dropped,
         // which reads as "not recorded" instead of the run's own answer.
         let mut report = sample_report();
-        report.relay_versions = BTreeMap::new();
-        let outcome = Prewarm::Done {
+        report.prewarm = Some(Prewarm::Done {
             unwarmed: vec!["quay.io".to_owned()],
-        };
-        report.prewarm = Some(outcome.clone());
+        });
         let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
-        assert_eq!(record.prewarm, Some(outcome));
-        assert_eq!(record.relays, Some(BTreeMap::new()));
-        assert_eq!(record.git_ref, "abc1234");
-        assert_eq!(record.scenarios.len(), report.scenarios.len());
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(written["relays"], serde_json::json!({}));
+        assert_eq!(
+            written["prewarm"],
+            serde_json::json!({"done": {"unwarmed": ["quay.io"]}})
+        );
     }
 
     #[test]

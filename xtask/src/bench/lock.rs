@@ -14,7 +14,7 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
-use crate::bench::registry::{self, Access, FetchError, Repository};
+use crate::bench::registry::{self, Access, Repository};
 
 /// The digest of `bytes`.
 fn digest_of(bytes: &[u8]) -> Digest {
@@ -174,7 +174,9 @@ impl Lock {
                 "failed to read corpus lock {shown}: {e}; create it with `cargo xtask bench-lock`"
             )
         })?;
-        Self::parse(&raw).map_err(|e| format!("corpus lock {shown}: {e}"))
+        Self::parse(&raw).map_err(|e| {
+            format!("corpus lock {shown}: {e}; re-create it with `cargo xtask bench-lock`")
+        })
     }
 
     /// Parse the text of a lock file.
@@ -192,6 +194,24 @@ impl Lock {
             serde_json::to_string_pretty(self).map_err(|e| format!("serialize lock: {e}"))?;
         text.push('\n');
         Ok(text)
+    }
+}
+
+/// Why one ref could not be resolved.
+#[derive(Clone)]
+struct FetchError {
+    /// The registry's answer, when it gave one.
+    status: Option<StatusCode>,
+    /// What went wrong.
+    reason: String,
+}
+
+impl From<String> for FetchError {
+    fn from(reason: String) -> Self {
+        Self {
+            status: None,
+            reason,
+        }
     }
 }
 
@@ -407,59 +427,114 @@ fn probe(header: Option<&str>) -> Result<Probe, String> {
     }
 }
 
-/// A manifest body, read only for the children an index lists.
-#[derive(Deserialize)]
-struct ManifestBody {
-    /// Child descriptors; absent from a single-image manifest.
-    #[serde(default)]
-    manifests: Vec<Child>,
-}
-
 /// A descriptor: one entry of an index's `manifests`, or a config or layer.
 #[derive(Deserialize)]
-struct Child {
+struct Descriptor {
     /// Digest of the manifest or blob it names.
     digest: Digest,
 }
 
-/// An image manifest body, read only for its blobs.
+/// A manifest body, read only for the digests it lists.
 #[derive(Deserialize)]
-struct ImageBody {
-    /// The image config.
-    config: Child,
-    /// The layers, in order.
-    layers: Vec<Child>,
+#[serde(untagged)]
+enum ManifestBody {
+    /// An index: the manifests it lists.
+    Index {
+        /// Child descriptors, in order.
+        manifests: Vec<Descriptor>,
+    },
+    /// An image: its config and layers.
+    Image {
+        /// The image config.
+        config: Descriptor,
+        /// The layers, in order.
+        layers: Vec<Descriptor>,
+    },
 }
 
-/// The config and layer digests of an image manifest body, config first. An
-/// index body, or a config or layer without a valid digest, is an error.
-fn blob_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a public manifest holding no credential"
-    )]
-    let parsed: ImageBody =
-        serde_json::from_slice(body).map_err(|e| format!("image manifest is not valid: {e}"))?;
-    Ok(std::iter::once(parsed.config)
-        .chain(parsed.layers)
-        .map(|b| b.digest)
-        .collect())
+impl ManifestBody {
+    /// Parse a body. Neither an index nor an image, a digest that is not one,
+    /// or an index listing nothing is an error.
+    fn parse(body: &[u8]) -> Result<Self, String> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a public manifest holding no credential"
+        )]
+        let parsed: Self = serde_json::from_slice(body)
+            .map_err(|e| format!("manifest is neither a valid index nor a valid image: {e}"))?;
+        match parsed {
+            Self::Index { manifests } if manifests.is_empty() => {
+                Err("index lists no manifests".to_owned())
+            }
+            parsed => Ok(parsed),
+        }
+    }
+
+    /// The config and layer digests of an image, config first. An index has
+    /// none of its own.
+    fn into_blobs(self) -> Result<Vec<Digest>, String> {
+        match self {
+            Self::Image { config, layers } => Ok(std::iter::once(config)
+                .chain(layers)
+                .map(|d| d.digest)
+                .collect()),
+            Self::Index { .. } => Err("is an index, not an image".to_owned()),
+        }
+    }
 }
 
-/// The child manifest digests of an index body, in order; empty for a single
-/// manifest.
-fn child_digests(body: &[u8]) -> Result<Vec<Digest>, String> {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a public manifest holding no credential"
-    )]
-    let parsed: ManifestBody =
-        serde_json::from_slice(body).map_err(|e| format!("manifest is not valid: {e}"))?;
-    Ok(parsed.manifests.into_iter().map(|c| c.digest).collect())
+/// The blobs of the child manifest `listed` by its index, read as `body`. The
+/// body must hash to `listed`, or the lock would record another image's blobs;
+/// and a child that is itself an index is refused.
+fn child_blobs(listed: &Digest, actual: &Digest, body: &[u8]) -> Result<Vec<Digest>, String> {
+    if actual != listed {
+        return Err(format!("body hashes to {actual}"));
+    }
+    ManifestBody::parse(body)?.into_blobs()
 }
+
+/// The manifest media types a source image can be stored as: OCI image,
+/// Docker v2 image, OCI index and Docker manifest list.
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
+     application/vnd.docker.distribution.manifest.v2+json,\
+     application/vnd.oci.image.index.v1+json,\
+     application/vnd.docker.distribution.manifest.list.v2+json";
 
 /// What the lock reads through [`Access`].
 impl Access<'_> {
+    /// Request a manifest, retrying what [`Access::send`] retries and renewing
+    /// an expired token once. Any other failing status is reported at once,
+    /// with the status.
+    async fn request_manifest(
+        &self,
+        method: Method,
+        repo: &Repository<'_>,
+        reference: &str,
+    ) -> Result<reqwest::Response, FetchError> {
+        let url = format!(
+            "https://{}/v2/{}/manifests/{reference}",
+            repo.host.api_host(),
+            repo.path
+        );
+        let response = self
+            .send(repo, Some(&format!("{repo}:{reference}")), |token| {
+                self.request(method.clone(), &url)
+                    .bearer_auth(token)
+                    .header("Accept", MANIFEST_ACCEPT)
+            })
+            .await
+            .map_err(|e| format!("manifest request {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response)
+        } else {
+            Err(FetchError {
+                status: Some(status),
+                reason: format!("manifest request returned {status}"),
+            })
+        }
+    }
+
     /// Resolve every ref with `fetch`. Returns what resolved and each ref that
     /// did not, so the caller decides what an incomplete answer means.
     async fn resolve<T>(
@@ -511,36 +586,33 @@ impl Access<'_> {
     }
 
     /// The digest, children and blobs of a tag, from a GET of its exact bytes
-    /// and of each child's, which must hash to the digest the index lists.
+    /// and of each child's.
     async fn fetch_entry(&self, repo: &Repository<'_>, tag: &str) -> Result<Entry, FetchError> {
-        let (digest, children, own_blobs) = self
+        let (digest, manifest) = self
             .get_manifest(repo, tag, |digest, body| {
-                let children = child_digests(body)?;
-                let blobs = if children.is_empty() {
-                    blob_digests(body)?
-                } else {
-                    Vec::new()
-                };
-                Ok((digest, children, blobs))
+                Ok((digest, ManifestBody::parse(body)?))
             })
             .await?;
-        let mut blobs = own_blobs;
-        for child in &children {
-            let listed = child.to_string();
-            let found = self
-                .get_manifest(repo, &listed, |actual, body| {
-                    if actual != *child {
-                        return Err(format!("body hashes to {actual}"));
-                    }
-                    blob_digests(body)
-                })
-                .await
-                .map_err(|e| FetchError {
-                    reason: format!("child {listed}: {}", e.reason),
-                    ..e
-                })?;
-            blobs.extend(found);
-        }
+        let (children, mut blobs) = match manifest {
+            ManifestBody::Index { manifests } => {
+                let children: Vec<Digest> = manifests.into_iter().map(|d| d.digest).collect();
+                let mut blobs = Vec::new();
+                for child in &children {
+                    let found = self
+                        .get_manifest(repo, &child.to_string(), |actual, body| {
+                            child_blobs(child, &actual, body)
+                        })
+                        .await
+                        .map_err(|e| FetchError {
+                            reason: format!("child {child}: {}", e.reason),
+                            ..e
+                        })?;
+                    blobs.extend(found);
+                }
+                (children, blobs)
+            }
+            image => (Vec::new(), image.into_blobs()?),
+        };
         blobs.sort_by_cached_key(ToString::to_string);
         blobs.dedup();
         Ok(Entry {
@@ -775,56 +847,123 @@ mod tests {
         }
     }
 
-    #[test]
-    fn child_digests_lists_an_index_in_order_and_is_empty_for_a_manifest() {
-        let index = format!(
-            r#"{{"manifests":[{{"digest":"sha256:{}"}},{{"digest":"sha256:{}"}}]}}"#,
-            "2".repeat(64),
-            "1".repeat(64)
-        );
-        assert_eq!(
-            child_digests(index.as_bytes()).unwrap(),
-            vec![d('2'), d('1')]
-        );
-        assert!(
-            child_digests(br#"{"layers":[]}"#).unwrap().is_empty(),
-            "a single manifest has no children"
-        );
-        assert!(child_digests(b"<html>").is_err());
+    /// A JSON array of `digests`, each as `{"digest": ...}`.
+    fn descriptors(digests: &[char]) -> String {
+        let listed: Vec<String> = digests
+            .iter()
+            .map(|c| format!(r#"{{"digest":"{}"}}"#, d(*c)))
+            .collect();
+        format!("[{}]", listed.join(","))
+    }
+
+    fn image_body(config: char, layers: &[char]) -> String {
+        format!(
+            r#"{{"config":{{"digest":"{}"}},"layers":{}}}"#,
+            d(config),
+            descriptors(layers)
+        )
+    }
+
+    fn index_body(children: &[char]) -> String {
+        format!(r#"{{"manifests":{}}}"#, descriptors(children))
     }
 
     #[test]
-    fn blob_digests_lists_config_then_layers_and_refuses_anything_else() {
-        let sha = |c: char| format!("sha256:{}", c.to_string().repeat(64));
-        let image = format!(
-            r#"{{"config":{{"digest":"{}"}},"layers":[{{"digest":"{}"}},{{"digest":"{}"}}]}}"#,
-            sha('c'),
-            sha('1'),
-            sha('2')
-        );
-        assert_eq!(
-            blob_digests(image.as_bytes()).unwrap(),
-            vec![d('c'), d('1'), d('2')]
-        );
-
-        let index = format!(r#"{{"manifests":[{{"digest":"{}"}}]}}"#, sha('a'));
-        let no_config = format!(r#"{{"layers":[{{"digest":"{}"}}]}}"#, sha('1'));
-        let no_layers = format!(r#"{{"config":{{"digest":"{}"}}}}"#, sha('c'));
-        let no_digest = format!(
-            r#"{{"config":{{}},"layers":[{{"digest":"{}"}}]}}"#,
-            sha('1')
-        );
-        let bad_digest = r#"{"config":{"digest":"sha256:xyz"},"layers":[]}"#;
-        for (name, body) in [
-            ("an index", index.as_str()),
-            ("no config", no_config.as_str()),
-            ("no layers", no_layers.as_str()),
-            ("a config with no digest", no_digest.as_str()),
-            ("a malformed digest", bad_digest),
-            ("not JSON", "<html>"),
-        ] {
-            assert!(blob_digests(body.as_bytes()).is_err(), "{name}");
+    fn a_manifest_body_is_an_index_or_an_image_and_nothing_else() {
+        // (name, body, the kind and digests it reads as; None for an error)
+        let no_config = format!(r#"{{"layers":{}}}"#, descriptors(&['1']));
+        let no_layers = format!(r#"{{"config":{{"digest":"{}"}}}}"#, d('c'));
+        let no_digest = format!(r#"{{"config":{{}},"layers":{}}}"#, descriptors(&['1']));
+        let cases = [
+            (
+                "an image lists its config first",
+                image_body('c', &['1', '2']),
+                Some(("image", vec![d('c'), d('1'), d('2')])),
+            ),
+            (
+                "an index lists its children in order",
+                index_body(&['2', '1']),
+                Some(("index", vec![d('2'), d('1')])),
+            ),
+            ("an index with no children", index_body(&[]), None),
+            (
+                "a body that is neither",
+                r#"{"layers":[]}"#.to_owned(),
+                None,
+            ),
+            ("an image with no config", no_config, None),
+            ("an image with no layers", no_layers, None),
+            ("a config with no digest", no_digest, None),
+            (
+                "a malformed digest",
+                r#"{"config":{"digest":"sha256:xyz"},"layers":[]}"#.to_owned(),
+                None,
+            ),
+            ("not JSON", "<html>".to_owned(), None),
+        ];
+        for (name, body, expected) in cases {
+            let got = ManifestBody::parse(body.as_bytes()).ok().map(|m| match m {
+                ManifestBody::Image { config, layers } => (
+                    "image",
+                    std::iter::once(config)
+                        .chain(layers)
+                        .map(|x| x.digest)
+                        .collect(),
+                ),
+                ManifestBody::Index { manifests } => {
+                    ("index", manifests.into_iter().map(|x| x.digest).collect())
+                }
+            });
+            assert_eq!(got, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_child_must_hash_to_its_listed_digest_and_be_an_image() {
+        // Catches: recording the blobs of a different image than the lock's
+        // digest names, or of an index nested under an index.
+        let image = image_body('c', &['1']);
+        let nested = index_body(&['a']);
+        let cases = [
+            (
+                "matches",
+                d('5'),
+                d('5'),
+                image.as_str(),
+                Some(vec![d('c'), d('1')]),
+            ),
+            (
+                "hashes to another digest",
+                d('5'),
+                d('6'),
+                image.as_str(),
+                None,
+            ),
+            ("is an index", d('5'), d('5'), nested.as_str(), None),
+            ("is not a manifest", d('5'), d('5'), "<html>", None),
+        ];
+        for (name, listed, actual, body, expected) in cases {
+            let got = child_blobs(&listed, &actual, body.as_bytes()).ok();
+            assert_eq!(got, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_lock_without_blobs_is_refused_with_the_command_that_writes_one() {
+        // Catches: a lock from before blobs were recorded failing with a bare
+        // parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corpus.lock.json");
+        let old = format!(
+            r#"{{"locked_at":"2026-10-30-120000","images":{{"s/a:1":{{"digest":"{}","children":[]}}}}}}"#,
+            d('1')
+        );
+        std::fs::write(&path, old).unwrap();
+        let error = Lock::load(&path).unwrap_err();
+        assert!(
+            error.contains("blobs") && error.contains("cargo xtask bench-lock"),
+            "{error}"
+        );
     }
 
     #[test]

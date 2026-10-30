@@ -1,6 +1,6 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
-//! normalization, the manifest `Accept` list, the OCI bearer-token flow and the
-//! retried manifest request.
+//! normalization, repository keys, and [`Access`], which sends requests with
+//! an OCI bearer token and retries what is transient.
 //!
 //! Independent of ocync's own registry client on purpose: the harness checks
 //! the tool under test, so a bug in that client must not also be in the check.
@@ -12,13 +12,6 @@ use std::time::Duration;
 use reqwest::{Method, StatusCode};
 
 use crate::bench::corpus::DockerHubAuth;
-
-/// The manifest media types a source image can be stored as: OCI image,
-/// Docker v2 image, OCI index and Docker manifest list.
-pub(crate) const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
-     application/vnd.docker.distribution.manifest.v2+json,\
-     application/vnd.oci.image.index.v1+json,\
-     application/vnd.docker.distribution.manifest.list.v2+json";
 
 /// API host Docker Hub serves its registry from.
 const DOCKER_HUB_API_HOST: &str = "registry-1.docker.io";
@@ -91,7 +84,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How long to wait before retry number `attempt` (from 0): the registry's
 /// `Retry-After` seconds when it sent them, else doubling from 2 s, never more
 /// than [`MAX_BACKOFF`].
-fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
+pub(crate) fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
     let secs = retry_after
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or_else(|| 2u64.saturating_pow(attempt.saturating_add(1)));
@@ -100,7 +93,7 @@ fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
 
 /// Whether a response status is worth another attempt: the registry is
 /// throttling (429) or failing (5xx), not refusing the request.
-fn transient(status: StatusCode) -> bool {
+pub(crate) fn transient(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
@@ -108,7 +101,7 @@ fn transient(status: StatusCode) -> bool {
 /// connection (always retried), a 429 and a 5xx, up to [`MAX_ATTEMPTS`] times. Any other
 /// response, whatever its status, is returned for the caller to judge. `what`
 /// names the request in the retry notice.
-pub(crate) async fn send_retrying(
+async fn send_retrying(
     what: &str,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, String> {
@@ -164,89 +157,18 @@ impl RepoKey {
     }
 }
 
-/// Bearer tokens by repository, so a repository with several tags is
-/// authorized once. Shared by reference, because blob tasks run together; no
-/// borrow is held across an exchange.
-#[derive(Default)]
-struct Tokens {
-    /// Latest exchange for each repository; a failure is kept so it is
-    /// reported for every tag and not retried at once.
-    by_repository: RefCell<HashMap<RepoKey, Result<String, String>>>,
-}
-
-impl Tokens {
-    /// The token for `repo`, exchanged for the first time it is asked, or when
-    /// the one held is `rejected`, which the registry refused. A token another
-    /// request already replaced is returned as it is.
-    async fn token(
-        &self,
-        client: &reqwest::Client,
-        repo: &Repository<'_>,
-        dockerhub_auth: Option<&DockerHubAuth>,
-        rejected: Option<&str>,
-    ) -> Result<String, String> {
-        let key = RepoKey::from(repo);
-        let held = self.by_repository.borrow().get(&key).cloned();
-        if let Some(held) =
-            held.filter(|held| rejected.is_none() || held.as_deref().ok() != rejected)
-        {
-            return held;
-        }
-        let exchanged = oci_token(client, repo, dockerhub_auth).await;
-        self.by_repository
-            .borrow_mut()
-            .insert(key, exchanged.clone());
-        exchanged
-    }
-
-    /// Send, with the token for `repo`, the request `build` makes. With a
-    /// `retrying` label a transient failure is retried by [`send_retrying`].
-    async fn send(
-        &self,
-        client: &reqwest::Client,
-        repo: &Repository<'_>,
-        dockerhub_auth: Option<&DockerHubAuth>,
-        retrying: Option<&str>,
-        build: impl Fn(&str) -> reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, String> {
-        send_renewing(
-            async || self.token(client, repo, dockerhub_auth, None).await,
-            async |old| self.token(client, repo, dockerhub_auth, Some(old)).await,
-            async |token| match retrying {
-                Some(what) => send_retrying(what, || build(token)).await,
-                None => build(token).send().await.map_err(|e| e.to_string()),
-            },
-        )
-        .await
-    }
-}
-
-/// Why one manifest request failed.
-#[derive(Clone)]
-pub(crate) struct FetchError {
-    /// The registry's answer, when it gave one.
-    pub(crate) status: Option<StatusCode>,
-    /// What went wrong.
-    pub(crate) reason: String,
-}
-
-impl From<String> for FetchError {
-    fn from(reason: String) -> Self {
-        Self {
-            status: None,
-            reason,
-        }
-    }
-}
-
-/// The client, token store and credentials manifest requests go through.
+/// The client, credentials and bearer tokens requests go through. Tokens are
+/// kept by repository, so a repository with several tags is authorized once.
+/// Shared by reference, because blob tasks run together; no borrow is held
+/// across an exchange.
 pub(crate) struct Access<'a> {
-    /// Client for every request.
+    /// Client for every request and token exchange.
     client: &'a reqwest::Client,
-    /// Bearer tokens, exchanged as each repository is first asked for.
-    tokens: Tokens,
     /// Docker Hub credentials for the token exchange, if any.
     auth: Option<&'a DockerHubAuth>,
+    /// Latest exchange for each repository; a failure is kept so it is
+    /// reported for every tag and not retried at once.
+    tokens: RefCell<HashMap<RepoKey, Result<String, String>>>,
 }
 
 impl<'a> Access<'a> {
@@ -254,9 +176,30 @@ impl<'a> Access<'a> {
     pub(crate) fn new(client: &'a reqwest::Client, auth: Option<&'a DockerHubAuth>) -> Self {
         Self {
             client,
-            tokens: Tokens::default(),
             auth,
+            tokens: RefCell::default(),
         }
+    }
+
+    /// A request on the shared client, for [`Self::send`] to authorize.
+    pub(crate) fn request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
+        self.client.request(method, url)
+    }
+
+    /// The token for `repo`, exchanged for the first time it is asked, or when
+    /// the one held is `rejected`, which the registry refused. A token another
+    /// request already replaced is returned as it is.
+    async fn token(&self, repo: &Repository<'_>, rejected: Option<&str>) -> Result<String, String> {
+        let key = RepoKey::from(repo);
+        let held = self.tokens.borrow().get(&key).cloned();
+        if let Some(held) =
+            held.filter(|held| rejected.is_none() || held.as_deref().ok() != rejected)
+        {
+            return held;
+        }
+        let exchanged = oci_token(self.client, repo, self.auth).await;
+        self.tokens.borrow_mut().insert(key, exchanged.clone());
+        exchanged
     }
 
     /// Send, with the token for `repo`, the request `build` makes. With a
@@ -267,43 +210,15 @@ impl<'a> Access<'a> {
         retrying: Option<&str>,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
-        self.tokens
-            .send(self.client, repo, self.auth, retrying, build)
-            .await
-    }
-
-    /// Request a manifest, retrying what [`send_retrying`] retries and
-    /// renewing an expired token once. Any other failing status is reported at
-    /// once, with the status.
-    pub(crate) async fn request_manifest(
-        &self,
-        method: Method,
-        repo: &Repository<'_>,
-        reference: &str,
-    ) -> Result<reqwest::Response, FetchError> {
-        let url = format!(
-            "https://{}/v2/{}/manifests/{reference}",
-            repo.host.api_host(),
-            repo.path
-        );
-        let response = self
-            .send(repo, Some(&format!("{repo}:{reference}")), |token| {
-                self.client
-                    .request(method.clone(), &url)
-                    .bearer_auth(token)
-                    .header("Accept", MANIFEST_ACCEPT)
-            })
-            .await
-            .map_err(|e| format!("manifest request {e}"))?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(response)
-        } else {
-            Err(FetchError {
-                status: Some(status),
-                reason: format!("manifest request returned {status}"),
-            })
-        }
+        send_renewing(
+            async || self.token(repo, None).await,
+            async |old| self.token(repo, Some(old)).await,
+            async |token| match retrying {
+                Some(what) => send_retrying(what, || build(token)).await,
+                None => build(token).send().await.map_err(|e| e.to_string()),
+            },
+        )
+        .await
     }
 }
 
@@ -328,7 +243,7 @@ async fn send_renewing<E>(
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
 /// request a bearer token from the auth realm. For Docker Hub, includes
 /// basic auth credentials if given. The error says which step failed.
-pub(crate) async fn oci_token(
+async fn oci_token(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
