@@ -1,200 +1,108 @@
 ---
 title: Benchmark design
-description: Layered benchmark plan covering protocol, throughput, and cross-tool comparison
+description: How ocync is measured against other sync tools so that every published number is accurate and reproducible
 order: 4
 ---
 
-> This document describes both current benchmark infrastructure (Layer 2 harness in `xtask/src/bench/`, bench-proxy, Terraform-managed EC2 instances) and planned enhancements (Layer 1 protocol tests, Layer 3 cross-tool comparison, `/proc/net/dev` measurement, `pidstat` capture). Planned items are marked inline.
-
-## Context
-
-The v1 benchmark was built to answer "is `ocync` faster than `dregsy`/`regsync` on real
-registries?" and acquired additional responsibilities along the way --
-visibility via HTTP proxy capture, competitor-config generation,
-optimization firing-rate checks, CI regression detection.
-
-Putting all of those on a single code path produced a benchmark that:
-
-- **Measured infrastructure more than tools.** mitmproxy's single-core
-  Python TLS capped measurable throughput at ~250 Mbps regardless of
-  instance size.
-- **Couldn't distinguish optimization firing rate from optimization
-  effectiveness.** "Did `ocync`'s cross-repo mount save bytes in this
-  run?" was not directly measurable. We only discovered that ECR
-  returns 202 to every mount attempt *after* the corpus was large
-  enough to force the path and the metric existed to count it.
-- **Papered over competitor-tool bugs.** `regsync`'s per-scope token
-  failures and `dregsy`'s exit-1-on-partial behavior both became
-  bench-suite configuration code rather than reported findings. This
-  made `ocync` look better than it should have because competitors were
-  silently partially-failing.
-- **Grew ad-hoc.** Scenarios, metrics, and corpus entries were added in
-  response to whatever question came up. There is no acceptance
-  criterion for what a scenario must establish before it's useful.
-
 ## Goal
 
-A benchmark that can be trusted, in the sense that anyone reading a
-number knows what it means, what it excludes, and how to reproduce it
--- and that keeps producing trustworthy numbers as `ocync` and the
-surrounding ecosystem evolve.
+Every published number says what it measured, what it excludes and how to reproduce it, and a difference between tools is published only when it is larger than the run-to-run noise.
 
-## Design
+The archive in `bench/results/ecr.json` shows why the noise comes first. regsync's code did not change across six cold syncs of the same corpus, yet its time ranged from 765 s to 1535 s, and dregsy's from 916 s to 1936 s. Most of that spread comes from the environment: public source registries, the time of day and the network. A single run per tool cannot tell a tool difference from that noise.
 
-Three separate things, formerly conflated, now strictly separated.
+## Two kinds of test
 
-### Layer 1: protocol tests
+### Protocol tests
 
-**Question it answers:** does the wire protocol actually do what we
-claim? For `ocync`: does each optimization take the designed fast path
-against the registry we target?
+**Question:** does each optimization take its fast path on the wire?
 
-**Where it lives:** alongside the existing integration tests in
-`crates/ocync-distribution/tests/`.
+They live with the integration tests in `crates/ocync-distribution/tests/`. The `registry2_*.rs` suites assert mounts, pushes and client fast paths against the reference `registry:2` image through testcontainers, in CI on every pull request. A registry behavior that `registry:2` cannot reproduce, such as ECR never fulfilling a mount, is recorded on that registry's page and pinned by an engine-level test of the adapted path.
 
-- `registry2_*.rs` suites run mount/client/push fast-path assertions
-  against the reference `registry:2` image via testcontainers. Cheap,
-  deterministic, runs in CI on every PR.
-- Registry-specific quirks that cannot be exercised against
-  `registry:2` (e.g. ECR's "never fulfills mount" behavior) are
-  captured as evidence in the per-registry documentation and pinned by engine-level
-  integration tests asserting the adapted code path.
+**Hard rule:** an optimization that claims to save bytes or requests ships with a protocol test that asserts its fast path was taken, such as a mount answered `201`. Without one, the optimization counts as unshipped.
 
-**Hard rule:** every `ocync` optimization that claims bytes/requests
-savings ships with a matching Layer 1 test that asserts the fast path
-was taken at the wire level, such as `mounts > 0 && status == 201` for
-cross-repo mount, `PATCH 202/201` counts for chunked upload, and `HEAD
-skipped` counts for cache hits. An optimization without a
-protocol test is considered unshipped; the PR is blocked.
+### Comparison benchmark
 
-**Output format:** standard Rust `#[test]` pass/fail. No aggregation,
-no dashboards. Either the protocol is correct or the build fails.
+**Question:** how does ocync compare with other sync tools on a realistic corpus, in time, bytes, requests and rate-limit responses?
 
-### Layer 2: throughput benchmark
+It lives in `xtask/src/bench/` and runs on one instance per cloud through `cargo xtask bench-remote`. All tools run on the same instance, taking turns. One instance per tool would multiply the cost by the number of tools. Taking turns in a fresh random order every round, and comparing tools within the same round, removes the bias of a shared machine.
 
-**Question it answers:** how fast is `ocync` in realistic conditions,
-and when it slows down, why?
+## Accuracy rules
 
-**Where it lives:** `xtask/src/bench/`.
+The harness enforces each rule. Where a rule is not built yet, the run's output says so.
 
-**Scope:** `ocync` only. No competitor tools. No MITM proxy. One
-scenario, one question, one headline number per run.
+### A fixed corpus
 
-**Measurement primitives:**
+> **Status: Planned.**
 
-- Wall clock: `std::time::Instant` around the `ocync` invocation.
-- Egress bytes (**planned**): diff of `/proc/net/dev` `ens5` tx_bytes before and
-  after the run. Captures actual network effort, immune to
-  implementation-level request counting.
-- CPU and memory (**planned**): `pidstat -u -r -p <ocync pid> 1` streamed to a file;
-  post-processed for p50/p95/max of each.
-- Per-image completion timestamps: parsed from `ocync`'s `--json` stdout.
-- API-level counts (request method histogram, HTTP status distribution,
-  bytes split): **not part of Layer 2**. Those belong in Layer 1
-  protocol tests or in ad-hoc capture runs.
+Every image in the corpus resolves to a manifest digest once and is recorded in a lock file beside the corpus. Before each round, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock. Today 29 of the corpus's 38 entries track `latest`, so two runs on different dates sync different content.
 
-**Scenarios** (designed to isolate one question each):
+### Content verified, not only tags
 
-- `cold`: fresh ECR target, first-time sync of a
-  representative corpus. Measures "how fast can `ocync` actually push
-  bytes?"
-- `warm`: re-sync of an already-synced corpus. Measures "how
-  cheap is the no-op path?"
-- `partial`: re-sync after ~5% of tags changed at source.
-  Measures "does `ocync` reliably skip unchanged blobs while pushing
-  changes?"
-- `scale`: cold throughput across corpus sizes (10, 25, 50, full).
-  Measures "does `ocync`'s throughput scale linearly with corpus size?"
+> **Status: Planned.** Today the check lists the target's tags and confirms each expected tag exists.
 
-**Rules:**
+After every tool's pass, every target tag must resolve to the same manifest digest as the locked source, and each index must hold the same child manifests. This holds every tool to ocync's own invariant that content is copied bit for bit. A tool that converts formats or drops platforms fails the run rather than being credited with a fast time.
 
-- **CDN pre-warm is mandatory.** Before the timed window, the harness
-  HEADs every source manifest and GETs every unique blob (following CDN
-  redirects) to equalize CDN edge cache state across all tools. Auth
-  token fetches, DNS, and TCP setup are also amortized during pre-warm.
-- **Iterations >= 3, default 5, median reported, p10/p90 published.**
-  Single-run variance hides real regressions.
-- **Results are versioned artifacts.** Output lands at
-  `bench-results/{git_sha}/{instance_type}/{corpus_sha}/{timestamp}/`.
-  Nothing is overwritten. Regression detection compares runs at the
-  same `(instance_type, corpus_sha)` coordinate.
-- **Failures are loud.** A scenario that can't complete (source
-  registry 403, ECR rate limit, partial tool failure) fails the run,
-  not the tool. The report says "incomplete" and explains why.
+### Repeated, interleaved rounds
 
-**Headline number per scenario:** one sentence. "`ocync` syncs 15 GB of
-images in X seconds (p50, N=5) on c6in.4xlarge, Docker Hub to
-us-east-2 ECR, from commit `<sha>`." If a scenario cannot be
-summarized in one sentence, it's measuring too many things and needs
-to be split.
+> **Status: Planned.** Today each tool runs once per scenario, in one shuffled order.
 
-### Layer 3: cross-tool comparison
+A run has at least 3 rounds, 5 by default. Each round runs every tool once, cold then warm, in a fresh random order. The order and seed are recorded.
 
-**Question it answers:** positioning. "For users considering `dregsy`
-or `regsync`, what tradeoff are they making?"
+- Each tool's metric is reported as its median, with the minimum and maximum.
+- A speed comparison is the median of the per-round ratios between two tools, with a 95% bootstrap confidence interval. Pairing within a round cancels drift that affects every tool in that round.
+- A difference whose interval includes 1 is reported as no measured difference.
 
-**Where it lives:** `bench/competitors/` (planned; directory does not exist yet), a separate directory with
-its own docs, harness, and runbook. Not part of `xtask bench`. Not
-part of CI. Runs are manually initiated.
+### Proxy overhead measured before it is trusted
 
-**Rules:**
+> **Status: Planned.**
 
-- **Explicit caveats.** Every output document leads with "`dregsy` and
-  `regsync` are Go/skopeo-based, have different auth architectures,
-  different concurrency defaults, different feature sets. Numbers are
-  directional, not authoritative."
-- **Only wall clock and egress bytes are compared.** Request counts
-  are not fairly comparable (skopeo subprocess boundary hides request
-  fan-out). Response bytes are not fairly comparable (mount success
-  reduces bytes asymmetrically).
-- **Separate EC2 instance per tool.** Eliminates NAT and endpoint
-  contention between tools.
-- **Competitor failures are reported, not compensated.** If `regsync`
-  needs `repoAuth: true` on cgr.dev, that's a `regsync` configuration
-  note in the report, not silent harness magic. If `dregsy` exits 1 on
-  partial success, the run is reported as partial. No more config
-  generation knowing every quirk.
+Every request goes through `bench-proxy`, which terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: each tool runs several times with and without the proxy, interleaved, and the per-tool overhead is published.
 
-### Cross-tool fairness for OCI 1.1 referrers
+- If every tool's overhead is within the run-to-run noise, wall clock is taken with the proxy in the same pass as the counts.
+- If not, wall clock is taken in a pass without the proxy, and counts in a separate pass with it.
 
-`ocync` syncs OCI 1.1 referrer artifacts (SBOM, SLSA attestations) by
-default. Comparable tools do not implement the referrers API. A naive
-"`ocync` 55.4 GB > comparable 55.3 GB" reading of the source-bytes
-column would infer `ocync` is less efficient when the truth is +117 MB
-of attestation content `ocync` correctly transferred.
+### Controlled and real-world sources
 
-To surface this honestly, the bench tracks `referrer_calls`
-(GET requests to `/v2/<repo>/referrers/...`) per tool and emits a
-footnote in `summary.md` and the docs `performance.md` snippet whenever
-any tool's count is non-zero. Comparable tools always show `0`;
-`ocync`'s count surfaces the feature gap so the bytes/GETs comparison is
-read with context.
+> **Status: Planned.** Today every run pulls from the public registries.
 
-## What this avoids
+- **Controlled.** The locked corpus is copied once into a registry the bench owns, in the instance's region, and synced from there into the target. The public internet is out of the path, so speed ratios measure the tools. This is where speed claims come from.
+- **Real-world.** The same corpus is pulled from its public sources. This is where rate-limit behavior, 429 counts and source request counts come from, since how a tool treats Docker Hub and the other public registries is part of what it claims.
 
-The wasted cycles in the original benchmark came from four questions
-being tangled into one number:
+Each published number names the source kind it came from.
 
-1. "Is `ocync` slow?" (Layer 2 question)
-2. "Is the proxy slow?" (Layer 2 infrastructure question)
-3. "Does ECR honor mount?" (Layer 1 question)
-4. "Is docker.io misconfigured?" (Layer 1 question)
+### Competitors at their best
 
-A byte count cannot answer those. A layered split maps each question
-to its answerable home. The rule "every optimization ships with a
-protocol test" means this kind of silent failure can't recur. If the
-mount optimization had shipped with a wire-level test asserting
-`mounts > 0 && status == 201`, CI would have failed on the original PR
-and the short-circuit would have shipped up front.
+> **Status: Planned.** Today regsync and dregsy run at their default concurrency.
 
-## What we do NOT do
+Before a published comparison, each tool's concurrency is swept once over a few values on the controlled source, and its fastest setting is used and recorded. A competitor's failure or quirk is reported in the results, not worked around silently in the generated configuration.
 
-- **Multi-tool parallel benchmarking on shared infrastructure.**
-  Contention masks signal.
-- **Time-series resource capture as default.** Adds scope for
-  diminishing return. Enable when we have a concrete question.
-- **"Ocync wins" framing in any published numbers.** Numbers are
-  directional, not endorsement. Positioning goes in marketing, not
-  in design docs.
-- **Performance regression as a PR-blocking check.** Too flaky at
-  the scale we operate. Post-merge notification only.
+### Full provenance
+
+Each run record carries the instance type, region and image ID, every tool's version and every relay's version (dregsy moves its bytes through skopeo). It also records the order and seed of every round.
+
+> **Status: Planned.** Published runs are taken only from a commit on `main`, recorded by its full hash, so a run can be rebuilt later. Most commits behind the April 2026 runs are gone from the repository's history.
+
+## Fairness steps already enforced
+
+These run before every tool pass and stay in place:
+
+- **CDN pre-warm** before the first tool: every source manifest and unique blob is fetched once, so the first tool does not meet a colder CDN than the last.
+- **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
+- **Clean the staging directory** and **delete and recreate the target repositories**, so a cold pass starts empty.
+- **A 10 s pause** between tools for process cleanup.
+
+`bench/CLAUDE.md` lists the operational details.
+
+## Referrers
+
+ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the compared tools do not. Its source bytes therefore include content the others never fetch: about 117 MB on the main corpus. The harness counts `referrers` requests per tool, and the summary and the performance page carry a footnote whenever a count is non-zero, so the byte columns are read with that difference in mind.
+
+## What a published claim looks like
+
+One sentence that names the comparison, the source kind, the statistic, the round count, the instance, the target and the commit. For example: "ocync finished a cold sync of the locked 55 GB corpus 3.4 times faster than regsync (median of 5 per-round ratios, 95% interval 3.1 to 3.7), controlled source, c6in.4xlarge, ECR us-east-2, commit `<hash>`."
+
+## What we do not do
+
+- **Run several tools at once on the same instance.** They would compete for the network and disk.
+- **Block a pull request on a performance regression.** Runs are too costly and noisy for a merge gate. A regression is reported after merge.
+- **Frame published numbers as wins.** They describe measured trade-offs under stated conditions.
