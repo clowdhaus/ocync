@@ -87,7 +87,9 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): every source manifest and unique blob is fetched once, so the first tool does not meet a colder CDN than the last.
+- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): unique blobs are fetched once, so the first tool does not meet a colder CDN than the last.
+
+  > **Status: Planned.** Today the pre-warm reads only each image's first tag, so the blobs of a second version (ten images in the corpus) are never warmed. On 30 October 2026 that left CDN misses of 174, 504 and 2 across the three tools.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.

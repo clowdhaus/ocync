@@ -9,10 +9,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -58,10 +56,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -107,10 +103,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -156,10 +150,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 6
@@ -205,10 +197,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -254,10 +244,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -303,10 +291,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -352,10 +338,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 3,
       "tags": 3
@@ -447,10 +431,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -542,10 +524,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-1",
-      "image_id": "unknown"
+      "region": "us-east-1"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -637,10 +617,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -806,10 +784,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -975,10 +951,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1144,10 +1118,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1237,10 +1209,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1330,10 +1300,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1426,10 +1394,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1519,10 +1485,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51
@@ -1713,10 +1677,8 @@
       "vcpus": 16,
       "memory_gib": 32.0,
       "network": "Up to 50 Gigabit",
-      "region": "us-east-2",
-      "image_id": "unknown"
+      "region": "us-east-2"
     },
-    "relays": {},
     "corpus": {
       "images": 39,
       "tags": 51

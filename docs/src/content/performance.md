@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync finishes a cold sync to ECR about 3 times faster than regsync and 4 times faster than dregsy, with fewer requests and cross-repo blob mounting.
+description: How ocync finishes a cold sync to ECR about 3 times faster than regsync and 4 times faster than dregsy, with fewer requests, about 10 GB fewer bytes than regsync, and cross-repo blob mounting.
 order: 6
 ---
 
@@ -28,9 +28,19 @@ Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 > Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
 <!-- BENCH:END -->
 
-The table is one run per tool on 30 October 2026 (ocync 0.8.2). Tools run in a random order, and in this run ocync went first and met a colder CDN than the tools after it: 174 CDN misses, against regsync's 2. The pre-warm meant to equalize that currently warms only each image's first tag, and the [benchmark design](/design/benchmark) covers the fix and the repeated rounds that will replace single runs.
+The table is one run per tool on 30 October 2026 (ocync 0.8.2), in the order ocync, dregsy, regsync. CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync, so the tools did not start from equally warm caches. The pre-warm meant to equalize them warms only each image's first tag today, and ten images in the corpus sync a second version; the [benchmark design](/design/benchmark) marks the fix as planned, along with repeated rounds that replace single runs.
 
-Two comparison runs exist since the fix that ended ocync's 429s (26 April 2026), on corpora of 51 and 55 tags. In them ocync was 3.4 and 3.0 times faster than regsync and 4.0 and 4.3 times faster than dregsy, and made 23% and 27% fewer requests than regsync and 35% and 39% fewer than dregsy. No tool drew a 429 in either run. ocync ran last in the April run and first in the October one, which is enough on its own to move its time. Earlier runs measured code from before the 429 fix and are not used here. Only ECR has been measured as a target.
+Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged (#66), on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
+
+| | 26 April | 30 October |
+|---|---:|---:|
+| ocync speed vs regsync, cold | 3.39x | 2.99x |
+| ocync speed vs dregsy, cold | 3.99x | 4.33x |
+| Requests: ocync / regsync / dregsy | 7373 / 9532 / 11301 | 6995 / 9588 / 11541 |
+| Response bytes: ocync / regsync / dregsy | 55.4 / 65.3 / 55.3 GB | 55.0 / 65.1 / 54.9 GB |
+| 429s, any tool | 0 | 0 |
+
+ocync moved about 10 GB less than regsync and slightly more than dregsy, whose total leaves out the referrer artifacts only ocync syncs. Only ECR has been measured as a target.
 
 ## How tools compare
 
@@ -93,7 +103,7 @@ Discovery and execution overlap. While images are being transferred, `ocync` is 
 
 ### Global blob deduplication
 
-Container images share layers heavily. A sync run touching 39 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
+Container images share layers heavily. A sync run touching 40 images may reference only a fraction as many unique blobs. `ocync` tracks every blob globally and transfers each unique blob exactly once.
 
 ### Cross-repo blob mounting
 
