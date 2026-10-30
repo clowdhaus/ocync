@@ -205,7 +205,7 @@ fn validate_ipv6(
 /// `https` (or `http` only when the registry itself is `http`).
 ///
 /// **Layer 2 -- IP denylist:** blocks link-local (169.254.0.0/16), Alibaba
-/// metadata (100.100.100.200), unspecified (0.0.0.0 / [::]), link-local
+/// metadata (100.100.100.200), unspecified (`0.0.0.0` / `[::]`), link-local
 /// IPv6 (`fe80::/10`), AWS IPv6 IMDS (`fd00:ec2::254`), `localhost`, and
 /// loopback unless the registry is also loopback. IPv4-mapped,
 /// IPv4-translated (RFC 6145), and NAT64 (RFC 6052) addresses are
