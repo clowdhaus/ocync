@@ -614,13 +614,21 @@ pub(crate) fn resolve_cache_ttl(config: &Config) -> Duration {
         .map_or(DEFAULT_CACHE_TTL, CacheTtl::get)
 }
 
+/// Whether this run's mappings can reuse blobs staged on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingNeed {
+    /// Several targets or images may share a blob.
+    Needed,
+    /// Every blob goes to one place, so staging would only add disk I/O.
+    NotNeeded,
+}
+
 /// Disk staging rooted at `dir`, with stale blobs evicted down to `limit`.
 /// A disabled limit turns staging off, as the config documents, after
-/// removing what earlier runs staged there, even when this run has no use
-/// for staging (`needs_staging` false). Any other limit leaves the
-/// directory alone when staging is not needed.
-fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, needs_staging: bool) -> BlobStage {
-    if !needs_staging && limit != Some(StagingLimit::Disabled) {
+/// removing what earlier runs staged there, whether or not this run needs
+/// staging. Any other limit leaves the directory alone when it is not needed.
+fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) -> BlobStage {
+    if need == StagingNeed::NotNeeded && limit != Some(StagingLimit::Disabled) {
         return BlobStage::disabled();
     }
     let stage = BlobStage::new(dir);
@@ -628,19 +636,21 @@ fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, needs_staging: bool) 
         tracing::warn!(error = %e, "failed to clean staging tmp files");
     }
     // Evict stale blobs from previous runs before starting new work.
-    let keep_bytes = match limit {
-        None => return stage,
-        Some(StagingLimit::Disabled) => 0,
-        Some(StagingLimit::Bytes(bytes)) => bytes.get(),
+    let evict = |keep_bytes: u64| {
+        if let Err(e) = stage.evict(keep_bytes) {
+            tracing::warn!(error = %e, "failed to evict staged blobs");
+        }
     };
-    if let Err(e) = stage.evict(keep_bytes) {
-        tracing::warn!(error = %e, "failed to evict staged blobs");
-    }
-    // Only `Disabled` keeps no bytes: `Bytes` is non-zero.
-    if keep_bytes == 0 {
-        BlobStage::disabled()
-    } else {
-        stage
+    match limit {
+        None => stage,
+        Some(StagingLimit::Bytes(bytes)) => {
+            evict(bytes.get());
+            stage
+        }
+        Some(StagingLimit::Disabled) => {
+            evict(0);
+            BlobStage::disabled()
+        }
     }
 }
 
@@ -733,11 +743,15 @@ pub(crate) async fn run(
     // disk round-trip per blob for zero benefit. Tighter detection would
     // require manifest data (unavailable pre-discovery). The overhead is
     // small (local I/O) relative to the network savings when blobs overlap.
-    let needs_staging = mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1;
+    let need = if mappings.iter().any(|m| m.targets.len() > 1) || mappings.len() > 1 {
+        StagingNeed::Needed
+    } else {
+        StagingNeed::NotNeeded
+    };
     let staging = open_staging(
         cache_dir.join("blobs"),
         config.global.as_ref().and_then(|g| g.staging_size_limit),
-        needs_staging,
+        need,
     );
 
     let max_concurrent = config
@@ -1967,6 +1981,11 @@ fn write_output(
 mod tests {
     use super::*;
 
+    /// A filter's semver range as written, for comparing against a literal.
+    fn semver_text(filter: &FilterConfig) -> Option<String> {
+        filter.semver.as_ref().map(ToString::to_string)
+    }
+
     /// A parsed version range, for filters built in the tests below.
     fn range(text: &str) -> ocync_sync::Range {
         ocync_sync::Range::parse(text).unwrap()
@@ -1991,39 +2010,49 @@ mod tests {
             (
                 "disabled, staging needed",
                 Some(StagingLimit::Disabled),
-                true,
+                StagingNeed::Needed,
                 (false, false),
             ),
             (
                 "disabled, staging not needed",
                 Some(StagingLimit::Disabled),
-                false,
+                StagingNeed::NotNeeded,
                 (false, false),
             ),
             (
                 "a limit above the staged size, needed",
                 above,
-                true,
+                StagingNeed::Needed,
                 (true, true),
             ),
-            ("a limit of one byte, needed", one_byte, true, (true, false)),
+            (
+                "a limit of one byte, needed",
+                one_byte,
+                StagingNeed::Needed,
+                (true, false),
+            ),
             (
                 "a limit of one byte, not needed",
                 one_byte,
-                false,
+                StagingNeed::NotNeeded,
                 (false, true),
             ),
-            ("no limit, needed", None, true, (true, true)),
-            ("no limit, not needed", None, false, (false, true)),
+            ("no limit, needed", None, StagingNeed::Needed, (true, true)),
+            (
+                "no limit, not needed",
+                None,
+                StagingNeed::NotNeeded,
+                (false, true),
+            ),
         ];
-        for (name, limit, needs_staging, want) in cases {
+        for (name, limit, need, want) in cases {
             let dir = tempfile::tempdir().unwrap();
             let earlier = BlobStage::new(dir.path().to_path_buf());
             let mut writer = earlier.begin_write(&digest).unwrap();
             writer.write_chunk(b"staged by an earlier run").unwrap();
             writer.finish().unwrap();
 
-            let stage = open_staging(dir.path().to_path_buf(), limit, needs_staging);
+            let stage = open_staging(dir.path().to_path_buf(), limit, need);
             let got = (stage.is_enabled(), earlier.exists(&digest));
             assert_eq!(got, want, "{name}");
         }
@@ -2069,10 +2098,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_filter(Some(&mapping), Some(&defaults));
-        assert_eq!(
-            filter.semver.as_ref().map(ToString::to_string).as_deref(),
-            Some(">=1.0")
-        );
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0"));
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
         assert!(filter.exclude.is_empty(), "mapping had no exclude");
     }
@@ -2105,10 +2131,7 @@ mod tests {
             ..Default::default()
         };
         let filter = build_filter(None, Some(&defaults));
-        assert_eq!(
-            filter.semver.as_ref().map(ToString::to_string).as_deref(),
-            Some(">=2.0")
-        );
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=2.0"));
         assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
         assert!(filter.exclude.is_empty());
     }
@@ -2161,10 +2184,7 @@ mod tests {
         let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
-        assert_eq!(
-            filter.semver.as_ref().map(ToString::to_string).as_deref(),
-            Some(">=1.0.0")
-        );
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0.0"));
         assert_eq!(filter.exclude, vec!["*-alpine"]);
         assert_eq!(filter.sort, Some(SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
@@ -2244,14 +2264,7 @@ latest: 5
         let inherited = build_filter(Some(&empty_mapping), Some(&defaults));
         assert_eq!(inherited.include, vec!["latest"]);
         assert_eq!(inherited.glob, vec!["v*"]);
-        assert_eq!(
-            inherited
-                .semver
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some(">=1.0")
-        );
+        assert_eq!(semver_text(&inherited).as_deref(), Some(">=1.0"));
         assert_eq!(inherited.sort, Some(SortOrder::Semver));
         assert_eq!(inherited.latest, Some(10));
         assert_eq!(inherited.min_tags, Some(2));
@@ -2274,14 +2287,7 @@ latest: 5
         let overridden = build_filter(Some(&override_mapping), Some(&defaults));
         assert_eq!(overridden.include, vec!["override"]);
         assert_eq!(overridden.glob, vec!["override*"]);
-        assert_eq!(
-            overridden
-                .semver
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some(">=2.0")
-        );
+        assert_eq!(semver_text(&overridden).as_deref(), Some(">=2.0"));
         assert_eq!(overridden.sort, Some(SortOrder::Alpha));
         assert_eq!(overridden.latest, Some(3));
         assert_eq!(overridden.min_tags, Some(1));
@@ -2474,10 +2480,7 @@ exclude: ["*-slim"]
         // mapping.exclude is the hard tier, separate from defaults.
         assert_eq!(filter.exclude, vec!["*-slim"]);
         // mapping fields override; unset fields inherit from defaults.
-        assert_eq!(
-            filter.semver.as_ref().map(ToString::to_string).as_deref(),
-            Some(">=1.0")
-        );
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=1.0"));
         assert_eq!(filter.sort, Some(ocync_sync::filter::SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
 
@@ -2513,10 +2516,7 @@ include: ["*-dev"]
         // in the soft tier; semver/sort/latest inherit from defaults.
         assert_eq!(filter.include, vec!["*-dev"]);
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
-        assert_eq!(
-            filter.semver.as_ref().map(ToString::to_string).as_deref(),
-            Some(">=8.0.0, <9.0.0")
-        );
+        assert_eq!(semver_text(&filter).as_deref(), Some(">=8.0.0, <9.0.0"));
         assert_eq!(filter.latest, Some(10));
 
         let tags = vec![

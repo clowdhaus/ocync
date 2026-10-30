@@ -703,19 +703,21 @@ impl CacheTtl {
     }
 }
 
+/// TTL suffixes and their seconds, largest first, so serializing picks the
+/// largest whole unit.
+const TTL_UNITS: [(char, u64); 4] = [('d', 86_400), ('h', 3_600), ('m', 60), ('s', 1)];
+
 impl TryFrom<String> for CacheTtl {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, String> {
         let invalid =
             || format!("cache_ttl '{text}' is not a valid duration (e.g. \"12h\", \"30m\", \"0\")");
-        let (digits, seconds_per_unit) = match text.chars().last() {
-            Some('s') => (&text[..text.len() - 1], 1u64),
-            Some('m') => (&text[..text.len() - 1], 60),
-            Some('h') => (&text[..text.len() - 1], 3600),
-            Some('d') => (&text[..text.len() - 1], 86400),
-            _ => (text.as_str(), 1),
-        };
+        // A bare integer is seconds.
+        let (digits, seconds_per_unit) = TTL_UNITS
+            .into_iter()
+            .find_map(|(unit, secs)| text.strip_suffix(unit).map(|digits| (digits, secs)))
+            .unwrap_or((text.as_str(), 1));
         scaled(digits, seconds_per_unit)
             .map(|secs| Self(Duration::from_secs(secs)))
             .ok_or_else(invalid)
@@ -730,12 +732,13 @@ impl From<CacheTtl> for String {
         if secs == 0 {
             return "0".to_owned();
         }
-        [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
+        // `s` is last, so every non-zero TTL finds a unit.
+        TTL_UNITS
             .into_iter()
-            .find(|(per_unit, _)| secs.is_multiple_of(*per_unit))
+            .find(|(_, per_unit)| secs.is_multiple_of(*per_unit))
             .map_or_else(
                 || format!("{secs}s"),
-                |(per_unit, unit)| format!("{}{unit}", secs / per_unit),
+                |(unit, per_unit)| format!("{}{unit}", secs / per_unit),
             )
     }
 }
@@ -1823,6 +1826,11 @@ mappings:
             let ttl = CacheTtl::try_from(text.to_string()).unwrap();
             assert_eq!(ttl.get(), Duration::from_secs(secs), "{text}");
             assert_eq!(String::from(ttl), serialized, "{text}");
+            assert_eq!(
+                CacheTtl::try_from(serialized.to_string()).unwrap(),
+                ttl,
+                "{text}: the serialized form reads back"
+            );
         }
     }
 
