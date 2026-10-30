@@ -462,11 +462,11 @@ impl Error {
     }
 }
 
-/// Send the request `build` makes for `call`, on the client its route
-/// takes, and read its successful answer. A transient failure sends this
-/// request again on the crate's schedule, and only this one, so a failure at the end of a chain repeats none of the calls before
-/// it. The prepare phase reaches these calls before the engine's retry
-/// exists, which is why they retry themselves.
+/// Send the request `build` makes for `call` on its route's client, and
+/// read its successful answer. A transient failure resends this request
+/// alone, so a failure late in a chain repeats none of the calls before
+/// it. These calls retry themselves because the prepare phase reaches them
+/// before the engine's retry exists.
 async fn send(
     clients: &Clients,
     call: Call,

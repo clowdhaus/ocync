@@ -68,7 +68,6 @@ pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
         let attrs_end = after_url.find('<').unwrap_or(after_url.len());
         let attrs = &after_url[..attrs_end];
 
-        // Check if the attributes contain rel="next".
         if attrs.contains("rel=\"next\"") {
             return Some(url.to_owned());
         }
@@ -79,17 +78,12 @@ pub(crate) fn parse_next_link(link_header: &str) -> Option<String> {
 }
 
 impl RegistryClient {
-    /// List all tags in a repository, automatically following pagination.
-    ///
-    /// Returns a complete list of tags by following `Link: rel="next"` headers.
+    /// List all tags in a repository, following `Link: rel="next"` pages.
     pub async fn list_tags(&self, repository: &RepositoryName) -> Result<Vec<String>, Error> {
         let mut all_tags = Vec::new();
         let mut path = "tags/list".to_owned();
         let mut page_count: usize = 0;
-        // One budget for the whole walk. Per-page retries would bound the
-        // worst case only nominally: a listing may run to MAX_TAG_PAGES, and
-        // four retries on each of those is hours of backing off at a registry
-        // that has stopped serving the listing.
+        // One budget for the whole walk; see MAX_LISTING_RETRIES.
         let retry_budget = Cell::new(MAX_LISTING_RETRIES);
 
         loop {
@@ -112,7 +106,6 @@ impl RegistryClient {
                         .get(repository, &path, None, RegistryAction::TagList)
                         .await?;
 
-                    // Check for the Link header before consuming the body.
                     let next_url = resp
                         .headers()
                         .get("link")
@@ -128,17 +121,12 @@ impl RegistryClient {
 
             match next_url {
                 Some(url) => {
-                    // The Link header may be an absolute URL or a relative path.
-                    // We need to extract just the path+query portion for build_url
-                    // since the client's get() method builds a full URL.
-                    //
-                    // For relative URLs like `/v2/repo/tags/list?n=100&last=tag`,
-                    // strip the `/v2/{repository}/` prefix.
+                    // `get` builds the URL from the path after `/v2/{repository}/`,
+                    // and the Link may be absolute or relative.
                     let prefix = format!("/v2/{repository}/");
                     if let Some(stripped) = url.strip_prefix(&prefix) {
                         path = stripped.to_owned();
                     } else if url.starts_with("http://") || url.starts_with("https://") {
-                        // Absolute URL - extract path+query after the /v2/{repo}/ prefix.
                         if let Ok(parsed) = url::Url::parse(&url) {
                             let full_path = parsed.path();
                             if let Some(stripped) = full_path.strip_prefix(&prefix) {

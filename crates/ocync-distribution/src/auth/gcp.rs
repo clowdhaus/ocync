@@ -1,7 +1,7 @@
 //! Google Artifact Registry / Container Registry authentication provider.
 //!
 //! Obtains `OAuth2` access tokens from Application Default Credentials,
-//! resolved in [`crate::google`], then performs standard OCI Bearer token
+//! resolved in `crate::google`, then performs standard OCI Bearer token
 //! exchange using `oauth2accesstoken` as the username. This is the Rust
 //! equivalent of:
 //!
@@ -9,10 +9,6 @@
 //! gcloud auth print-access-token \
 //!   | docker login -u oauth2accesstoken --password-stdin us-docker.pkg.dev
 //! ```
-//!
-//! ADC resolves credentials in order: `GOOGLE_APPLICATION_CREDENTIALS` env
-//! var, `~/.config/gcloud/application_default_credentials.json`, GCE/GKE
-//! metadata server. GKE Workload Identity is transparent.
 
 use std::fmt;
 use std::future::Future;
@@ -30,16 +26,11 @@ use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
 use crate::google::{self, AccessToken, Expiry};
 
-/// Username for GCP `OAuth2` token exchange.
-///
-/// GAR and GCR accept `oauth2accesstoken` as the username in HTTP Basic
-/// auth, with the `OAuth2` access token as the password.
+/// The HTTP Basic username GAR and GCR take with an `OAuth2` access token as
+/// the password.
 const GCP_USERNAME: &str = "oauth2accesstoken";
 
-/// Abstraction over GCP token acquisition for testability.
-///
-/// The real implementation resolves Application Default Credentials. Tests
-/// inject a mock that returns canned tokens without hitting GCP.
+/// GCP token acquisition, injectable for tests.
 trait GcpTokenSource: Send + Sync + fmt::Debug {
     /// Obtain an `OAuth2` access token and its expiry.
     fn access_token(
@@ -205,29 +196,19 @@ impl GcpTokenSource for AdcTokenSource {
 
 /// Google Artifact Registry / Container Registry authentication provider.
 ///
-/// Obtains GCP `OAuth2` access tokens via Application Default Credentials,
-/// then uses them as HTTP Basic credentials (`oauth2accesstoken:<token>`)
-/// in the standard OCI Bearer token exchange flow.
-///
-/// The Google token is kept in a [`CredentialCache`] the run's GAR and GCR
-/// providers share, and refreshed before it expires, supporting
-/// long-running processes (watch mode).
-///
-/// Bearer tokens are coalesced per scope via [`TokenCache`]: concurrent
-/// fetches for the same scope produce one token exchange while distinct
+/// The Google token sits in a `CredentialCache` the run's GAR and GCR
+/// providers share, refreshed before it expires so watch mode keeps
+/// running. Bearer tokens are coalesced per scope in a `TokenCache`:
+/// concurrent fetches for one scope make one exchange, while distinct
 /// scopes run in parallel.
 pub struct GcpAuth {
-    /// The registry base URL.
     base_url: String,
-    /// Registry hostname for error context.
+    /// For error context.
     hostname: String,
-    /// HTTP client for OCI token exchange.
     http: reqwest::Client,
-    /// The Google token, shared by the run's GAR and GCR providers.
+    /// Shared by the run's GAR and GCR providers.
     cached_token: Arc<CachedGoogleToken>,
-    /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
-    /// What the token endpoint's refusals of the Google token come to.
     recovery: Recovery<google::Secret>,
 }
 
@@ -240,14 +221,13 @@ impl fmt::Debug for GcpAuth {
 }
 
 impl GcpAuth {
-    /// Create a new GCP auth provider using Application Default Credentials.
+    /// Create a GCP auth provider using Application Default Credentials.
+    /// `registry` is the base URL the registry's client uses.
     ///
     /// The run's credentials are read and parsed on the first call, which
     /// for an external account with an AWS source may also ask the EC2
     /// instance metadata service for the region, so a bad credentials file
-    /// fails here. The token is fetched on the first `get_token` call and
-    /// refreshed when approaching expiry. `registry` is the base URL the
-    /// registry's client uses.
+    /// fails here. The token is fetched on the first `get_token` call.
     pub async fn new(
         registry: &url::Url,
         http: reqwest::Client,
@@ -296,7 +276,7 @@ impl GcpAuth {
         }
     }
 
-    /// Create a GCP auth provider with an injected token source (test helper).
+    /// Create a GCP auth provider with an injected token source.
     #[cfg(test)]
     fn with_api(
         base_url: impl Into<String>,

@@ -189,18 +189,12 @@ impl Platform {
     }
 }
 
-/// A parsed platform filter for matching against [`Platform`] values.
-///
-/// Constructed from strings like `"linux/amd64"` or `"linux/arm64/v8"` via
-/// [`FromStr`]. Parsing validates the format upfront so matching is a simple
-/// field comparison with no runtime splitting.
+/// A platform filter such as `linux/amd64` or `linux/arm64/v8`, for matching
+/// against [`Platform`] values.
 #[derive(Debug, Clone)]
 pub struct PlatformFilter {
-    /// Operating system (e.g. `linux`, `windows`).
     os: String,
-    /// CPU architecture (e.g. `amd64`, `arm64`).
     arch: String,
-    /// Optional CPU variant (e.g. `v8`).
     variant: Option<String>,
 }
 
@@ -254,18 +248,13 @@ impl fmt::Display for PlatformFilter {
 
 /// An OCI repository name (e.g. `library/nginx`, `mirror/nginx`).
 ///
-/// Wraps a raw string to distinguish repository names from tag names,
-/// registry hostnames, and other string-typed values. Implements
-/// [`Deref<Target=str>`] for transparent borrowing in functions that
-/// accept `&str`.
+/// Distinguishes repository names from tags, hostnames and other strings.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepositoryName(String);
 
 impl RepositoryName {
-    /// Create a new repository name after validating characters.
-    ///
-    /// Repository names must be non-empty and contain only `[a-zA-Z0-9._/-]`.
-    /// This matches the validation in [`Reference::from_str`](crate::Reference).
+    /// A repository name: non-empty and only `[a-zA-Z0-9._/-]`, as
+    /// [`Reference`](crate::Reference) parsing accepts.
     pub fn new(name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
         if name.is_empty() {
@@ -439,21 +428,6 @@ impl ManifestKind {
             _ => Err(Error::UnsupportedMediaType {
                 media_type: media_type.to_string(),
             }),
-        }
-    }
-
-    /// Return the digests of all content referenced by this manifest.
-    ///
-    /// For an image manifest this includes the config and all layers.
-    /// For an index this includes the digests of the child manifests.
-    pub fn referenced_digests(&self) -> Vec<&Digest> {
-        match self {
-            Self::Image(m) => {
-                let mut digests = vec![&m.config.digest];
-                digests.extend(m.layers.iter().map(|l| &l.digest));
-                digests
-            }
-            Self::Index(m) => m.manifests.iter().map(|d| &d.digest).collect(),
         }
     }
 }
@@ -643,42 +617,6 @@ mod tests {
         let other = MediaType::Other("text/plain".into());
         let err = ManifestKind::from_json(&other, &image).unwrap_err();
         assert!(matches!(err, Error::UnsupportedMediaType { .. }), "{err:?}");
-    }
-
-    #[test]
-    fn referenced_digests_image() {
-        let json = serde_json::json!({
-            "schemaVersion": 2,
-            "config": test_descriptor(),
-            "layers": [test_layer_descriptor()]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciManifest, &bytes).unwrap();
-        let digests = m.referenced_digests();
-        assert_eq!(digests.len(), 2); // config + 1 layer
-    }
-
-    #[test]
-    fn referenced_digests_index() {
-        let json = serde_json::json!({
-            "schemaVersion": 2,
-            "manifests": [
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": TEST_DIGEST,
-                    "size": 1000
-                },
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": TEST_DIGEST,
-                    "size": 2000
-                }
-            ]
-        });
-        let bytes = serde_json::to_vec(&json).unwrap();
-        let m = ManifestKind::from_json(&MediaType::OciIndex, &bytes).unwrap();
-        let digests = m.referenced_digests();
-        assert_eq!(digests.len(), 2);
     }
 
     // - Platform::matches tests --

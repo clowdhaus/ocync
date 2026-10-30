@@ -4,9 +4,9 @@
 //! retries the ones it drives. The prepare phase has no such layer above it:
 //! it runs before the engine exists, so a transient failure there fails a
 //! whole mapping or image. The operations that run there retry themselves,
-//! through [`retrying`], and share one schedule so they cannot drift apart.
+//! through `retrying`, and share one schedule so they cannot drift apart.
 //! Each passes the predicate for its own errors, built on
-//! [`is_transient_transport`]. The AWS API calls run the same loop under the AWS
+//! `is_transient_transport`. The AWS API calls run the same loop under the AWS
 //! SDK's retry policy instead (see `crate::aws`).
 
 use std::cell::Cell;
@@ -23,11 +23,9 @@ pub const MAX_TRANSIENT_RETRIES: u32 = 4;
 
 /// Total retries allowed across one multi-page tag listing.
 ///
-/// [`MAX_TRANSIENT_RETRIES`] still caps any single page, which keeps that
-/// page's backoff ladder short. This is the ceiling on the walk as a whole:
-/// a long listing may legitimately meet a throttle on several different
-/// pages, but four retries on each of up to `MAX_TAG_PAGES` pages is a bound
-/// only on paper.
+/// [`MAX_TRANSIENT_RETRIES`] still caps each page. A per-page cap alone over
+/// up to `MAX_TAG_PAGES` pages would permit hours of backing off at a
+/// registry that has stopped serving the listing.
 pub const MAX_LISTING_RETRIES: u32 = 32;
 
 /// Delay before the first retry.
@@ -38,19 +36,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Whether a transport-level failure is worth re-sending.
 ///
-/// # Predicate set
+/// `is_request()` covers dispatch, including connect failures and timeouts,
+/// which reqwest wraps as `Kind::Request`. `is_body()` and `is_decode()`
+/// cover the response body: reqwest reports a body cut short as a decode
+/// failure. A status error means the registry answered, so it is judged by
+/// status instead.
 ///
-/// `is_request()` covers errors raised during request dispatch, which on the
-/// async hyper path includes connect failures and timeouts: reqwest wraps both
-/// as `Kind::Request`. `is_body()` and `is_decode()` cover the response-body
-/// phase, which is not classified as `Kind::Request`: reqwest reports a body
-/// cut short while read as a decode failure. A status error means the
-/// registry answered, so whether to re-send it is the status arm of
-/// [`is_transient`] rather than this.
-///
-/// This is the single definition of the transient-transport surface for the
-/// workspace. `ocync_sync::retry::should_retry_transport` delegates here
-/// rather than repeating the predicate, because two copies drift.
+/// The single definition for the workspace;
+/// `ocync_sync::retry::should_retry_transport` delegates here.
 pub fn is_transient_transport(error: &reqwest::Error) -> bool {
     error.is_request() || error.is_body() || error.is_decode()
 }
@@ -104,13 +97,8 @@ pub(crate) trait Policy<E> {
 
 /// The crate's policy: an [`is_transient`] failure is sent again on the jittered
 /// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call, and each retry
-/// is drawn from the budget.
-///
-/// The budget may be shared across calls, which is the bound that matters for
-/// an operation made of many of them. A tag listing may walk thousands of
-/// pages, and four retries on each of them is a bound only on paper: it
-/// permits hours of backing off against a registry that is plainly refusing to
-/// serve the listing.
+/// is drawn from the budget, which may be shared across the calls of one
+/// operation (see [`MAX_LISTING_RETRIES`]).
 pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
 
 impl Policy<Error> for Budgeted<'_> {
@@ -174,25 +162,19 @@ where
 /// Send `request`, re-sending it while the answer looks transient: a
 /// transport failure or an [`is_transient_status`] answer.
 ///
-/// Returns the **final response**, including a throttled or failing one,
-/// rather than turning a 429 or 5xx into an error. That distinction is
-/// load-bearing for the auth paths: their callers collapse any non-success
-/// into
+/// Returns the final response, a throttled or failing one included, rather
+/// than an error. The auth callers collapse any non-success into
 /// `Error::RegistryPing`, `Error::TokenEndpoint` or `Error::CloudCredentials`,
-/// none of which carries a `status_code()`, and the engine's `with_retry` therefore
-/// cannot classify it as retryable. Surfacing a 429 as a typed error instead
-/// would hand the engine a retryable auth failure and multiply this retry by
-/// the engine's own, aiming 4x the requests at a registry that is already
-/// asking for less.
+/// none of which the engine's `with_retry` retries. A typed 429 would
+/// multiply this retry by the engine's own, aiming 4x the requests at a
+/// registry already asking for less.
 ///
 /// `Err` is only for a transport failure that outlived its attempts.
 pub(crate) async fn send_retrying(
     request: reqwest::RequestBuilder,
     what: &str,
 ) -> Result<reqwest::Response, Error> {
-    // Bodyless requests always clone. The guard keeps a future request with a
-    // streaming body correct rather than silently replaying something that
-    // cannot be replayed.
+    // Bodyless requests always clone; a streaming body cannot be replayed.
     let Some(probe) = request.try_clone() else {
         return Ok(request.send().await?);
     };

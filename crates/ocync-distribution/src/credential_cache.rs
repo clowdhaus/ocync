@@ -21,10 +21,8 @@ pub(crate) fn remaining(until: SystemTime) -> Duration {
 /// Cached credential with TTL tracking.
 ///
 /// A refresh runs once however many callers need it: the callers that
-/// arrive while it is in flight wait for it. Used by the ECR, ECR Public,
-/// Azure and Google auth providers, the AWS API client and the instance
-/// metadata session token. Time is tokio's, so a test with paused time
-/// moves it.
+/// arrive while it is in flight wait for it. Time is tokio's, so a test with
+/// paused time moves it.
 ///
 /// A landing never stores a value refused after its refresh began (see
 /// [`Self::refuse`]); the callers that waited on it still get its value.
@@ -187,7 +185,7 @@ impl<T: Clone, E: Clone> CredentialCache<T, E> {
         })
     }
 
-    /// Replace the cached value (test helper).
+    /// Replace the cached value.
     #[cfg(test)]
     pub(crate) fn set(&self, value: T, ttl: Duration) {
         self.write().entry = Some(CacheEntry::new(value, ttl));

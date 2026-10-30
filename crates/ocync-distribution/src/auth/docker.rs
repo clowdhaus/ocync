@@ -190,11 +190,8 @@ fn decode_auth(encoded: &str, registry: &str) -> Result<(String, String), Error>
     Ok((username.to_owned(), password.to_owned()))
 }
 
-/// Execute a Docker credential helper and return the credentials.
-///
-/// Runs `docker-credential-{helper} get` with the registry on stdin.
-/// Uses `tokio::process::Command` to avoid blocking the single-threaded
-/// tokio runtime.
+/// Run `docker-credential-{helper} get` with the registry on stdin, without
+/// blocking the single-threaded runtime.
 async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Credentials>, Error> {
     let program = helper_program(helper)?;
 
@@ -230,8 +227,7 @@ async fn run_credential_helper(helper: &str, registry: &str) -> Result<Option<Cr
     )
     .await
     .map_err(|_| {
-        // Timeout is a real operational problem (hung helper, locked keychain).
-        // Distinct from the noisy fallback paths around it -- keep at WARN.
+        // A hung helper or locked keychain needs an operator: WARN.
         tracing::warn!(helper = %program, registry, "credential helper timed out after 30s");
         Error::CredentialHelperFailed {
             helper: program.clone(),
@@ -323,7 +319,6 @@ fn is_docker_hub(registry: &str) -> bool {
 
 /// Get the default Docker config path.
 fn default_config_path() -> Option<PathBuf> {
-    // Check DOCKER_CONFIG env var first.
     if let Ok(dir) = std::env::var("DOCKER_CONFIG") {
         return Some(PathBuf::from(dir).join("config.json"));
     }

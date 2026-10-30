@@ -51,10 +51,8 @@ pub enum Error {
     #[error("manifest deserialization failed: {0}")]
     ManifestParse(#[source] Arc<serde_json::Error>),
 
-    /// A manifest was deserialized successfully but is semantically invalid.
-    ///
-    /// Currently raised when `schemaVersion` is not 2 (the only version
-    /// defined by the OCI Image and Docker v2 specs).
+    /// A manifest deserialized but is invalid, such as a `schemaVersion`
+    /// other than 2, the only one the OCI Image and Docker v2 specs define.
     #[error("invalid manifest: {reason}")]
     InvalidManifest {
         /// Why the manifest is invalid.
@@ -226,10 +224,8 @@ pub enum Error {
         reason: String,
     },
 
-    /// Credential configuration file I/O or parse failure.
-    ///
-    /// Covers Docker (`~/.docker/config.json`) and any future credential
-    /// store formats (podman `auth.json`, etc.).
+    /// A credential configuration file, such as `~/.docker/config.json`,
+    /// could not be read or parsed.
     #[error("credential config error: {reason}")]
     CredentialConfig {
         /// What went wrong reading or parsing the config.

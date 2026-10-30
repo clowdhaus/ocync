@@ -62,10 +62,8 @@ impl Reference {
     }
 }
 
-/// Determine whether a hostname-like token is a registry host.
-///
-/// A token is considered a registry if it contains a dot, a colon (port),
-/// or equals `localhost`.
+/// Whether the first path component names a registry host: it contains a
+/// dot or a port colon, or is `localhost`.
 fn is_registry(s: &str) -> bool {
     s.contains('.') || s.contains(':') || s == "localhost"
 }
@@ -81,7 +79,6 @@ impl FromStr for Reference {
             });
         }
 
-        // Split off @digest first.
         let (name_tag, digest) = if let Some(at) = s.rfind('@') {
             let digest_str = &s[at + 1..];
             let digest: Digest = digest_str.parse().map_err(|_| Error::InvalidReference {
@@ -93,9 +90,6 @@ impl FromStr for Reference {
             (s, None)
         };
 
-        // Split name_tag into name and tag.
-        // We need to find the tag separator, which is the LAST colon that
-        // appears after the last slash (to avoid confusing port colons).
         let (name, tag) = split_name_tag(name_tag);
 
         if name.is_empty() {
@@ -105,7 +99,6 @@ impl FromStr for Reference {
             });
         }
 
-        // Determine registry vs repository.
         let (registry, repository) = if let Some(slash) = name.find('/') {
             let first = &name[..slash];
             if is_registry(first) {
@@ -129,9 +122,8 @@ impl FromStr for Reference {
             });
         }
 
-        // Reject characters that would corrupt URLs when interpolated into
-        // path segments. This is more permissive than the OCI spec (which
-        // requires lowercase) but catches the dangerous characters.
+        // Reject characters that would corrupt a URL path segment. More
+        // permissive than the OCI spec, which requires lowercase.
         if let Some(bad) = repository
             .chars()
             .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
@@ -176,10 +168,8 @@ impl FromStr for Reference {
     }
 }
 
-/// Split a name (without digest) into (name, optional tag).
-///
-/// The tag separator is the last colon that appears after the last slash.
-/// This avoids treating a port number as a tag.
+/// Split a name (without digest) into (name, optional tag) at the last
+/// colon after the last slash, so a port is never read as a tag.
 fn split_name_tag(name_tag: &str) -> (&str, Option<String>) {
     let after_slash = name_tag.rfind('/').map_or(0, |i| i + 1);
     let suffix = &name_tag[after_slash..];

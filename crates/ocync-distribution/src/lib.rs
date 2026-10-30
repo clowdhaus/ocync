@@ -55,9 +55,8 @@ pub(crate) const REDACTED: &str = "[REDACTED]";
 
 /// Install `aws-lc-rs` as the process-wide rustls crypto provider.
 ///
-/// Must be called before any TLS connection is established. Safe to call
-/// multiple times - subsequent calls are no-ops (returns `Err` which is
-/// ignored).
+/// Must be called before any TLS connection is established. Later calls
+/// are no-ops.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
@@ -116,13 +115,7 @@ pub fn tls_fips() -> TlsFips {
     }
 }
 
-/// Create a [`reqwest::Client`] with the crypto provider installed.
-///
-/// Convenience for tests that need an HTTP client without going through
-/// [`RegistryClientBuilder`]. Production code should use
-/// [`install_crypto_provider`] at startup and construct clients directly.
-///
-/// This is a test utility; do not use in production code.
+/// A [`reqwest::Client`] with the crypto provider installed, for tests only.
 #[doc(hidden)]
 pub fn test_http_client() -> reqwest::Client {
     install_crypto_provider();

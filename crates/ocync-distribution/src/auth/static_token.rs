@@ -8,21 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{AuthProvider, Scope, Token};
 use crate::error::Error;
 
-/// Auth provider that returns a pre-configured bearer token.
+/// Auth provider that returns a pre-configured bearer token, such as a CI
+/// token or personal access token.
 ///
-/// Used for CI tokens, personal access tokens (PATs), and other
-/// scenarios where the caller already has a valid bearer token
-/// that doesn't require a token-exchange flow.
-///
-/// When `refuse()` is called (after a 401 from the registry),
-/// the token is marked as revoked and subsequent `get_token()` calls
-/// return an error, breaking the infinite retry loop.
+/// Once refused after a 401, every later `get_token()` fails, so the client
+/// cannot retry the same token forever.
 pub struct StaticTokenAuth {
-    /// The bearer token value.
     token: String,
-    /// The registry this token authenticates against (for error messages).
+    /// For error messages.
     registry: String,
-    /// Whether the token has been invalidated by a 401 response.
     invalidated: AtomicBool,
 }
 

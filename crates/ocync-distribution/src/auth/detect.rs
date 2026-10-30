@@ -6,12 +6,8 @@ use regex_lite::Regex;
 
 /// The kind of registry provider detected from a hostname.
 ///
-/// Not all variants have a corresponding [`AuthProvider`](super::AuthProvider)
-/// implementation. Currently only [`Ecr`](Self::Ecr) has a full auth provider.
-/// Hostnames that don't match any known provider return `None` from
-/// [`detect_provider_kind`] -- these registries (e.g. Quay, Harbor, private
-/// registries) use the standard OCI token-exchange flow via
-/// [`configured::Auth`](super::configured::Auth).
+/// A host matching none (Quay, Harbor, private registries) uses the standard
+/// OCI token exchange via [`configured::Auth`](super::configured::Auth).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     /// AWS Elastic Container Registry (private).
@@ -71,12 +67,8 @@ static ACR_RE: LazyLock<Regex> =
 /// The ECR Public registry hostname.
 pub(crate) const ECR_PUBLIC_HOST: &str = "public.ecr.aws";
 
-/// Detect the registry provider kind from a hostname.
-///
-/// Normalizes the hostname to lowercase, strips any port number and trailing
-/// dot before matching. Returns `None` for unrecognized hostnames (e.g. Quay,
-/// Harbor, private registries) -- these should fall through to the standard OCI
-/// token-exchange flow or Docker config credential resolution.
+/// Detect the registry provider kind from a hostname, ignoring case, port
+/// and a trailing dot. `None` for an unrecognized host.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
     let hostname = hostname.to_ascii_lowercase();
     let hostname = hostname.split(':').next().unwrap();

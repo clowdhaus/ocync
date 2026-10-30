@@ -68,12 +68,12 @@ impl Scope {
         }
     }
 
-    /// Convenience constructor for a pull-only scope.
+    /// A pull-only scope.
     pub fn pull(repository: impl Into<String>) -> Self {
         Self::new(repository, vec![Action::Pull])
     }
 
-    /// Convenience constructor for pull+push scope.
+    /// A pull and push scope.
     pub fn pull_push(repository: impl Into<String>) -> Self {
         Self::new(repository, vec![Action::Pull, Action::Push])
     }
@@ -124,11 +124,9 @@ pub enum AuthScheme {
 /// An authentication token with optional expiry tracking.
 #[derive(Clone)]
 pub struct Token {
-    /// The raw token string.
     value: String,
     /// When this token expires (if known).
     expires_at: Option<Instant>,
-    /// How to format the `Authorization` header.
     scheme: AuthScheme,
 }
 
@@ -157,15 +155,6 @@ impl Token {
         Self {
             value: value.into(),
             expires_at: Instant::now().checked_add(ttl),
-            scheme: AuthScheme::Bearer,
-        }
-    }
-
-    /// Create a Bearer token that expires at a specific instant.
-    pub fn with_expiry(value: impl Into<String>, expires_at: Instant) -> Self {
-        Self {
-            value: value.into(),
-            expires_at: Some(expires_at),
             scheme: AuthScheme::Bearer,
         }
     }
@@ -204,7 +193,7 @@ impl Token {
     }
 
     /// Whether this token should be proactively refreshed (remaining lifetime
-    /// is at most [`EARLY_REFRESH_WINDOW`]).
+    /// is at most `EARLY_REFRESH_WINDOW`).
     pub fn should_refresh(&self) -> bool {
         !is_fresh(self.expires_at, EARLY_REFRESH_WINDOW)
     }
@@ -221,10 +210,8 @@ pub(crate) fn is_fresh(expires_at: Option<Instant>, window: Duration) -> bool {
     })
 }
 
-/// Build a sorted, space-joined cache key from a set of scopes.
-///
-/// Used by auth providers to key their token caches. The sort ensures
-/// that the same set of scopes in any order produces the same key.
+/// A sorted, space-joined cache key for a set of scopes, the same in any
+/// order.
 pub(crate) fn scopes_cache_key(scopes: &[Scope]) -> String {
     let mut parts: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
     parts.sort();
@@ -264,18 +251,12 @@ pub(crate) enum Refusal {
     Stale,
 }
 
-/// Trait for providers that can obtain authentication tokens for registries.
-///
-/// Uses `Pin<Box<dyn Future>>` for object safety, allowing `Box<dyn AuthProvider>`.
-/// Implementations must be `Send + Sync` for use across async tasks.
+/// A provider of authentication tokens for a registry.
 pub trait AuthProvider: Send + Sync {
     /// Human-readable name of this provider (e.g. "anonymous", "docker-config").
     fn name(&self) -> &'static str;
 
-    /// Obtain a bearer token valid for the given scopes.
-    ///
-    /// The `scopes` slice is converted to owned data before the future is created,
-    /// so callers don't need to worry about borrow lifetimes.
+    /// Obtain a token valid for the given scopes.
     fn get_token(
         &self,
         scopes: &[Scope],
@@ -287,8 +268,6 @@ pub trait AuthProvider: Send + Sync {
     /// requests may be using it. A fetch already in flight may still answer
     /// the next call. The cloud credential a token was exchanged with is
     /// judged only by the exchange that uses it, not by this call.
-    ///
-    /// Called by the client when a request returns 401.
     fn refuse(&self, refused: Token) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
@@ -377,7 +356,7 @@ mod tests {
 
     #[test]
     fn token_with_zero_ttl_is_expired() {
-        let token = Token::with_expiry("abc123", Instant::now() - Duration::from_secs(1));
+        let token = Token::with_ttl("abc123", Duration::ZERO);
         assert!(token.is_expired());
         assert!(token.should_refresh());
     }

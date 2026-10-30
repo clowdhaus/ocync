@@ -41,10 +41,8 @@ impl Digest {
         &self.raw[self.algo_len + 1..]
     }
 
-    /// Build the OCI tag fallback name for referrers discovery.
-    ///
-    /// Older registries that do not support the referrers API store artifact
-    /// references as tags named `{algorithm}-{hex}` (e.g. `sha256-abcd...`).
+    /// The OCI referrers tag fallback name, `{algorithm}-{hex}`, under which
+    /// registries without the referrers API store artifact references.
     pub fn tag_fallback(&self) -> String {
         format!("{}-{}", self.algorithm(), self.hex())
     }

@@ -248,12 +248,10 @@ const ENOENT: i32 = 2;
 const OWNER_ONLY: u32 = 0o600;
 
 impl Fs {
-    /// Replace `path` with `contents`, readable and writable by its owner
-    /// alone where the platform has modes: written to a new file beside it,
-    /// then renamed over it, so a reader sees the old file or the new, never
-    /// part of one. Not flushed to disk, so the call does not wait on it;
-    /// the files written here are caches their owner can rebuild. Blocking,
-    /// as [`Self::read`] is.
+    /// Replace `path` with `contents`, owner-only where the platform has
+    /// modes, through a rename so a reader never sees part of a file. Not
+    /// flushed to disk: the files written here are caches their owner can
+    /// rebuild. Blocking, as [`Self::read`] is.
     pub(super) fn replace_private(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
         match self {
             Self::Real => {
