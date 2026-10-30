@@ -34,13 +34,11 @@ The harness is to enforce each rule. A rule marked Planned is not built yet, and
 
 ### A fixed corpus
 
-> **Status: Planned.**
+Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before a run, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
 
-Every image in the corpus resolves to a manifest digest once and is recorded in a lock file beside the corpus. Before each round, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock. Today 29 of the corpus's 40 entries sync `latest` (28 of them only `latest`), so two runs on different dates can sync different content.
+> **Status: Planned.** Re-resolving the tags before each round, not only before the run, comes with repeated rounds.
 
 ### Content verified, not only tags
-
-> **Status: Planned.** Today the check lists the target's tags and confirms each expected tag exists.
 
 After every tool's pass, every target tag must resolve to the same manifest digest as the locked source, and each index must hold the same child manifests. This holds every tool to ocync's own invariant that content is copied bit for bit. A tool that converts formats or drops platforms fails the run rather than being credited with a fast time.
 
@@ -89,7 +87,7 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 - **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): unique blobs are fetched once, so the first tool does not meet a colder CDN than the last.
 
-  > **Status: Planned.** Today the pre-warm reads only each image's first tag, so the blobs of a second version (ten images in the corpus) are never warmed. On 30 October 2026 that left CDN misses of 174, 504 and 2 across the three tools.
+  > **Status: Planned.** Today the pre-warm reads only each image's first tag, so the blobs of later versions of 11 images in the corpus are never warmed. The fix warms every tag the run syncs and warns, naming the registry, when any manifest or blob could not be warmed.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.

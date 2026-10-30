@@ -28,16 +28,16 @@ Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 > Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
 <!-- BENCH:END -->
 
-The table is one run per tool on 30 October 2026 (ocync 0.8.2), in the order ocync, dregsy, regsync. CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync, so the tools did not start from equally warm caches. The pre-warm meant to equalize them warms only each image's first tag today, and ten images in the corpus sync a second version; the [benchmark design](/design/benchmark) marks the fix as planned, along with repeated rounds that replace single runs.
+The 30 October 2026 run (ocync 0.8.2) was one run per tool, in the order ocync, dregsy, regsync. Its CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync, so the tools did not start from equally warm caches. The pre-warm meant to equalize them warmed only each image's first tag, and 11 images in the corpus sync more than one version; the [benchmark design](/design/benchmark) describes the fix, along with repeated rounds that replace single runs.
 
-Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged (#66), on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
+Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged, on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
 
 | | 26 April | 30 October |
 |---|---:|---:|
 | ocync speed vs regsync, cold | 3.39x | 2.99x |
 | ocync speed vs dregsy, cold | 3.99x | 4.33x |
-| Requests: ocync / regsync / dregsy | 7373 / 9532 / 11301 | 6995 / 9588 / 11541 |
-| Response bytes: ocync / regsync / dregsy | 55.4 / 65.3 / 55.3 GB | 55.0 / 65.1 / 54.9 GB |
+| Requests: ocync / dregsy / regsync | 7373 / 11301 / 9532 | 6995 / 11541 / 9588 |
+| Response bytes: ocync / dregsy / regsync | 55.4 / 55.3 / 65.3 GB | 55.0 / 54.9 / 65.1 GB |
 | 429s, any tool | 0 | 0 |
 
 ocync moved about 10 GB less than regsync and slightly more than dregsy, whose total leaves out the referrer artifacts only ocync syncs. Only ECR has been measured as a target.

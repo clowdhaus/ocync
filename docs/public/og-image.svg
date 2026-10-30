@@ -80,8 +80,9 @@
   <rect x="620" y="70" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="115" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
   <text x="660" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="64" font-weight="800" fill="url(#cyan-grad)">3x</text>
-  <text x="810" y="155" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">faster than</text>
-  <text x="810" y="180" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">regsync</text>
+  <text x="810" y="145" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">faster than</text>
+  <text x="810" y="170" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">regsync, with</text>
+  <text x="810" y="195" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="22" fill="#bcc6ec">15% fewer bytes</text>
 
   <rect x="620" y="230" width="520" height="140" rx="16" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="275" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
