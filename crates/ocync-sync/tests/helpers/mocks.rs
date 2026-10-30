@@ -372,6 +372,14 @@ impl MockChecker {
         )
     }
 
+    /// The digests reported present, or `None` for a failing checker.
+    fn existing(&self) -> Option<&HashSet<Digest>> {
+        match &self.mode {
+            Mode::Answers { existing, .. } => Some(existing),
+            Mode::Fails => None,
+        }
+    }
+
     fn assert_repo(&self, repo: &RepositoryName) {
         assert_eq!(
             repo.as_str(),
@@ -410,14 +418,13 @@ impl BatchBlobChecker for MockChecker {
 /// `check_blob_existence` calls. Every other checker keeps the trait default.
 pub struct WaitTrackingChecker {
     checker: MockChecker,
-    existing: HashSet<Digest>,
 }
 
 impl WaitTrackingChecker {
     /// A checker reporting `existing` present and every other digest missing.
     pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
-        let (checker, calls) = MockChecker::new(expected_repo, existing.clone());
-        (Self { checker, existing }, calls)
+        let (checker, calls) = MockChecker::new(expected_repo, existing);
+        (Self { checker }, calls)
     }
 }
 
@@ -437,7 +444,10 @@ impl BatchBlobChecker for WaitTrackingChecker {
         _deadline: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
         self.checker.assert_repo(repo);
-        let all_known = digests.iter().all(|d| self.existing.contains(d));
+        let all_known = self
+            .checker
+            .existing()
+            .is_some_and(|existing| digests.iter().all(|d| existing.contains(d)));
         let waits = &self.checker.calls.waits;
         Box::pin(async move {
             waits.set(waits.get() + 1);

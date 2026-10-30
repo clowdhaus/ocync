@@ -114,10 +114,10 @@ pub async fn run_sync_with_shutdown(
 }
 
 /// Drive `run` to completion, triggering `shutdown` once `received` counts
-/// `want` requests so it lands mid-transfer however slow the host is. When
-/// `run` returns first the trigger is dropped, so the caller's assertions name
-/// the failure. Panics after 10s of wall-clock time if `run` is still going and
-/// `want` was never reached, which also bounds `start_paused` runs.
+/// `want` requests so it lands mid-transfer however slow the host is. Panics
+/// if `run` returns before shutdown fired, or after 10s of wall-clock time if
+/// `run` is still going and `want` was never reached, which also bounds
+/// `start_paused` runs.
 pub async fn run_with_shutdown_at<T>(
     run: impl Future<Output = T>,
     shutdown: &ShutdownSignal,
@@ -136,10 +136,15 @@ pub async fn run_with_shutdown_at<T>(
         shutdown.trigger();
         std::future::pending::<()>().await;
     };
-    tokio::select! {
+    let out = tokio::select! {
         out = run => out,
         () = trigger => unreachable!("the trigger never completes"),
-    }
+    };
+    assert!(
+        shutdown.is_triggered(),
+        "the run finished before shutdown was triggered"
+    );
+    out
 }
 
 /// Assert the report holds exactly `want` images, all `Synced`; `name` labels a failure.

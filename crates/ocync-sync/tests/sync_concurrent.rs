@@ -1485,10 +1485,6 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         1,
         "the shared layer is uploaded once; its waiter had not pushed it"
     );
-    assert!(
-        shutdown.is_triggered(),
-        "the run finished before shutdown was triggered"
-    );
 }
 
 /// Two images share a blob and run concurrently; the blob already exists at

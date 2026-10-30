@@ -537,10 +537,8 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         skipped: u64,
         transferred: u64,
         bytes: u64,
-        /// Source blob GETs, target blob HEADs and target blob upload PUTs.
-        blob_gets: usize,
-        blob_heads: usize,
-        uploads: usize,
+        /// Blob uploads, one session (POST and PUT) each.
+        uploads: u64,
     }
     use Answer::{Exists, Missing, Unknown};
     let single = Case {
@@ -552,8 +550,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         skipped: 3,
         transferred: 0,
         bytes: 0,
-        blob_gets: 0,
-        blob_heads: 0,
         uploads: 0,
     };
     let cases = [
@@ -579,7 +575,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 2,
             transferred: 1,
             bytes: 14,
-            blob_gets: 1,
             uploads: 1,
             ..single
         },
@@ -591,7 +586,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 5,
             transferred: 1,
             bytes: 14,
-            blob_gets: 1,
             uploads: 1,
             ..single
         },
@@ -601,8 +595,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 2,
             transferred: 1,
             bytes: 14,
-            blob_gets: 1,
-            blob_heads: 1,
             uploads: 1,
             ..single
         },
@@ -612,7 +604,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 0,
             transferred: 3,
             bytes: 42,
-            blob_gets: 3,
             uploads: 3,
             ..single
         },
@@ -620,13 +611,11 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             name: "no checker: per-blob HEAD",
             check: Check::Absent,
             batch_calls: 0,
-            blob_heads: 3,
             ..single
         },
         Case {
             name: "failing checker: per-blob HEAD",
             check: Check::Fails,
-            blob_heads: 3,
             ..single
         },
     ];
@@ -663,13 +652,25 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                 .mount(&target_server)
                 .await;
         }
-        for (digest, data) in digests.into_iter().zip(BATCH_BLOBS) {
+        // Per blob, not per tag: a blob shared by tags is pulled once.
+        for ((digest, data), answer) in digests.into_iter().zip(BATCH_BLOBS).zip(answers) {
+            let (pulls, heads) = match answer {
+                Exists => (0, 0),
+                Missing => (1, 0),
+                Unknown => (0, 1),
+            };
             blob_pull_mock(src, digest, data)
+                .expect(pulls)
+                .named(format!("{name}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
-            blob_head_mock(tgt, digest, 200).mount(&target_server).await;
+            blob_head_mock(tgt, digest, 200)
+                .expect(heads)
+                .named(format!("{name}: blob HEAD {digest}"))
+                .mount(&target_server)
+                .await;
         }
-        mount_blob_push(&target_server, tgt).await;
+        mount_blob_push_expecting(&target_server, tgt, case.uploads, name).await;
 
         let (target, calls) = match case.check {
             Check::Absent => (
@@ -723,27 +724,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             "{name}: transferred"
         );
         assert_eq!(report.stats.bytes_transferred, case.bytes, "{name}: bytes");
-        let blob_gets = count_requests(
-            &source_server,
-            Some(&Method::GET),
-            PathMatch::Contains("/blobs/"),
-        )
-        .await;
-        assert_eq!(blob_gets, case.blob_gets, "{name}: source blob GETs");
-        let blob_heads = count_requests(
-            &target_server,
-            Some(&Method::HEAD),
-            PathMatch::Contains("/blobs/"),
-        )
-        .await;
-        assert_eq!(blob_heads, case.blob_heads, "{name}: target blob HEADs");
-        let uploads = count_requests(
-            &target_server,
-            Some(&Method::PUT),
-            PathMatch::Contains("/blobs/uploads/"),
-        )
-        .await;
-        assert_eq!(uploads, case.uploads, "{name}: blob upload PUTs");
     }
 }
 
