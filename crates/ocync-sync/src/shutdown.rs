@@ -66,6 +66,15 @@ impl fmt::Debug for ShutdownSignal {
 mod tests {
     use super::*;
 
+    /// The hand-written `Debug` shows the flag and hides the `Notify`.
+    #[test]
+    fn debug_shows_triggered_state() {
+        let signal = ShutdownSignal::new();
+        assert_eq!(format!("{signal:?}"), "ShutdownSignal { triggered: false }");
+        signal.trigger();
+        assert_eq!(format!("{signal:?}"), "ShutdownSignal { triggered: true }");
+    }
+
     #[test]
     fn new_and_default_start_untriggered() {
         assert!(!ShutdownSignal::new().is_triggered(), "new");
