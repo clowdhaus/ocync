@@ -412,7 +412,7 @@ impl fmt::Display for NoTagsInfo {
 }
 
 /// How a mapping's outcome compares with the prior cycle's.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutcomeChange {
     /// Identical to the prior cycle: suppress the line.
     Unchanged,
@@ -634,6 +634,12 @@ pub(crate) async fn run(
 ) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
 
+    let min_tags = if args.dry_run {
+        MinTags::Report
+    } else {
+        MinTags::Enforce
+    };
+
     // One ticker spans client construction, batch-checker setup and mapping
     // resolution, so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
@@ -648,11 +654,7 @@ pub(crate) async fn run(
             &config,
             &clients,
             &batch_checkers,
-            if args.dry_run {
-                Selection::DryRun
-            } else {
-                Selection::Sync
-            },
+            min_tags,
             watch_log.as_deref_mut(),
             &tracker,
             PREPARE_MAPPING_CONCURRENCY,
@@ -680,7 +682,7 @@ pub(crate) async fn run(
         state.retain_active(config.mappings.iter().map(|m| m.from.as_str()));
     }
 
-    if args.dry_run {
+    if min_tags == MinTags::Report {
         crate::cli::commands::dry_run::print(&mappings, &unresolved, &dropped_targets, verbose);
         return Ok(dry_run_exit_code(
             mappings.len() + no_match,
@@ -893,15 +895,15 @@ fn emit_mapping_outcomes(
         if outcome.is_empty() {
             continue;
         }
-        let recovered = match watch_log.as_deref_mut() {
+        let change = match watch_log.as_deref_mut() {
             Some(state) => match state.observe_mapping_outcome(&d.from, &outcome) {
                 OutcomeChange::Unchanged => continue,
-                OutcomeChange::Changed => false,
-                OutcomeChange::Recovered => true,
+                change => change,
             },
-            None => false,
+            None => OutcomeChange::Changed,
         };
-        let line = format_mapping_outcome(d, &outcome, recovered);
+        let recovered = change == OutcomeChange::Recovered;
+        let line = format_mapping_outcome(d, &outcome, change);
         // `from` / `to` are not structured fields: the message already names
         // them, and the text formatter would repeat them. The counts stay
         // because they carry zero values the terse message elides.
@@ -952,7 +954,11 @@ fn aggregate_mapping_outcome(
     o
 }
 
-fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: bool) -> String {
+fn format_mapping_outcome(
+    d: &MappingDescriptor,
+    o: &MappingOutcome,
+    change: OutcomeChange,
+) -> String {
     let mut parts = Vec::with_capacity(3);
     if o.synced > 0 {
         parts.push(format!("synced {}", o.synced));
@@ -969,7 +975,11 @@ fn format_mapping_outcome(d: &MappingDescriptor, o: &MappingOutcome, recovered: 
     } else {
         String::new()
     };
-    let recovered_clause = if recovered { " [recovered]" } else { "" };
+    let recovered_clause = if change == OutcomeChange::Recovered {
+        " [recovered]"
+    } else {
+        ""
+    };
     // Shown whenever more than one registry was configured, including when
     // only one survived: that is when the operator needs to see which.
     let targets_clause = if d.target_names.len() + d.dropped_names.len() > 1 {
@@ -1249,7 +1259,7 @@ async fn resolve_all(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    selection: Selection,
+    min_tags: MinTags,
     mut watch_log: Option<&mut WatchLogState>,
     tracker: &PrepareTracker,
     concurrency: usize,
@@ -1270,9 +1280,6 @@ async fn resolve_all(
     //
     // Mappings behind a config error may already have run and warned; the run
     // still stops at the first config error in config order.
-    /// One mapping's resolution alongside the targets it lost on the way.
-    type ResolutionAndDropped = (Result<MappingResolution, CliError>, Vec<DroppedTarget>);
-
     let mut indexed: Vec<(usize, ResolutionAndDropped)> =
         futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
             async move {
@@ -1280,7 +1287,7 @@ async fn resolve_all(
                 let _item = tracker.track(&mapping.from);
                 (
                     idx,
-                    resolve_mapping(mapping, config, clients, batch_checkers, selection).await,
+                    resolve_mapping(mapping, config, clients, batch_checkers, min_tags).await,
                 )
             }
         }))
@@ -1451,6 +1458,9 @@ fn build_targets(
     (targets, worst_err)
 }
 
+/// One mapping's resolution alongside the targets it lost on the way.
+pub(crate) type ResolutionAndDropped = (Result<MappingResolution, CliError>, Vec<DroppedTarget>);
+
 /// Resolve a single mapping config, falling back to `defaults.source`,
 /// `defaults.targets` and `defaults.tags`.
 ///
@@ -1460,8 +1470,8 @@ pub(crate) async fn resolve_mapping(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    selection: Selection,
-) -> (Result<MappingResolution, CliError>, Vec<DroppedTarget>) {
+    min_tags: MinTags,
+) -> ResolutionAndDropped {
     // Returned unconditionally: a `?` in the rest of resolution would discard
     // them, and a mapping that loses a mirror and then hits a rate limit would
     // report the outage nowhere.
@@ -1471,7 +1481,7 @@ pub(crate) async fn resolve_mapping(
         config,
         clients,
         batch_checkers,
-        selection,
+        min_tags,
         &mut dropped,
     )
     .await;
@@ -1483,7 +1493,7 @@ async fn resolve_mapping_inner(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    selection: Selection,
+    min_tags: MinTags,
     dropped: &mut Vec<DroppedTarget>,
 ) -> Result<MappingResolution, CliError> {
     // --- Source registry ---
@@ -1569,7 +1579,7 @@ async fn resolve_mapping_inner(
             samples,
         };
         let (kept, count, report) =
-            select_filtered_tags(mapping_tags, defaults_tags, all_tags, selection)?;
+            select_filtered_tags(mapping_tags, defaults_tags, all_tags, min_tags)?;
         (kept, count, report, Some(template))
     };
 
@@ -1763,16 +1773,16 @@ type SelectionResult = (
     Option<ocync_sync::filter::FilterReport>,
 );
 
-/// How tag selection treats `min_tags`.
+/// What tag selection does when fewer tags survive than `min_tags` requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Selection {
+pub(crate) enum MinTags {
     /// A real sync: [`FilterConfig::apply`] returns `BelowMinTags` when
     /// `min_tags` is violated, and no filter trace is built.
-    Sync,
+    Enforce,
     /// `--dry-run`: [`FilterConfig::apply_with_report`] does NOT enforce
     /// `min_tags`; the report carries the configured value so the gap can be
     /// rendered.
-    DryRun,
+    Report,
 }
 
 /// Apply the filter pipeline to `all_tags`.
@@ -1780,17 +1790,17 @@ fn select_filtered_tags(
     mapping_tags: Option<&TagsConfig>,
     defaults_tags: Option<&TagsConfig>,
     all_tags: Vec<String>,
-    selection: Selection,
+    min_tags: MinTags,
 ) -> Result<SelectionResult, CliError> {
     let n_candidates = all_tags.len();
     let filter = build_filter(mapping_tags, defaults_tags);
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    match selection {
-        Selection::DryRun => {
+    match min_tags {
+        MinTags::Report => {
             let result = filter.apply_with_report(&tag_refs)?;
             Ok((result.kept, Some(n_candidates), Some(result.report)))
         }
-        Selection::Sync => Ok((filter.apply(&tag_refs)?, Some(n_candidates), None)),
+        MinTags::Enforce => Ok((filter.apply(&tag_refs)?, Some(n_candidates), None)),
     }
 }
 
@@ -1870,44 +1880,74 @@ mod tests {
             std::num::NonZeroU64::new(1_000_000_000).unwrap(),
         ));
         let one_byte = Some(StagingLimit::Bytes(std::num::NonZeroU64::new(1).unwrap()));
-        // want: (staging enabled, an earlier run's blob kept)
+        #[derive(Debug, PartialEq)]
+        struct Staging {
+            enabled: bool,
+            earlier_blob_kept: bool,
+        }
         let cases = [
             (
                 "disabled, staging needed",
                 Some(StagingLimit::Disabled),
                 StagingNeed::Needed,
-                (false, false),
+                Staging {
+                    enabled: false,
+                    earlier_blob_kept: false,
+                },
             ),
             (
                 "disabled, staging not needed",
                 Some(StagingLimit::Disabled),
                 StagingNeed::NotNeeded,
-                (false, false),
+                Staging {
+                    enabled: false,
+                    earlier_blob_kept: false,
+                },
             ),
             (
                 "a limit above the staged size, needed",
                 above,
                 StagingNeed::Needed,
-                (true, true),
+                Staging {
+                    enabled: true,
+                    earlier_blob_kept: true,
+                },
             ),
             (
                 "a limit of one byte, needed",
                 one_byte,
                 StagingNeed::Needed,
-                (true, false),
+                Staging {
+                    enabled: true,
+                    earlier_blob_kept: false,
+                },
             ),
             (
                 "a limit of one byte, not needed",
                 one_byte,
                 StagingNeed::NotNeeded,
-                (false, true),
+                Staging {
+                    enabled: false,
+                    earlier_blob_kept: true,
+                },
             ),
-            ("no limit, needed", None, StagingNeed::Needed, (true, true)),
+            (
+                "no limit, needed",
+                None,
+                StagingNeed::Needed,
+                Staging {
+                    enabled: true,
+                    earlier_blob_kept: true,
+                },
+            ),
             (
                 "no limit, not needed",
                 None,
                 StagingNeed::NotNeeded,
-                (false, true),
+                Staging {
+                    enabled: false,
+                    earlier_blob_kept: true,
+                },
             ),
         ];
         for (name, limit, need, want) in cases {
@@ -1918,7 +1958,10 @@ mod tests {
             writer.finish().unwrap();
 
             let stage = open_staging(dir.path().to_path_buf(), limit, need);
-            let got = (stage.is_enabled(), earlier.exists(&digest));
+            let got = Staging {
+                enabled: stage.is_enabled(),
+                earlier_blob_kept: earlier.exists(&digest),
+            };
             assert_eq!(got, want, "{name}");
         }
     }
@@ -2653,8 +2696,8 @@ include: ["1.25.0-rc1"]
         );
     }
 
-    /// `failed > 0` followed by `failed == 0` returns `Some(true)` (the
-    /// `[recovered]` marker) and advances the cycle counter on each transition.
+    /// `failed > 0` followed by `failed == 0` returns
+    /// [`OutcomeChange::Recovered`] (the `[recovered]` marker) and advances the cycle counter on each transition.
     #[test]
     fn watch_log_state_surfaces_failure_to_clean_transition() {
         let mut state = WatchLogState::default();
@@ -2720,7 +2763,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(3, 0, 0, 1024),
-                false,
+                OutcomeChange::Changed,
                 "library/alpine -> mirror/alpine: synced 3 (1.0 KB)",
             ),
             (
@@ -2728,7 +2771,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(0, 5, 0, 0),
-                false,
+                OutcomeChange::Changed,
                 "library/alpine -> mirror/alpine: skipped 5",
             ),
             (
@@ -2736,7 +2779,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(1, 2, 1, 2048),
-                false,
+                OutcomeChange::Changed,
                 "library/alpine -> mirror/alpine: synced 1, skipped 2, failed 1 (2.0 KB)",
             ),
             (
@@ -2744,7 +2787,7 @@ include: ["1.25.0-rc1"]
                 vec!["ttl"],
                 vec![],
                 outcome(3, 0, 0, 1024),
-                true,
+                OutcomeChange::Recovered,
                 "library/alpine -> mirror/alpine: synced 3 (1.0 KB) [recovered]",
             ),
             (
@@ -2752,7 +2795,7 @@ include: ["1.25.0-rc1"]
                 vec!["ecr-prod", "ghcr-mirror"],
                 vec![],
                 outcome(1, 0, 0, 1024),
-                false,
+                OutcomeChange::Changed,
                 "library/alpine -> mirror/alpine [ecr-prod, ghcr-mirror]: synced 1 (1.0 KB)",
             ),
             (
@@ -2760,23 +2803,23 @@ include: ["1.25.0-rc1"]
                 vec!["good"],
                 vec!["broken"],
                 outcome(4, 0, 0, 0),
-                false,
+                OutcomeChange::Changed,
                 "library/alpine -> mirror/alpine [good, broken unreachable]: synced 4",
             ),
         ];
-        for (name, targets, dropped, o, recovered, want) in cases {
+        for (name, targets, dropped, o, change, want) in cases {
             let d = MappingDescriptor {
                 from: "library/alpine".into(),
                 target_repo: "mirror/alpine".into(),
                 target_names: targets.into_iter().map(String::from).collect(),
                 dropped_names: dropped.into_iter().map(String::from).collect(),
             };
-            assert_eq!(format_mapping_outcome(&d, &o, recovered), want, "{name}");
+            assert_eq!(format_mapping_outcome(&d, &o, change), want, "{name}");
         }
     }
 
     /// A dry run yields a `FilterReport` carrying the configured `min_tags`
-    /// and `include_kept`; selecting `Selection::Sync` instead fails this.
+    /// and `include_kept`; selecting `MinTags::Enforce` instead fails this.
     #[test]
     fn select_filtered_tags_dry_run_populates_min_tags_and_include() {
         use ocync_sync::filter::SortOrder;
@@ -2797,7 +2840,7 @@ include: ["1.25.0-rc1"]
             "0.9.0-rc1".into(),
         ];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, MinTags::Report).unwrap();
 
         assert_eq!(candidate_count, Some(5));
         let report = report.expect("report present for a dry run");
@@ -2820,7 +2863,7 @@ include: ["1.25.0-rc1"]
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::Sync).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, MinTags::Enforce).unwrap();
         assert_eq!(candidate_count, Some(2));
         assert_eq!(kept.len(), 2);
         assert!(report.is_none());
@@ -2834,7 +2877,7 @@ include: ["1.25.0-rc1"]
             ..Default::default()
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
-        let result = select_filtered_tags(Some(&tags_config), None, all_tags, Selection::Sync);
+        let result = select_filtered_tags(Some(&tags_config), None, all_tags, MinTags::Enforce);
         assert!(result.is_err(), "expected BelowMinTags");
     }
 
@@ -2848,7 +2891,7 @@ include: ["1.25.0-rc1"]
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun)
+            select_filtered_tags(Some(&tags_config), None, all_tags, MinTags::Report)
                 .expect("a dry run does not enforce min_tags");
         assert_eq!(kept.len(), 2);
         assert_eq!(candidate_count, Some(2));
@@ -2893,12 +2936,8 @@ mappings:
     }
 
     /// A registry whose client could not be built, as `build_clients` records it.
-    fn broken_client(message: &str, auth: bool) -> Result<Arc<RegistryClient>, ClientInitError> {
-        Err(ClientInitError(if auth {
-            CliError::Auth(message.to_string())
-        } else {
-            CliError::Input(message.to_string())
-        }))
+    fn broken_client(message: &str) -> Result<Arc<RegistryClient>, ClientInitError> {
+        Err(ClientInitError(CliError::Auth(message.to_string())))
     }
 
     async fn resolve(config: &Config, clients: &ClientMap) -> Resolution {
@@ -2906,7 +2945,7 @@ mappings:
             config,
             clients,
             &HashMap::new(),
-            Selection::Sync,
+            MinTags::Enforce,
             None,
             &PrepareTracker::default(),
             PREPARE_MAPPING_CONCURRENCY,
@@ -2964,7 +3003,7 @@ mappings:
             ("src".to_string(), Ok(test_client("https://source.test"))),
             (
                 "broken".to_string(),
-                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden"),
             ),
             ("dst".to_string(), Ok(test_client("https://target.test"))),
         ]);
@@ -3051,7 +3090,7 @@ mappings:
             ("good".to_string(), Ok(test_client("https://good.test"))),
             (
                 "broken".to_string(),
-                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden"),
             ),
         ]);
 
@@ -3141,7 +3180,7 @@ mappings:
             ("src".to_string(), Ok(test_client("https://source.test"))),
             (
                 "broken".to_string(),
-                broken_client("ECR auth setup for 'broken.test': 403 Forbidden", true),
+                broken_client("ECR auth setup for 'broken.test': 403 Forbidden"),
             ),
         ]);
 
@@ -3536,7 +3575,7 @@ mappings:
             &config,
             &working_clients(),
             &HashMap::new(),
-            Selection::Sync,
+            MinTags::Enforce,
             None,
             &PrepareTracker::default(),
             PREPARE_MAPPING_CONCURRENCY,
@@ -3560,18 +3599,6 @@ mappings:
         )
     }
 
-    fn unresolved_mapping(from: &str, auth: bool) -> UnresolvedMapping {
-        UnresolvedMapping {
-            from: from.into(),
-            error: "boom".into(),
-            code: if auth {
-                ExitCode::AuthError
-            } else {
-                ExitCode::Failure
-            },
-        }
-    }
-
     /// An unresolved mapping produces no `ImageResult`, so the report alone
     /// would score the run a clean success; a run denied everywhere keeps the
     /// auth code, and one non-auth failure makes the set generic.
@@ -3591,31 +3618,40 @@ mappings:
             (
                 "clean report downgraded by an unresolved mapping",
                 vec![ImageStatus::Synced],
-                vec![("repo/two", false)],
+                vec![("repo/two", ExitCode::Failure)],
                 ExitCode::PartialFailure,
             ),
             (
                 "nothing succeeded is a total failure",
                 vec![],
-                vec![("repo/one", false), ("repo/two", true)],
+                vec![
+                    ("repo/one", ExitCode::Failure),
+                    ("repo/two", ExitCode::AuthError),
+                ],
                 ExitCode::Failure,
             ),
             (
                 "a skipped image counts as the run having worked",
                 vec![skipped()],
-                vec![("repo/two", false)],
+                vec![("repo/two", ExitCode::Failure)],
                 ExitCode::PartialFailure,
             ),
             (
                 "denied everywhere keeps the auth code",
                 vec![],
-                vec![("repo/one", true), ("repo/two", true)],
+                vec![
+                    ("repo/one", ExitCode::AuthError),
+                    ("repo/two", ExitCode::AuthError),
+                ],
                 ExitCode::AuthError,
             ),
             (
                 "a mixed failure set is not auth",
                 vec![],
-                vec![("repo/one", true), ("repo/two", false)],
+                vec![
+                    ("repo/one", ExitCode::AuthError),
+                    ("repo/two", ExitCode::Failure),
+                ],
                 ExitCode::Failure,
             ),
         ];
@@ -3623,7 +3659,7 @@ mappings:
             let report = report_from(statuses);
             let unresolved: Vec<_> = unresolved
                 .into_iter()
-                .map(|(from, auth)| unresolved_mapping(from, auth))
+                .map(|(from, code)| unresolved_mapping(from, code))
                 .collect();
             assert_eq!(
                 combined_exit_code(&report, &unresolved, &[], 0),
@@ -3641,32 +3677,38 @@ mappings:
             (
                 "some unresolved",
                 2,
-                vec![("repo/two", false)],
+                vec![("repo/two", ExitCode::Failure)],
                 ExitCode::PartialFailure,
             ),
             (
                 "none resolved",
                 0,
-                vec![("repo/two", false)],
+                vec![("repo/two", ExitCode::Failure)],
                 ExitCode::Failure,
             ),
             (
                 "none resolved, all denied",
                 0,
-                vec![("repo/one", true), ("repo/two", true)],
+                vec![
+                    ("repo/one", ExitCode::AuthError),
+                    ("repo/two", ExitCode::AuthError),
+                ],
                 ExitCode::AuthError,
             ),
             (
                 "partly denied",
                 1,
-                vec![("repo/one", true), ("repo/two", true)],
+                vec![
+                    ("repo/one", ExitCode::AuthError),
+                    ("repo/two", ExitCode::AuthError),
+                ],
                 ExitCode::PartialFailure,
             ),
         ];
         for (name, succeeded, unresolved, want) in cases {
             let unresolved: Vec<_> = unresolved
                 .into_iter()
-                .map(|(from, auth)| unresolved_mapping(from, auth))
+                .map(|(from, code)| unresolved_mapping(from, code))
                 .collect();
             assert_eq!(
                 dry_run_exit_code(succeeded, &unresolved, &[]),
@@ -3737,16 +3779,15 @@ mappings:
             ..Default::default()
         };
         let all_tags: Vec<String> = (0..10).map(|i| format!("1.{i}.0")).collect();
-        let (kept, candidate_count, filter_report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun).unwrap();
+        let (kept, _, filter_report) =
+            select_filtered_tags(Some(&tags_config), None, all_tags, MinTags::Report).unwrap();
         assert_eq!(kept.len(), 0); // all dropped by semver >=2.0
         assert!(filter_report.is_some());
 
-        let mut mapping = mapping_with_tags_and_report(
+        let mapping = mapping_with_tags_and_report(
             kept.into_iter().map(TagPair::same).collect(),
             filter_report,
         );
-        mapping.candidate_count = candidate_count;
 
         let mut buf: Vec<u8> = Vec::new();
         crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], &[], &[], false).unwrap();
@@ -3760,28 +3801,24 @@ mappings:
     }
 
     use crate::cli::commands::test_support::{
-        SlowRecorder, arrivals, config_yaml, mapping_with_tags_and_report, max_in_flight,
-        repo_names, slow_registry, test_client,
+        SlowRecorder, SlowRegistry, arrivals, config_yaml, max_in_flight, repo_names,
+        slow_registry, unresolved_mapping,
     };
+    use crate::cli::test_support::{mapping_with_tags_and_report, test_client};
 
     /// Mapping resolution must overlap its network waits.
     #[tokio::test]
     async fn resolve_all_resolves_mappings_concurrently() {
         let delay = Duration::from_millis(250);
-        let (_server, config, clients, arrivals, _) =
-            slow_registry(&repo_names(8), &["v1"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            tag_arrivals: arrivals,
+            ..
+        } = slow_registry(&repo_names(8), &["v1"], delay).await;
 
-        let resolution = resolve_all(
-            &config,
-            &clients,
-            &HashMap::new(),
-            Selection::Sync,
-            None,
-            &PrepareTracker::default(),
-            PREPARE_MAPPING_CONCURRENCY,
-        )
-        .await
-        .expect("no config-class failure in this fixture");
+        let resolution = resolve(&config, &clients).await;
 
         assert_eq!(resolution.resolved.len(), 8, "every mapping must resolve");
         let observed = max_in_flight(&arrivals, delay);
@@ -3797,14 +3834,19 @@ mappings:
     async fn resolve_all_never_exceeds_its_concurrency_limit() {
         let delay = Duration::from_millis(250);
         let limit = 2;
-        let (_server, config, clients, arrivals, _) =
-            slow_registry(&repo_names(8), &["v1"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            tag_arrivals: arrivals,
+            ..
+        } = slow_registry(&repo_names(8), &["v1"], delay).await;
 
         resolve_all(
             &config,
             &clients,
             &HashMap::new(),
-            Selection::Sync,
+            MinTags::Enforce,
             None,
             &PrepareTracker::default(),
             limit,
@@ -3819,18 +3861,22 @@ mappings:
         );
     }
 
-    /// `buffered(0)` never completes, so a zero limit must floor at one or the
-    /// run hangs before the engine starts.
+    /// `buffer_unordered(0)` never completes, so a zero limit must floor at one
+    /// or the run hangs before the engine starts.
     #[tokio::test]
     async fn resolve_all_treats_a_zero_limit_as_one() {
-        let (_server, config, clients, ..) =
-            slow_registry(&repo_names(2), &["v1"], Duration::from_millis(1)).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            ..
+        } = slow_registry(&repo_names(2), &["v1"], Duration::from_millis(1)).await;
 
         let resolution = resolve_all(
             &config,
             &clients,
             &HashMap::new(),
-            Selection::Sync,
+            MinTags::Enforce,
             None,
             &PrepareTracker::default(),
             0,
@@ -3926,7 +3972,7 @@ mappings:
             &config,
             &clients,
             &checkers,
-            Selection::Sync,
+            MinTags::Enforce,
             None,
             &tracker,
             limit,
@@ -4020,7 +4066,7 @@ mappings:
             &config,
             &clients,
             &HashMap::new(),
-            Selection::Sync,
+            MinTags::Enforce,
         )
         .await;
         assert!(matches!(
@@ -4182,15 +4228,20 @@ mappings:
         for concurrency in [1usize, 4, 8, 16, 32] {
             // Fresh server and clients per row: reused AIMD windows would give
             // later rows a head start.
-            let (_server, config, clients, arrivals, _) =
-                slow_registry(&repo_names(mappings), &["v1"], delay).await;
+            let SlowRegistry {
+                _server,
+                config,
+                clients,
+                tag_arrivals: arrivals,
+                ..
+            } = slow_registry(&repo_names(mappings), &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let resolution = resolve_all(
                 &config,
                 &clients,
                 &HashMap::new(),
-                Selection::Sync,
+                MinTags::Enforce,
                 None,
                 &PrepareTracker::default(),
                 concurrency,
@@ -4249,7 +4300,7 @@ mappings:
                 &config,
                 &clients,
                 &HashMap::new(),
-                Selection::Sync,
+                MinTags::Enforce,
                 None,
                 &PrepareTracker::default(),
                 concurrency,

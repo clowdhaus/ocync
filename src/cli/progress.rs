@@ -145,16 +145,7 @@ mod tests {
         SyncReport {
             run_id: Uuid::now_v7(),
             images,
-            stats: SyncStats {
-                images_synced: 3,
-                images_skipped: 47,
-                images_failed: 1,
-                blobs_transferred: 12,
-                blobs_skipped: 0,
-                blobs_mounted: 34,
-                bytes_transferred: 432_000_000,
-                ..SyncStats::default()
-            },
+            stats: SyncStats::default(),
             duration: Duration::from_secs(47),
         }
     }

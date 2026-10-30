@@ -18,9 +18,9 @@ use ocync_sync::ShutdownSignal;
 use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
-    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, Selection,
-    UnresolvedMapping, build_clients, log_unresolved_mapping, referenced_registries,
-    resolve_mapping, shared_failure_code, with_prepare_progress,
+    ClientMap, DroppedTarget, MappingResolution, MinTags, PreparePhase, PrepareTracker,
+    ResolutionAndDropped, UnresolvedMapping, build_clients, log_unresolved_mapping,
+    referenced_registries, resolve_mapping, shared_failure_code, with_prepare_progress,
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
@@ -152,13 +152,10 @@ async fn collect_analysis(
     let mut analysis = Analysis::default();
     tracker.begin(PreparePhase::Mappings, config.mappings.len());
 
-    /// One mapping's resolution, or `None` if shutdown reached it first.
-    type MappingOutcome = Option<(Result<MappingResolution, CliError>, Vec<DroppedTarget>)>;
-
     // `None` marks a mapping shutdown reached before it started. Checked
     // inside the task so a signal part way through still stops work that has
     // not begun.
-    let mut indexed: Vec<(usize, MappingOutcome)> =
+    let mut indexed: Vec<(usize, Option<ResolutionAndDropped>)> =
         futures_util::stream::iter(config.mappings.iter().enumerate().map(|(idx, mapping)| {
             async move {
                 if shutdown.is_triggered() {
@@ -170,7 +167,7 @@ async fn collect_analysis(
                 (
                     idx,
                     Some(
-                        resolve_mapping(mapping, config, clients, no_checkers, Selection::Sync)
+                        resolve_mapping(mapping, config, clients, no_checkers, MinTags::Enforce)
                             .await,
                     ),
                 )
@@ -180,7 +177,7 @@ async fn collect_analysis(
         .collect()
         .await;
     indexed.sort_by_key(|(idx, _)| *idx);
-    let outcomes: Vec<MappingOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
+    let outcomes: Vec<Option<ResolutionAndDropped>> = indexed.into_iter().map(|(_, o)| o).collect();
 
     let mut resolved_mappings = Vec::new();
     for (mapping, outcome) in config.mappings.iter().zip(outcomes) {
@@ -564,14 +561,6 @@ mod tests {
         }
     }
 
-    fn unresolved_mapping() -> UnresolvedMapping {
-        UnresolvedMapping {
-            from: "repo/one".into(),
-            error: "403 Forbidden".into(),
-            code: ExitCode::AuthError,
-        }
-    }
-
     #[test]
     fn exit_code_reflects_how_complete_the_analysis_is() {
         let cases = [
@@ -602,7 +591,7 @@ mod tests {
             (
                 "unresolved mapping alone",
                 Analysis {
-                    unresolved: vec![unresolved_mapping()],
+                    unresolved: vec![unresolved_mapping("repo/one", ExitCode::AuthError)],
                     ..analysis(3, 0, 0, 0)
                 },
                 ExitCode::PartialFailure,
@@ -619,15 +608,22 @@ mod tests {
         }
     }
 
-    use crate::cli::commands::test_support::{max_in_flight, repo_names, slow_registry};
+    use crate::cli::commands::test_support::{
+        SlowRegistry, max_in_flight, repo_names, slow_registry, unresolved_mapping,
+    };
 
     /// Many mappings with few tags each: a per-mapping walk would stay serial.
     #[tokio::test]
     async fn collect_analysis_overlaps_tag_listings_and_manifest_pulls() {
         let delay = std::time::Duration::from_millis(250);
         let repos = repo_names(8);
-        let (_server, config, clients, tag_arrivals, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            tag_arrivals,
+            manifest_arrivals,
+        } = slow_registry(&repos, &["v1"], delay).await;
 
         let analysis = collect_analysis(
             &config,
@@ -658,8 +654,13 @@ mod tests {
     async fn collect_analysis_starts_nothing_once_shutdown_is_triggered() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(8);
-        let (_server, config, clients, tag_arrivals, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            tag_arrivals,
+            manifest_arrivals,
+        } = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         shutdown.trigger();
@@ -695,8 +696,13 @@ mod tests {
         let delay = std::time::Duration::from_millis(1);
         let images = ANALYZE_CONCURRENCY * 3;
         let repos = repo_names(images);
-        let (_server, config, clients, _, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            manifest_arrivals,
+            ..
+        } = slow_registry(&repos, &["v1"], delay).await;
 
         let shutdown = ShutdownSignal::new();
         let no_checkers = HashMap::new();
@@ -754,7 +760,12 @@ mod tests {
         let mut baseline: Option<std::time::Duration> = None;
         for concurrency in [1usize, 4, 8, 16, 32] {
             // Fresh server and clients per row: AIMD widens with reuse.
-            let (_server, config, clients, _, _) = slow_registry(&repos, &["v1"], delay).await;
+            let SlowRegistry {
+                _server,
+                config,
+                clients,
+                ..
+            } = slow_registry(&repos, &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let analysis = collect_analysis(
@@ -788,7 +799,12 @@ mod tests {
     async fn collect_analysis_reports_the_image_walk_as_its_own_step() {
         let delay = std::time::Duration::from_millis(1);
         let repos = repo_names(3);
-        let (_server, config, clients, _, _) = slow_registry(&repos, &["v1", "v2"], delay).await;
+        let SlowRegistry {
+            _server,
+            config,
+            clients,
+            ..
+        } = slow_registry(&repos, &["v1", "v2"], delay).await;
 
         let tracker = PrepareTracker::default();
         let analysis = collect_analysis(

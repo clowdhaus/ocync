@@ -233,7 +233,7 @@ fn render_samples(samples: &[String], verbose: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::commands::test_support::mapping_with_tags_and_report;
+    use crate::cli::test_support::mapping_with_tags_and_report;
     use ocync_sync::filter::{DropReason, FilterReport, StageDelta};
 
     fn report_fixture() -> FilterReport {
@@ -386,36 +386,34 @@ mod tests {
         }
     }
 
-    /// (name, kept, `min_tags`, expected substrings, absent substrings)
-    type MinTagsCase = (
-        &'static str,
-        usize,
-        usize,
-        &'static [&'static str],
-        &'static [&'static str],
-    );
-
     #[test]
     fn min_tags_status_reports_whether_it_is_satisfied() {
-        let cases: [MinTagsCase; 2] = [
-            (
-                "satisfied",
-                5,
-                3,
-                &["min_tags: 3", "kept 5", "satisfied"],
-                &["FAIL"],
-            ),
-            (
-                "unsatisfied warns real sync will fail",
-                3,
-                10,
-                &["min_tags: 10", "kept 3", "FAIL", "BelowMinTags"],
-                &[],
-            ),
+        struct Case {
+            name: &'static str,
+            kept: usize,
+            min_tags: usize,
+            present: &'static [&'static str],
+            absent: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                name: "satisfied",
+                kept: 5,
+                min_tags: 3,
+                present: &["min_tags: 3", "kept 5", "satisfied"],
+                absent: &["FAIL"],
+            },
+            Case {
+                name: "unsatisfied warns real sync will fail",
+                kept: 3,
+                min_tags: 10,
+                present: &["min_tags: 10", "kept 3", "FAIL", "BelowMinTags"],
+                absent: &[],
+            },
         ];
-        for (name, kept, min, present, absent) in cases {
-            let out = capture(|w| write_min_tags_status(w, kept, Some(min), false));
-            assert_output(name, &out, present, absent);
+        for case in cases {
+            let out = capture(|w| write_min_tags_status(w, case.kept, Some(case.min_tags), false));
+            assert_output(case.name, &out, case.present, case.absent);
         }
     }
 
@@ -520,7 +518,8 @@ mod tests {
             }],
             min_tags: Some(5),
         };
-        let mapping = mapping_with_kept_and_report(2, Some(report));
+        let tags = (0..2).map(|i| TagPair::same(format!("v{i}"))).collect();
+        let mapping = mapping_with_tags_and_report(tags, Some(report));
         let out = capture(|w| write_mapping(w, &mapping, false));
         assert!(out.contains("min_tags: 5"), "{out}");
         assert!(out.contains("kept 2"), "{out}");
@@ -551,10 +550,5 @@ mod tests {
         // Came through the pipeline, so unmarked.
         assert!(out.contains("    1.0.0\n"), "{out}");
         assert!(!out.contains("1.0.0  [via include]"), "{out}");
-    }
-
-    fn mapping_with_kept_and_report(n: usize, report: Option<FilterReport>) -> ResolvedMapping {
-        let tags: Vec<TagPair> = (0..n).map(|i| TagPair::same(format!("v{i}"))).collect();
-        mapping_with_tags_and_report(tags, report)
     }
 }

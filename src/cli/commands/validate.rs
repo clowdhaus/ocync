@@ -19,12 +19,11 @@ pub(crate) fn run(args: &ValidateArgs) -> Result<ExitCode, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::commands::test_support::write_temp_config;
+    use crate::cli::test_support::write_temp_config;
 
     #[test]
     fn validate_valid_config() {
-        let path = write_temp_config(
-            "validate_valid",
+        let file = write_temp_config(
             r#"
 registries:
   hub:
@@ -37,39 +36,39 @@ mappings:
 "#,
         );
         let args = ValidateArgs {
-            config: path.clone(),
+            config: file.path().to_path_buf(),
         };
         let result = run(&args).unwrap();
         assert_eq!(result, ExitCode::Success);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn validate_rejects_bad_configs() {
+        // (name, config text or `None` for a missing file, error substring)
         let cases = [
-            ("invalid yaml", Some("validate_bad_yaml"), "{{{{ not yaml"),
+            ("invalid yaml", Some("{{{{ not yaml"), "failed to parse"),
             (
                 "missing tags block",
-                Some("validate_no_tags"),
-                "\nmappings:\n  - from: library/nginx\n",
+                Some("\nmappings:\n  - from: library/nginx\n"),
+                "missing a tags block",
             ),
             (
                 "unknown source registry",
-                Some("validate_bad_ref"),
-                "\nregistries:\n  hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    source: nonexistent\n    tags:\n      glob: \"*\"\n",
+                Some(
+                    "\nregistries:\n  hub:\n    url: registry-1.docker.io\nmappings:\n  - from: nginx\n    source: nonexistent\n    tags:\n      glob: \"*\"\n",
+                ),
+                "unknown registry 'nonexistent'",
             ),
-            ("nonexistent file", None, ""),
+            ("nonexistent file", None, "failed to read"),
         ];
-        for (name, file, content) in cases {
-            let path = match file {
-                Some(file) => write_temp_config(file, content),
+        for (name, content, want) in cases {
+            let file = content.map(write_temp_config);
+            let config = match &file {
+                Some(file) => file.path().to_path_buf(),
                 None => std::path::PathBuf::from("/tmp/ocync_test_does_not_exist.yaml"),
             };
-            let result = run(&ValidateArgs {
-                config: path.clone(),
-            });
-            assert!(result.is_err(), "{name}");
-            let _ = std::fs::remove_file(path);
+            let err = run(&ValidateArgs { config }).unwrap_err().to_string();
+            assert!(err.contains(want), "{name}: expected '{want}' in: {err}");
         }
     }
 }

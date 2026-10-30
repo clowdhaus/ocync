@@ -503,6 +503,7 @@ impl<'de> Deserialize<'de> for RemovedSemverPrerelease {
     where
         D: serde::Deserializer<'de>,
     {
+        // Consume the value so the deserializer is in a clean state.
         let _: serde::de::IgnoredAny = Deserialize::deserialize(deserializer)?;
         Err(<D::Error as serde::de::Error>::custom(
             "tags.semver_prerelease has been removed. \
@@ -548,7 +549,7 @@ fn is_blocked(var_name: &str) -> bool {
 /// (SECRET, TOKEN, etc.) are rejected so display output cannot leak them.
 /// Config loading always passes `Allow`: it works on raw YAML without
 /// field-level context, and blocking would reject legitimate auth config.
-pub(crate) fn expand_env_vars(input: &str, secrets: SecretVars) -> Result<String, ConfigError> {
+fn expand_env_vars(input: &str, secrets: SecretVars) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -923,7 +924,7 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::commands::test_support::write_temp_config;
+    use crate::cli::test_support::{lock_env, write_temp_config};
 
     const SCHEMA_JSON_PATH: &str = "docs/public/config.schema.json";
 
@@ -1181,6 +1182,7 @@ mappings:
 
     #[test]
     fn expand_env_vars_resolves_values() {
+        let _env = lock_env();
         // (name, variable, value or unset, input, secrets, want)
         let cases = [
             (
@@ -1220,6 +1222,7 @@ mappings:
 
     #[test]
     fn expand_required_missing() {
+        let _env = lock_env();
         unsafe { std::env::remove_var("OCYNC_REQUIRED_VAR") };
         let result = expand_env_vars("${OCYNC_REQUIRED_VAR:?must be set}", SecretVars::Block);
         assert!(result.is_err());
@@ -1231,6 +1234,7 @@ mappings:
 
     #[test]
     fn blocked_secret_when_secrets_disallowed() {
+        let _env = lock_env();
         unsafe { std::env::set_var("MY_SECRET_KEY", "s3cret") };
         let result = expand_env_vars("${MY_SECRET_KEY}", SecretVars::Block);
         assert!(result.is_err());
@@ -1813,7 +1817,7 @@ mappings:
     fn invalid_platforms_rejected() {
         let cases: [(&str, &[&str], &str); 7] = [
             ("no slash", &["linux-amd64"], "linux-amd64"),
-            ("slash only", &["/"], "/"),
+            ("slash only", &["/"], "'/'"),
             ("empty os", &["/amd64"], "/amd64"),
             ("empty arch", &["linux/"], "linux/"),
             ("two slashes", &["//"], "//"),
@@ -1833,12 +1837,10 @@ mappings:
 
     #[test]
     fn invalid_platform_in_defaults_rejected() {
-        let path = write_temp_config(
-            "config_invalid_default_platform",
+        let file = write_temp_config(
             "defaults:\n  platforms:\n    - linux-amd64\nmappings:\n  - from: library/nginx\n    tags:\n      glob: \"*\"\n",
         );
-        let err = load_config(&path).unwrap_err();
-        let _ = std::fs::remove_file(path);
+        let err = load_config(file.path()).unwrap_err();
         match err {
             ConfigError::Validation(msg) => {
                 assert!(msg.contains("defaults"), "{msg}");
@@ -2032,6 +2034,7 @@ mappings:
 
     #[test]
     fn expansion_substitutes_values_verbatim() {
+        let _env = lock_env();
         // Expansion is plain text substitution: a quoted field keeps ":" and
         // "#" inside the value, and an unquoted one is left for the user to
         // quote rather than escaped.

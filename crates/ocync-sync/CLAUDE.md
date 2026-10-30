@@ -70,7 +70,7 @@ Production default: 30s. Tests default to `Duration::ZERO` via `fast_retry()` so
 - Do not write tests that capture tracing output via `set_default()` -- tracing's global `MAX_LEVEL` and callsite interest caching make per-test subscriber capture unreliable when `cargo test` runs tests in parallel within the same process. Test behavior via engine outcomes, not log messages.
 - Each test file starts with `mod helpers; use helpers::*;` -- helpers are NOT auto-discovered.
 - Helper sub-modules use `#![allow(dead_code, unused_imports, unreachable_pub)]` (required for test module visibility).
-- Batch checker mocks live in `tests/helpers/mocks.rs`: `MockChecker::new` (listed digests present, the rest missing), `MockChecker::failing` (every check fails) and `WaitTrackingChecker`, which also counts the manifest-commit gate's `wait_for_blobs_available` calls.
+- Batch checker mocks live in `tests/helpers/mocks.rs`: `MockChecker::new` (listed digests present, the rest missing), `MockChecker::leaving_out` (as `new`, but the unknown digests are left out of the answer), `MockChecker::failing` (every check fails) and `WaitTrackingChecker`, which also counts the manifest-commit gate's `wait_for_blobs_available` calls.
 
 ### Writing new tests
 

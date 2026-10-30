@@ -483,7 +483,8 @@ mod tests {
         for (name, flags, want_dry_run, want_json) in cases {
             let mut argv = vec!["ocync", "sync", "--config", "c.yaml"];
             argv.extend(flags);
-            let Commands::Sync(args) = Cli::parse_from(argv).command else {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let Commands::Sync(args) = cli.command else {
                 panic!("{name}: expected Sync command");
             };
             assert_eq!(args.dry_run, want_dry_run, "{name}");
@@ -498,7 +499,8 @@ mod tests {
         for (name, flags, want) in cases {
             let mut argv = vec!["ocync", "watch", "--config", "c.yaml"];
             argv.extend(flags);
-            let Commands::Watch(args) = Cli::parse_from(argv).command else {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let Commands::Watch(args) = cli.command else {
                 panic!("{name}: expected Watch command");
             };
             assert_eq!(args.interval, want, "{name}");

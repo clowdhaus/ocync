@@ -9,6 +9,8 @@ pub(crate) mod shutdown;
 
 #[cfg(test)]
 mod auth_dispatch_tests;
+#[cfg(test)]
+mod test_support;
 
 use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::acr::AcrAuth;
@@ -514,6 +516,30 @@ mod tests {
         ];
         for (name, input, want) in cases {
             assert_eq!(bare_hostname(input), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn is_ecr_registry_prefers_an_explicit_auth_type() {
+        const ECR_HOST: &str = "123456789012.dkr.ecr.us-east-1.amazonaws.com";
+        let cases = [
+            (
+                "explicit ecr on another host",
+                Some(AuthType::Ecr),
+                "ghcr.io",
+                true,
+            ),
+            (
+                "explicit static token opts out of an ECR host",
+                Some(AuthType::StaticToken),
+                ECR_HOST,
+                false,
+            ),
+            ("no auth type on an ECR host", None, ECR_HOST, true),
+            ("no auth type on another host", None, "ghcr.io", false),
+        ];
+        for (name, auth_type, host, want) in cases {
+            assert_eq!(is_ecr_registry(auth_type.as_ref(), host), want, "{name}");
         }
     }
 

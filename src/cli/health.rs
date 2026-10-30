@@ -118,80 +118,91 @@ mod tests {
 
     const MINUTE: Duration = Duration::from_secs(60);
 
-    /// Cases shared by the handler and TCP tests:
-    /// (name, state, path, status line, body suffix). Liveness stays 200 while
+    /// One request and the response it must draw.
+    struct Route {
+        name: &'static str,
+        state: HealthState,
+        path: &'static str,
+        /// The response's status line.
+        status: &'static str,
+        /// The response's body, which the response must end with.
+        body: &'static str,
+    }
+
+    /// Cases shared by the handler and TCP tests. Liveness stays 200 while
     /// readiness is 503, whatever the state.
-    fn route_cases() -> Vec<(
-        &'static str,
-        HealthState,
-        &'static str,
-        &'static str,
-        &'static str,
-    )> {
+    fn route_cases() -> Vec<Route> {
         let short = Duration::from_millis(10);
         vec![
-            (
-                "healthz before first sync",
-                state(MINUTE, None),
-                "/healthz",
-                OK,
-                "ok\n",
-            ),
-            (
-                "healthz after success",
-                succeeded(MINUTE),
-                "/healthz",
-                OK,
-                "ok\n",
-            ),
-            (
-                "healthz when stale",
-                state(short, Some(short * 3)),
-                "/healthz",
-                OK,
-                "ok\n",
-            ),
-            (
-                "readyz before first sync",
-                state(MINUTE, None),
-                "/readyz",
-                UNAVAILABLE,
-                "sync stale\n",
-            ),
-            (
-                "readyz after success",
-                succeeded(MINUTE),
-                "/readyz",
-                OK,
-                "ok\n",
-            ),
-            (
-                "readyz when stale",
-                state(short, Some(short * 3)),
-                "/readyz",
-                UNAVAILABLE,
-                "sync stale\n",
-            ),
-            (
-                "unknown path",
-                state(MINUTE, None),
-                "/foo",
-                NOT_FOUND,
-                "not found\n",
-            ),
-            (
-                "empty path",
-                state(MINUTE, None),
-                "",
-                NOT_FOUND,
-                "not found\n",
-            ),
+            Route {
+                name: "healthz before first sync",
+                state: state(MINUTE, None),
+                path: "/healthz",
+                status: OK,
+                body: "ok\n",
+            },
+            Route {
+                name: "healthz after success",
+                state: succeeded(MINUTE),
+                path: "/healthz",
+                status: OK,
+                body: "ok\n",
+            },
+            Route {
+                name: "healthz when stale",
+                state: state(short, Some(short * 3)),
+                path: "/healthz",
+                status: OK,
+                body: "ok\n",
+            },
+            Route {
+                name: "readyz before first sync",
+                state: state(MINUTE, None),
+                path: "/readyz",
+                status: UNAVAILABLE,
+                body: "sync stale\n",
+            },
+            Route {
+                name: "readyz after success",
+                state: succeeded(MINUTE),
+                path: "/readyz",
+                status: OK,
+                body: "ok\n",
+            },
+            Route {
+                name: "readyz when stale",
+                state: state(short, Some(short * 3)),
+                path: "/readyz",
+                status: UNAVAILABLE,
+                body: "sync stale\n",
+            },
+            Route {
+                name: "unknown path",
+                state: state(MINUTE, None),
+                path: "/foo",
+                status: NOT_FOUND,
+                body: "not found\n",
+            },
+            Route {
+                name: "empty path",
+                state: state(MINUTE, None),
+                path: "",
+                status: NOT_FOUND,
+                body: "not found\n",
+            },
         ]
     }
 
     #[test]
     fn handle_request_routes_by_path_and_state() {
-        for (name, state, path, status, body) in route_cases() {
+        for route in route_cases() {
+            let Route {
+                name,
+                state,
+                path,
+                status,
+                body,
+            } = route;
             let resp = handle_request(path, &state);
             assert!(resp.starts_with(status), "{name}: {resp}");
             assert!(resp.ends_with(body), "{name}: {resp}");
@@ -282,7 +293,14 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                for (name, state, path, status, body) in route_cases() {
+                for Route {
+                    name,
+                    state,
+                    path,
+                    status,
+                    body,
+                } in route_cases()
+                {
                     if path.is_empty() {
                         continue;
                     }

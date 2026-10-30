@@ -1,4 +1,4 @@
-//! Shared scaffolding for the prepare-phase concurrency tests.
+//! Shared scaffolding for the command modules' prepare-phase concurrency tests.
 //!
 //! `sync` and `analyze` resolve mappings through the same code and prove the
 //! same property: independent network work overlaps. Both need a registry that
@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ocync_distribution::{RegistryClient, RegistryClientBuilder};
 use wiremock::{MockServer, Request, Respond, ResponseTemplate};
 
 /// Instants at which requests reached a stub, shared with the test.
@@ -94,16 +93,16 @@ impl Respond for SlowRecorder {
     }
 }
 
-/// A config whose `mappings` all point at `server`; `tags` is the body of each
-/// mapping's `tags:` block.
-pub(crate) fn config_yaml(server: &MockServer, repos: &[String], tags: &str) -> String {
+/// A config whose `mappings` all point at `server`; `tags_block` is the body of
+/// each mapping's `tags:` block.
+pub(crate) fn config_yaml(server: &MockServer, repos: &[String], tags_block: &str) -> String {
     let mut yaml = format!(
         "registries:\n  src:\n    url: {uri}\n  dst:\n    url: {uri}\n\
          defaults:\n  source: src\n  targets: [dst]\nmappings:\n",
         uri = server.uri()
     );
     for repo in repos {
-        yaml.push_str(&format!("  - from: {repo}\n    tags:\n{tags}"));
+        yaml.push_str(&format!("  - from: {repo}\n    tags:\n{tags_block}"));
     }
     yaml
 }
@@ -113,70 +112,40 @@ pub(crate) fn repo_names(count: usize) -> Vec<String> {
     (0..count).map(|i| format!("repo/img{i}")).collect()
 }
 
-/// An anonymous client pointed at a mock server.
-pub(crate) fn test_client(url: &str) -> Arc<RegistryClient> {
-    Arc::new(
-        RegistryClientBuilder::new(url::Url::parse(url).expect("mock server url parses"))
-            .build()
-            .expect("client builds"),
-    )
-}
-
-/// Write `content` to a named file in the temp dir and return its path.
-pub(crate) fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
-    std::fs::write(&path, content).expect("temp config writes");
-    path
-}
-
-/// A single-target mapping over `tags` carrying `filter_report`, for
-/// formatter and wiring tests. The clients are placeholders that issue no
-/// requests.
-pub(crate) fn mapping_with_tags_and_report(
-    tags: Vec<ocync_sync::engine::TagPair>,
-    filter_report: Option<ocync_sync::filter::FilterReport>,
-) -> ocync_sync::engine::ResolvedMapping {
-    use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
-    use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TargetEntry};
-    use std::collections::HashSet;
-    use std::rc::Rc;
-
-    let client = test_client("http://127.0.0.1");
-
-    ResolvedMapping {
-        source_authority: RegistryAuthority::new("source.test:443"),
-        source_client: client.clone(),
-        source_repo: RepositoryName::new("repo").unwrap(),
-        target_repo: RepositoryName::new("repo").unwrap(),
-        targets: vec![TargetEntry {
-            name: RegistryAlias::new("target"),
-            client,
-            batch_checker: None,
-            existing_tags: HashSet::new(),
-        }],
-        tags,
-        platforms: None,
-        head_first: false,
-        immutable_glob: None,
-        artifacts_config: Rc::new(ResolvedArtifacts::default()),
-        candidate_count: filter_report.as_ref().map(|r| r.candidate_count),
-        filter_report,
+/// A mapping that failed to resolve, classified as `code`.
+pub(crate) fn unresolved_mapping(
+    from: &str,
+    code: crate::cli::ExitCode,
+) -> crate::cli::commands::synchronize::UnresolvedMapping {
+    crate::cli::commands::synchronize::UnresolvedMapping {
+        from: from.into(),
+        error: "boom".into(),
+        code,
     }
 }
 
-/// A registry that answers tag listings and manifest pulls after `delay`,
-/// recording each separately, with the config and clients pointed at it.
+/// A registry that answers tag listings and manifest pulls after a delay,
+/// with the config and clients pointed at it.
+pub(crate) struct SlowRegistry {
+    /// Keeps the stub server alive for the test.
+    pub(crate) _server: MockServer,
+    /// A config with one mapping per repository, all through the server.
+    pub(crate) config: crate::cli::config::Config,
+    /// Clients for the config's `src` and `dst` registries.
+    pub(crate) clients: crate::cli::commands::synchronize::ClientMap,
+    /// When each `tags/list` request arrived.
+    pub(crate) tag_arrivals: Arrivals,
+    /// When each manifest request arrived.
+    pub(crate) manifest_arrivals: Arrivals,
+}
+
+/// Start a [`SlowRegistry`] serving `tags` for each of `repos`.
 pub(crate) async fn slow_registry(
     repos: &[String],
     tags: &[&str],
     delay: Duration,
-) -> (
-    MockServer,
-    crate::cli::config::Config,
-    crate::cli::commands::synchronize::ClientMap,
-    Arrivals,
-    Arrivals,
-) {
+) -> SlowRegistry {
+    use crate::cli::test_support::test_client;
     use wiremock::matchers::{method, path_regex};
 
     let server = MockServer::start().await;
@@ -200,5 +169,11 @@ pub(crate) async fn slow_registry(
         ("src".to_string(), Ok(test_client(&server.uri()))),
         ("dst".to_string(), Ok(test_client(&server.uri()))),
     ]);
-    (server, config, clients, tag_arrivals, manifest_arrivals)
+    SlowRegistry {
+        _server: server,
+        config,
+        clients,
+        tag_arrivals,
+        manifest_arrivals,
+    }
 }

@@ -5,15 +5,16 @@
 //! `ghcr | docker_config` with no docker config file is a `CliError::Input`.
 //!
 //! Tests that read `DockerConfig::load_default()` set the process-global
-//! `DOCKER_CONFIG` to a tempdir under `DISPATCH_ENV_GUARD`, a hand-rolled
+//! `DOCKER_CONFIG` to a tempdir under the shared environment lock, a hand-rolled
 //! mutex (`serial_test` is not a workspace dependency).
 
 use std::ffi::OsString;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 use ocync_distribution::RegistryClient;
 
 use crate::cli::config::{AuthType, BasicCredentials, RegistryConfig};
+use crate::cli::test_support::lock_env;
 use crate::cli::{CliError, Registry, RunCredentials, build_registry_client};
 
 /// Build the client for `cfg`, with credentials of its own.
@@ -21,11 +22,8 @@ async fn build(cfg: &RegistryConfig) -> Result<RegistryClient, CliError> {
     build_registry_client(Registry::Configured(cfg), &RunCredentials::default()).await
 }
 
-/// Serializes tests that mutate `DOCKER_CONFIG`.
-static DISPATCH_ENV_GUARD: Mutex<()> = Mutex::new(());
-
-/// Sets `DOCKER_CONFIG` and restores its prior value on drop, holding
-/// `DISPATCH_ENV_GUARD` meanwhile.
+/// Sets `DOCKER_CONFIG` and restores its prior value on drop, holding the
+/// shared environment lock meanwhile.
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
     prior: Option<OsString>,
@@ -33,10 +31,9 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn set_docker_config(value: &std::path::Path) -> Self {
-        // Poison is irrelevant: the env state is overwritten either way.
-        let lock = DISPATCH_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = lock_env();
         let prior = std::env::var_os("DOCKER_CONFIG");
-        // SAFETY: env mutations are serialized by DISPATCH_ENV_GUARD.
+        // SAFETY: env mutations are serialized by `lock_env`.
         unsafe {
             std::env::set_var("DOCKER_CONFIG", value);
         }
@@ -46,7 +43,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: env mutations are serialized by DISPATCH_ENV_GUARD.
+        // SAFETY: env mutations are serialized by `lock_env`.
         unsafe {
             match &self.prior {
                 Some(v) => std::env::set_var("DOCKER_CONFIG", v),
