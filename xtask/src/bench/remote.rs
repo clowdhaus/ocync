@@ -248,7 +248,7 @@ enum RemoteOutcome {
 impl RemoteOutcome {
     /// A script that printed [`RUN_IN_PROGRESS_LINE`] was refused, whatever
     /// its exit code: `set -e` makes any failing command exit with any code,
-    /// [`RUN_IN_PROGRESS_EXIT`] included.
+    /// the refusal's own `exit 3` included.
     fn new(refusal_line_seen: bool, exit_code: Option<i32>) -> Self {
         if refusal_line_seen {
             Self::Refused
@@ -257,6 +257,11 @@ impl RemoteOutcome {
         }
     }
 }
+
+/// Command that receives the script on stdin. `setsid -w` makes the script
+/// lead its own process group, so `$$` is a group id `--force` can kill, and
+/// waits so the script's exit status is the command's.
+const REMOTE_COMMAND: &str = "setsid -w bash -s";
 
 /// Pipe a script to the remote instance via SSH and stream stdout.
 fn ssh_stream(
@@ -268,7 +273,7 @@ fn ssh_stream(
         .args(["-o", "ServerAliveInterval=30"])
         .args(["-o", "ServerAliveCountMax=120"])
         .arg(format!("{}@{}", config.user, config.host))
-        .arg("bash -s")
+        .arg(REMOTE_COMMAND)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -438,12 +443,9 @@ impl ExistingRun {
     }
 }
 
-/// Line the remote script prints, before exiting [`RUN_IN_PROGRESS_EXIT`],
-/// when it refuses to replace a live run.
+/// Line the remote script prints, before exiting 3, when it refuses to
+/// replace a live run.
 const RUN_IN_PROGRESS_LINE: &str = "bench-remote: a benchmark is already running on this instance";
-
-/// Exit status of the remote script when it refuses to replace a live run.
-const RUN_IN_PROGRESS_EXIT: i32 = 3;
 
 /// Seconds `--force` waits for a killed run to release the run lock.
 const KILL_WAIT_SECS: u32 = 30;
@@ -454,8 +456,8 @@ const KILL_WAIT_SECS: u32 = 30;
 /// Needs `$LOCK_FILE` and `$PGID_FILE`. The lock is held until every process
 /// holding fd 9 exits, so it spans checkout, build and the benchmark and
 /// outlives the SSH session, and the kernel drops it when they die. Liveness
-/// is the lock alone. `$PGID_FILE`, written by the benchmark's own process
-/// group leader, only says whom to kill, and is read only while the lock is
+/// is the lock alone. `$PGID_FILE`, written by each process group leader
+/// of the run (the script, then the benchmark), only says whom to kill, and is read only while the lock is
 /// held by someone else.
 ///
 /// A new run never attaches to an old one, since the old one may be running a
@@ -464,7 +466,7 @@ fn existing_run_guard(existing: ExistingRun) -> String {
     let on_held = match existing {
         ExistingRun::Refuse => format!(
             r#"echo "{RUN_IN_PROGRESS_LINE}"
-  exit {RUN_IN_PROGRESS_EXIT}"#
+  exit 3"#
         ),
         ExistingRun::Kill => format!(
             r#"OLD_PGID=$(cat "$PGID_FILE" 2>/dev/null || true)
@@ -473,7 +475,7 @@ fn existing_run_guard(existing: ExistingRun) -> String {
     kill -9 -- "-$OLD_PGID" 2>/dev/null || true
   fi
   if ! flock -w {KILL_WAIT_SECS} 9; then
-    echo "bench-remote: error: the running benchmark did not release the run lock in {KILL_WAIT_SECS}s"
+    echo "bench-remote: error: the run lock is still held after {KILL_WAIT_SECS}s"
     exit 1
   fi"#
         ),
@@ -487,57 +489,42 @@ rm -f "$PGID_FILE""#
     )
 }
 
-/// Shell that records the script's own process group in `$PGID_FILE`, so
-/// `--force` can end a run that is still checking out or building, before the
-/// benchmark's group exists. sshd starts the remote command as a session
-/// leader; a script that does not lead its own group records nothing, since
-/// killing its group would kill unrelated processes.
-const RECORD_OWN_GROUP: &str = r#"if [ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ]; then
-  echo "$$" > "$PGID_FILE"
-fi"#;
-
-/// Shell that stops the script when a tool the run lock needs is missing.
-/// Without it a missing `flock` fails the lock test and reads as a live run.
-const REQUIRE_UTIL_LINUX: &str = r#"for tool in flock setsid; do
-  if ! command -v "$tool" >/dev/null; then
-    echo "bench-remote: error: $tool (util-linux) is not installed on the instance"
-    exit 1
-  fi
-done"#;
-
-/// Shell that runs the benchmark and records how it ended.
+/// Shell that runs the benchmark with its own arguments and records how it
+/// ended.
 ///
-/// Run as its own session leader (`setsid`), so `$$` is the process group of
-/// the harness and every tool it spawns, and `--force` can kill them together.
-/// Needs `$PGID_FILE` and `$EXIT_FILE`. The exit status is captured with `if`
-/// because `set -e` would otherwise end the script before recording it.
-fn bench_runner(bench_args: &str) -> String {
-    format!(
-        r#"set -euo pipefail
+/// Fixed text: the benchmark's arguments arrive as `"$@"`, never as script
+/// source. Run as its own session leader (`setsid`), so `$$` is the process
+/// group of the harness and every tool it spawns, and `--force` can kill them
+/// together. Needs `$PGID_FILE` and `$EXIT_FILE`. The exit status is captured
+/// with `if` because `set -e` would otherwise end the script before recording
+/// it.
+const BENCH_RUNNER: &str = r#"set -euo pipefail
 echo "$$" > "$PGID_FILE"
-if cargo xtask bench {bench_args} 2>&1; then BENCH_EXIT=0; else BENCH_EXIT=$?; fi
+if cargo xtask bench "$@" 2>&1; then BENCH_EXIT=0; else BENCH_EXIT=$?; fi
 echo "$BENCH_EXIT" > "$EXIT_FILE"
 echo "[bench-remote] exit code: $BENCH_EXIT"
 rm -f "$PGID_FILE"
-exit "$BENCH_EXIT""#
-    )
-}
+exit "$BENCH_EXIT""#;
+
+/// Removes untracked files left by previous builds, keeping the build cache,
+/// results and the run's own files. The run-file pattern is quoted so the
+/// shell cannot expand it against the files present.
+const GIT_CLEAN: &str =
+    "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/";
 
 /// The script piped to `bash -s` on the instance.
 ///
 /// Every value is already shell-escaped or trusted: `bench_args` and
-/// `registry_env` are shell text, `git_sha` is the hex object name from
-/// `rev-parse --verify`.
+/// `registry_env` are shell text, and a [`CommitSha`] is hex.
 fn remote_script(
     git_ref: &str,
-    git_sha: &str,
+    git_sha: &CommitSha,
     bench_args: &str,
     registry_env: &str,
     existing: ExistingRun,
 ) -> String {
     let existing_run = existing_run_guard(existing);
     let escaped_git_ref = shell_escape(git_ref);
-    let runner = bench_runner(bench_args);
     format!(
         r#"#!/bin/bash
 set -euo pipefail
@@ -567,14 +554,10 @@ EXIT_FILE=bench/.bench-run.exit
 RUNNER_FILE=bench/.bench-run.sh
 # The run lock is held from here to the end of the benchmark, so a second
 # invocation cannot delete target/ under a run that is still checking out or
-# building.
-{REQUIRE_UTIL_LINUX}
+# building. The script leads its own process group (see REMOTE_COMMAND), so
+# --force can end a run that has not started the benchmark yet.
 {existing_run}
-{RECORD_OWN_GROUP}
-# Descendants that left the killed run's process group. cargo xtask execs the
-# harness, so its command line is the built binary's.
-pkill -9 -f 'xtask bench|dregsy|regsync|skopeo|bench-proxy serve|target/release/ocync' 2>/dev/null || true
-sleep 1
+echo "$$" > "$PGID_FILE"
 
 # Pull code and build. Use exact SHA (not branch name) so force-pushes
 # between our local push and the instance's fetch cannot change what gets
@@ -583,7 +566,7 @@ echo '[1/4] Checking out {git_sha} ({escaped_git_ref})...'
 git fetch origin
 git checkout '{git_sha}' --detach
 # Remove untracked files left by previous builds or deleted from the repo.
-git clean -fdx -e target/ -e bench/results/ -e bench/.bench-run.* -e bench/.tmp/
+{GIT_CLEAN}
 
 echo '[2/4] Building ocync + bench-proxy...'
 source ~/.bench-env 2>/dev/null || true
@@ -619,10 +602,10 @@ mkdir -p "$TMPDIR"
 > "$LOG_FILE"
 rm -f "$EXIT_FILE"
 cat > "$RUNNER_FILE" <<'RUNNER_EOF'
-{runner}
+{BENCH_RUNNER}
 RUNNER_EOF
 export PGID_FILE EXIT_FILE
-setsid bash "$RUNNER_FILE" >> "$LOG_FILE" 2>&1 &
+setsid bash "$RUNNER_FILE" {bench_args} >> "$LOG_FILE" 2>&1 &
 BENCH_PID=$!
 echo "bench-remote: started (PID $BENCH_PID), streaming log..."
 
@@ -661,9 +644,34 @@ fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::erro
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+/// A full commit object name: 40 lowercase hex digits, safe to place in a
+/// shell command unescaped.
+#[derive(Debug, PartialEq, Eq)]
+struct CommitSha(String);
+
+impl CommitSha {
+    /// Accepts only 40 lowercase hex digits.
+    fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        if s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(format!("git resolved to {s:?}, not a 40-digit lowercase hex commit id").into())
+        }
+    }
+}
+
+impl std::fmt::Display for CommitSha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Resolves `git_ref` to the commit it names in the repository at `repo`.
-fn resolve_commit(repo: &Path, git_ref: &str) -> Result<String, Box<dyn std::error::Error>> {
-    git_rev_parse(repo, &["--verify", &format!("{git_ref}^{{commit}}")])
+fn resolve_commit(repo: &Path, git_ref: &str) -> Result<CommitSha, Box<dyn std::error::Error>> {
+    CommitSha::parse(&git_rev_parse(
+        repo,
+        &["--verify", &format!("{git_ref}^{{commit}}")],
+    )?)
 }
 
 /// Get the current local git branch name.
@@ -756,8 +764,11 @@ mod tests {
 
         let resolved = resolve_commit(repo.path(), "other").unwrap();
 
-        assert_eq!(resolved, other);
-        assert_ne!(resolved, git(repo.path(), &["rev-parse", "HEAD"]));
+        assert_eq!(resolved.to_string(), other);
+        assert_ne!(
+            resolved.to_string(),
+            git(repo.path(), &["rev-parse", "HEAD"])
+        );
     }
 
     #[test]
@@ -798,10 +809,12 @@ mod tests {
         assert_eq!(ExistingRun::from_force(false), ExistingRun::Refuse);
     }
 
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn script_for(existing: ExistingRun) -> String {
         remote_script(
             "main",
-            "0123456789abcdef0123456789abcdef01234567",
+            &CommitSha::parse(SHA).unwrap(),
             "--tools 'ocync' 'all'",
             "export BENCH_TARGET_REGISTRY=registry.example.com",
             existing,
@@ -818,7 +831,13 @@ mod tests {
                     .unwrap_or_else(|| panic!("{needle:?} missing from the script"))
             };
             let guard = at("flock -n 9");
-            assert!(guard < at("pkill"), "{existing:?}: guard after pkill");
+            // The first occurrence is the script's own; the runner's comes later.
+            let record = at(r#"echo "$$" > "$PGID_FILE""#);
+            assert!(guard < record, "{existing:?}: group recorded before guard");
+            assert!(
+                record < at("git checkout"),
+                "{existing:?}: group recorded after checkout"
+            );
             assert!(
                 guard < at("git checkout"),
                 "{existing:?}: guard after checkout"
@@ -826,48 +845,6 @@ mod tests {
             assert!(guard < at("rm -rf target/"), "{existing:?}: guard after rm");
             assert!(at("setsid bash") > at("rm -rf target/"));
         }
-    }
-
-    #[test]
-    fn remote_script_records_its_group_after_the_guard_and_before_checkout() {
-        let script = script_for(ExistingRun::Kill);
-        let at = |needle: &str| script.find(needle).unwrap();
-        assert!(at("flock -n 9") < at(RECORD_OWN_GROUP));
-        assert!(at(RECORD_OWN_GROUP) < at("git checkout"));
-        assert!(at(REQUIRE_UTIL_LINUX) < at("flock -n 9"));
-    }
-
-    #[test]
-    fn record_own_group_records_only_a_group_leader() {
-        let dir = tempfile::tempdir().unwrap();
-        let pgid_file = dir.path().join("pgid");
-        let run = |leader: bool| {
-            let mut cmd = if leader {
-                let mut c = Command::new("setsid");
-                c.args(["-w", "bash", "-c"]);
-                c
-            } else {
-                let mut c = Command::new("bash");
-                c.arg("-c");
-                c
-            };
-            // The pid is echoed so the file can be compared with it.
-            cmd.arg(format!("echo $$; {RECORD_OWN_GROUP}"))
-                .env("PGID_FILE", &pgid_file)
-                .output()
-                .unwrap()
-        };
-
-        let leader = run(true);
-        let pid = String::from_utf8(leader.stdout).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&pgid_file).unwrap().trim(),
-            pid.trim()
-        );
-
-        std::fs::remove_file(&pgid_file).unwrap();
-        run(false);
-        assert!(!pgid_file.exists(), "a non-leader recorded its group");
     }
 
     #[test]
@@ -887,20 +864,52 @@ mod tests {
     }
 
     #[test]
-    fn remote_script_kills_only_under_force() {
-        let kill = r#"kill -9 -- "-$OLD_PGID""#;
-        assert!(script_for(ExistingRun::Kill).contains(kill));
-        let refuse = script_for(ExistingRun::Refuse);
-        assert!(!refuse.contains(kill));
-        assert!(refuse.contains("exit 3"));
+    fn remote_script_pins_the_resolved_sha() {
+        let script = script_for(ExistingRun::Refuse);
+        assert!(script.contains(&format!("git checkout '{SHA}' --detach")));
     }
 
     #[test]
-    fn remote_script_pins_the_resolved_sha() {
-        let script = script_for(ExistingRun::Refuse);
-        assert!(
-            script.contains("git checkout '0123456789abcdef0123456789abcdef01234567' --detach")
-        );
+    fn commit_sha_accepts_only_forty_lowercase_hex_digits() {
+        assert_eq!(CommitSha::parse(SHA).unwrap().to_string(), SHA);
+        for bad in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456'; rm -rf ~; '",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            assert!(CommitSha::parse(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn git_clean_keeps_the_run_files_and_removes_strays() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        let bench = repo.path().join("bench");
+        std::fs::create_dir(&bench).unwrap();
+        let run_files = ["lock", "log", "pgid", "sh", "exit"].map(|ext| {
+            let file = bench.join(format!(".bench-run.{ext}"));
+            std::fs::write(&file, "").unwrap();
+            file
+        });
+        let stray = bench.join("stray");
+        std::fs::write(&stray, "").unwrap();
+
+        let status = Command::new("bash")
+            .args(["-c", GIT_CLEAN])
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        for file in &run_files {
+            assert!(file.exists(), "{} was cleaned", file.display());
+        }
+        assert!(!stray.exists(), "the stray file survived");
     }
 
     #[derive(Clone, Copy)]
@@ -1036,11 +1045,11 @@ mod tests {
         let script = format!(
             "cargo() {{ echo \"$*\" > \"$SEEN_ARGS\"; cat \"$PGID_FILE\" > \"$SEEN_PGID\"; \
              echo \"$$\" > \"$SEEN_PID\"; return 7; }}\n{}",
-            bench_runner("--tools 'ocync' 'cold'")
+            BENCH_RUNNER
         );
 
         let status = Command::new("bash")
-            .args(["-c", &script])
+            .args(["-c", &script, "runner", "--tools", "ocync", "cold"])
             .env("PGID_FILE", file("pgid"))
             .env("EXIT_FILE", file("exit"))
             .env("SEEN_ARGS", file("args"))

@@ -19,7 +19,7 @@ use clap::{Args, Subcommand};
 
 use corpus::Corpus;
 use regression::Baseline;
-use report::{BenchReport, ScenarioResult, ToolRun};
+use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun};
 use runner::Tool;
 
 /// Arguments for the bench subcommand.
@@ -520,10 +520,10 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     .runs
                     .iter()
                     .map(|r| report::ToolRecord {
-                        tool: r.tool.clone(),
+                        tool: r.tool.to_string(),
                         version: report
                             .tool_versions
-                            .get(&r.tool)
+                            .get(r.tool.binary())
                             .cloned()
                             .unwrap_or_default(),
                         wall_clock_secs: r.wall_clock_secs,
@@ -563,10 +563,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 /// The ocync run of the cold sync scenario, the only run a baseline is
 /// comparable against.
 fn cold_ocync_run(scenarios: &[ScenarioResult]) -> Option<&ToolRun> {
-    report::find_scenario(scenarios, "cold")?
+    scenarios
+        .iter()
+        .find(|s| s.kind == ScenarioKind::Cold)?
         .runs
         .iter()
-        .find(|r| r.tool == "ocync")
+        .find(|r| r.tool == Tool::Ocync)
 }
 
 /// Compare the current ocync run against a stored baseline.
@@ -606,10 +608,42 @@ fn check_regression(
             regression::save_baseline(&baseline_path, &current)?;
         }
     } else {
-        eprintln!("bench: no ocync run found for regression comparison");
+        eprintln!("bench: no cold sync ocync run; regression check skipped");
     }
 
     Ok(())
+}
+
+/// Which run of a scenario a tool process is, named in its proxy log file.
+/// Each run needs its own, or a later one truncates the earlier one's
+/// `{tool}-{phase}-proxy.jsonl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// The measured cold sync.
+    Cold,
+    /// The measured warm sync.
+    Warm,
+    /// The unmeasured sync that populates the target before a partial run.
+    Prime,
+    /// The measured partial sync.
+    Partial,
+    /// The scale run at this many images.
+    Scale(usize),
+    /// The dry-run prepare measurement.
+    Prepare,
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cold => f.write_str("cold"),
+            Self::Warm => f.write_str("warm"),
+            Self::Prime => f.write_str("prime"),
+            Self::Partial => f.write_str("partial"),
+            Self::Scale(images) => write!(f, "scale-{images}"),
+            Self::Prepare => f.write_str("prepare"),
+        }
+    }
 }
 
 /// Run a single tool against the corpus and return a `ToolRun`.
@@ -619,7 +653,7 @@ async fn run_single_tool(
     corpus: &Corpus,
     config_dir: &Path,
     output_dir: &Path,
-    phase: &str,
+    phase: Phase,
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     // 1. Generate config.
@@ -727,7 +761,7 @@ async fn run_single_tool(
     };
 
     Ok(ToolRun {
-        tool: tool.to_string(),
+        tool,
         wall_clock_secs: result.wall_clock.as_secs_f64(),
         exit_code: result.exit_code,
         peak_rss_kb: result.peak_rss_kb,
@@ -820,7 +854,7 @@ async fn run_sync(
                 corpus,
                 config_dir.path(),
                 output_dir,
-                "cold",
+                Phase::Cold,
                 false,
             )
             .await?;
@@ -850,7 +884,7 @@ async fn run_sync(
                 corpus,
                 config_dir.path(),
                 output_dir,
-                "warm",
+                Phase::Warm,
                 false,
             )
             .await?;
@@ -884,12 +918,14 @@ async fn run_sync(
 
     Ok((
         ScenarioResult {
+            kind: ScenarioKind::Cold,
             scenario: "Cold sync".to_string(),
             runs: cold_runs,
             shuffle_seed,
             tool_order: tool_order.to_vec(),
         },
         ScenarioResult {
+            kind: ScenarioKind::Warm,
             scenario: "Warm sync (no-op)".to_string(),
             runs: warm_runs,
             shuffle_seed,
@@ -929,7 +965,7 @@ async fn run_partial(
                 base_corpus,
                 config_dir.path(),
                 output_dir,
-                "prime",
+                Phase::Prime,
                 false,
             )
             .await?;
@@ -949,7 +985,7 @@ async fn run_partial(
                 partial_corpus,
                 config_dir.path(),
                 output_dir,
-                "partial",
+                Phase::Partial,
                 false,
             )
             .await?;
@@ -977,17 +1013,12 @@ async fn run_partial(
     }
 
     Ok(ScenarioResult {
+        kind: ScenarioKind::Partial,
         scenario: "Partial sync (~5% changed)".to_string(),
         runs,
         shuffle_seed,
         tool_order: tool_order.to_vec(),
     })
-}
-
-/// Phase label of the scale run at `size` images. Each size needs its own, or
-/// a later size truncates the earlier one's `{tool}-{phase}-proxy.jsonl`.
-fn scale_phase(size: usize) -> String {
-    format!("scale-{size}")
 }
 
 /// Scale scenario: run at increasing corpus sizes [10, 25, 50, all], one
@@ -1029,7 +1060,7 @@ async fn run_scale(
                     &subset,
                     config_dir.path(),
                     output_dir,
-                    &scale_phase(size),
+                    Phase::Scale(size),
                     false,
                 )
                 .await?;
@@ -1053,6 +1084,7 @@ async fn run_scale(
         }
 
         scale_results.push(ScenarioResult::unshuffled(
+            ScenarioKind::Scale { images: size },
             format!("Scale ({size} images)"),
             runs,
         ));
@@ -1096,7 +1128,7 @@ async fn run_prepare(
         &corpus,
         config_dir.path(),
         output_dir,
-        "prepare",
+        Phase::Prepare,
         true,
     )
     .await?;
@@ -1112,7 +1144,11 @@ async fn run_prepare(
         .into());
     }
 
-    Ok(ScenarioResult::unshuffled("Prepare (dry-run)", vec![run]))
+    Ok(ScenarioResult::unshuffled(
+        ScenarioKind::Prepare,
+        "Prepare (dry-run)",
+        vec![run],
+    ))
 }
 
 /// Sleep for 30 seconds between benchmark runs to let rate limits recover.
@@ -2023,9 +2059,9 @@ mod tests {
         assert!(docker_hub_auth_from_env().is_none());
     }
 
-    fn ocync_run(wall_clock_secs: f64) -> ToolRun {
+    fn tool_run(tool: Tool, wall_clock_secs: f64) -> ToolRun {
         ToolRun {
-            tool: "ocync".to_string(),
+            tool,
             wall_clock_secs,
             exit_code: Some(0),
             peak_rss_kb: None,
@@ -2036,28 +2072,36 @@ mod tests {
 
     #[test]
     fn cold_ocync_run_skips_scale_and_prepare_runs() {
-        let scenarios = vec![
-            ScenarioResult::unshuffled("Scale (10 images)", vec![ocync_run(1.0)]),
-            ScenarioResult::unshuffled("Prepare (dry-run)", vec![ocync_run(2.0)]),
-            ScenarioResult::unshuffled("Cold sync", vec![ocync_run(3.0)]),
-        ];
-        let run = cold_ocync_run(&scenarios).unwrap();
-        assert_eq!(run.wall_clock_secs, 3.0);
+        let scale = ScenarioResult::unshuffled(
+            ScenarioKind::Scale { images: 10 },
+            "Scale (10 images)",
+            vec![tool_run(Tool::Ocync, 1.0)],
+        );
+        let prepare = ScenarioResult::unshuffled(
+            ScenarioKind::Prepare,
+            "Prepare (dry-run)",
+            vec![tool_run(Tool::Ocync, 2.0)],
+        );
+        let cold = ScenarioResult::unshuffled(
+            ScenarioKind::Cold,
+            "Cold sync",
+            vec![tool_run(Tool::Dregsy, 9.0), tool_run(Tool::Ocync, 3.0)],
+        );
+        let scenarios = vec![scale, prepare, cold];
+
+        assert_eq!(cold_ocync_run(&scenarios).unwrap().wall_clock_secs, 3.0);
+        assert!(cold_ocync_run(&scenarios[..2]).is_none());
     }
 
     #[test]
-    fn cold_ocync_run_is_none_without_a_cold_scenario() {
-        let scenarios = vec![
-            ScenarioResult::unshuffled("Scale (10 images)", vec![ocync_run(1.0)]),
-            ScenarioResult::unshuffled("Prepare (dry-run)", vec![ocync_run(2.0)]),
-        ];
-        assert!(cold_ocync_run(&scenarios).is_none());
-    }
-
-    #[test]
-    fn scale_phase_differs_per_size() {
-        assert_eq!(scale_phase(10), "scale-10");
-        assert_ne!(scale_phase(10), scale_phase(25));
+    fn phase_names_the_proxy_log_per_run() {
+        assert_eq!(Phase::Cold.to_string(), "cold");
+        assert_eq!(Phase::Warm.to_string(), "warm");
+        assert_eq!(Phase::Prime.to_string(), "prime");
+        assert_eq!(Phase::Partial.to_string(), "partial");
+        assert_eq!(Phase::Prepare.to_string(), "prepare");
+        assert_eq!(Phase::Scale(10).to_string(), "scale-10");
+        assert_ne!(Phase::Scale(10).to_string(), Phase::Scale(25).to_string());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::proxy::ProxyMetrics;
+use crate::bench::runner::Tool;
 
 /// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
 fn is_zero(v: &u64) -> bool {
@@ -140,8 +141,8 @@ pub(crate) struct ToolRecord {
 /// Results for one tool in one scenario.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ToolRun {
-    /// Name of the tool (e.g. "ocync", "dregsy").
-    pub(crate) tool: String,
+    /// The tool that ran.
+    pub(crate) tool: Tool,
     /// Wall-clock time in seconds.
     pub(crate) wall_clock_secs: f64,
     /// Process exit code, if captured.
@@ -155,9 +156,30 @@ pub(crate) struct ToolRun {
     pub(crate) phase_timing_ms: BTreeMap<String, u64>,
 }
 
+/// Which scenario a [`ScenarioResult`] measured. Code that selects a result
+/// matches this, never the display label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ScenarioKind {
+    /// Full sync into an empty target.
+    Cold,
+    /// Immediate re-sync of a populated target.
+    Warm,
+    /// Re-sync after a share of the tags changed.
+    Partial,
+    /// Full sync of a corpus subset of this many images.
+    Scale {
+        /// Number of images in the subset.
+        images: usize,
+    },
+    /// Resolution of every mapping with no transfer.
+    Prepare,
+}
+
 /// One scenario across all tools.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ScenarioResult {
+    /// Which scenario this is.
+    pub(crate) kind: ScenarioKind,
     /// Human-readable scenario name (e.g. "Cold sync").
     pub(crate) scenario: String,
     /// Per-tool run results.
@@ -173,8 +195,13 @@ pub(crate) struct ScenarioResult {
 impl ScenarioResult {
     /// A scenario whose tool order was not shuffled, so the record carries no
     /// seed and no order.
-    pub(crate) fn unshuffled(scenario: impl Into<String>, runs: Vec<ToolRun>) -> Self {
+    pub(crate) fn unshuffled(
+        kind: ScenarioKind,
+        scenario: impl Into<String>,
+        runs: Vec<ToolRun>,
+    ) -> Self {
         Self {
+            kind,
             scenario: scenario.into(),
             runs,
             shuffle_seed: 0,
@@ -420,7 +447,7 @@ fn referrer_footnote(scenario: &ScenarioResult) -> Option<String> {
         .filter_map(|r| {
             r.proxy_metrics
                 .as_ref()
-                .map(|m| (r.tool.as_str(), m.referrer_calls))
+                .map(|m| (r.tool.binary(), m.referrer_calls))
         })
         .collect();
     if !calls.iter().any(|(_, n)| *n > 0) {
@@ -494,7 +521,7 @@ fn summary_markdown(report: &BenchReport) -> String {
         out.push_str(&format!("## {}\n\n", scenario.scenario));
 
         let by_tool: BTreeMap<&str, &ToolRun> =
-            scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
+            scenario.runs.iter().map(|r| (r.tool.binary(), r)).collect();
 
         render_metric_table(&columns, &by_tool, &mut out);
         if let Some(footnote) = referrer_footnote(scenario) {
@@ -526,11 +553,12 @@ fn tool_columns(report: &BenchReport) -> Vec<String> {
         let mut seen: HashSet<String> = HashSet::new();
         for scenario in &report.scenarios {
             for run in &scenario.runs {
-                if seen.insert(run.tool.clone()) {
-                    if run.tool == "ocync" {
-                        columns.insert(0, run.tool.clone());
+                let name = run.tool.to_string();
+                if seen.insert(name.clone()) {
+                    if run.tool == Tool::Ocync {
+                        columns.insert(0, name);
                     } else {
-                        columns.push(run.tool.clone());
+                        columns.push(name);
                     }
                 }
             }
@@ -759,7 +787,7 @@ fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, descriptio
 
     let columns = tool_columns(report);
     let by_tool: BTreeMap<&str, &ToolRun> =
-        scenario.runs.iter().map(|r| (r.tool.as_str(), r)).collect();
+        scenario.runs.iter().map(|r| (r.tool.binary(), r)).collect();
 
     render_metric_table(&columns, &by_tool, &mut out);
     if let Some(footnote) = referrer_footnote(scenario) {
@@ -769,15 +797,9 @@ fn scenario_markdown(report: &BenchReport, scenario: &ScenarioResult, descriptio
     out
 }
 
-/// Finds a scenario whose name starts with `prefix` (case-insensitive).
-pub(crate) fn find_scenario<'a>(
-    scenarios: &'a [ScenarioResult],
-    prefix: &str,
-) -> Option<&'a ScenarioResult> {
-    let prefix_lower = prefix.to_lowercase();
-    scenarios
-        .iter()
-        .find(|s| s.scenario.to_lowercase().starts_with(&prefix_lower))
+/// Finds the result of the scenario of this kind.
+fn find_scenario(scenarios: &[ScenarioResult], kind: ScenarioKind) -> Option<&ScenarioResult> {
+    scenarios.iter().find(|s| s.kind == kind)
 }
 
 const BENCH_COLD_START: &str = "<!-- BENCH:START -->";
@@ -831,7 +853,7 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
     let mut updated = false;
 
     // Cold scenario.
-    if let Some(scenario) = find_scenario(&report.scenarios, "cold") {
+    if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Cold) {
         let snippet = scenario_markdown(report, scenario, "Cold sync");
         match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
             Some(new_content) => {
@@ -848,7 +870,7 @@ fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), Stri
     }
 
     // Warm scenario.
-    if let Some(scenario) = find_scenario(&report.scenarios, "warm") {
+    if let Some(scenario) = find_scenario(&report.scenarios, ScenarioKind::Warm) {
         let snippet = scenario_markdown(report, scenario, "Warm sync (no changes)");
         match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {
             Some(new_content) => {
@@ -937,11 +959,12 @@ mod tests {
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                runs: vec![
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![
                     ToolRun {
-                        tool: "ocync".to_string(),
+                        tool: Tool::Ocync,
                         wall_clock_secs: 47.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536),
@@ -949,7 +972,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "dregsy".to_string(),
+                        tool: Tool::Dregsy,
                         wall_clock_secs: 521.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(131072),
@@ -957,9 +980,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                 ],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         }
     }
 
@@ -1112,20 +1133,18 @@ mod tests {
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                // Only ocync ran -- dregsy is missing.
-                runs: vec![ToolRun {
-                    tool: "ocync".to_string(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![ToolRun {
+                    tool: Tool::Ocync,
                     wall_clock_secs: 47.0,
                     exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
         // dregsy column shows "--"; ocync is NOT bolded because there's
@@ -1284,19 +1303,18 @@ mod tests {
             total_tags: 40,
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                runs: vec![ToolRun {
-                    tool: "ocync".to_string(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![ToolRun {
+                    tool: Tool::Ocync,
                     wall_clock_secs: 47.0,
                     exit_code: Some(0),
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
         // Single tool -- nothing should be bolded.
@@ -1307,7 +1325,7 @@ mod tests {
     #[test]
     fn scenario_markdown_context_line() {
         let report = sample_report();
-        let scenario = find_scenario(&report.scenarios, "cold").unwrap();
+        let scenario = find_scenario(&report.scenarios, ScenarioKind::Cold).unwrap();
         let md = scenario_markdown(&report, scenario, "Cold sync");
         assert!(md.contains("Measured 2026-04-15"));
         assert!(md.contains("c7g.xlarge"));
@@ -1329,33 +1347,42 @@ mod tests {
             total_tags: 40,
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Warm sync (no-op)".to_string(),
-                runs: vec![ToolRun {
-                    tool: "ocync".to_string(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Warm,
+                "Warm sync (no-op)",
+                vec![ToolRun {
+                    tool: Tool::Ocync,
                     wall_clock_secs: 2.5,
                     exit_code: Some(0),
                     peak_rss_kb: Some(51200),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
-        let scenario = find_scenario(&report.scenarios, "warm").unwrap();
+        let scenario = find_scenario(&report.scenarios, ScenarioKind::Warm).unwrap();
         let md = scenario_markdown(&report, scenario, "Warm sync (no changes)");
         assert!(md.contains("Warm sync (no changes) to ECR"));
         assert!(md.contains("| Wall clock | 2s |"), "md:\n{md}");
     }
 
     #[test]
-    fn find_scenario_case_insensitive() {
-        let report = sample_report();
-        assert!(find_scenario(&report.scenarios, "cold").is_some());
-        assert!(find_scenario(&report.scenarios, "Cold").is_some());
-        assert!(find_scenario(&report.scenarios, "COLD").is_some());
-        assert!(find_scenario(&report.scenarios, "warm").is_none());
+    fn find_scenario_matches_the_kind_not_the_label() {
+        let mut report = sample_report();
+        report.scenarios.insert(
+            0,
+            ScenarioResult::unshuffled(
+                ScenarioKind::Scale { images: 10 },
+                "Cold start (10 images)",
+                vec![],
+            ),
+        );
+
+        let cold = find_scenario(&report.scenarios, ScenarioKind::Cold).unwrap();
+
+        assert_eq!(cold.scenario, "Cold sync");
+        assert!(find_scenario(&report.scenarios, ScenarioKind::Warm).is_none());
+        assert!(find_scenario(&report.scenarios, ScenarioKind::Scale { images: 25 }).is_none());
     }
 
     #[test]
@@ -1405,11 +1432,12 @@ mod tests {
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                runs: vec![
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![
                     ToolRun {
-                        tool: "ocync".to_string(),
+                        tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(59468),
@@ -1425,7 +1453,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "dregsy".to_string(),
+                        tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(304500),
@@ -1443,9 +1471,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                 ],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         }
     }
 
@@ -1500,11 +1526,12 @@ mod tests {
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                runs: vec![
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![
                     ToolRun {
-                        tool: "ocync".to_string(),
+                        tool: Tool::Ocync,
                         wall_clock_secs: 273.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(59468),
@@ -1520,7 +1547,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "dregsy".to_string(),
+                        tool: Tool::Dregsy,
                         wall_clock_secs: 2182.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(304500),
@@ -1529,9 +1556,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                 ],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
 
@@ -1559,11 +1584,12 @@ mod tests {
                 ("ocync".to_string(), "0.1.0".to_string()),
                 ("dregsy".to_string(), "0.5.0".to_string()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".to_string(),
-                runs: vec![
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![
                     ToolRun {
-                        tool: "ocync".to_string(),
+                        tool: Tool::Ocync,
                         wall_clock_secs: 120.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536),
@@ -1574,7 +1600,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "dregsy".to_string(),
+                        tool: Tool::Dregsy,
                         wall_clock_secs: 120.0, // same wall clock
                         exit_code: Some(0),
                         peak_rss_kb: Some(65536), // same RSS
@@ -1585,9 +1611,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                 ],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
 
@@ -1639,32 +1663,30 @@ mod tests {
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![
-                ScenarioResult {
-                    scenario: "Cold sync".to_string(),
-                    runs: vec![ToolRun {
-                        tool: "ocync".to_string(),
+                ScenarioResult::unshuffled(
+                    ScenarioKind::Cold,
+                    "Cold sync",
+                    vec![ToolRun {
+                        tool: Tool::Ocync,
                         wall_clock_secs: 429.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(51200),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
                     }],
-                    shuffle_seed: 0,
-                    tool_order: Vec::new(),
-                },
-                ScenarioResult {
-                    scenario: "Warm sync (no-op)".to_string(),
-                    runs: vec![ToolRun {
-                        tool: "ocync".to_string(),
+                ),
+                ScenarioResult::unshuffled(
+                    ScenarioKind::Warm,
+                    "Warm sync (no-op)",
+                    vec![ToolRun {
+                        tool: Tool::Ocync,
                         wall_clock_secs: 2.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(40960),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
                     }],
-                    shuffle_seed: 0,
-                    tool_order: Vec::new(),
-                },
+                ),
             ],
         };
         update_performance_page(&path, &report).unwrap();
@@ -1697,19 +1719,18 @@ mod tests {
             total_tags: 51,
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Warm sync (no-op)".to_string(),
-                runs: vec![ToolRun {
-                    tool: "ocync".to_string(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Warm,
+                "Warm sync (no-op)",
+                vec![ToolRun {
+                    tool: Tool::Ocync,
                     wall_clock_secs: 3.0,
                     exit_code: Some(0),
                     peak_rss_kb: Some(40960),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         update_performance_page(&path, &report).unwrap();
 
@@ -1734,11 +1755,12 @@ mod tests {
                 ("dregsy".into(), "0.5.0".into()),
                 ("regsync".into(), "0.7.0".into()),
             ]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".into(),
-                runs: vec![
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![
                     ToolRun {
-                        tool: "ocync".into(),
+                        tool: Tool::Ocync,
                         wall_clock_secs: 250.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(60_000),
@@ -1749,7 +1771,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "dregsy".into(),
+                        tool: Tool::Dregsy,
                         wall_clock_secs: 2000.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(300_000),
@@ -1757,7 +1779,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                     ToolRun {
-                        tool: "regsync".into(),
+                        tool: Tool::Regsync,
                         wall_clock_secs: 2200.0,
                         exit_code: Some(0),
                         peak_rss_kb: Some(280_000),
@@ -1765,9 +1787,7 @@ mod tests {
                         phase_timing_ms: BTreeMap::new(),
                     },
                 ],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
         assert!(
@@ -1788,19 +1808,18 @@ mod tests {
             total_tags: 40,
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("dregsy".into(), "0.5.0".into())]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".into(),
-                runs: vec![ToolRun {
-                    tool: "dregsy".into(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![ToolRun {
+                    tool: Tool::Dregsy,
                     wall_clock_secs: 2000.0,
                     exit_code: Some(0),
                     peak_rss_kb: Some(300_000),
                     proxy_metrics: Some(ProxyMetrics::default()),
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let md = summary_markdown(&report);
         assert!(
@@ -1821,10 +1840,11 @@ mod tests {
             total_tags: 40,
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".into(), "0.1.0".into())]),
-            scenarios: vec![ScenarioResult {
-                scenario: "Cold sync".into(),
-                runs: vec![ToolRun {
-                    tool: "ocync".into(),
+            scenarios: vec![ScenarioResult::unshuffled(
+                ScenarioKind::Cold,
+                "Cold sync",
+                vec![ToolRun {
+                    tool: Tool::Ocync,
                     wall_clock_secs: 250.0,
                     exit_code: Some(0),
                     peak_rss_kb: Some(60_000),
@@ -1834,9 +1854,7 @@ mod tests {
                     }),
                     phase_timing_ms: BTreeMap::new(),
                 }],
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-            }],
+            )],
         };
         let scenario = &report.scenarios[0];
         let md = scenario_markdown(&report, scenario, "Cold sync");
