@@ -10,46 +10,33 @@ use tokio::sync::Notify;
 
 /// State of a blob at a single (target, repo) pair.
 ///
-/// Each repo's lifecycle is independent of every other repo's; mutations
-/// to one repo's state never disturb another repo's state. This is the
-/// structural fix for the override-bug class where a HEAD-success or
-/// batch-check at one repo could break another repo's in-flight upload claim.
+/// Each repo's lifecycle is independent: writing one repo's state never
+/// disturbs another repo's state or an in-flight upload claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoBlobState {
-    /// Verified to exist at the target's repo via HEAD or batch check.
-    /// Persistable.
+    /// Verified to exist via HEAD or batch check. Persistable.
     Verified,
-    /// We hold the upload claim for this digest at this repo.
-    /// Transient; stripped before persistence.
+    /// We hold the upload claim for this digest at this repo. Transient.
     Uploading,
-    /// We successfully uploaded (or mounted) the blob to this repo.
-    /// Persistable.
+    /// Uploaded or mounted to this repo. Persistable.
     Completed,
-    /// Either upload to this repo failed, or this repo was selected as
-    /// a mount source by another repo and the mount returned 202/4xx/5xx.
-    /// Excluded from future mount-source selection regardless of how it
-    /// was reached. Transient; stripped before persistence.
+    /// Upload to this repo failed, or a mount from it (as another repo's
+    /// source) returned 202/4xx/5xx. Excluded from mount-source selection
+    /// either way. Transient.
     Failed(String),
-    /// Present according to an earlier run, not yet confirmed by this one.
-    /// A batch check that finds the blob missing, or a manifest refused for
-    /// a missing blob, drops it, since the repository may have lost it.
-    /// Persisted as `Verified`.
+    /// Present according to an earlier run, not yet confirmed by this one. A
+    /// batch check that misses the blob, or a manifest refused for a missing
+    /// blob, drops it. Persisted as `Verified`.
     Remembered,
 }
 
 impl RepoBlobState {
-    /// Whether this state means "blob is present at this repo for skip purposes".
+    /// Whether the blob counts as present at this repo for skip purposes.
     pub fn is_present(&self) -> bool {
         matches!(self, Self::Verified | Self::Completed | Self::Remembered)
     }
 
-    /// Whether this state means "blob is unusable at this repo for mount purposes".
-    pub fn is_failed(&self) -> bool {
-        matches!(self, Self::Failed(_))
-    }
-
     /// Whether this state was recorded this run and is not a dead end.
-    /// Used by `unresolved_watches_for` to filter candidates to wait on.
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Verified | Self::Uploading | Self::Completed)
     }
@@ -58,14 +45,12 @@ impl RepoBlobState {
 /// Outcome of an atomic check-and-claim on a blob's upload coordination slot.
 #[derive(Debug)]
 pub enum ClaimAction {
-    /// Caller now holds the upload claim. Proceed with mount/HEAD/push;
-    /// call `release_blob_claim` when done.
+    /// Caller holds the upload claim; call `release_blob_claim` when done.
     Claimed,
     /// Another task holds the claim, for this repo or another; await
     /// `notify` and retry.
-    /// `holder` is included for diagnostic logging.
     Wait {
-        /// The repo currently holding the upload claim (for diagnostic logging).
+        /// The repo holding the claim, for diagnostic logging.
         holder: RepositoryName,
         /// Wakes when the holder calls `release_blob_claim`.
         notify: Rc<Notify>,
@@ -74,22 +59,18 @@ pub enum ClaimAction {
 
 /// Metadata for a tracked blob at a single target.
 ///
-/// Per-(repo) state lives in `repos`; each repo's lifecycle is independent.
-/// The `claim` slot serializes uploads of this digest at the target side:
-/// at most one task holds the claim at a time, and every other task calling
-/// `claim_blob_upload` sees it as `Some` and waits, including a task for the
-/// holder's own repo.
+/// The `claim` slot serializes uploads of this digest at the target: one task
+/// holds it, and every other task calling `claim_blob_upload` waits, including
+/// one for the holder's own repo.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct BlobInfo {
     /// Per-(repo) state. `BTreeMap` for deterministic iteration.
     pub(crate) repos: BTreeMap<RepositoryName, RepoBlobState>,
-    /// Upload-claim holder. `Some(R)` means R is currently
-    /// uploading (or in mount/HEAD/push for) this digest at the target.
-    /// Stripped before persistence.
+    /// Repo whose task is uploading (or mounting, HEAD-checking or pushing)
+    /// this digest at the target. Not persisted.
     #[serde(skip)]
     pub(crate) claim: Option<RepositoryName>,
-    /// Lazily-created notify; fires when `claim` transitions back to None.
-    /// Stripped before persistence.
+    /// Lazily created; fires when `claim` returns to `None`. Not persisted.
     #[serde(skip)]
     pub(crate) claim_notify: Option<Rc<Notify>>,
 }
@@ -104,7 +85,6 @@ pub(crate) struct BlobDedupMap {
 }
 
 impl BlobDedupMap {
-    /// Get or create the `BlobInfo` entry for the given target and digest.
     fn entry_mut(&mut self, target: &str, digest: &Digest) -> &mut BlobInfo {
         self.inner
             .entry(target.to_owned())
@@ -113,7 +93,7 @@ impl BlobDedupMap {
             .or_default()
     }
 
-    /// Get the per-(repo) state for a blob at a target, if recorded.
+    /// The recorded state of a blob at one (target, repo), if any.
     pub(crate) fn repo_state(
         &self,
         target: &str,
@@ -123,7 +103,8 @@ impl BlobDedupMap {
         self.inner.get(target)?.get(digest)?.repos.get(repo)
     }
 
-    /// Whether the blob is present (Verified, Completed or Remembered) at the given (target, repo).
+    /// Whether the blob is present (`Verified`, `Completed` or `Remembered`) at
+    /// the given (target, repo).
     pub(crate) fn blob_present_at(
         &self,
         target: &str,
@@ -134,8 +115,7 @@ impl BlobDedupMap {
             .is_some_and(RepoBlobState::is_present)
     }
 
-    /// Set a repo's state to `Verified`. Does not disturb other repos' state
-    /// or the cross-repo claim.
+    /// Set a repo's state to `Verified`, leaving other repos and the claim alone.
     pub(crate) fn set_blob_verified(
         &mut self,
         target: &str,
@@ -171,9 +151,9 @@ impl BlobDedupMap {
             .insert(repo.clone(), RepoBlobState::Failed(error));
     }
 
-    /// Mark a repo as a stale mount source (mount from this repo was rejected).
-    /// Sets the repo's state to `Failed` so it is excluded from future
-    /// `mount_sources` and `unresolved_watches_for` results.
+    /// Mark a repo as a stale mount source (a mount from it was rejected) by
+    /// setting `Failed`, which excludes it from `mount_sources` and
+    /// `unresolved_watches_for`.
     pub(crate) fn mark_blob_repo_stale(
         &mut self,
         target: &str,
@@ -189,10 +169,10 @@ impl BlobDedupMap {
 
     /// Atomic check-and-claim on the upload coordination slot.
     ///
-    /// Returns `ClaimAction::Claimed` if `current_repo` now holds the claim
-    /// (state for `current_repo` is set to `Uploading`), or `ClaimAction::Wait`
-    /// with the existing holder's notify handle. A holder in `current_repo`
-    /// also means wait: two images syncing into one repo share the upload.
+    /// Returns `ClaimAction::Claimed` (and sets `current_repo` to `Uploading`)
+    /// or `ClaimAction::Wait` with the holder's notify handle. A holder in
+    /// `current_repo` also means wait: two images syncing into one repo share
+    /// the upload.
     pub(crate) fn claim_blob_upload(
         &mut self,
         target: &str,
@@ -221,8 +201,8 @@ impl BlobDedupMap {
         }
     }
 
-    /// Release the upload claim, firing `claim_notify` to wake any waiting
-    /// tasks. Called by the holder on terminal outcome.
+    /// Release the upload claim and wake waiters. Called by the holder on a
+    /// terminal outcome.
     pub(crate) fn release_blob_claim(&mut self, target: &str, digest: &Digest) {
         if let Some(index) = self.inner.get_mut(target) {
             if let Some(info) = index.get_mut(digest) {
@@ -234,8 +214,7 @@ impl BlobDedupMap {
         }
     }
 
-    /// Iterate `(repo, state)` pairs for a blob at a target.
-    /// Returns an empty iterator if the entry doesn't exist.
+    /// `(repo, state)` pairs for a blob at a target; empty if untracked.
     pub(crate) fn repos_iter<'a>(
         &'a self,
         target: &str,
@@ -249,7 +228,7 @@ impl BlobDedupMap {
     }
 
     /// Drop `repo`'s state for the blob if it is only [`RepoBlobState::Remembered`],
-    /// returning whether it was. State this run recorded is kept: a batch
+    /// returning whether it was. State this run recorded is kept, since a batch
     /// check can lag an upload made seconds before it.
     pub(crate) fn forget_remembered(
         &mut self,
@@ -277,9 +256,9 @@ impl BlobDedupMap {
         }
     }
 
-    /// Start a run from what persisting and reloading would give: every
-    /// present state becomes [`RepoBlobState::Remembered`], and `Uploading`,
-    /// `Failed` and upload claims are dropped.
+    /// Start a run from what persisting and reloading would give: present
+    /// states become [`RepoBlobState::Remembered`]; `Uploading`, `Failed` and
+    /// claims are dropped.
     pub(crate) fn remember_present(&mut self) {
         for index in self.inner.values_mut() {
             index.retain(|_, info| {
@@ -295,10 +274,9 @@ impl BlobDedupMap {
         self.inner.retain(|_, index| !index.is_empty());
     }
 
-    /// Return a copy with only persistable per-(repo) state entries.
-    /// `Verified` and `Completed` survive and `Remembered` is kept as
-    /// `Verified`; `Uploading` and `Failed` are stripped. The `claim` slot is
-    /// also stripped.
+    /// A copy with only persistable state: `Verified` and `Completed` survive,
+    /// `Remembered` becomes `Verified`, and `Uploading`, `Failed` and the claim
+    /// slot are stripped.
     pub(crate) fn filter_persistable(&self) -> BlobDedupMap {
         let inner = self
             .inner
@@ -347,13 +325,13 @@ impl BlobDedupMap {
         BlobDedupMap { inner }
     }
 
-    /// Returns `true` if the map contains no entries.
+    /// Whether the map holds no entries.
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.values().all(|index| index.is_empty())
     }
 
-    /// Drop entries for targets not in `live_targets`.
-    /// Returns the number of individual blob entries removed.
+    /// Drop entries for targets not in `live_targets`, returning the number of
+    /// blob entries removed.
     pub(crate) fn retain_targets(&mut self, live_targets: &HashSet<String>) -> usize {
         let mut removed = 0usize;
         self.inner.retain(|target, index| {
@@ -368,25 +346,37 @@ impl BlobDedupMap {
     }
 }
 
+/// Digest and repository fixtures shared by the unit tests of this module and
+/// of [`crate::cache`].
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use ocync_distribution::Digest;
+    use ocync_distribution::spec::RepositoryName;
 
-    fn test_digest() -> Digest {
+    /// The digest of empty content.
+    pub(crate) fn test_digest() -> Digest {
         "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             .parse()
             .unwrap()
     }
 
-    fn other_digest() -> Digest {
+    /// A digest distinct from [`test_digest`].
+    pub(crate) fn other_digest() -> Digest {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .parse()
             .unwrap()
     }
 
-    fn repo(name: &str) -> RepositoryName {
+    /// A valid repository name.
+    pub(crate) fn repo(name: &str) -> RepositoryName {
         RepositoryName::new(name).unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{other_digest, repo, test_digest};
+    use super::*;
 
     /// A new run marks present states `Remembered`, which a missing batch
     /// answer drops. State this run recorded, at the same repo or
@@ -451,7 +441,7 @@ mod tests {
         map.confirm("reg.io", &d, &repo("w"));
         assert!(
             map.repo_state("reg.io", &d, &repo("w"))
-                .is_some_and(RepoBlobState::is_failed),
+                .is_some_and(|state| matches!(state, RepoBlobState::Failed(_))),
             "a commit keeps a refused mount source excluded"
         );
     }
@@ -493,67 +483,53 @@ mod tests {
         assert_eq!(map.repo_state("reg.io", &other, &repo("x")), None);
     }
 
-    /// Per-(repo) state independence: writing Y's state must not disturb X's
-    /// Uploading state, must not release the claim, must not fire `claim_notify`.
+    /// Writing Y's state must not disturb X's `Uploading` state or release X's
+    /// claim.
     #[test]
-    fn set_verified_at_one_repo_does_not_disturb_uploading_at_another() {
-        let mut map = BlobDedupMap::default();
-        let d = test_digest();
+    fn writing_one_repos_state_leaves_another_repos_claim_held() {
+        type WriteY = fn(&mut BlobDedupMap);
+        let cases: [(&str, WriteY, RepoBlobState); 2] = [
+            (
+                "a batch check verifies Y",
+                |m| m.set_blob_verified("reg.io", &test_digest(), &repo("y")),
+                RepoBlobState::Verified,
+            ),
+            (
+                "Y's own upload fails",
+                |m| m.set_blob_failed("reg.io", &test_digest(), &repo("y"), "io error".into()),
+                RepoBlobState::Failed("io error".into()),
+            ),
+        ];
+        for (name, write_y, want_y) in cases {
+            let mut map = BlobDedupMap::default();
+            let d = test_digest();
+            assert!(
+                matches!(
+                    map.claim_blob_upload("reg.io", &d, &repo("x")),
+                    ClaimAction::Claimed
+                ),
+                "{name}: first claim should succeed"
+            );
 
-        // X claims and is Uploading.
-        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
-            ClaimAction::Claimed => {}
-            ClaimAction::Wait { .. } => panic!("first claim should succeed"),
+            write_y(&mut map);
+
+            assert_eq!(
+                map.repo_state("reg.io", &d, &repo("x")),
+                Some(&RepoBlobState::Uploading),
+                "{name}: X is unchanged"
+            );
+            assert_eq!(
+                map.repo_state("reg.io", &d, &repo("y")),
+                Some(&want_y),
+                "{name}: Y holds the written state"
+            );
+            match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+                ClaimAction::Wait { holder, notify: _ } => {
+                    assert_eq!(holder, repo("x"), "{name}");
+                }
+                ClaimAction::Claimed => panic!("{name}: X's claim must still be held"),
+            }
         }
-        assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
-            Some(&RepoBlobState::Uploading),
-        );
-
-        // Y's batch check finds D at Y -> Verified.
-        map.set_blob_verified("reg.io", &d, &repo("y"));
-
-        // X is unchanged.
-        assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
-            Some(&RepoBlobState::Uploading),
-        );
-        // Y is Verified.
-        assert_eq!(
-            map.repo_state("reg.io", &d, &repo("y")),
-            Some(&RepoBlobState::Verified),
-        );
-        // Claim is still X.
-        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
-            ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
-            ClaimAction::Claimed => panic!("X's claim must still be held"),
-        }
-    }
-
-    /// `set_blob_failed` at one repo must not release another repo's claim.
-    #[test]
-    fn set_failed_at_one_repo_does_not_release_other_repos_claim() {
-        let mut map = BlobDedupMap::default();
-        let d = test_digest();
-
-        // X holds the claim.
-        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
-            ClaimAction::Claimed => {}
-            _ => panic!(),
-        }
-        // Y attempts upload, fails.
-        map.set_blob_failed("reg.io", &d, &repo("y"), "io error".into());
-
-        // Claim is still X.
-        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
-            ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
-            ClaimAction::Claimed => panic!("X's claim must still be held"),
-        }
-        // X's state is unchanged.
-        assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
-            Some(&RepoBlobState::Uploading),
-        );
     }
 
     /// Releasing the claim wakes waiters and clears the holder.
@@ -565,12 +541,10 @@ mod tests {
                 let mut map = BlobDedupMap::default();
                 let d = test_digest();
 
-                // X claims.
                 match map.claim_blob_upload("reg.io", &d, &repo("x")) {
                     ClaimAction::Claimed => {}
                     _ => panic!(),
                 }
-                // Y tries -> Wait.
                 let notify = match map.claim_blob_upload("reg.io", &d, &repo("y")) {
                     ClaimAction::Wait { holder, notify } => {
                         assert_eq!(holder, repo("x"));
@@ -579,19 +553,15 @@ mod tests {
                     _ => panic!("Y should wait"),
                 };
 
-                // Spawn a task awaiting the notify.
                 let waiter = tokio::task::spawn_local(async move {
                     notify.notified().await;
                 });
                 tokio::task::yield_now().await;
 
-                // X releases.
                 map.release_blob_claim("reg.io", &d);
 
-                // Waiter wakes.
                 waiter.await.expect("waiter should complete");
 
-                // Now Y can claim.
                 match map.claim_blob_upload("reg.io", &d, &repo("y")) {
                     ClaimAction::Claimed => {}
                     _ => panic!("Y should claim after X releases"),
@@ -655,15 +625,12 @@ mod tests {
             ClaimAction::Claimed => {}
             _ => panic!(),
         }
-        // Y's batch check finds D at Y.
         map.set_blob_verified("reg.io", &d, &repo("y"));
 
-        // State transitions Uploading -> Verified.
         assert_eq!(
             map.repo_state("reg.io", &d, &repo("y")),
             Some(&RepoBlobState::Verified),
         );
-        // Claim still held by Y.
         let entry = map.entry_mut("reg.io", &d);
         assert_eq!(entry.claim, Some(repo("y")));
     }
@@ -682,12 +649,11 @@ mod tests {
             _ => panic!(),
         }
         map.set_blob_failed("reg.io", &d, &repo("e"), "oops".into());
-        // d2: only Failed -- whole entry should be stripped.
+        // d2 holds only a Failed state, so its whole entry is stripped.
         map.set_blob_failed("reg.io", &d2, &repo("z"), "oops".into());
 
         let persisted = map.filter_persistable();
 
-        // d's entry exists with only A and B.
         assert_eq!(
             persisted.repo_state("reg.io", &d, &repo("a")),
             Some(&RepoBlobState::Verified),
@@ -698,8 +664,27 @@ mod tests {
         );
         assert!(persisted.repo_state("reg.io", &d, &repo("c")).is_none());
         assert!(persisted.repo_state("reg.io", &d, &repo("e")).is_none());
-        // d2 has no persistable entries -- the entry should be gone entirely.
         assert!(persisted.repos_iter("reg.io", &d2).next().is_none());
+    }
+
+    /// Only `Verified` and `Completed` blobs count as present; an upload in
+    /// flight and a failure do not.
+    #[test]
+    fn blob_present_at_excludes_uploading_and_failed() {
+        let mut map = BlobDedupMap::default();
+        let d = test_digest();
+        map.set_blob_verified("reg.io", &d, &repo("a"));
+        map.set_blob_completed("reg.io", &d, &repo("b"));
+        assert!(matches!(
+            map.claim_blob_upload("reg.io", &d, &repo("c")),
+            ClaimAction::Claimed
+        ));
+        map.set_blob_failed("reg.io", &d, &repo("d"), "oops".into());
+
+        assert!(map.blob_present_at("reg.io", &d, &repo("a")));
+        assert!(map.blob_present_at("reg.io", &d, &repo("b")));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("c")));
+        assert!(!map.blob_present_at("reg.io", &d, &repo("d")));
     }
 
     /// A second image syncing into the holder's own repo waits for the

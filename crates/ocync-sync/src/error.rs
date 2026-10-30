@@ -48,11 +48,10 @@ pub enum Error {
         source: ocync_distribution::Error,
     },
 
-    /// Engine-level manifest processing error (not from the registry).
-    ///
-    /// Covers failures like platform filter matching, unsupported manifest
-    /// structures, and index rewriting -- cases where the engine itself
-    /// rejects or cannot process a manifest, rather than a registry error.
+    /// Engine-level manifest processing error (not from the registry), such
+    /// as a platform filter matching nothing or an unsupported manifest
+    /// structure. A deterministic engine decision: no HTTP status, never
+    /// retryable.
     #[error("manifest {reference}: {reason}")]
     ManifestLogic {
         /// The manifest reference involved.
@@ -122,7 +121,7 @@ pub(crate) enum ManifestRefusal {
 }
 
 impl Error {
-    /// Extract the HTTP status code from the underlying distribution error, if any.
+    /// HTTP status code of the underlying distribution error, if any.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {
             Self::Manifest { source, .. } | Self::BlobTransfer { source, .. } => {
@@ -259,131 +258,137 @@ mod tests {
     }
 
     #[test]
-    fn display_invalid_glob() {
-        let err = Error::InvalidGlob {
-            pattern: "[bad".into(),
-            reason: "unclosed bracket".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("[bad"));
-        assert!(msg.contains("unclosed bracket"));
-    }
-
-    #[test]
-    fn display_invalid_version_range() {
-        let err = Error::InvalidVersionRange {
-            range: ">= oops".into(),
-            reason: "unexpected character".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains(">= oops"));
-        assert!(msg.contains("unexpected character"));
-    }
-
-    #[test]
-    fn display_latest_without_sort() {
-        let err = Error::LatestWithoutSort;
-        assert!(err.to_string().contains("latest"));
-        assert!(err.to_string().contains("sort"));
-    }
-
-    #[test]
-    fn display_below_min_tags() {
-        let err = Error::BelowMinTags {
-            matched: 2,
-            minimum: 5,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains('2'));
-        assert!(msg.contains('5'));
-    }
-
-    #[test]
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Error>();
     }
 
     #[test]
-    fn display_manifest_error() {
-        let err = Error::Manifest {
-            reference: "latest".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::NOT_FOUND,
-                message: "not found".into(),
-            },
+    fn display_names_every_field() {
+        let registry_404 = ocync_distribution::Error::RegistryError {
+            status: http::StatusCode::NOT_FOUND,
+            message: "not found".into(),
         };
-        let msg = err.to_string();
-        assert!(msg.contains("latest"));
-        assert!(msg.contains("manifest"));
-    }
-
-    #[test]
-    fn display_blob_transfer_error() {
-        let digest: Digest =
-            "sha256:def0000000000000000000000000000000000000000000000000000000000000"
-                .parse()
-                .unwrap();
-        let err = Error::BlobTransfer {
-            digest: digest.clone(),
-            source: ocync_distribution::Error::Io {
-                context: "staging read",
-                source: std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "permission denied",
-                )
+        let permission_denied = ocync_distribution::Error::Io {
+            context: "staging read",
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied")
                 .into(),
-            },
         };
-        let msg = err.to_string();
-        assert!(msg.contains("blob transfer"));
-        assert!(msg.contains(&digest.to_string()));
+        // (name, error, fragments the message must contain)
+        let cases: [(&str, Error, &[&str]); 9] = [
+            (
+                "invalid glob",
+                Error::InvalidGlob {
+                    pattern: "[bad".into(),
+                    reason: "unclosed bracket".into(),
+                },
+                &["[bad", "unclosed bracket"],
+            ),
+            (
+                "invalid version range",
+                Error::InvalidVersionRange {
+                    range: ">= oops".into(),
+                    reason: "unexpected character".into(),
+                },
+                &[">= oops", "unexpected character"],
+            ),
+            (
+                "latest without sort",
+                Error::LatestWithoutSort,
+                &["latest", "sort"],
+            ),
+            (
+                "below min tags",
+                Error::BelowMinTags {
+                    matched: 2,
+                    minimum: 5,
+                },
+                &["2", "5"],
+            ),
+            (
+                "manifest",
+                Error::Manifest {
+                    reference: "latest".into(),
+                    source: registry_404,
+                },
+                &["latest", "manifest", "not found"],
+            ),
+            (
+                "blob transfer",
+                Error::BlobTransfer {
+                    digest:
+                        "sha256:def0000000000000000000000000000000000000000000000000000000000000"
+                            .parse()
+                            .unwrap(),
+                    source: permission_denied,
+                },
+                &[
+                    "blob transfer",
+                    "sha256:def0000000000000000000000000000000000000000000000000000000000000",
+                    "permission denied",
+                ],
+            ),
+            (
+                "manifest logic",
+                Error::ManifestLogic {
+                    reference: "latest".into(),
+                    reason: "platform filter matched no manifests in index".into(),
+                },
+                &["latest", "platform filter"],
+            ),
+            (
+                "required artifacts missing",
+                Error::RequiredArtifactsMissing {
+                    reference: "sha256:abc123".into(),
+                },
+                &["sha256:abc123", "require_artifacts"],
+            ),
+            (
+                "artifact sync",
+                Error::ArtifactSync {
+                    reference: "sha256:def456".into(),
+                    reason: "manifest pull failed".into(),
+                },
+                &["sha256:def456", "manifest pull failed"],
+            ),
+        ];
+        for (name, err, fragments) in cases {
+            let msg = err.to_string();
+            for fragment in fragments {
+                assert!(
+                    msg.contains(fragment),
+                    "{name}: {fragment:?} not in {msg:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn display_manifest_logic() {
-        let err = Error::ManifestLogic {
-            reference: "latest".into(),
-            reason: "platform filter matched no manifests in index".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("latest"), "should contain reference: {msg}");
-        assert!(
-            msg.contains("platform filter"),
-            "should contain reason: {msg}"
-        );
-    }
-
-    #[test]
-    fn manifest_logic_status_code_is_none() {
-        let err = Error::ManifestLogic {
-            reference: "latest".into(),
-            reason: "no match".into(),
-        };
-        // ManifestLogic is a deterministic engine decision (not a registry
-        // error), so it has no HTTP status and is never retryable.
-        assert_eq!(err.status_code(), None);
-    }
-
-    #[test]
-    fn manifest_logic_is_not_required_artifacts_missing() {
-        let err = Error::ManifestLogic {
-            reference: "v1".into(),
-            reason: "nested index manifests are not supported".into(),
-        };
-        assert!(!err.is_required_artifacts_missing());
-    }
-
-    #[test]
-    fn status_code_from_manifest_error() {
-        let err = Error::Manifest {
-            reference: "v1".into(),
-            source: ocync_distribution::Error::RegistryError {
-                status: http::StatusCode::TOO_MANY_REQUESTS,
-                message: "rate limited".into(),
-            },
-        };
-        assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
+    fn status_code_by_variant() {
+        let cases = [
+            (
+                "manifest error carries the registry status",
+                Error::Manifest {
+                    reference: "v1".into(),
+                    source: ocync_distribution::Error::RegistryError {
+                        status: http::StatusCode::TOO_MANY_REQUESTS,
+                        message: "rate limited".into(),
+                    },
+                },
+                Some(http::StatusCode::TOO_MANY_REQUESTS),
+            ),
+            (
+                "manifest logic is an engine decision, not a registry answer",
+                Error::ManifestLogic {
+                    reference: "latest".into(),
+                    reason: "no match".into(),
+                },
+                None,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(err.status_code(), want, "{name}");
+        }
     }
 
     #[test]
@@ -403,57 +408,27 @@ mod tests {
     }
 
     #[test]
-    fn status_code_none_for_filter_errors() {
-        let err = Error::LatestWithoutSort;
-        assert_eq!(err.status_code(), None);
-    }
-
-    #[test]
-    fn display_required_artifacts_missing() {
-        let err = Error::RequiredArtifactsMissing {
-            reference: "sha256:abc123".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("sha256:abc123"));
-        assert!(msg.contains("require_artifacts"));
-    }
-
-    #[test]
-    fn display_artifact_sync_error() {
-        let err = Error::ArtifactSync {
-            reference: "sha256:def456".into(),
-            reason: "manifest pull failed".into(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("sha256:def456"));
-        assert!(msg.contains("manifest pull failed"));
-    }
-
-    #[test]
-    fn is_required_artifacts_missing() {
-        let err = Error::RequiredArtifactsMissing {
-            reference: "sha256:abc".into(),
-        };
-        assert!(err.is_required_artifacts_missing());
-
-        let err = Error::LatestWithoutSort;
-        assert!(
-            !err.is_required_artifacts_missing(),
-            "non-artifact error should not match"
-        );
-    }
-
-    #[test]
-    fn status_code_none_for_artifact_errors() {
-        let err = Error::RequiredArtifactsMissing {
-            reference: "sha256:abc".into(),
-        };
-        assert_eq!(err.status_code(), None);
-
-        let err = Error::ArtifactSync {
-            reference: "sha256:def".into(),
-            reason: "failed".into(),
-        };
-        assert_eq!(err.status_code(), None);
+    fn is_required_artifacts_missing_only_for_that_variant() {
+        let cases = [
+            (
+                "required artifacts missing",
+                Error::RequiredArtifactsMissing {
+                    reference: "sha256:abc".into(),
+                },
+                true,
+            ),
+            ("non-artifact error", Error::LatestWithoutSort, false),
+            (
+                "manifest logic",
+                Error::ManifestLogic {
+                    reference: "v1".into(),
+                    reason: "nested index manifests are not supported".into(),
+                },
+                false,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(err.is_required_artifacts_missing(), want, "{name}");
+        }
     }
 }

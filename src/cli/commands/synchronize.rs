@@ -850,7 +850,7 @@ fn total_failure_code(unresolved: &[UnresolvedMapping]) -> ExitCode {
 /// Fold mapping-level resolution failures into the run's exit code.
 ///
 /// A mapping that never reached the engine produces no [`ocync_sync::ImageResult`],
-/// so [`SyncReport::exit_code`] cannot see it. Counting each as a failure is
+/// so [`SyncReport::outcome`] cannot see it. Counting each as a failure is
 /// what keeps a run whose mappings all 403'd from exiting 0.
 fn combined_exit_code(
     report: &SyncReport,
@@ -861,7 +861,7 @@ fn combined_exit_code(
     if unresolved.is_empty() {
         // A dropped target means images never reached a registry the config
         // named, so an otherwise clean run is still only partial.
-        return match ExitCode::from_report(report.exit_code()) {
+        return match ExitCode::from_report(report.outcome()) {
             ExitCode::Success if !dropped.is_empty() => ExitCode::PartialFailure,
             other => other,
         };

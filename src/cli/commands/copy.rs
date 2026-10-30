@@ -124,5 +124,5 @@ pub(crate) async fn run(
         .run(vec![mapping], cache, staging, progress, shutdown)
         .await;
 
-    Ok(ExitCode::from_report(report.exit_code()))
+    Ok(ExitCode::from_report(report.outcome()))
 }

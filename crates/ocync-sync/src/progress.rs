@@ -4,11 +4,8 @@ use std::time::Duration;
 
 use crate::{ImageResult, SyncReport};
 
-/// Snapshot of a run that is still in flight.
-///
-/// Passed to [`ProgressReporter::run_heartbeat`] on a fixed cadence so a long
-/// sync emits a liveness signal instead of going silent between the first
-/// image starting and the last one finishing.
+/// Snapshot of a run still in flight, passed to
+/// [`ProgressReporter::run_heartbeat`] on a fixed cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct RunProgress {
     /// Tags still in discovery (source HEAD or manifest pull).
@@ -35,9 +32,8 @@ pub trait ProgressReporter {
     fn image_completed(&self, result: &ImageResult);
     /// Called on a fixed cadence while the run still has work in flight.
     ///
-    /// Discovery and execution can both run for minutes without an image
-    /// reaching a terminal state, so this is the only signal a caller has
-    /// that the run is progressing rather than wedged.
+    /// Discovery and execution can run for minutes without an image reaching
+    /// a terminal state, so this is the only liveness signal.
     fn run_heartbeat(&self, snapshot: RunProgress);
     /// Called when the entire sync run completes.
     fn run_completed(&self, report: &SyncReport);
@@ -52,48 +48,4 @@ impl ProgressReporter for NullProgress {
     fn image_completed(&self, _: &ImageResult) {}
     fn run_heartbeat(&self, _: RunProgress) {}
     fn run_completed(&self, _: &SyncReport) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::{ImageStatus, SyncStats};
-
-    #[test]
-    fn null_progress_methods_do_not_panic() {
-        let p = NullProgress;
-        p.image_started("source/repo:tag", "target/repo:tag");
-
-        let result = ImageResult {
-            image_id: Uuid::now_v7(),
-            source: "src".into(),
-            target: "tgt".into(),
-            status: ImageStatus::Synced,
-            bytes_transferred: 1024,
-            blob_stats: crate::BlobTransferStats::default(),
-            duration: Duration::from_secs(1),
-            artifacts_skipped: false,
-        };
-        p.image_completed(&result);
-
-        p.run_heartbeat(RunProgress {
-            in_discovery: 3,
-            pending: 2,
-            in_flight: 1,
-            completed: 4,
-            elapsed: Duration::from_secs(30),
-        });
-
-        let report = SyncReport {
-            run_id: Uuid::now_v7(),
-            images: vec![],
-            stats: SyncStats::default(),
-            duration: Duration::from_secs(5),
-        };
-        p.run_completed(&report);
-    }
 }

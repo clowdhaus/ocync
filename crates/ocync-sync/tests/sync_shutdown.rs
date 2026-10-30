@@ -3,9 +3,9 @@
 
 mod helpers;
 
-use ocync_sync::ImageStatus;
 use ocync_sync::engine::TagPair;
 use ocync_sync::shutdown::ShutdownSignal;
+use ocync_sync::{ImageStatus, RunOutcome};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -183,5 +183,5 @@ async fn sync_exits_with_untriggered_shutdown_signal() {
     assert_eq!(report.images.len(), 1);
     assert!(matches!(report.images[0].status, ImageStatus::Synced));
     assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.outcome(), RunOutcome::Clean);
 }

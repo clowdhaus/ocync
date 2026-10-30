@@ -37,8 +37,8 @@ impl ShutdownSignal {
 
     /// Wait until shutdown is triggered. Returns immediately if already triggered.
     ///
-    /// Registers the `Notify` listener before checking the flag to avoid a
-    /// TOCTOU race where `trigger()` fires between the check and the await.
+    /// Registers the `Notify` listener before checking the flag so a
+    /// `trigger()` between the check and the await is not missed.
     pub async fn notified(&self) {
         let future = self.notify.notified();
         if self.is_triggered() {
@@ -66,21 +66,23 @@ impl fmt::Debug for ShutdownSignal {
 mod tests {
     use super::*;
 
+    /// The hand-written `Debug` shows the flag and hides the `Notify`.
     #[test]
-    fn shutdown_signal_default_not_triggered() {
+    fn debug_shows_triggered_state() {
         let signal = ShutdownSignal::new();
-        assert!(!signal.is_triggered());
-    }
-
-    #[test]
-    fn shutdown_signal_trigger_sets_flag() {
-        let signal = ShutdownSignal::new();
+        assert_eq!(format!("{signal:?}"), "ShutdownSignal { triggered: false }");
         signal.trigger();
-        assert!(signal.is_triggered());
+        assert_eq!(format!("{signal:?}"), "ShutdownSignal { triggered: true }");
     }
 
     #[test]
-    fn shutdown_signal_clone_shares_state() {
+    fn new_and_default_start_untriggered() {
+        assert!(!ShutdownSignal::new().is_triggered(), "new");
+        assert!(!ShutdownSignal::default().is_triggered(), "default");
+    }
+
+    #[test]
+    fn clone_shares_state() {
         let signal = ShutdownSignal::new();
         let cloned = signal.clone();
         signal.trigger();
@@ -88,27 +90,12 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_signal_double_trigger_idempotent() {
+    fn trigger_sets_flag_and_is_idempotent() {
         let signal = ShutdownSignal::new();
         signal.trigger();
+        assert!(signal.is_triggered(), "first trigger");
         signal.trigger();
-        assert!(signal.is_triggered());
-    }
-
-    #[test]
-    fn shutdown_signal_default_trait() {
-        let signal = ShutdownSignal::default();
-        assert!(!signal.is_triggered());
-    }
-
-    #[test]
-    fn shutdown_signal_debug_format() {
-        let signal = ShutdownSignal::new();
-        let debug = format!("{signal:?}");
-        assert!(debug.contains("triggered: false"));
-        signal.trigger();
-        let debug = format!("{signal:?}");
-        assert!(debug.contains("triggered: true"));
+        assert!(signal.is_triggered(), "second trigger");
     }
 
     #[tokio::test]

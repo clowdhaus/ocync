@@ -76,12 +76,19 @@ pub(crate) fn is_transient(error: &Error) -> bool {
 /// Jitter is not decoration here. The prepare phase runs up to 16 mappings at
 /// once against one registry, so a burst of 429s throttles them together; an
 /// unjittered schedule would send all 16 retries back in lockstep and produce
-/// the next burst. The factor is drawn from `[0.75, 1.25)`, matching
-/// `ocync_sync::retry`.
+/// the next burst. The factor comes from [`jittered`].
 fn backoff(attempt: u32) -> Duration {
     let base = INITIAL_BACKOFF
         .saturating_mul(1u32 << attempt.min(16))
         .min(MAX_BACKOFF);
+    jittered(base)
+}
+
+/// Scale `base` by a random factor in `[0.75, 1.25)` to decorrelate concurrent
+/// retries. `fastrand`'s thread-local PRNG makes each call one `f64` draw with
+/// no syscall. The single definition for the workspace; the sync engine's
+/// backoff uses it too.
+pub fn jittered(base: Duration) -> Duration {
     base.mul_f64(0.75 + fastrand::f64() * 0.5)
 }
 

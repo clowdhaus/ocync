@@ -18,14 +18,13 @@ pub struct RetryConfig {
     /// Multiplier applied to backoff on each successive attempt.
     pub backoff_multiplier: u32,
     /// Maximum time the engine waits for the target's blob-availability
-    /// view to converge before issuing a manifest `PUT`, when a
+    /// view to converge before a manifest `PUT`, when a
     /// [`BatchBlobChecker`](ocync_distribution::ecr::BatchBlobChecker)
-    /// is configured (production: ECR targets).
+    /// is configured (ECR targets).
     ///
-    /// Production default: 30s -- larger than typical ECR consistency
-    /// windows but bounded so a stuck view does not hold the engine
-    /// open. Set to `Duration::ZERO` to disable the wait entirely; the
-    /// standard retry path will still catch any `BLOB_UPLOAD_UNKNOWN`.
+    /// Default 30s: larger than typical ECR consistency windows, bounded so
+    /// a stuck view does not hold the engine open. `Duration::ZERO` disables
+    /// the wait; the retry path still catches any `BLOB_UPLOAD_UNKNOWN`.
     pub manifest_commit_wait: Duration,
 }
 
@@ -42,54 +41,33 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    /// Compute the backoff duration for the given attempt (0-indexed).
-    ///
-    /// Uses exponential backoff capped at `max_backoff`, then applies
-    /// multiplicative jitter in \[0.75, 1.25) to decorrelate concurrent
-    /// retries. All arithmetic saturates instead of overflowing.
+    /// Backoff for the given attempt (0-indexed): exponential, capped at
+    /// `max_backoff`, then jittered in \[0.75, 1.25). All arithmetic saturates.
     pub fn backoff_for(&self, attempt: u32) -> Duration {
         let multiplier = self.backoff_multiplier.saturating_pow(attempt);
         let backoff = self.initial_backoff.saturating_mul(multiplier);
         let capped = backoff.min(self.max_backoff);
-        jitter(capped)
+        ocync_distribution::retry::jittered(capped)
     }
 }
 
-/// Determine whether a request should be retried based on HTTP status code.
-///
-/// Retries the statuses `ocync_distribution::retry::is_transient_status`
+/// Whether attempts remain and `status` is one `ocync_distribution::retry::is_transient_status`
 /// names.
 pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) -> bool {
     current_attempt < max_retries && ocync_distribution::retry::is_transient_status(status)
 }
 
-/// ECR (and possibly other registries) can return 404 with the OCI error
-/// code `BLOB_UPLOAD_UNKNOWN` when a manifest push references blobs
-/// whose PUT-201 came back but haven't been promoted to the
-/// manifest-validation index yet. The OCI distribution spec describes
-/// `BLOB_UPLOAD_UNKNOWN` as a state that "may be returned" for upload
-/// sessions in flux, leaving room for transient interpretation.
+/// Whether `error` is a 404 `RegistryError` whose body is OCI error JSON with
+/// an `errors[].code == "BLOB_UPLOAD_UNKNOWN"` entry.
 ///
-/// Returns `true` only when the error is a `RegistryError` with status
-/// 404 whose body is structured-OCI-error JSON and contains an
-/// `errors[].code == "BLOB_UPLOAD_UNKNOWN"` entry. A free-text mention
-/// of the string in some other shape (or a body that fails to parse) is
-/// NOT classified as retryable -- substring matching would otherwise
-/// false-positive on bodies that reference the code in prose.
+/// ECR answers a manifest push this way when a blob's PUT-201 has not reached
+/// the manifest-validation index yet. A body that does not parse, or that
+/// mentions the code only in prose, is not retryable: substring matching
+/// would false-positive there.
 ///
-/// # Interaction with the manifest-commit blob-visibility wait
-///
-/// For ECR targets, [`crate::engine::push_manifests`] now gates the
-/// manifest `PUT` on
-/// [`BatchBlobChecker::wait_for_blobs_available`](ocync_distribution::ecr::BatchBlobChecker::wait_for_blobs_available),
-/// which polls the authoritative `BatchCheckLayerAvailability` API
-/// until every referenced layer is visible (deadline:
-/// [`RetryConfig::manifest_commit_wait`]). This eliminates the
-/// `BLOB_UPLOAD_UNKNOWN` race for the common case. Retrying on this
-/// error remains as a defence-in-depth fallback for the wait-deadline
-/// case (a stuck consistency view that exceeds
-/// `manifest_commit_wait`) and for non-ECR targets that don't have a
-/// batch checker configured.
+/// The ECR manifest-commit wait ([`RetryConfig::manifest_commit_wait`])
+/// removes this race in the common case. Retrying on it stays as the
+/// fallback for a wait that times out and for targets without a batch checker.
 pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
     let ocync_distribution::Error::RegistryError { status, message } = error else {
         return false;
@@ -122,48 +100,24 @@ struct OciError {
     code: String,
 }
 
-/// Determine whether a transport-level (non-HTTP) error should be retried.
+/// Whether a transport-level (non-HTTP) error should be retried.
 ///
-/// Returns `true` for connection failures, request timeouts, mid-stream
-/// send failures (connection reset during body upload), and response body
-/// errors (premature EOF, truncated body) surfaced by `reqwest`, which
-/// reports a body cut short as a decode failure. These are transient by
-/// nature and safe to retry idempotent OCI operations on. An answer that
-/// arrived whole and is not the JSON expected is final.
+/// Which transport failures count is defined once, by
+/// `ocync_distribution::retry::is_transient_transport`.
 ///
-/// # Predicate set
+/// Only `Error::Http` is inspected. Other variants are not retried:
+/// - `Io`: local filesystem, never transient
+/// - `RegistryError`: HTTP-level, retried via [`should_retry`] instead
+/// - `RegistryProtocol`: deterministic spec violation
+/// - `UnreadableAnswer`: the same body comes back if asked again
+/// - `AnswerTooLarge`: asking again does not raise the limit
 ///
-/// `reqwest::Error::is_request()` covers errors raised during request
-/// dispatch (including connect failures and timeouts on the async hyper
-/// path - both are wrapped as `Kind::Request` by reqwest). `is_body()`
-/// and `is_decode()` cover the response-body phase, which is NOT
-/// classified as `Kind::Request`: reqwest reports a body cut short while
-/// read as a decode failure. Together these three predicates cover the
-/// transient-network surface without overlap.
-///
-/// The `should_retry_transport_*` tests below verify that connection
-/// failures and timeouts both classify as retryable through `is_request()`
-/// alone, pinning the equivalence.
-///
-/// # Known limitation
-///
-/// Only inspects `ocync_distribution::Error::Http`. Transport
-/// errors that arrive wrapped in other variants are NOT retried:
-/// - `Error::Io { .. }` -- local filesystem errors, never transient (typed `io::Error`)
-/// - `Error::RegistryError { .. }` -- HTTP-level; retried via `should_retry()` instead
-/// - `Error::RegistryProtocol { .. }` -- deterministic spec violation, never transient
-/// - `Error::UnreadableAnswer { .. }` -- an answer that arrived whole and does
-///   not parse; the same body comes back if asked again
-/// - `Error::AnswerTooLarge { .. }` -- an answer past a fixed limit, which
-///   asking again does not raise
-///
-/// If operators observe unretrieved transient errors, the debug log below will
-/// show which variant was encountered so the match can be extended.
+/// The debug log names the variant when a transient error goes unretried, so
+/// the match can be extended.
 pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
     if let ocync_distribution::Error::Http(reqwest_err) = error {
-        // One definition, in the crate that owns the reqwest surface. Two
-        // copies of this predicate drift; the prepare-phase retry in
-        // `ocync_distribution::retry` needs the same answer this does.
+        // One definition, shared with the prepare-phase retry in
+        // `ocync_distribution::retry`; two copies drift.
         ocync_distribution::retry::is_transient_transport(reqwest_err)
     } else {
         tracing::debug!(
@@ -172,17 +126,6 @@ pub fn should_retry_transport(error: &ocync_distribution::Error) -> bool {
         );
         false
     }
-}
-
-/// Apply multiplicative jitter to a backoff duration.
-///
-/// Scales the base duration by a random factor in \[0.75, 1.25) to
-/// decorrelate concurrent retries. Uses `fastrand`'s thread-local PRNG
-/// (auto-seeded from OS entropy on first use) so each call is a single
-/// `f64` draw with no per-call syscall.
-fn jitter(base: Duration) -> Duration {
-    let factor = 0.75 + fastrand::f64() * 0.5;
-    base.mul_f64(factor)
 }
 
 tokio::task_local! {
@@ -216,14 +159,11 @@ enum TokenRetry {
     Spent,
 }
 
-/// Retry an async operation with exponential backoff on transient errors.
+/// Retry an async operation with jittered exponential backoff, up to
+/// `config.max_retries` times.
 ///
-/// Calls `f()` in a loop. Retries on HTTP 408/429/5xx, transport-level
-/// errors (connection refused, DNS failure, request timeout), and the
-/// ECR-specific 404 `BLOB_UPLOAD_UNKNOWN` body marker via
-/// [`is_blob_upload_unknown`] (ECR returns this code on manifest
-/// push when blob upload PUT-201s haven't fully propagated).
-/// Waits with jittered exponential backoff up to `config.max_retries` times.
+/// Retries HTTP 408/429/5xx, transport-level errors, and the ECR 404
+/// `BLOB_UPLOAD_UNKNOWN` body marker ([`is_blob_upload_unknown`]).
 ///
 /// A streamed upload answered 401, whose token the client has dropped, is
 /// sent once more at once, outside that budget: nothing is throttled, and a
@@ -256,8 +196,6 @@ where
                     should_retry(status, attempt, config.max_retries)
                         || (attempt < config.max_retries && is_blob_upload_unknown(&e))
                 } else {
-                    // Transport-level errors (connection refused, DNS failure,
-                    // request timeout) are retryable when attempts remain.
                     attempt < config.max_retries && should_retry_transport(&e)
                 };
 
@@ -295,207 +233,159 @@ mod tests {
         assert_eq!(cfg.manifest_commit_wait, Duration::from_secs(30));
     }
 
-    /// Helper: assert a duration falls within the jitter range [base*0.75, base*1.25].
-    fn assert_in_jitter_range(actual: Duration, base: Duration) {
+    /// Assert a duration falls within the jitter range [base*0.75, base*1.25].
+    fn assert_in_jitter_range(actual: Duration, base: Duration, name: &str) {
         let lo = base.mul_f64(0.75);
         let hi = base.mul_f64(1.25);
         assert!(
             actual >= lo && actual <= hi,
-            "expected {actual:?} in [{lo:?}, {hi:?}] (base={base:?})"
+            "{name}: expected {actual:?} in [{lo:?}, {hi:?}] (base={base:?})"
         );
     }
 
     #[test]
-    fn backoff_exponential() {
-        let cfg = RetryConfig::default();
-        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
-        assert_in_jitter_range(cfg.backoff_for(1), Duration::from_secs(2));
-        assert_in_jitter_range(cfg.backoff_for(2), Duration::from_secs(4));
-        assert_in_jitter_range(cfg.backoff_for(3), Duration::from_secs(8));
-    }
-
-    #[test]
-    fn backoff_caps_at_max() {
-        let cfg = RetryConfig {
-            max_backoff: Duration::from_secs(5),
+    fn backoff_for_lands_in_jitter_range_of_base() {
+        let with = |multiplier, max_secs| RetryConfig {
+            backoff_multiplier: multiplier,
+            max_backoff: Duration::from_secs(max_secs),
             ..RetryConfig::default()
         };
-        // 2^10 = 1024 seconds, but capped at 5, then jitter applied
-        assert_in_jitter_range(cfg.backoff_for(10), Duration::from_secs(5));
-    }
-
-    #[test]
-    fn backoff_with_multiplier_one_is_constant() {
-        let cfg = RetryConfig {
-            backoff_multiplier: 1,
-            ..RetryConfig::default()
-        };
-        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
-        assert_in_jitter_range(cfg.backoff_for(5), Duration::from_secs(1));
-        assert_in_jitter_range(cfg.backoff_for(100), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn backoff_saturates_on_overflow() {
-        let cfg = RetryConfig {
-            backoff_multiplier: 3,
-            max_backoff: Duration::from_secs(300),
-            ..RetryConfig::default()
-        };
-        // 3^30 overflows u32 - saturating_pow caps at u32::MAX,
-        // saturating_mul caps Duration, then min caps at max_backoff
-        let result = cfg.backoff_for(30);
-        assert_in_jitter_range(result, Duration::from_secs(300));
-    }
-
-    #[test]
-    fn backoff_with_multiplier_zero_gives_zero_after_first() {
-        let cfg = RetryConfig {
-            backoff_multiplier: 0,
-            ..RetryConfig::default()
-        };
-        // 0^0 = 1, so attempt 0 gives initial_backoff * 1
-        assert_in_jitter_range(cfg.backoff_for(0), Duration::from_secs(1));
-        // 0^n = 0 for n > 0, so all subsequent attempts give zero backoff
-        // jitter of zero is still zero
-        assert_eq!(cfg.backoff_for(1), Duration::ZERO);
-        assert_eq!(cfg.backoff_for(5), Duration::ZERO);
-    }
-
-    #[test]
-    fn jitter_stays_in_range() {
-        // Run jitter many times and verify bounds. RandomState seeds
-        // differ per call, so we get coverage of the range.
-        let base = Duration::from_secs(10);
-        for _ in 0..100 {
-            let j = jitter(base);
-            assert!(
-                j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25),
-                "jitter {j:?} out of range for base {base:?}"
-            );
+        let s = Duration::from_secs;
+        // (name, config, attempt, base before jitter)
+        let cases = [
+            ("exponential 0", with(2, 300), 0, s(1)),
+            ("exponential 1", with(2, 300), 1, s(2)),
+            ("exponential 2", with(2, 300), 2, s(4)),
+            ("exponential 3", with(2, 300), 3, s(8)),
+            // 2^10 = 1024s, capped at 5s before jitter.
+            ("caps at max_backoff", with(2, 5), 10, s(5)),
+            ("multiplier one is constant 0", with(1, 300), 0, s(1)),
+            ("multiplier one is constant 5", with(1, 300), 5, s(1)),
+            ("multiplier one is constant 100", with(1, 300), 100, s(1)),
+            // 3^30 overflows u32; saturating_pow, saturating_mul then min cap it.
+            ("saturates on overflow", with(3, 300), 30, s(300)),
+            // 0^0 = 1, so attempt 0 keeps initial_backoff; 0^n = 0 after.
+            ("multiplier zero attempt 0", with(0, 300), 0, s(1)),
+            ("multiplier zero attempt 1", with(0, 300), 1, Duration::ZERO),
+            ("multiplier zero attempt 5", with(0, 300), 5, Duration::ZERO),
+        ];
+        for (name, cfg, attempt, base) in cases {
+            assert_in_jitter_range(cfg.backoff_for(attempt), base, name);
         }
     }
 
     #[test]
-    fn jitter_of_zero_is_zero() {
-        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+    fn should_retry_by_status_and_attempt() {
+        use StatusCode as S;
+        // (name, status, current attempt, expected); max_retries is 3.
+        let cases = [
+            ("408 first attempt", S::REQUEST_TIMEOUT, 0, true),
+            ("408 budget spent", S::REQUEST_TIMEOUT, 3, false),
+            ("429 first attempt", S::TOO_MANY_REQUESTS, 0, true),
+            ("429 last attempt", S::TOO_MANY_REQUESTS, 2, true),
+            ("429 budget spent", S::TOO_MANY_REQUESTS, 3, false),
+            ("500", S::INTERNAL_SERVER_ERROR, 0, true),
+            ("502", S::BAD_GATEWAY, 0, true),
+            ("503 second attempt", S::SERVICE_UNAVAILABLE, 1, true),
+            ("400", S::BAD_REQUEST, 0, false),
+            ("401", S::UNAUTHORIZED, 0, false),
+            ("403", S::FORBIDDEN, 0, false),
+            ("404", S::NOT_FOUND, 0, false),
+            ("200", S::OK, 0, false),
+            ("201", S::CREATED, 0, false),
+            ("204", S::NO_CONTENT, 0, false),
+        ];
+        for (name, status, attempt, want) in cases {
+            assert_eq!(should_retry(status, attempt, 3), want, "{name}");
+        }
     }
 
     #[test]
-    fn should_retry_on_408() {
-        assert!(should_retry(StatusCode::REQUEST_TIMEOUT, 0, 3));
-        assert!(!should_retry(StatusCode::REQUEST_TIMEOUT, 3, 3));
-    }
-
-    #[test]
-    fn should_retry_on_429() {
-        assert!(should_retry(StatusCode::TOO_MANY_REQUESTS, 0, 3));
-        assert!(should_retry(StatusCode::TOO_MANY_REQUESTS, 2, 3));
-        assert!(!should_retry(StatusCode::TOO_MANY_REQUESTS, 3, 3));
-    }
-
-    #[test]
-    fn should_retry_on_5xx() {
-        assert!(should_retry(StatusCode::INTERNAL_SERVER_ERROR, 0, 3));
-        assert!(should_retry(StatusCode::BAD_GATEWAY, 0, 3));
-        assert!(should_retry(StatusCode::SERVICE_UNAVAILABLE, 1, 3));
-    }
-
-    #[test]
-    fn should_not_retry_on_4xx() {
-        assert!(!should_retry(StatusCode::BAD_REQUEST, 0, 3));
-        assert!(!should_retry(StatusCode::UNAUTHORIZED, 0, 3));
-        assert!(!should_retry(StatusCode::FORBIDDEN, 0, 3));
-        assert!(!should_retry(StatusCode::NOT_FOUND, 0, 3));
-    }
-
-    #[test]
-    fn is_blob_upload_unknown_matches_404_with_marker() {
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::NOT_FOUND,
-            message: r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN","message":"Layers with digests do not exist"}]}"#.into(),
+    fn is_blob_upload_unknown_classifies_errors() {
+        let registry = |status, message: &str| ocync_distribution::Error::RegistryError {
+            status,
+            message: message.into(),
         };
-        assert!(is_blob_upload_unknown(&err));
-    }
-
-    #[test]
-    fn is_blob_upload_unknown_rejects_other_404() {
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::NOT_FOUND,
-            message: r#"{"errors":[{"code":"NAME_UNKNOWN"}]}"#.into(),
-        };
-        assert!(!is_blob_upload_unknown(&err));
-    }
-
-    /// Free-text mention of the code outside of `errors[].code` must NOT
-    /// classify as retryable -- the old substring match would have
-    /// false-positived here.
-    #[test]
-    fn is_blob_upload_unknown_rejects_free_text_mention_of_code() {
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::NOT_FOUND,
-            message: r#"{"errors":[{"code":"NAME_UNKNOWN","message":"related to BLOB_UPLOAD_UNKNOWN flow"}]}"#.into(),
-        };
-        assert!(!is_blob_upload_unknown(&err));
-    }
-
-    /// A malformed body (not parseable as the OCI error shape) is NOT
-    /// retried. Substring matching would have been ambiguous here.
-    #[test]
-    fn is_blob_upload_unknown_rejects_malformed_body() {
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::NOT_FOUND,
-            message: "BLOB_UPLOAD_UNKNOWN".into(),
-        };
-        assert!(!is_blob_upload_unknown(&err));
-    }
-
-    #[test]
-    fn is_blob_upload_unknown_rejects_non_404() {
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::BAD_REQUEST,
-            message: r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN"}]}"#.into(),
-        };
-        assert!(!is_blob_upload_unknown(&err));
-    }
-
-    #[test]
-    fn is_blob_upload_unknown_rejects_non_registry_error() {
-        let err = ocync_distribution::Error::DigestMismatch {
-            expected: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        let digest = |c: char| -> ocync_distribution::Digest {
+            format!("sha256:{}", c.to_string().repeat(64))
                 .parse()
-                .unwrap(),
-            actual: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                .parse()
-                .unwrap(),
+                .unwrap()
         };
-        assert!(!is_blob_upload_unknown(&err));
+        let cases = [
+            (
+                "404 with marker",
+                registry(
+                    StatusCode::NOT_FOUND,
+                    r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN","message":"Layers with digests do not exist"}]}"#,
+                ),
+                true,
+            ),
+            (
+                "other 404 code",
+                registry(
+                    StatusCode::NOT_FOUND,
+                    r#"{"errors":[{"code":"NAME_UNKNOWN"}]}"#,
+                ),
+                false,
+            ),
+            // A substring match would false-positive on prose mentions.
+            (
+                "code only in free text",
+                registry(
+                    StatusCode::NOT_FOUND,
+                    r#"{"errors":[{"code":"NAME_UNKNOWN","message":"related to BLOB_UPLOAD_UNKNOWN flow"}]}"#,
+                ),
+                false,
+            ),
+            (
+                "malformed body",
+                registry(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN"),
+                false,
+            ),
+            (
+                "non-404 status",
+                registry(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"errors":[{"code":"BLOB_UPLOAD_UNKNOWN"}]}"#,
+                ),
+                false,
+            ),
+            (
+                "non-registry error",
+                ocync_distribution::Error::DigestMismatch {
+                    expected: digest('0'),
+                    actual: digest('1'),
+                },
+                false,
+            ),
+        ];
+        for (name, err, want) in cases {
+            assert_eq!(is_blob_upload_unknown(&err), want, "{name}");
+        }
     }
 
     #[test]
-    fn should_not_retry_on_success() {
-        assert!(!should_retry(StatusCode::OK, 0, 3));
-        assert!(!should_retry(StatusCode::CREATED, 0, 3));
-        assert!(!should_retry(StatusCode::NO_CONTENT, 0, 3));
-    }
-
-    #[test]
-    fn should_retry_transport_on_registry_error() {
-        // RegistryError wraps HTTP responses, not transport failures.
-        let err = ocync_distribution::Error::RegistryError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "broke".into(),
-        };
-        assert!(!should_retry_transport(&err));
-    }
-
-    #[test]
-    fn should_retry_transport_on_io() {
-        let err = ocync_distribution::Error::Io {
-            context: "staging read",
-            source: std::io::Error::other("staging read failed").into(),
-        };
-        assert!(!should_retry_transport(&err));
+    fn should_not_retry_transport_for_non_http_errors() {
+        let cases = [
+            // RegistryError wraps HTTP responses, not transport failures.
+            (
+                "registry error",
+                ocync_distribution::Error::RegistryError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "broke".into(),
+                },
+            ),
+            (
+                "io error",
+                ocync_distribution::Error::Io {
+                    context: "staging read",
+                    source: std::io::Error::other("staging read failed").into(),
+                },
+            ),
+        ];
+        for (name, err) in cases {
+            assert!(!should_retry_transport(&err), "{name}");
+        }
     }
 
     /// A streamed upload whose token was refused is sent once more at once,
@@ -542,58 +432,17 @@ mod tests {
         }
     }
 
-    /// Positive-path test: a real reqwest connection failure (refused port)
-    /// must be classified as retryable through `is_request()` alone.
-    ///
-    /// Pins the comment-claimed equivalence: connection failures on the
-    /// async hyper path surface as `Kind::Request`, so `is_request()` is
-    /// sufficient to catch them. If a future reqwest version changes this
-    /// wrapping, this test will fail and the predicate set must be
-    /// re-evaluated.
-    #[tokio::test]
-    async fn should_retry_transport_on_connect_failure() {
-        ocync_distribution::install_crypto_provider();
-        // Connect to a port where nothing is listening -- produces a real
-        // reqwest::Error with is_connect()=true and is_request()=true.
-        let client = reqwest::Client::new();
-        let reqwest_err = client
-            .get("http://127.0.0.1:1")
-            .send()
-            .await
-            .expect_err("connect to port 1 should fail");
-        assert!(
-            reqwest_err.is_connect(),
-            "expected is_connect(), got: {reqwest_err}"
-        );
-        assert!(
-            reqwest_err.is_request(),
-            "is_request() must cover connect failures (predicate-set invariant); got: {reqwest_err}"
-        );
-        let err = ocync_distribution::Error::from(reqwest_err);
-        assert!(
-            should_retry_transport(&err),
-            "connection refused should be retryable"
-        );
-    }
-
-    /// Positive-path test: a real reqwest request timeout must be
-    /// classified as retryable through `is_request()` alone.
-    ///
-    /// Pins the comment-claimed equivalence: timeouts on the async hyper
-    /// path surface as `Kind::Request`, so `is_request()` is sufficient.
-    /// Drives the timeout by binding a `TcpListener` that accepts
-    /// connections but never sends data, then issuing a reqwest GET with
-    /// a 50ms request timeout.
+    /// A real request timeout is retryable through `is_request()` alone.
+    /// Driven by a `TcpListener` that accepts but never writes, and a 50ms
+    /// request timeout.
     #[tokio::test]
     async fn should_retry_transport_on_request_timeout() {
         ocync_distribution::install_crypto_provider();
 
-        // Bind an accepting-but-silent TCP listener on an ephemeral port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            // Hold each accepted connection open without writing so the
-            // client's read times out.
+            // Hold connections open without writing so the client times out.
             loop {
                 let Ok((_sock, _addr)) = listener.accept().await else {
                     break;

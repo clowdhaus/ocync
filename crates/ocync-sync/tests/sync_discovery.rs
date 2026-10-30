@@ -724,6 +724,8 @@ async fn discovery_pull_failure_does_not_populate_cache() {
             ..
         }
     );
+    // The label names the target registry alias.
+    assert_eq!(report.images[0].target, "tgt/repo (target):v1");
 
     // Discovery counters: HEAD succeeded (cache miss, not head failure).
     assert_eq!(report.stats.discovery_cache_misses, 1);

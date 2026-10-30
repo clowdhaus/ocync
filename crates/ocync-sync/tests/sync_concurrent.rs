@@ -6,11 +6,11 @@ mod helpers;
 use std::sync::{Arc, Mutex};
 
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType, RepositoryName};
-use ocync_sync::ImageStatus;
 use ocync_sync::engine::{SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
+use ocync_sync::{ImageStatus, RunOutcome};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -93,7 +93,7 @@ async fn sync_index_manifest_child_pull_failure() {
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Failed { .. });
     assert_eq!(report.stats.images_failed, 1);
-    assert_eq!(report.exit_code(), 2);
+    assert_eq!(report.outcome(), RunOutcome::AllFailed);
 }
 
 /// Blob 1 (config) push succeeds. Blob 2 (layer) push POST returns 403.
@@ -1467,7 +1467,7 @@ async fn sync_leader_commits_before_follower_subscribes() {
 }
 
 /// Leader's manifest push fails (500). Followers waiting on the watch channel
-/// must unblock via `notify_repo_failed`, see `is_repo_committed` = false,
+/// must unblock via `notify_repo_failed`, find the repo not committed,
 /// and fall through to HEAD+push instead of deadlocking.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_leader_manifest_push_fails_follower_falls_through() {

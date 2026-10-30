@@ -1,16 +1,17 @@
-//! Tag-version parser, comparator, and range matcher.
+//! Lenient tag-version parser, comparator, and range matcher.
 //!
-//! Lenient prefix-based parser for OCI registry tag patterns.
-//! Handles real-world variants (alpine, Chainguard `-rN`, Eclipse Temurin
-//! `_<digits>`, EKS Distro compound suffixes) by treating the suffix as
-//! opaque tokens for ordering only. Range matching is prefix-only.
+//! Real-world tag shapes (alpine, Chainguard `-rN`, Eclipse Temurin
+//! `_<digits>`, EKS Distro compound suffixes) parse by treating the suffix as
+//! opaque tokens used for ordering only. Range matching is prefix-only.
 
 use std::cmp::Ordering;
 
 /// A token in a tokenized tag suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Token<'a> {
+    /// An all-digit run.
     Numeric(u64),
+    /// Any other run.
     Alpha(&'a str),
 }
 
@@ -20,13 +21,15 @@ pub(crate) enum Token<'a> {
 /// tokenized to nothing, e.g. `1.0-` or `1.0---`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TagVersion<'a> {
+    /// Numeric components before the first `-`.
     pub(crate) prefix: Vec<u64>,
+    /// Tokens after the first `-`.
     pub(crate) suffix: Vec<Token<'a>>,
 }
 
 impl<'a> TagVersion<'a> {
-    /// Parse a tag string into a `TagVersion`.
-    /// Returns `None` if the tag has no parseable numeric prefix.
+    /// Parse a tag into a `TagVersion`, or `None` if it has no parseable
+    /// numeric prefix.
     pub(crate) fn parse(tag: &'a str) -> Option<Self> {
         if tag.is_empty() {
             return None;
@@ -56,12 +59,11 @@ impl<'a> TagVersion<'a> {
         Some(TagVersion { prefix, suffix })
     }
 
-    /// Total order over `TagVersion`. Free associated function rather than
-    /// `impl Ord` because zero-padding equality (`1.0` and `1.0.0` compare
-    /// Equal) is incompatible with `Ord`'s contract that
-    /// `cmp(a, b) == Equal` implies `a == b`.
+    /// Total order over `TagVersion`. Not `impl Ord` because zero-padding
+    /// equality (`1.0` and `1.0.0` compare Equal) breaks `Ord`'s contract
+    /// that `cmp(a, b) == Equal` implies `a == b`.
     pub(crate) fn compare(a: &TagVersion<'_>, b: &TagVersion<'_>) -> Ordering {
-        // Step 1: numeric prefix (zero-padded).
+        // Numeric prefix, zero-padded.
         let max_len = a.prefix.len().max(b.prefix.len());
         for i in 0..max_len {
             let ai = a.prefix.get(i).copied().unwrap_or(0);
@@ -72,7 +74,7 @@ impl<'a> TagVersion<'a> {
             }
         }
 
-        // Step 2: suffix presence (empty suffix wins).
+        // An empty suffix beats any suffix.
         match (a.suffix.is_empty(), b.suffix.is_empty()) {
             (true, true) => return Ordering::Equal,
             (true, false) => return Ordering::Greater,
@@ -80,7 +82,7 @@ impl<'a> TagVersion<'a> {
             (false, false) => {}
         }
 
-        // Step 3: token-by-token.
+        // Token by token.
         for (at, bt) in a.suffix.iter().zip(b.suffix.iter()) {
             let ord = compare_tokens(at, bt);
             if ord != Ordering::Equal {
@@ -88,13 +90,13 @@ impl<'a> TagVersion<'a> {
             }
         }
 
-        // Length-mismatch tie-breaker: shorter token list is less.
+        // Shorter token list is less.
         a.suffix.len().cmp(&b.suffix.len())
     }
 }
 
-/// Compare two suffix tokens. Numeric is less than Alpha at the same
-/// position; tokens of the same kind compare by their inner value.
+/// Numeric sorts below Alpha at the same position (semver identifier
+/// precedence); tokens of the same kind compare by value.
 fn compare_tokens(a: &Token<'_>, b: &Token<'_>) -> Ordering {
     match (a, b) {
         (Token::Numeric(x), Token::Numeric(y)) => x.cmp(y),
@@ -104,8 +106,8 @@ fn compare_tokens(a: &Token<'_>, b: &Token<'_>) -> Ordering {
     }
 }
 
-/// Parse the prefix region: u64 components separated by '.' or '_'.
-/// Any non-digit character causes the whole tag to fail to parse.
+/// Parse u64 components separated by '.' or '_'. Any non-digit character
+/// fails the whole tag.
 fn parse_prefix(s: &str) -> Option<Vec<u64>> {
     let mut components = Vec::new();
     for part in s.split(['.', '_']) {
@@ -122,12 +124,8 @@ fn parse_prefix(s: &str) -> Option<Vec<u64>> {
     }
 }
 
-/// Tokenize the suffix region. Two passes:
-///   1. Split on '.', '-', '_'.
-///   2. For each token, split at letter-digit boundaries.
-///
-/// Empty strings are dropped. Each surviving string becomes Numeric(u64) if
-/// all-digit, otherwise Alpha(&str).
+/// Split on '.', '-', '_', then at letter-digit boundaries. Empty pieces are
+/// dropped; all-digit pieces become `Numeric`, the rest `Alpha`.
 fn tokenize_suffix(s: &str) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     for part in s.split(['.', '-', '_']) {
@@ -191,6 +189,7 @@ enum Op {
 /// Error returned when a version range string cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RangeParseError {
+    /// Operator-facing explanation of what was rejected.
     pub(crate) reason: String,
 }
 
@@ -203,11 +202,11 @@ impl std::fmt::Display for RangeParseError {
 impl std::error::Error for RangeParseError {}
 
 impl Range {
-    /// Parse a range string into a `Range`.
+    /// Parse comma-joined constraints such as `>=1.0, <2.0`.
     ///
-    /// Accepts comma-joined constraints of the form `>=1.0, <2.0`.
-    /// Supported operators: `>=`, `<=`, `>`, `<`, `=`, and bare (implies `=`).
-    /// Caret (`^`), tilde (`~`), and wildcards (`x`, `X`, `*`) are rejected.
+    /// Operators: `>=`, `<=`, `>`, `<`, `=`, and bare (implies `=`).
+    /// Caret, tilde, wildcards (`x`, `X`, `*`) and prerelease bounds are
+    /// rejected.
     pub(crate) fn parse(s: &str) -> Result<Self, RangeParseError> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -222,9 +221,8 @@ impl Range {
         Ok(Range { constraints })
     }
 
-    /// `true` if every constraint matches against `v.prefix`. Constraints
-    /// zero-pad both sides to the longer length before comparing, so a
-    /// two-part bound (`>=15.0`) matches a three-part prefix (`15.10.5`).
+    /// `true` if every constraint matches `v.prefix`. Both sides are
+    /// zero-padded to the longer length, so `>=15.0` matches `15.10.5`.
     pub(crate) fn matches(&self, v: &TagVersion<'_>) -> bool {
         self.constraints.iter().all(|c| c.matches(&v.prefix))
     }
@@ -322,202 +320,98 @@ mod parse_tests {
     use super::*;
 
     #[test]
-    fn parses_three_part_numeric() {
-        let v = TagVersion::parse("1.21.5").unwrap();
-        assert_eq!(v.prefix, vec![1, 21, 5]);
-        assert!(v.suffix.is_empty());
+    fn parses_prefix_and_suffix() {
+        use Token::{Alpha, Numeric};
+        // (name, tag, prefix, suffix)
+        let cases: &[(&str, &str, &[u64], &[Token<'_>])] = &[
+            ("three-part numeric", "1.21.5", &[1, 21, 5], &[]),
+            ("two-part numeric", "15.10", &[15, 10], &[]),
+            ("one-part numeric", "21", &[21], &[]),
+            ("v prefix stripped", "v1.27.6", &[1, 27, 6], &[]),
+            ("v0", "v0", &[0], &[]),
+            (
+                "underscore is a prefix separator",
+                "21.0.5_11",
+                &[21, 0, 5, 11],
+                &[],
+            ),
+            ("date as one integer", "20240115", &[20240115], &[]),
+            ("trailing dash collapses", "1.0-", &[1, 0], &[]),
+            ("separator-only suffix collapses", "1.0---", &[1, 0], &[]),
+            ("alpine", "15.10-alpine", &[15, 10], &[Alpha("alpine")]),
+            (
+                "chainguard revision",
+                "1.25.5-r0",
+                &[1, 25, 5],
+                &[Alpha("r"), Numeric(0)],
+            ),
+            (
+                "temurin compound",
+                "25.0.3_9-jre-alpine-3.23",
+                &[25, 0, 3, 9],
+                &[Alpha("jre"), Alpha("alpine"), Numeric(3), Numeric(23)],
+            ),
+            (
+                "eks distro",
+                "v1.27.6-eks-1-27-14",
+                &[1, 27, 6],
+                &[Alpha("eks"), Numeric(1), Numeric(27), Numeric(14)],
+            ),
+            (
+                "node alpine compound",
+                "20.18.1-alpine3.20",
+                &[20, 18, 1],
+                &[Alpha("alpine"), Numeric(3), Numeric(20)],
+            ),
+            (
+                "dotnet compound variant",
+                "8.0-bookworm-slim",
+                &[8, 0],
+                &[Alpha("bookworm"), Alpha("slim")],
+            ),
+            (
+                "hashicorp alpha date stamp",
+                "1.10.0-alpha20241016",
+                &[1, 10, 0],
+                &[Alpha("alpha"), Numeric(20241016)],
+            ),
+            (
+                "arm variant",
+                "2.21.0-arm64v8",
+                &[2, 21, 0],
+                &[Alpha("arm"), Numeric(64), Alpha("v"), Numeric(8)],
+            ),
+        ];
+        for (name, tag, prefix, suffix) in cases {
+            let v = TagVersion::parse(tag).unwrap_or_else(|| panic!("{name}: {tag} must parse"));
+            assert_eq!(v.prefix, *prefix, "{name}: prefix");
+            assert_eq!(v.suffix, *suffix, "{name}: suffix");
+        }
     }
 
     #[test]
-    fn parses_two_part_numeric() {
-        let v = TagVersion::parse("15.10").unwrap();
-        assert_eq!(v.prefix, vec![15, 10]);
-        assert!(v.suffix.is_empty());
+    fn rejects_unparseable_tags() {
+        let cases = [
+            ("empty", ""),
+            ("bare v", "v"),
+            ("non-numeric prefix", "latest"),
+            ("non-numeric prefix with dash", "lts-iron"),
+            // A letter before any '-' (postgres `17rc1`) drops the tag.
+            ("letter in prefix region", "17rc1"),
+            ("letter in two-part prefix region", "1.24rc2"),
+            ("u64 overflow", "1111111111111111111111111"),
+        ];
+        for (name, tag) in cases {
+            assert!(TagVersion::parse(tag).is_none(), "{name}: {tag}");
+        }
     }
 
     #[test]
-    fn parses_one_part_numeric() {
-        let v = TagVersion::parse("21").unwrap();
-        assert_eq!(v.prefix, vec![21]);
-        assert!(v.suffix.is_empty());
-    }
-
-    #[test]
-    fn strips_v_prefix() {
-        let v = TagVersion::parse("v1.27.6").unwrap();
-        assert_eq!(v.prefix, vec![1, 27, 6]);
-    }
-
-    #[test]
-    fn parses_v0() {
-        let v = TagVersion::parse("v0").unwrap();
-        assert_eq!(v.prefix, vec![0]);
-    }
-
-    #[test]
-    fn parses_underscore_separator() {
-        let v = TagVersion::parse("21.0.5_11").unwrap();
-        assert_eq!(v.prefix, vec![21, 0, 5, 11]);
-        assert!(v.suffix.is_empty());
-    }
-
-    #[test]
-    fn rejects_empty() {
-        assert!(TagVersion::parse("").is_none());
-    }
-
-    #[test]
-    fn rejects_bare_v() {
-        assert!(TagVersion::parse("v").is_none());
-    }
-
-    #[test]
-    fn rejects_non_numeric_prefix() {
-        assert!(TagVersion::parse("latest").is_none());
-        assert!(TagVersion::parse("lts-iron").is_none());
-    }
-
-    #[test]
-    fn rejects_letter_in_prefix_region() {
-        // postgres `17rc1` has 'r' in the prefix region (before any '-') -> drop.
-        assert!(TagVersion::parse("17rc1").is_none());
-        assert!(TagVersion::parse("1.24rc2").is_none());
-    }
-
-    #[test]
-    fn rejects_u64_overflow() {
-        // 25 digits exceeds u64::MAX.
-        let too_big = "1".repeat(25);
-        assert!(TagVersion::parse(&too_big).is_none());
-    }
-
-    #[test]
-    fn collapses_trailing_dash() {
-        let v = TagVersion::parse("1.0-").unwrap();
-        assert_eq!(v.prefix, vec![1, 0]);
-        assert!(v.suffix.is_empty());
-    }
-
-    #[test]
-    fn collapses_suffix_with_only_separators() {
-        let v = TagVersion::parse("1.0---").unwrap();
-        assert!(v.suffix.is_empty());
-    }
-
-    #[test]
-    fn parses_suffix_alpine() {
-        let v = TagVersion::parse("15.10-alpine").unwrap();
-        assert_eq!(v.prefix, vec![15, 10]);
-        assert_eq!(v.suffix, vec![Token::Alpha("alpine")]);
-    }
-
-    #[test]
-    fn parses_suffix_chainguard_revision() {
-        let v = TagVersion::parse("1.25.5-r0").unwrap();
-        assert_eq!(v.prefix, vec![1, 25, 5]);
-        assert_eq!(v.suffix, vec![Token::Alpha("r"), Token::Numeric(0)]);
-    }
-
-    #[test]
-    fn parses_suffix_temurin_compound() {
-        let v = TagVersion::parse("25.0.3_9-jre-alpine-3.23").unwrap();
-        assert_eq!(v.prefix, vec![25, 0, 3, 9]);
-        assert_eq!(
-            v.suffix,
-            vec![
-                Token::Alpha("jre"),
-                Token::Alpha("alpine"),
-                Token::Numeric(3),
-                Token::Numeric(23),
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_suffix_eks_distro() {
-        let v = TagVersion::parse("v1.27.6-eks-1-27-14").unwrap();
-        assert_eq!(v.prefix, vec![1, 27, 6]);
-        assert_eq!(
-            v.suffix,
-            vec![
-                Token::Alpha("eks"),
-                Token::Numeric(1),
-                Token::Numeric(27),
-                Token::Numeric(14),
-            ]
-        );
-    }
-
-    #[test]
-    fn parses_suffix_node_alpine_compound() {
-        let v = TagVersion::parse("20.18.1-alpine3.20").unwrap();
-        assert_eq!(v.prefix, vec![20, 18, 1]);
-        assert_eq!(
-            v.suffix,
-            vec![
-                Token::Alpha("alpine"),
-                Token::Numeric(3),
-                Token::Numeric(20),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenization_equivalence_rc1_and_rc_dot_1() {
-        // 1.0.0-rc1 and 1.0.0-rc.1 produce identical tokens.
+    fn rc1_and_rc_dot_1_tokenize_identically() {
         let a = TagVersion::parse("1.0.0-rc1").unwrap();
         let b = TagVersion::parse("1.0.0-rc.1").unwrap();
         assert_eq!(a.suffix, b.suffix);
         assert_eq!(a.suffix, vec![Token::Alpha("rc"), Token::Numeric(1)]);
-    }
-
-    /// dotnet major-only with multi-part dashed variant: `8.0-bookworm-slim`
-    /// (mcr.microsoft.com/dotnet/aspnet).
-    #[test]
-    fn parses_suffix_dotnet_compound_variant() {
-        let v = TagVersion::parse("8.0-bookworm-slim").unwrap();
-        assert_eq!(v.prefix, vec![8, 0]);
-        assert_eq!(
-            v.suffix,
-            vec![Token::Alpha("bookworm"), Token::Alpha("slim")]
-        );
-    }
-
-    /// `HashiCorp` alpha date-stamp: `1.10.0-alpha20241016`
-    /// (terraform pre-release with embedded YYYYMMDD).
-    #[test]
-    fn parses_suffix_hashicorp_alpha_date_stamp() {
-        let v = TagVersion::parse("1.10.0-alpha20241016").unwrap();
-        assert_eq!(v.prefix, vec![1, 10, 0]);
-        assert_eq!(
-            v.suffix,
-            vec![Token::Alpha("alpha"), Token::Numeric(20241016)]
-        );
-    }
-
-    /// ARM variant suffix: `2.21.0-arm64v8` (aws-cli).
-    #[test]
-    fn parses_suffix_arm_variant() {
-        let v = TagVersion::parse("2.21.0-arm64v8").unwrap();
-        assert_eq!(v.prefix, vec![2, 21, 0]);
-        assert_eq!(
-            v.suffix,
-            vec![
-                Token::Alpha("arm"),
-                Token::Numeric(64),
-                Token::Alpha("v"),
-                Token::Numeric(8),
-            ]
-        );
-    }
-
-    /// Date as a single 8-digit integer: `20240115` (some image tag schemes).
-    /// Should parse as a one-component prefix and sort numerically.
-    #[test]
-    fn parses_date_as_single_integer() {
-        let v = TagVersion::parse("20240115").unwrap();
-        assert_eq!(v.prefix, vec![20240115]);
-        assert!(v.suffix.is_empty());
     }
 }
 
@@ -532,200 +426,150 @@ mod range_tests {
     }
 
     #[test]
-    fn ge_simple() {
-        assert!(matches(">=1.0", "1.0.0"));
-        assert!(matches(">=1.0", "1.5.0"));
-        assert!(!matches(">=1.0", "0.9.0"));
+    fn range_matches_prefix() {
+        // (name, range, tag, want)
+        let cases = [
+            ("ge at bound", ">=1.0", "1.0.0", true),
+            ("ge above bound", ">=1.0", "1.5.0", true),
+            ("ge below bound", ">=1.0", "0.9.0", false),
+            ("lt below bound", "<2.0", "1.99.99", true),
+            ("lt at bound", "<2.0", "2.0.0", false),
+            // The suffix is opaque: 2.0.0-rc1 has prefix [2,0,0].
+            ("lt at bound with suffix", "<2.0", "2.0.0-rc1", false),
+            ("comma-joined inside", ">=1.0, <2.0", "1.5.0", true),
+            ("comma-joined above", ">=1.0, <2.0", "2.0.0", false),
+            ("comma-joined below", ">=1.0, <2.0", "0.9.0", false),
+            ("whitespace tolerated", " >= 1.0 , < 2.0 ", "1.5.0", true),
+            ("bare equals zero-padded", "1.0", "1.0.0", true),
+            ("bare equals shorter tag", "1.0", "1", true),
+            ("bare equals rejects higher", "1.0", "1.0.5", false),
+            ("explicit eq one part", "=15.0", "15", true),
+            ("explicit eq two part", "=15.0", "15.0", true),
+            ("explicit eq three part", "=15.0", "15.0.0", true),
+            ("explicit eq rejects higher", "=15.0", "15.0.5", false),
+            (
+                "two-part bound, three-part prefix",
+                ">=15.0",
+                "15.10.5",
+                true,
+            ),
+        ];
+        for (name, range, tag, want) in cases {
+            assert_eq!(matches(range, tag), want, "{name}: {range} vs {tag}");
+        }
     }
 
     #[test]
-    fn lt_simple() {
-        assert!(matches("<2.0", "1.99.99"));
-        assert!(!matches("<2.0", "2.0.0"));
-        // suffix opaque: 2.0.0-rc1 has prefix [2,0,0]
-        assert!(!matches("<2.0", "2.0.0-rc1"));
-    }
-
-    #[test]
-    fn comma_joined_narrows() {
-        assert!(matches(">=1.0, <2.0", "1.5.0"));
-        assert!(!matches(">=1.0, <2.0", "2.0.0"));
-        assert!(!matches(">=1.0, <2.0", "0.9.0"));
-    }
-
-    #[test]
-    fn whitespace_tolerated() {
-        assert!(matches(" >= 1.0 , < 2.0 ", "1.5.0"));
-    }
-
-    #[test]
-    fn no_operator_implies_equal() {
-        assert!(matches("1.0", "1.0.0"));
-        assert!(matches("1.0", "1"));
-        assert!(!matches("1.0", "1.0.5"));
-    }
-
-    #[test]
-    fn equal_explicit() {
-        assert!(matches("=15.0", "15"));
-        assert!(matches("=15.0", "15.0"));
-        assert!(matches("=15.0", "15.0.0"));
-        assert!(!matches("=15.0", "15.0.5"));
-    }
-
-    #[test]
-    fn two_part_bound_matches_three_part_prefix() {
-        assert!(matches(">=15.0", "15.10.5"));
-    }
-
-    #[test]
-    fn rejects_caret() {
-        assert!(Range::parse("^2").is_err());
-    }
-
-    #[test]
-    fn rejects_tilde() {
-        assert!(Range::parse("~1").is_err());
-    }
-
-    #[test]
-    fn rejects_wildcard() {
-        assert!(Range::parse("1.x").is_err());
-        assert!(Range::parse("1.*").is_err());
-        assert!(Range::parse("1.X").is_err());
-    }
-
-    #[test]
-    fn rejects_empty() {
-        assert!(Range::parse("").is_err());
-    }
-
-    #[test]
-    fn rejects_prerelease_bound() {
-        assert!(Range::parse(">=1.0-rc1").is_err());
-        // Bare bound (no operator falls through to Op::Eq); same rejection path.
-        assert!(Range::parse("1.0.0-r0").is_err());
+    fn rejects_unsupported_ranges() {
+        let cases = [
+            ("caret", "^2"),
+            ("tilde", "~1"),
+            ("wildcard x", "1.x"),
+            ("wildcard star", "1.*"),
+            ("wildcard X", "1.X"),
+            ("empty", ""),
+            ("prerelease bound", ">=1.0-rc1"),
+            // No operator falls through to Op::Eq; same rejection path.
+            ("bare prerelease bound", "1.0.0-r0"),
+        ];
+        for (name, range) in cases {
+            assert!(Range::parse(range).is_err(), "{name}: {range}");
+        }
     }
 }
 
 #[cfg(test)]
 mod compare_tests {
     use super::*;
-
-    fn p(s: &str) -> TagVersion<'_> {
-        TagVersion::parse(s).expect("valid tag")
-    }
+    use Ordering::{Equal, Greater, Less};
 
     fn compare(a: &str, b: &str) -> Ordering {
+        let p = |s| TagVersion::parse(s).expect("valid tag");
         TagVersion::compare(&p(a), &p(b))
     }
 
     #[test]
-    fn three_part_numeric_descending() {
-        assert_eq!(compare("1.0.0", "2.0.0"), Ordering::Less);
-        assert_eq!(compare("2.0.0", "1.0.0"), Ordering::Greater);
-        assert_eq!(compare("1.21.5", "1.21.5"), Ordering::Equal);
-    }
-
-    #[test]
-    fn zero_pad_one_dot_zero_equals_one_zero_zero() {
-        assert_eq!(compare("1.0", "1.0.0"), Ordering::Equal);
-    }
-
-    #[test]
-    fn zero_pad_three_part_beats_two_part() {
-        // 1.0.5 > 1.0 (which pads to 1.0.0)
-        assert_eq!(compare("1.0.5", "1.0"), Ordering::Greater);
-    }
-
-    #[test]
-    fn suffix_less_wins() {
-        assert_eq!(compare("1.0.0", "1.0.0-rc1"), Ordering::Greater);
-        assert_eq!(compare("1.0.0-alpha", "1.0.0"), Ordering::Less);
-    }
-
-    #[test]
-    fn temurin_underscore_build_orders() {
-        assert_eq!(compare("25.0.3_10", "25.0.3_9"), Ordering::Greater);
-        // 25.0.3 > 25.0.2_999: prefix [25,0,3,0] > [25,0,2,999] after padding.
-        assert_eq!(compare("25.0.3", "25.0.2_999"), Ordering::Greater);
-    }
-
-    #[test]
-    fn rc10_above_rc9_via_letter_digit_split() {
-        assert_eq!(compare("1.0.0-rc10", "1.0.0-rc9"), Ordering::Greater);
-    }
-
-    #[test]
-    fn rc1_and_rc_dot_1_compare_equal() {
-        assert_eq!(compare("1.0.0-rc1", "1.0.0-rc.1"), Ordering::Equal);
-    }
-
-    #[test]
-    fn rc_dot_2_above_rc_dot_1() {
-        assert_eq!(compare("1.0.0-rc.1", "1.0.0-rc.2"), Ordering::Less);
-    }
-
-    #[test]
-    fn eks_distro_compound_suffix_orders() {
-        assert_eq!(
-            compare("v1.27.6-eks-1-27-14", "v1.27.6-eks-1-27-9"),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn bitnami_release_counter_orders() {
-        assert_eq!(
-            compare("1.31.3-debian-12-r3", "1.31.3-debian-12-r2"),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn case_significant_alpha() {
-        // ASCII: 'R' (0x52) < 'r' (0x72), so RC1 sorts before rc1.
-        assert_eq!(compare("1.0.0-RC1", "1.0.0-rc1"), Ordering::Less);
-    }
-
-    #[test]
-    fn numeric_lt_alpha_at_same_position() {
-        // SemVer identifier-precedence rule.
-        let a = p("1.0.0-1");
-        let b = p("1.0.0-alpha");
-        assert_eq!(TagVersion::compare(&a, &b), Ordering::Less);
-    }
-
-    #[test]
-    fn longer_suffix_beats_shorter_when_tokens_equal() {
-        // Exercises the length tie-breaker: [rc, 1] vs [rc, 1, "hotfix"].
-        // Tokens compare equal at positions 0 and 1; falls through to
-        // length comparison.
-        assert_eq!(compare("1.0.0-rc.1", "1.0.0-rc.1.hotfix"), Ordering::Less);
-        // Antisymmetry: the reverse comparison must yield Greater.
-        assert_eq!(
-            compare("1.0.0-rc.1.hotfix", "1.0.0-rc.1"),
-            Ordering::Greater
-        );
-    }
-
-    /// Maven/Java uppercase RC tokens are NOT equivalent to lowercase under
-    /// `compare` -- the suffix comparison is byte-wise. The system-exclude
-    /// glob layer is case-insensitive (handled separately), but the parse
-    /// and compare layers preserve case.
-    #[test]
-    fn maven_uppercase_rc_distinct_from_lowercase() {
-        // 'R' (0x52) < 'r' (0x72) by ASCII byte order.
-        assert_eq!(compare("5.0.0-RC1", "5.0.0-rc1"), Ordering::Less);
-        // SNAPSHOT vs snapshot: same property.
-        assert_eq!(compare("5.0.0-SNAPSHOT", "5.0.0-snapshot"), Ordering::Less);
-    }
-
-    /// Single-integer date sorts as a number, not lex: `20240115 > 2024.1.15`
-    /// (the single integer 20240115 is much greater than the [2024,1,15]
-    /// list under zero-pad).
-    #[test]
-    fn date_single_integer_sorts_above_date_components() {
-        assert_eq!(compare("20240115", "2024.01.15"), Ordering::Greater);
+    fn compare_orders() {
+        // (name, a, b, want)
+        let cases = [
+            ("numeric less", "1.0.0", "2.0.0", Less),
+            ("numeric greater", "2.0.0", "1.0.0", Greater),
+            ("numeric equal", "1.21.5", "1.21.5", Equal),
+            ("zero-pad equal", "1.0", "1.0.0", Equal),
+            // 1.0.5 > 1.0, which pads to 1.0.0.
+            (
+                "zero-pad three-part beats two-part",
+                "1.0.5",
+                "1.0",
+                Greater,
+            ),
+            ("no suffix beats suffix", "1.0.0", "1.0.0-rc1", Greater),
+            ("suffix loses to none", "1.0.0-alpha", "1.0.0", Less),
+            ("temurin build 10 above 9", "25.0.3_10", "25.0.3_9", Greater),
+            // [25,0,3,0] > [25,0,2,999] after padding.
+            (
+                "temurin higher patch beats build",
+                "25.0.3",
+                "25.0.2_999",
+                Greater,
+            ),
+            (
+                "rc10 above rc9 via letter-digit split",
+                "1.0.0-rc10",
+                "1.0.0-rc9",
+                Greater,
+            ),
+            ("rc.2 above rc.1", "1.0.0-rc.1", "1.0.0-rc.2", Less),
+            (
+                "eks distro compound suffix",
+                "v1.27.6-eks-1-27-14",
+                "v1.27.6-eks-1-27-9",
+                Greater,
+            ),
+            (
+                "bitnami release counter",
+                "1.31.3-debian-12-r3",
+                "1.31.3-debian-12-r2",
+                Greater,
+            ),
+            // ASCII: 'R' (0x52) < 'r' (0x72); parse and compare preserve case.
+            ("case-significant alpha", "1.0.0-RC1", "1.0.0-rc1", Less),
+            (
+                "uppercase SNAPSHOT below lowercase",
+                "5.0.0-SNAPSHOT",
+                "5.0.0-snapshot",
+                Less,
+            ),
+            // SemVer identifier precedence.
+            (
+                "numeric below alpha at same position",
+                "1.0.0-1",
+                "1.0.0-alpha",
+                Less,
+            ),
+            // Tokens tie at [rc, 1]; the length tie-breaker decides.
+            (
+                "longer suffix wins on tied tokens",
+                "1.0.0-rc.1",
+                "1.0.0-rc.1.hotfix",
+                Less,
+            ),
+            (
+                "longer suffix wins, reversed",
+                "1.0.0-rc.1.hotfix",
+                "1.0.0-rc.1",
+                Greater,
+            ),
+            // The single integer 20240115 exceeds [2024,1,15] under zero-pad.
+            (
+                "date integer above date components",
+                "20240115",
+                "2024.01.15",
+                Greater,
+            ),
+        ];
+        for (name, a, b, want) in cases {
+            assert_eq!(compare(a, b), want, "{name}: {a} vs {b}");
+        }
     }
 }
