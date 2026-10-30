@@ -117,10 +117,7 @@ pub(in crate::aws) enum Error {
     Endpoint(EndpointError),
     /// The token file does not read.
     #[error("could not read the auth token file {}", path.display())]
-    TokenFile {
-        path: PathBuf,
-        source: io::Error,
-    },
+    TokenFile { path: PathBuf, source: io::Error },
     /// The token is not a header value.
     #[error("the auth token could not be used as an HTTP header value. {0}")]
     InvalidToken(#[source] InvalidHeaderValue),
@@ -141,10 +138,7 @@ pub(in crate::aws) enum Error {
     TooLarge,
     /// An error document in place of credentials.
     #[error("failed to load credentials [{code}]: {message}")]
-    Document {
-        code: Code,
-        message: String,
-    },
+    Document { code: Code, message: String },
 }
 
 impl From<reqwest::Error> for Error {

@@ -6,7 +6,7 @@
 //!
 //! [`AimdController`] manages one set of windows per registry host under an
 //! aggregate concurrency cap. Windows of registries with documented TPS
-//! ceilings are also paced by a [`TokenBucket`].
+//! ceilings are also paced by a `TokenBucket`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -412,7 +412,7 @@ impl std::fmt::Debug for WindowState {
 /// Adaptive concurrency controller for a single registry host.
 ///
 /// An aggregate cap bounds all requests to the host; per-action
-/// [`AimdWindow`]s find each endpoint's own limit from 429 feedback.
+/// `AimdWindow`s find each endpoint's own limit from 429 feedback.
 ///
 /// A [`Mutex`] keeps the controller `Sync` for `Arc<RegistryClient>`. It is
 /// never held across an await.

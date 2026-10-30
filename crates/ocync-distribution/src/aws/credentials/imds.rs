@@ -173,10 +173,7 @@ pub(in crate::aws) enum Error {
     NotUtf8(#[source] Utf8Error),
     /// An error document in place of credentials.
     #[error("{}", DocumentText { code, message })]
-    Document {
-        code: Code,
-        message: String,
-    },
+    Document { code: Code, message: String },
     /// The credentials document does not read.
     #[error(transparent)]
     Json(json::Error),

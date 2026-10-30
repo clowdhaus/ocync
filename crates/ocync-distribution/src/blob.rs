@@ -393,7 +393,7 @@ impl RegistryClient {
     /// ~20 MB streaming-PUT body limit.
     ///
     /// Buffers the stream so the digest is verified before any PATCH is
-    /// sent, then sends [`ACR_PATCH_CHUNK_SIZE`] PATCHes and a finalize PUT,
+    /// sent, then sends it in [`ACR_PATCH_CHUNK_SIZE`] chunks and a finalize PUT,
     /// each to the `Location` the previous response named.
     async fn blob_push_stream_acr(
         &self,
