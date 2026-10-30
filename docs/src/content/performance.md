@@ -28,7 +28,7 @@ Measured 2026-04-26 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 > Referrers calls -- dregsy: 0, regsync: 0, ocync: 51.
 <!-- BENCH:END -->
 
-Six full-corpus cold syncs compared all three tools between 19 and 26 April 2026, on the same instance type, corpus and ECR target. Across them ocync was 3.1 to 3.8 times faster than regsync and 2.5 to 5.2 times faster than dregsy, and made 19 to 25% fewer requests than regsync and 32 to 39% fewer than dregsy. ocync drew 0, 23, 21, 17, 5 and 0 rate-limit 429s, backing off on each; regsync and dregsy drew none. ocync fetched 3 blobs twice in one run and none in the others. ocync's no-change sync took 1.4 to 2.3 s in the four latest runs and about 150 s in the two before, when regsync took 12 to 15 s. Only ECR has been measured as a target.
+Six full-corpus cold syncs compared all three tools between 19 and 26 April 2026, on the same instance type, to ECR in us-east-2 (the 19 April run in us-east-1). Each was a single run per tool, and most corpus tags track `latest`, so the content synced may differ between dates; see the [benchmark design](/design/benchmark) for how this is being tightened. Across them ocync was 3.1 to 3.8 times faster than regsync and 2.5 to 5.2 times faster than dregsy, and made 19 to 25% fewer requests than regsync and 32 to 39% fewer than dregsy. ocync drew 0, 23, 21, 17, 5 and 0 rate-limit 429s, backing off on each; regsync and dregsy drew none. ocync fetched 3 blobs twice in one run and none in the others. ocync's no-change sync took 1.4 to 2.3 s in the four latest runs and about 150 s in the two before, when regsync took 12 to 15 s. Only ECR has been measured as a target.
 
 ## How tools compare
 
