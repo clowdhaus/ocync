@@ -10,9 +10,17 @@ terraform {
       source  = "hashicorp/google"
       version = ">= 7.0"
     }
+    http = {
+      source  = "hashicorp/http"
+      version = ">= 3.0"
+    }
     local = {
       source  = "hashicorp/local"
       version = ">= 2.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = ">= 4.0"
     }
   }
 
@@ -47,6 +55,8 @@ locals {
 
   pool_name = google_iam_workload_identity_pool.bench.name
   audience  = "//iam.googleapis.com/${google_iam_workload_identity_pool_provider.aws.name}"
+
+  my_ip = "${trimspace(data.http.my_ip.response_body)}/32"
 }
 
 ################################################################################
@@ -57,6 +67,10 @@ data "aws_caller_identity" "current" {}
 
 data "google_project" "current" {}
 
+data "http" "my_ip" {
+  url = "https://checkip.amazonaws.com"
+}
+
 ################################################################################
 # APIs
 ################################################################################
@@ -64,6 +78,7 @@ data "google_project" "current" {}
 resource "google_project_service" "this" {
   for_each = toset([
     "artifactregistry.googleapis.com",
+    "compute.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "sts.googleapis.com",
@@ -88,9 +103,21 @@ resource "google_artifact_registry_repository" "bench" {
   depends_on = [google_project_service.this]
 }
 
+# A second repository, so a mount between two repositories can be tested.
+resource "google_artifact_registry_repository" "mirror" {
+  repository_id = "${local.name}-mirror"
+  location      = local.region
+  format        = "DOCKER"
+  description   = "ocync cross-repository mount target"
+
+  depends_on = [google_project_service.this]
+}
+
 ################################################################################
 # Service account
-# What the AWS bench instance acts as, with push and pull on the repository.
+# What the AWS bench instance (through federation) and the Compute Engine
+# instance (through the metadata server) act as, with push and pull on both
+# repositories.
 ################################################################################
 
 resource "google_service_account" "bench" {
@@ -101,10 +128,20 @@ resource "google_service_account" "bench" {
 }
 
 resource "google_artifact_registry_repository_iam_member" "bench_writer" {
-  repository = google_artifact_registry_repository.bench.name
-  location   = google_artifact_registry_repository.bench.location
+  for_each = {
+    bench  = google_artifact_registry_repository.bench
+    mirror = google_artifact_registry_repository.mirror
+  }
+
+  repository = each.value.name
+  location   = each.value.location
   role       = "roles/artifactregistry.writer"
   member     = google_service_account.bench.member
+}
+
+moved {
+  from = google_artifact_registry_repository_iam_member.bench_writer
+  to   = google_artifact_registry_repository_iam_member.bench_writer["bench"]
 }
 
 ################################################################################
@@ -170,4 +207,80 @@ resource "local_file" "credentials" {
       imdsv2_session_token_url       = "http://169.254.169.254/latest/api/token"
     }
   })
+}
+
+################################################################################
+# Compute Engine instance
+# Runs ocync as the bench service account through the metadata server, the
+# path a user on Compute Engine or GKE takes.
+################################################################################
+
+resource "google_compute_network" "bench" {
+  name                    = local.name
+  auto_create_subnetworks = false
+
+  depends_on = [google_project_service.this]
+}
+
+resource "google_compute_subnetwork" "bench" {
+  name          = local.name
+  network       = google_compute_network.bench.id
+  region        = local.region
+  ip_cidr_range = "10.10.0.0/24"
+}
+
+resource "google_compute_firewall" "ssh" {
+  name          = "${local.name}-ssh"
+  network       = google_compute_network.bench.id
+  source_ranges = [local.my_ip]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+}
+
+resource "tls_private_key" "ssh" {
+  algorithm = "ED25519"
+}
+
+resource "local_sensitive_file" "ssh_key" {
+  filename        = "${path.module}/.ssh-key"
+  content         = tls_private_key.ssh.private_key_openssh
+  file_permission = "0600"
+}
+
+resource "google_compute_instance" "bench" {
+  name         = local.name
+  machine_type = "e2-standard-2"
+  zone         = "${local.region}-a"
+
+  # A change to the machine type or service account stops the instance
+  # rather than failing the apply.
+  allow_stopping_for_update = true
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+      size  = 20
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.bench.id
+    access_config {}
+  }
+
+  service_account {
+    email  = google_service_account.bench.email
+    scopes = ["cloud-platform"]
+  }
+
+  # Only this key logs in: the instance hands out the service account's
+  # tokens, so project-wide keys and OS Login users are kept out.
+  metadata = {
+    ssh-keys               = "bench:${tls_private_key.ssh.public_key_openssh}"
+    block-project-ssh-keys = "TRUE"
+    enable-oslogin         = "FALSE"
+  }
 }
