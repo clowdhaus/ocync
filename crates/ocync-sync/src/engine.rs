@@ -350,11 +350,6 @@ fn failed_status(kind: ErrorKind, err: &crate::Error) -> ImageStatus {
     }
 }
 
-/// Build an `ImageResult` for a skipped image (zero transfer, zero duration).
-fn skip_image_result(source: &ImageRef, target: &ImageRef, reason: SkipReason) -> ImageResult {
-    image_result(source, target, ImageStatus::Skipped { reason })
-}
-
 /// Source manifest data pulled once per tag, however many targets it fans out to.
 struct PulledManifest {
     pull: ManifestPull,
@@ -889,8 +884,13 @@ impl SyncEngine {
                         tag: tag_pair.target.clone(),
                     };
                     for _entry in &mapping.targets {
-                        let r =
-                            skip_image_result(&source_ref, &target_ref, SkipReason::ImmutableTag);
+                        let r = image_result(
+                            &source_ref,
+                            &target_ref,
+                            ImageStatus::Skipped {
+                                reason: SkipReason::ImmutableTag,
+                            },
+                        );
                         progress.image_completed(&r);
                         results.push(r);
                     }
@@ -1435,7 +1435,13 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                     digest = %compare_digest,
                     "skipping -- digest matches at target ({label})"
                 );
-                skipped.push(skip_image_result(source, target, SkipReason::DigestMatch));
+                skipped.push(image_result(
+                    source,
+                    target,
+                    ImageStatus::Skipped {
+                        reason: SkipReason::DigestMatch,
+                    },
+                ));
             }
             other => {
                 if let Err(e) = &other {
@@ -1566,7 +1572,13 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     digest = %source_digest,
                     "skipping -- digest matches at target"
                 );
-                skipped_results.push(skip_image_result(source, target, SkipReason::DigestMatch));
+                skipped_results.push(image_result(
+                    source,
+                    target,
+                    ImageStatus::Skipped {
+                        reason: SkipReason::DigestMatch,
+                    },
+                ));
             }
             other => {
                 if let Err(e) = &other {
@@ -3059,7 +3071,8 @@ mod tests {
             },
             error: None,
         };
-        let start = Instant::now() - Duration::from_secs(5);
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
 
         let result = outcome.into_result(&image("src"), &image("dst"), ImageStatus::Synced, start);
 
@@ -3073,7 +3086,7 @@ mod tests {
             (2, 1, 3)
         );
         assert!(
-            result.duration >= Duration::from_secs(5),
+            result.duration >= Duration::from_millis(5),
             "{:?}",
             result.duration
         );
@@ -3147,15 +3160,13 @@ mod tests {
     }
 
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
+        let image = |repo: &str| ImageRef {
+            repo: repo.parse().unwrap(),
+            tag: "tag".into(),
+        };
         ImageResult {
-            image_id: Uuid::now_v7(),
-            source: "source/repo:tag".into(),
-            target: "target/repo:tag".into(),
-            status,
             bytes_transferred: bytes,
-            blob_stats: BlobTransferStats::default(),
-            duration: Duration::from_millis(100),
-            artifacts_skipped: false,
+            ..image_result(&image("source/repo"), &image("target/repo"), status)
         }
     }
 
@@ -3169,9 +3180,9 @@ mod tests {
                     make_image_result(ImageStatus::Synced, 1024),
                     make_image_result(
                         ImageStatus::Skipped {
-                            reason: SkipReason::DigestMatch,
+                            reason: SkipReason::ImmutableTag,
                         },
-                        0,
+                        512,
                     ),
                     make_image_result(
                         ImageStatus::Failed {
@@ -3180,7 +3191,7 @@ mod tests {
                             retries: 3,
                             status_code: None,
                         },
-                        0,
+                        256,
                     ),
                 ],
                 (1, 1, 1, 1024),
@@ -3712,14 +3723,20 @@ mod tests {
         let mut file = Some(std::fs::File::create(&path).unwrap());
         let start = Instant::now();
 
-        write_timing(&mut file, TimingPhase::DiscoveryStart, &start);
-        write_timing(&mut file, TimingPhase::ExecutionComplete, &start);
+        let phases = [
+            (TimingPhase::DiscoveryStart, "discovery_start"),
+            (TimingPhase::DiscoveryComplete, "discovery_complete"),
+            (TimingPhase::ExecutionComplete, "execution_complete"),
+        ];
+        for (phase, _) in phases {
+            write_timing(&mut file, phase, &start);
+        }
 
         drop(file);
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
-        for (i, phase) in ["discovery_start", "execution_complete"].iter().enumerate() {
+        assert_eq!(lines.len(), phases.len());
+        for (i, (_, phase)) in phases.iter().enumerate() {
             let v: serde_json::Value = serde_json::from_str(lines[i]).unwrap();
             assert_eq!(v["phase"].as_str().unwrap(), *phase);
             assert!(v["elapsed_ms"].as_u64().is_some());

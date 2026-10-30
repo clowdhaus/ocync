@@ -614,15 +614,20 @@ mod tests {
 
     #[test]
     fn unresolved_watches_skip_fired_and_failed_repos() {
-        let cases: [(&str, Setup); 2] = [
-            ("a repo whose watch already fired", |c| {
-                c.mark_repo_committed("reg.io", &repo("repo/a"));
-            }),
-            ("a repo whose blob state is failed", |c| {
-                c.mark_blob_repo_stale("reg.io", &test_digest(), &repo("repo/b"));
-            }),
+        // The third field is the repo whose watch must be the one left.
+        let cases: [(&str, Setup, &str); 2] = [
+            (
+                "a repo whose watch already fired",
+                |c| c.mark_repo_committed("reg.io", &repo("repo/a")),
+                "repo/b",
+            ),
+            (
+                "a repo whose blob state is failed",
+                |c| c.mark_blob_repo_stale("reg.io", &test_digest(), &repo("repo/b")),
+                "repo/a",
+            ),
         ];
-        for (name, setup) in cases {
+        for (name, setup, left) in cases {
             let mut cache = TransferStateCache::new();
             cache.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
             cache.set_blob_completed("reg.io", test_digest(), repo("repo/b"));
@@ -630,6 +635,8 @@ mod tests {
 
             let receivers = cache.unresolved_watches_for("reg.io", &test_digest(), &repo("repo/c"));
             assert_eq!(receivers.len(), 1, "{name}");
+            cache.mark_repo_committed("reg.io", &repo(left));
+            assert!(*receivers[0].borrow(), "{name}: the watch left is {left}'s");
         }
     }
 

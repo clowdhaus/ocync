@@ -41,20 +41,6 @@ fn read_staged(stage: &BlobStage, digest: &ocync_distribution::Digest) -> Vec<u8
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stage_and_read_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-
-    let data = b"hello staging world";
-    stage_blob(&stage, &digest_a(), data);
-
-    assert!(stage.exists(&digest_a()));
-
-    let read_back = read_staged(&stage, &digest_a());
-    assert_eq!(read_back, data);
-}
-
-#[test]
 fn exists_returns_false_for_unstaged_blob() {
     let dir = tempfile::tempdir().unwrap();
     let stage = BlobStage::new(dir.path().to_path_buf());
@@ -89,16 +75,6 @@ fn begin_write_and_finish_roundtrip() {
     assert!(stage.exists(&digest_a()));
     let data = read_staged(&stage, &digest_a());
     assert_eq!(data, b"hello world");
-}
-
-#[test]
-fn open_read_returns_file_contents() {
-    let dir = tempfile::tempdir().unwrap();
-    let stage = BlobStage::new(dir.path().to_path_buf());
-
-    stage_blob(&stage, &digest_a(), b"read me");
-
-    assert_eq!(read_staged(&stage, &digest_a()), b"read me");
 }
 
 #[test]

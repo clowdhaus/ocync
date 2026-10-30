@@ -7,15 +7,24 @@
     )
 )]
 
+/// Persistent transfer state cache wrapping [`plan::BlobDedupMap`].
 pub mod cache;
+/// Sync engine: pipelined concurrent orchestration of image transfers.
 pub mod engine;
+/// Error types for sync operations.
 pub mod error;
+/// Tag filtering pipeline: glob, semver, exclude, sort, and latest.
 pub mod filter;
+/// Sync planning and transfer ordering.
 pub mod plan;
+/// Progress reporting trait and types.
 pub mod progress;
+/// Retry configuration and backoff logic.
 pub mod retry;
 pub(crate) mod shared;
+/// Cooperative shutdown signal for the sync engine.
 pub mod shutdown;
+/// Content-addressable disk staging for multi-target blob reuse.
 pub mod staging;
 pub(crate) mod version;
 
@@ -299,6 +308,16 @@ mod tests {
                 vec![
                     ImageStatus::Synced,
                     failed(ErrorKind::BlobTransfer, "timeout", 3, None),
+                ],
+                RunOutcome::Partial,
+            ),
+            (
+                "skipped and failed",
+                vec![
+                    ImageStatus::Skipped {
+                        reason: SkipReason::DigestMatch,
+                    },
+                    failed(ErrorKind::ManifestPull, "a", 1, None),
                 ],
                 RunOutcome::Partial,
             ),
