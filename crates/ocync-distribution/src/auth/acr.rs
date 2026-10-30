@@ -14,9 +14,10 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use super::detect::normalize_host;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
@@ -67,27 +68,51 @@ fn ttl_from_unix_exp(exp: i64) -> Duration {
     }
 }
 
-/// Map ACR registry hostname to the matching Azure AD authority and
-/// container registry resource endpoint.
-///
-/// Expects a DNS hostname, as the ACR regex in `detect_provider_kind()`
-/// enforces.
-fn azure_endpoints(host: &str) -> (&'static str, &'static str) {
-    if host.ends_with(".azurecr.cn") {
-        (
-            "login.chinacloudapi.cn",
-            "https://containerregistry.azure.cn",
-        )
-    } else if host.ends_with(".azurecr.us") {
-        (
-            "login.microsoftonline.us",
-            "https://containerregistry.azure.us",
-        )
-    } else {
-        (
-            "login.microsoftonline.com",
-            "https://containerregistry.azure.net",
-        )
+/// The Azure cloud an ACR host belongs to, which fixes the Entra ID
+/// authority and the container registry resource its tokens are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AzureCloud {
+    /// Azure public cloud, and the cloud of any host not under a
+    /// sovereign suffix, so an explicit `auth_type: acr` on another host
+    /// still gets a token.
+    Public,
+    /// Azure China (`.azurecr.cn`).
+    China,
+    /// Azure US Government (`.azurecr.us`).
+    UsGov,
+}
+
+impl AzureCloud {
+    /// The cloud of `host`, compared by the same normal form provider
+    /// detection uses.
+    fn of_host(host: &str) -> Self {
+        let host = normalize_host(host);
+        if host.ends_with(".azurecr.cn") {
+            Self::China
+        } else if host.ends_with(".azurecr.us") {
+            Self::UsGov
+        } else {
+            Self::Public
+        }
+    }
+
+    /// The Entra ID authority host.
+    fn authority(self) -> &'static str {
+        match self {
+            Self::Public => "login.microsoftonline.com",
+            Self::China => "login.chinacloudapi.cn",
+            Self::UsGov => "login.microsoftonline.us",
+        }
+    }
+
+    /// The container registry resource, with no `&` or `#`, so it needs no
+    /// URL encoding.
+    fn resource(self) -> &'static str {
+        match self {
+            Self::Public => "https://containerregistry.azure.net",
+            Self::China => "https://containerregistry.azure.cn",
+            Self::UsGov => "https://containerregistry.azure.us",
+        }
     }
 }
 
@@ -299,20 +324,51 @@ enum CredentialError {
     Failed(CredentialFailure, String),
 }
 
-/// Source indexes in the credential chain.
-const SOURCE_CLIENT_SECRET: usize = 0;
-const SOURCE_WORKLOAD_IDENTITY: usize = 1;
-const SOURCE_MANAGED_IDENTITY: usize = 2;
-const SOURCE_AZURE_CLI: usize = 3;
-/// No cached source, in an `AtomicUsize` that cannot hold an `Option`.
-const SOURCE_NONE: usize = usize::MAX;
+/// A source in the credential chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Source {
+    ClientSecret,
+    WorkloadIdentity,
+    ManagedIdentity,
+    AzureCli,
+}
+
+impl Source {
+    /// The sources in the order the chain tries them.
+    const CHAIN: [Source; 4] = [
+        Self::ClientSecret,
+        Self::WorkloadIdentity,
+        Self::ManagedIdentity,
+        Self::AzureCli,
+    ];
+
+    /// The `AtomicU8` value for no cached source, as an atomic cannot hold
+    /// an `Option`. It is past every `Source` discriminant.
+    const NONE: u8 = u8::MAX;
+
+    /// The source stored as `raw`, or `None` for [`Self::NONE`].
+    fn from_u8(raw: u8) -> Option<Self> {
+        Self::CHAIN.into_iter().find(|source| *source as u8 == raw)
+    }
+
+    /// The name the logs and errors give the source.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ClientSecret => "ClientSecret",
+            Self::WorkloadIdentity => "WorkloadIdentity",
+            Self::ManagedIdentity => "ManagedIdentity",
+            Self::AzureCli => "AzureCli",
+        }
+    }
+}
 
 /// Azure credential chain that tries four credential sources in order and
 /// keeps using the first that succeeds until reset.
 struct AzureCredentialChain {
     authority: &'static str,
     resource: &'static str,
-    cached_source: AtomicUsize,
+    cached_source: AtomicU8,
     http: reqwest::Client,
 }
 
@@ -325,7 +381,7 @@ impl fmt::Debug for AzureCredentialChain {
 }
 
 impl AzureCredentialChain {
-    fn new(authority: &'static str, resource: &'static str) -> Self {
+    fn new(cloud: AzureCloud) -> Self {
         crate::install_crypto_provider();
         let http = no_redirect_builder()
             .connect_timeout(Duration::from_secs(1))
@@ -333,15 +389,26 @@ impl AzureCredentialChain {
             .build()
             .expect("failed to build Azure credential HTTP client");
         Self {
-            authority,
-            resource,
-            cached_source: AtomicUsize::new(SOURCE_NONE),
+            authority: cloud.authority(),
+            resource: cloud.resource(),
+            cached_source: AtomicU8::new(Source::NONE),
             http,
         }
     }
 
+    /// The source that last gave a token, if any.
+    fn cached(&self) -> Option<Source> {
+        Source::from_u8(self.cached_source.load(Ordering::Relaxed))
+    }
+
+    /// Keep `source` as the one to use until reset, or forget it for `None`.
+    fn cache(&self, source: Option<Source>) {
+        self.cached_source
+            .store(source.map_or(Source::NONE, |s| s as u8), Ordering::Relaxed);
+    }
+
     fn reset_cached_source(&self) {
-        self.cached_source.store(SOURCE_NONE, Ordering::Relaxed);
+        self.cache(None);
     }
 
     /// POST to the Entra ID v2.0 token endpoint and parse the response.
@@ -431,7 +498,7 @@ impl AzureCredentialChain {
     }
 
     async fn try_managed_identity(&self) -> Result<String, CredentialError> {
-        // `resource` is one of `azure_endpoints()`'s constants, none holding
+        // `resource` is one of `AzureCloud::resource()`'s constants, none holding
         // `&` or `#`, so it needs no encoding.
         let resource = self.resource;
         let url = format!(
@@ -514,23 +581,12 @@ impl AzureCredentialChain {
         cli_access_token(&output.stdout)
     }
 
-    async fn try_source(&self, index: usize) -> Result<String, CredentialError> {
-        match index {
-            SOURCE_CLIENT_SECRET => self.try_client_secret().await,
-            SOURCE_WORKLOAD_IDENTITY => self.try_workload_identity().await,
-            SOURCE_MANAGED_IDENTITY => self.try_managed_identity().await,
-            SOURCE_AZURE_CLI => self.try_azure_cli().await,
-            _ => unreachable!("invalid source index"),
-        }
-    }
-
-    fn source_name(index: usize) -> &'static str {
-        match index {
-            SOURCE_CLIENT_SECRET => "ClientSecret",
-            SOURCE_WORKLOAD_IDENTITY => "WorkloadIdentity",
-            SOURCE_MANAGED_IDENTITY => "ManagedIdentity",
-            SOURCE_AZURE_CLI => "AzureCli",
-            _ => "Unknown",
+    async fn try_source(&self, source: Source) -> Result<String, CredentialError> {
+        match source {
+            Source::ClientSecret => self.try_client_secret().await,
+            Source::WorkloadIdentity => self.try_workload_identity().await,
+            Source::ManagedIdentity => self.try_managed_identity().await,
+            Source::AzureCli => self.try_azure_cli().await,
         }
     }
 }
@@ -542,10 +598,8 @@ impl AzureTokenSource for AzureCredentialChain {
 
     fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>> {
         Box::pin(async move {
-            let cached = self.cached_source.load(Ordering::Relaxed);
-
-            if cached != SOURCE_NONE {
-                let name = Self::source_name(cached);
+            if let Some(cached) = self.cached() {
+                let name = cached.name();
                 return self.try_source(cached).await.map_err(|e| {
                     let (failure, reason) = match e {
                         CredentialError::NotConfigured => {
@@ -563,17 +617,12 @@ impl AzureTokenSource for AzureCredentialChain {
 
             let mut errors = Vec::new();
             let mut failures = Vec::new();
-            for index in [
-                SOURCE_CLIENT_SECRET,
-                SOURCE_WORKLOAD_IDENTITY,
-                SOURCE_MANAGED_IDENTITY,
-                SOURCE_AZURE_CLI,
-            ] {
-                let name = Self::source_name(index);
-                match self.try_source(index).await {
+            for source in Source::CHAIN {
+                let name = source.name();
+                match self.try_source(source).await {
                     Ok(token) => {
                         tracing::debug!(source = name, "Azure credential acquired");
-                        self.cached_source.store(index, Ordering::Relaxed);
+                        self.cache(Some(source));
                         return Ok(token);
                     }
                     Err(CredentialError::NotConfigured) => {
@@ -642,8 +691,7 @@ impl AcrAuth {
     /// its client uses.
     pub async fn new(registry: &url::Url) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
-        let (authority, resource) = azure_endpoints(&hostname);
-        let api = Box::new(AzureCredentialChain::new(authority, resource));
+        let api = Box::new(AzureCredentialChain::new(AzureCloud::of_host(&hostname)));
         Ok(Self {
             base_url: registry_origin(registry),
             service: hostname,
@@ -793,6 +841,8 @@ impl AuthProvider for AcrAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     /// A chain is refused when any source refused, whichever failed first,
@@ -907,25 +957,90 @@ mod tests {
         assert!(err.to_string().contains("not valid JSON"));
     }
 
+    /// A host maps to its cloud's authority and resource whatever its case,
+    /// port or trailing dot, and a host under no sovereign suffix (an
+    /// explicit `auth_type: acr`) gets the public cloud. Breaks if the
+    /// match is made on the raw host.
     #[test]
-    fn azure_endpoints_public() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.io");
-        assert_eq!(authority, "login.microsoftonline.com");
-        assert_eq!(resource, "https://containerregistry.azure.net");
+    fn azure_cloud_of_host_table() {
+        let cases = [
+            (
+                "myregistry.azurecr.io",
+                AzureCloud::Public,
+                "login.microsoftonline.com",
+                "https://containerregistry.azure.net",
+            ),
+            (
+                "registry.example.com",
+                AzureCloud::Public,
+                "login.microsoftonline.com",
+                "https://containerregistry.azure.net",
+            ),
+            (
+                "myregistry.azurecr.cn",
+                AzureCloud::China,
+                "login.chinacloudapi.cn",
+                "https://containerregistry.azure.cn",
+            ),
+            (
+                "MyReg.AzureCR.cn",
+                AzureCloud::China,
+                "login.chinacloudapi.cn",
+                "https://containerregistry.azure.cn",
+            ),
+            (
+                "myreg.azurecr.cn.",
+                AzureCloud::China,
+                "login.chinacloudapi.cn",
+                "https://containerregistry.azure.cn",
+            ),
+            (
+                "myreg.azurecr.cn:443",
+                AzureCloud::China,
+                "login.chinacloudapi.cn",
+                "https://containerregistry.azure.cn",
+            ),
+            (
+                "myregistry.azurecr.us",
+                AzureCloud::UsGov,
+                "login.microsoftonline.us",
+                "https://containerregistry.azure.us",
+            ),
+            (
+                "MyReg.AzureCR.us",
+                AzureCloud::UsGov,
+                "login.microsoftonline.us",
+                "https://containerregistry.azure.us",
+            ),
+            (
+                "myreg.azurecr.us.",
+                AzureCloud::UsGov,
+                "login.microsoftonline.us",
+                "https://containerregistry.azure.us",
+            ),
+        ];
+        for (host, cloud, authority, resource) in cases {
+            let got = AzureCloud::of_host(host);
+            assert_eq!(got, cloud, "{host}");
+            assert_eq!(got.authority(), authority, "{host}");
+            assert_eq!(got.resource(), resource, "{host}");
+        }
     }
 
+    /// Each source survives the atomic encoding the chain caches it in, and
+    /// the empty value reads back as none. Breaks if a discriminant
+    /// collides with the reserved one or the chain loses a source.
     #[test]
-    fn azure_endpoints_china() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.cn");
-        assert_eq!(authority, "login.chinacloudapi.cn");
-        assert_eq!(resource, "https://containerregistry.azure.cn");
-    }
-
-    #[test]
-    fn azure_endpoints_usgov() {
-        let (authority, resource) = azure_endpoints("myregistry.azurecr.us");
-        assert_eq!(authority, "login.microsoftonline.us");
-        assert_eq!(resource, "https://containerregistry.azure.us");
+    fn cached_source_round_trips_through_the_atomic() {
+        let chain = AzureCredentialChain::new(AzureCloud::Public);
+        assert_eq!(chain.cached(), None);
+        for source in Source::CHAIN {
+            chain.cache(Some(source));
+            assert_eq!(chain.cached(), Some(source));
+            chain.reset_cached_source();
+            assert_eq!(chain.cached(), None);
+        }
+        assert_eq!(Source::from_u8(Source::NONE), None);
     }
 
     /// Mock Azure token source that returns pre-configured access token strings.

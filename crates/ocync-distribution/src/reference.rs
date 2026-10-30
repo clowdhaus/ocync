@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
 use crate::error::Error;
+use crate::spec::RepositoryName;
 
 const DOCKER_HUB_REGISTRY: &str = "docker.io";
 const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
@@ -122,20 +123,15 @@ impl FromStr for Reference {
             });
         }
 
-        // Reject characters that would corrupt a URL path segment. More
-        // permissive than the OCI spec, which requires lowercase.
-        if let Some(bad) = repository
-            .chars()
-            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '/' | '-'))
-        {
-            return Err(Error::InvalidReference {
+        // The character rule lives in `RepositoryName::new`; only the error's
+        // `input` is widened to the full reference string.
+        RepositoryName::new(&repository).map_err(|e| match e {
+            Error::InvalidReference { reason, .. } => Error::InvalidReference {
                 input: s.into(),
-                reason: format!(
-                    "repository name contains invalid character '{bad}'; \
-                     allowed: [a-zA-Z0-9._/-]"
-                ),
-            });
-        }
+                reason,
+            },
+            other => other,
+        })?;
 
         // Validate tag: must be 1-128 chars and match [a-zA-Z0-9_.-].
         if let Some(ref t) = tag {

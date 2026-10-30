@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::digest::Digest;
-use crate::error::Error;
+use crate::error::{CredentialFailure, Error};
 use crate::spec::RepositoryName;
 
 /// Extract the AWS region from an ECR hostname.
@@ -60,15 +60,24 @@ impl RegistryId {
 
 /// The AWS API client for the ECR registry at `hostname`, in the region the
 /// hostname names, with credentials from `profile` or the default chain,
-/// shared through `aws_credentials`.
+/// shared through `aws_credentials`. Both ECR callers take their failure
+/// from here, so a bad configuration reads the same whichever sees it first.
 pub(crate) fn api_client(
     hostname: &str,
     profile: Option<&str>,
     aws_credentials: &crate::AwsCredentialProviders,
-) -> Result<crate::aws::Client, crate::aws::ConfigError> {
+) -> Result<crate::aws::Client, Error> {
     let region = ecr_region(hostname)
-        .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))?;
+        .ok_or_else(|| crate::aws::ConfigError::NoRegionInHostname(hostname.to_owned()))
+        .map_err(|e| config_failed(hostname, e))?;
     crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr, aws_credentials)
+        .map_err(|e| config_failed(hostname, e))
+}
+
+/// The error for `hostname` when the AWS configuration cannot build a
+/// client: final, since asking again reads the same configuration.
+fn config_failed(hostname: &str, cause: crate::aws::ConfigError) -> Error {
+    Error::cloud_credentials_caused_by(hostname, CredentialFailure::Failed, cause)
 }
 
 /// ECR's limit on layer digests per `BatchCheckLayerAvailability` call.
@@ -371,7 +380,7 @@ impl std::fmt::Debug for BatchChecker {
 impl BatchChecker {
     /// Create a batch checker for an ECR hostname. Fails when the hostname
     /// names no region, or a configured endpoint URL is combined with FIPS
-    /// or dual-stack.
+    /// or dual-stack; [`crate::auth::ecr::EcrAuth::new`] fails the same way.
     ///
     /// `profile` must match the one passed to [`crate::auth::ecr::EcrAuth::new`],
     /// or the checker authenticates as another identity and silently fails
@@ -382,9 +391,7 @@ impl BatchChecker {
         profile: Option<&str>,
         aws_credentials: &crate::AwsCredentialProviders,
     ) -> Result<Self, Error> {
-        let client = api_client(hostname, profile, aws_credentials).map_err(|e| Error::EcrApi {
-            reason: e.to_string(),
-        })?;
+        let client = api_client(hostname, profile, aws_credentials)?;
         let registry_id = RegistryId::from_hostname(hostname);
         Ok(Self {
             api: Box::new(AwsEcrBatchApi {
@@ -1171,6 +1178,41 @@ mod tests {
             result.err()
         );
         assert_eq!(log.calls(), 2);
+    }
+
+    /// A configuration that cannot build the client keeps its error as the
+    /// source, for the checker and for the auth provider alike. Breaks if
+    /// either path flattens the cause to text.
+    #[test]
+    fn client_construction_failure_keeps_the_config_error_as_source() {
+        let error = config_failed(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            crate::aws::ConfigError::FipsWithEndpointUrl,
+        );
+        let source = std::error::Error::source(&error).expect("source");
+        assert_eq!(
+            source.to_string(),
+            "Invalid Configuration: FIPS and custom endpoint are not supported"
+        );
+        assert!(matches!(
+            error,
+            Error::CloudCredentials {
+                failure: CredentialFailure::Failed,
+                ..
+            }
+        ));
+
+        let no_region = BatchChecker::from_hostname(
+            "localhost",
+            None,
+            &crate::AwsCredentialProviders::default(),
+        )
+        .unwrap_err();
+        let source = std::error::Error::source(&no_region).expect("source");
+        assert_eq!(
+            source.to_string(),
+            "cannot extract AWS region from ECR hostname 'localhost'"
+        );
     }
 
     #[test]

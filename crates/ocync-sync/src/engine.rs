@@ -1238,7 +1238,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     )
     .await
     {
-        Ok(Ok(Some(head))) => Some(head.digest),
+        Ok(Ok(Some(digest))) => Some(digest),
         Ok(Ok(None)) => {
             debug!(
                 repo = %source.repo, tag = %source.tag,
@@ -1427,7 +1427,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
-            Ok(Some(head)) if head.digest == *compare_digest => {
+            Ok(Some(digest)) if digest == *compare_digest => {
                 debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
@@ -1564,7 +1564,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
         match result {
-            Ok(Some(head)) if head.digest == *source_digest => {
+            Ok(Some(digest)) if digest == *source_digest => {
                 debug!(
                     source_repo = %source.repo,
                     source_tag = %source.tag,
@@ -2436,12 +2436,12 @@ async fn transfer_claimed_blob(
     if !batch_checked.contains(digest) {
         let head_result = io.target_client.blob_exists(io.target_repo, digest).await;
         match head_result {
-            Ok(Some(_)) => {
+            Ok(true) => {
                 io.sink.exists(digest.clone(), io.target_repo.to_owned());
                 io.sink.release_claim(digest);
                 return BlobResult::Skipped;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => {
                 debug!(
                     %digest,

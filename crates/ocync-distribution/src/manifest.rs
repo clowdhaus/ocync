@@ -14,17 +14,6 @@ use crate::spec::{ImageIndex, ManifestKind, MediaType, RepositoryName};
 /// The header in which a registry reports a manifest's digest.
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
-/// Result of a manifest HEAD request.
-#[derive(Debug, Clone)]
-pub struct ManifestHead {
-    /// The digest of the manifest.
-    pub digest: Digest,
-    /// The media type reported by the registry.
-    pub media_type: MediaType,
-    /// The size in bytes.
-    pub size: u64,
-}
-
 /// Result of a manifest pull (GET) request.
 #[derive(Debug, Clone)]
 pub struct ManifestPull {
@@ -60,16 +49,12 @@ fn referrers_path(digest: &Digest) -> String {
 }
 
 impl RegistryClient {
-    /// Check whether a manifest exists and retrieve its metadata, `None` on
-    /// 404.
-    ///
-    /// `size` comes from `Content-Length` and is `0`, meaning unknown, when
-    /// the header is missing or unparseable.
+    /// The digest a registry reports for a manifest, `None` on 404.
     pub async fn manifest_head(
         &self,
         repository: &RepositoryName,
         reference: &str,
-    ) -> Result<Option<ManifestHead>, Error> {
+    ) -> Result<Option<Digest>, Error> {
         let path = manifest_path(reference);
         match self
             .head(
@@ -93,24 +78,7 @@ impl RegistryClient {
                 let digest: Digest = digest_str.parse().map_err(|_| Error::RegistryProtocol {
                     reason: format!("invalid digest in Docker-Content-Digest header: {digest_str}"),
                 })?;
-
-                let media_type: MediaType = headers
-                    .get(CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default()
-                    .into();
-
-                let size = headers
-                    .get(CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-
-                Ok(Some(ManifestHead {
-                    digest,
-                    media_type,
-                    size,
-                }))
+                Ok(Some(digest))
             }
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),

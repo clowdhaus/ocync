@@ -67,12 +67,19 @@ static ACR_RE: LazyLock<Regex> =
 /// The ECR Public registry hostname.
 pub(crate) const ECR_PUBLIC_HOST: &str = "public.ecr.aws";
 
+/// A hostname with its case, port and trailing dot removed, the form every
+/// host comparison is made against.
+pub(crate) fn normalize_host(hostname: &str) -> String {
+    let hostname = hostname.to_ascii_lowercase();
+    let hostname = hostname.split(':').next().unwrap();
+    hostname.trim_end_matches('.').to_owned()
+}
+
 /// Detect the registry provider kind from a hostname, ignoring case, port
 /// and a trailing dot. `None` for an unrecognized host.
 pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
-    let hostname = hostname.to_ascii_lowercase();
-    let hostname = hostname.split(':').next().unwrap();
-    let hostname = hostname.trim_end_matches('.');
+    let hostname = normalize_host(hostname);
+    let hostname = hostname.as_str();
 
     match hostname {
         ECR_PUBLIC_HOST => Some(ProviderKind::EcrPublic),

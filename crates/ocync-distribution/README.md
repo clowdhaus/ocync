@@ -64,7 +64,7 @@ The primary entry points and types are listed below.
 | `RegistryClient` / `RegistryClientBuilder` | Main entry point for all registry operations |
 | `Reference` | OCI image reference parser (`registry/repo:tag@digest`) |
 | `Digest` | Content-addressable SHA-256 digest |
-| `ManifestPull` / `ManifestHead` | Manifest operation results |
+| `ManifestPull` | Manifest pull result |
 | `MountResult` | Cross-repo mount outcome (mounted or upload session) |
 | `BatchBlobChecker` | ECR batch blob existence checks |
 | `Descriptor` | OCI content descriptor (digest, size, media type) |

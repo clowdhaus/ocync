@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
-use crate::auth::detect::{ProviderKind, detect_provider_kind};
+use crate::auth::detect::ProviderKind;
 use crate::client::{RegistryClient, auth_headers, build_url, report_permit};
 use crate::digest::Digest;
 use crate::error::Error;
@@ -27,7 +27,7 @@ const ACR_PATCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// The hint is a manifest's declared blob size, which an attacker
 /// controls: uncapped, one malicious manifest could allocate gigabytes per
 /// concurrent fallback upload. Larger streams grow the `Vec` as they arrive.
-const MAX_BUFFER_PREALLOC: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BUFFER_PREALLOC: usize = 16 * 1024 * 1024;
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
@@ -85,31 +85,19 @@ async fn buffer_stream(
 }
 
 impl RegistryClient {
-    /// Check whether a blob exists: `Some(size)` if it does, `None` if not
-    /// found.
-    ///
-    /// `size` comes from `Content-Length` and is `0`, meaning unknown, when
-    /// the header is missing or unparseable.
+    /// Check whether a blob exists in `repository`. A 404 is `false`.
     pub async fn blob_exists(
         &self,
         repository: &RepositoryName,
         digest: &Digest,
-    ) -> Result<Option<u64>, Error> {
+    ) -> Result<bool, Error> {
         let path = blob_path(digest);
         match self
             .head(repository, &path, None, RegistryAction::BlobHead)
             .await
         {
-            Ok(resp) => {
-                let size = resp
-                    .headers()
-                    .get(CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                Ok(Some(size))
-            }
-            Err(e) if e.is_not_found() => Ok(None),
+            Ok(_) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -191,7 +179,7 @@ impl RegistryClient {
                 "blob push upload",
                 |headers| {
                     self.http
-                        .put(&put_url)
+                        .put(put_url.to_url())
                         .headers(headers)
                         .query(&[("digest", &digest_str)])
                         .header(CONTENT_LENGTH, data.len().to_string())
@@ -222,7 +210,7 @@ impl RegistryClient {
 
         // Exhaustive, so a new `ProviderKind` fails to compile until its
         // upload path is chosen here.
-        let provider = self.base_url.host_str().and_then(detect_provider_kind);
+        let provider = self.aimd.provider();
         match provider {
             Some(ProviderKind::Ghcr) => {
                 return self
@@ -272,7 +260,7 @@ impl RegistryClient {
         let body = reqwest::Body::wrap_stream(stream);
         let result = self
             .http
-            .put(&upload_url)
+            .put(upload_url.to_url())
             .headers(headers)
             .query(&[("digest", &digest_str)])
             .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
@@ -302,7 +290,7 @@ impl RegistryClient {
         repository: &RepositoryName,
         scopes: &[Scope],
         log_context: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<UploadUrl, Error> {
         let url = build_url(&self.base_url, repository, "blobs/uploads/")?;
         let resp = self
             .send_with_aimd(RegistryAction::BlobUploadInit, scopes, log_context, |h| {
@@ -356,7 +344,7 @@ impl RegistryClient {
                 "blob push ghcr patch",
                 |headers| {
                     self.http
-                        .patch(&upload_url)
+                        .patch(upload_url.to_url())
                         .headers(headers)
                         .header(CONTENT_LENGTH, body_len.to_string())
                         .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
@@ -376,7 +364,7 @@ impl RegistryClient {
                 "blob push ghcr finalize",
                 |headers| {
                     self.http
-                        .put(&finalize_url)
+                        .put(finalize_url.to_url())
                         .headers(headers)
                         .query(&[("digest", &digest_str)])
                         .header(CONTENT_LENGTH, "0")
@@ -424,10 +412,9 @@ impl RegistryClient {
         let mut upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push acr initiate")
             .await?;
-        // Each next URL comes from `extract_location`, which refuses a
-        // `Location` on another host; a URL built any other way would
-        // carry the bearer token unchecked. An empty blob sends no PATCH:
-        // the OCI distribution spec accepts the finalize PUT alone.
+        // Each next URL is an `UploadUrl`, which only `extract_location`
+        // makes. An empty blob sends no PATCH: the OCI distribution spec
+        // accepts the finalize PUT alone.
         let mut offset: u64 = 0;
         while offset < total_len {
             let chunk_len = (ACR_PATCH_CHUNK_SIZE as u64).min(total_len - offset);
@@ -444,7 +431,7 @@ impl RegistryClient {
                     "blob push acr patch",
                     |headers| {
                         self.http
-                            .patch(&upload_url)
+                            .patch(upload_url.to_url())
                             .headers(headers)
                             .header(CONTENT_LENGTH, &chunk_len_str)
                             .header(CONTENT_RANGE, &range_header)
@@ -467,7 +454,7 @@ impl RegistryClient {
                 "blob push acr finalize",
                 |headers| {
                     self.http
-                        .put(&upload_url)
+                        .put(upload_url.to_url())
                         .headers(headers)
                         .query(&[("digest", &digest_str)])
                         .header(CONTENT_LENGTH, "0")
@@ -481,13 +468,30 @@ impl RegistryClient {
     }
 }
 
+/// The URL of the next request in an upload chain.
+///
+/// Only [`extract_location`] builds one, after checking it shares the
+/// registry's origin, so no other URL can carry the registry's bearer
+/// token through the chain.
+#[derive(Debug)]
+struct UploadUrl(url::Url);
+
+impl UploadUrl {
+    /// An owned copy for a request builder, which takes the URL by value.
+    fn to_url(&self) -> url::Url {
+        self.0.clone()
+    }
+}
+
 /// Extract and resolve the `Location` header from an upload response,
-/// enforcing same-origin against `base_url`.
+/// refusing any URL whose origin (scheme, host or port) differs from
+/// `base_url`'s.
 ///
 /// Every step of the upload chain (initiate, each PATCH, finalize PUT)
 /// goes through here. The chain carries the registry's bearer token, so a
-/// `Location` on another host would leak it on the next request.
-fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<String, Error> {
+/// `Location` on another host, port or scheme (an `http` downgrade of an
+/// `https` registry included) would leak it on the next request.
+fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<UploadUrl, Error> {
     let raw = resp
         .headers()
         .get(LOCATION)
@@ -496,31 +500,22 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
             reason: "missing Location header in upload response".into(),
         })?;
 
-    let resolved = if raw.starts_with("http://") || raw.starts_with("https://") {
-        raw.to_owned()
-    } else {
-        base_url
-            .join(raw)
-            .map(|u| u.to_string())
-            .map_err(|e| Error::UploadProtocol {
-                reason: format!("failed to resolve upload URL: {e}"),
-            })?
-    };
-
-    let resolved_url = url::Url::parse(&resolved).map_err(|e| Error::UploadProtocol {
-        reason: format!("upload Location is not a valid URL: {e}"),
+    // `join` keeps an absolute `raw` as it is and resolves a relative one
+    // against the registry.
+    let resolved = base_url.join(raw).map_err(|e| Error::UploadProtocol {
+        reason: format!("failed to resolve upload URL: {e}"),
     })?;
-    if resolved_url.host_str() != base_url.host_str() {
+    if resolved.origin() != base_url.origin() {
         return Err(Error::UploadProtocol {
             reason: format!(
-                "upload Location host {:?} differs from base host {:?}; refusing to forward credentials cross-host",
-                resolved_url.host_str(),
-                base_url.host_str(),
+                "upload Location origin {} differs from registry origin {}; refusing to forward credentials cross-origin",
+                resolved.origin().ascii_serialization(),
+                base_url.origin().ascii_serialization(),
             ),
         });
     }
 
-    Ok(resolved)
+    Ok(UploadUrl(resolved))
 }
 
 /// Classify a mount response into [`MountResult`].
@@ -602,15 +597,23 @@ mod tests {
     }
 
     /// The upload `Location` resolves against the registry, absolute or
-    /// relative, keeping its query; a missing header is refused. Breaks if
-    /// the query that carries upload state is dropped or a relative path
-    /// is not joined to the registry.
+    /// relative, keeping its query. Anything off the registry's origin or
+    /// missing is refused: another host, another port, a scheme downgrade
+    /// (the bearer token would go out in the clear), a scheme-relative URL
+    /// to another host, and a missing header. Breaks if the query that
+    /// carries upload state is dropped, a relative path is not joined to the
+    /// registry, or a `Location` that differs only in scheme or port is
+    /// accepted.
     #[test]
-    fn the_upload_location_resolves_against_the_registry() {
+    fn the_upload_location_must_share_the_registry_origin() {
         let base = url::Url::parse("https://registry.example.com").unwrap();
         let cases = [
             (
                 Some("https://registry.example.com/upload/uuid-1"),
+                Some("https://registry.example.com/upload/uuid-1"),
+            ),
+            (
+                Some("https://registry.example.com:443/upload/uuid-1"),
                 Some("https://registry.example.com/upload/uuid-1"),
             ),
             (
@@ -623,6 +626,13 @@ mod tests {
                     "https://registry.example.com/v2/repo/blobs/uploads/uuid-1?_state=token123&foo=bar",
                 ),
             ),
+            (Some("http://registry.example.com/upload/uuid-1"), None),
+            (
+                Some("https://registry.example.com:8443/upload/uuid-1"),
+                None,
+            ),
+            (Some("https://attacker.example.net/upload/uuid-1"), None),
+            (Some("//attacker.example.net/upload/uuid-1"), None),
             (None, None),
         ];
         for (header, expected) in cases {
@@ -631,9 +641,40 @@ mod tests {
                 resp = resp.header("Location", location);
             }
             let resp = reqwest::Response::from(resp.body("").unwrap());
-            let result = extract_location(&resp, &base).ok();
+            let result = extract_location(&resp, &base)
+                .ok()
+                .map(|upload| upload.to_url().to_string());
             assert_eq!(result.as_deref(), expected, "{header:?}");
         }
+    }
+
+    /// A registry that answers a blob HEAD 200 without a usable
+    /// `Content-Length` still has the blob, and a 404 still means it does
+    /// not. Breaks if a missing size turns a hit into a miss (or an error),
+    /// or a 404 into a hit.
+    #[tokio::test]
+    async fn blob_exists_does_not_depend_on_content_length() {
+        let server = wiremock::MockServer::start().await;
+        let present = test_digest(b"present");
+        let absent = test_digest(b"absent");
+        for (digest, status) in [(&present, 200), (&absent, 404)] {
+            wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+                .and(wiremock::matchers::path(format!(
+                    "/v2/repo/{}",
+                    blob_path(digest)
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = crate::client::RegistryClientBuilder::new(server.uri().parse().unwrap())
+            .build()
+            .unwrap();
+        let repo = RepositoryName::new("repo").unwrap();
+
+        assert!(client.blob_exists(&repo, &present).await.unwrap());
+        assert!(!client.blob_exists(&repo, &absent).await.unwrap());
     }
 
     /// Build a `RegistryClient` with the given hostname, routing all traffic
@@ -1022,7 +1063,7 @@ mod tests {
             .expect_err("cross-host PATCH Location must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("differs from base host"),
+            msg.contains("differs from registry origin"),
             "expected same-origin rejection error, got: {msg}"
         );
     }

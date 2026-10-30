@@ -31,17 +31,15 @@ async fn push_blob(client: &RegistryClient, repo: &RepositoryName, data: &[u8]) 
         .expect("blob_push failed")
 }
 
-/// Verify a blob exists in `repo` via HEAD; returns its size.
-async fn assert_blob_exists(
-    client: &RegistryClient,
-    repo: &RepositoryName,
-    digest: &Digest,
-) -> u64 {
-    client
-        .blob_exists(repo, digest)
-        .await
-        .expect("blob_exists HEAD failed")
-        .expect("blob should exist")
+/// Verify a blob exists in `repo` via HEAD.
+async fn assert_blob_exists(client: &RegistryClient, repo: &RepositoryName, digest: &Digest) {
+    assert!(
+        client
+            .blob_exists(repo, digest)
+            .await
+            .expect("blob_exists HEAD failed"),
+        "blob should exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -79,8 +77,7 @@ async fn mount_committed_blob_returns_mounted() {
     );
 
     // Target repo now has the blob at the same digest.
-    let size = assert_blob_exists(&client, &target_repo, &digest).await;
-    assert_eq!(size, data.len() as u64);
+    assert_blob_exists(&client, &target_repo, &digest).await;
 }
 
 /// When the source blob doesn't exist in `source_repo`, the registry must

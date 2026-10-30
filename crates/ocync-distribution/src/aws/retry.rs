@@ -234,9 +234,9 @@ impl Default for Partition {
 /// Partitions by service and region.
 type Partitions = HashMap<(ServiceId, Region), Arc<Partition>>;
 
-/// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
-/// because the AWS client is a `Send + Sync` leaf. No lock is held across
-/// an `.await`.
+/// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`:
+/// `EcrAuth` sits behind `AuthProvider: Send + Sync`, so the state its client
+/// shares must be `Sync`. No lock is held across an `.await`.
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.

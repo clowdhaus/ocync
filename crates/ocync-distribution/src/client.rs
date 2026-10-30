@@ -70,9 +70,8 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY
 const DEFAULT_BUFFERED_BLOB_BYTES: usize = 512 * 1024 * 1024;
 
 /// Fallback acquisition size when a fallback upload has no `known_size`
-/// hint. Equals `blob::MAX_BUFFER_PREALLOC`, the buffer's own initial
-/// allocation cap.
-const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u32 = 16 * 1024 * 1024;
+/// hint: the buffer's own initial allocation cap.
+const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u64 = crate::blob::MAX_BUFFER_PREALLOC as u64;
 
 /// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
 /// rate-limit header has been observed yet.
@@ -137,14 +136,15 @@ impl RegistryClientBuilder {
     /// Set the cap on concurrent blob uploads. Each upload holds an HTTP/2
     /// stream open on the one connection per origin, so the cap must stay
     /// under the server's `SETTINGS_MAX_CONCURRENT_STREAMS` less headroom for
-    /// manifest, mount and auth requests. Default: 64.
+    /// manifest, mount and auth requests. Default: `DEFAULT_BLOB_UPLOAD_CONCURRENCY`
+    /// (64).
     pub fn blob_upload_concurrency(mut self, n: usize) -> Self {
         self.blob_upload_concurrency = n.max(1);
         self
     }
 
     /// Set the cap on concurrent blob downloads. Default:
-    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    /// `DEFAULT_BLOB_DOWNLOAD_CONCURRENCY` (64).
     #[cfg(test)]
     pub(crate) fn blob_download_concurrency(mut self, n: usize) -> Self {
         self.blob_download_concurrency = n.max(1);
@@ -159,7 +159,7 @@ impl RegistryClientBuilder {
     /// unknown-size upload requests still admits it, since each request is
     /// capped at the budget.
     ///
-    /// Default: 512 MB.
+    /// Default: `DEFAULT_BUFFERED_BLOB_BYTES` (512 MB).
     pub fn buffered_blob_bytes(mut self, n: usize) -> Self {
         self.buffered_blob_bytes = n.max(1);
         self
@@ -329,13 +329,14 @@ impl RegistryClient {
     ///   empty blob still counts against the budget. An oversized blob
     ///   takes the whole budget and others queue until it completes, though
     ///   its memory exceeds the budget.
-    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`]. The blob
-    ///   may buffer more; the upload count cap still bounds how many.
+    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`], also
+    ///   capped at the budget. The blob may buffer more; the upload count
+    ///   cap still bounds how many.
     pub(crate) async fn acquire_buffered_bytes_permit(
         &self,
         expected: Option<u64>,
     ) -> OwnedSemaphorePermit {
-        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE as u64);
+        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE);
         let budget = self.buffered_blob_bytes_budget as u64;
         // Above the budget the semaphore could never grant the request.
         // `acquire_many_owned` takes a u32.

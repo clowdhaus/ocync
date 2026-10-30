@@ -249,8 +249,19 @@ impl fmt::Display for PlatformFilter {
 /// An OCI repository name (e.g. `library/nginx`, `mirror/nginx`).
 ///
 /// Distinguishes repository names from tags, hostnames and other strings.
+///
+/// Deserialization goes through [`RepositoryName::new`] so a name read from a
+/// cache file obeys the same character rule as one parsed from user input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct RepositoryName(String);
+
+impl TryFrom<String> for RepositoryName {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
 
 impl RepositoryName {
     /// A repository name: non-empty and only `[a-zA-Z0-9._/-]`, as
@@ -813,6 +824,25 @@ mod tests {
 
         assert!(RepositoryName::new("repo name").is_err());
         assert!(RepositoryName::new("repo#frag").is_err());
+    }
+
+    #[test]
+    fn repository_name_serde_round_trips_as_plain_string() {
+        let name = RepositoryName::new("library/nginx").unwrap();
+        let json = serde_json::to_string(&name).unwrap();
+        assert_eq!(json, r#""library/nginx""#);
+        let back: RepositoryName = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, name);
+    }
+
+    #[test]
+    fn repository_name_deserialize_rejects_invalid() {
+        for json in [r#""bad name""#, r#""a?b""#, r#""a#b""#, r#""""#] {
+            assert!(
+                serde_json::from_str::<RepositoryName>(json).is_err(),
+                "{json} must not deserialize"
+            );
+        }
     }
 
     #[test]

@@ -79,6 +79,10 @@ pub enum Error {
         /// Whether the identity was refused, the failure may pass, or
         /// something else failed.
         failure: CredentialFailure,
+        /// The error behind `reason`, when it came from one, so a caller
+        /// can walk the chain. Shared, as the cause cannot be cloned.
+        #[source]
+        source: Option<Arc<dyn std::error::Error + Send + Sync>>,
     },
 
     /// A registry's token endpoint answered with an error status. 401
@@ -383,6 +387,22 @@ impl Error {
             registry: registry.to_owned(),
             reason: reason.to_string(),
             failure,
+            source: None,
+        }
+    }
+
+    /// An [`Error::CloudCredentials`] for `registry` caused by `cause`: the
+    /// text names `cause` and its own causes, and `cause` stays the source.
+    pub(crate) fn cloud_credentials_caused_by(
+        registry: &str,
+        failure: CredentialFailure,
+        cause: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::CloudCredentials {
+            registry: registry.to_owned(),
+            reason: error_chain(&cause),
+            failure,
+            source: Some(Arc::new(cause)),
         }
     }
 
@@ -731,11 +751,13 @@ mod tests {
                 registry: "gcr.io".into(),
                 reason: "throttled".into(),
                 failure: CredentialFailure::Transient,
+                source: None,
             },
             Error::CloudCredentials {
                 registry: "gcr.io".into(),
                 reason: "no credentials".into(),
                 failure: CredentialFailure::Failed,
+                source: None,
             },
             Error::Io {
                 context: "test",

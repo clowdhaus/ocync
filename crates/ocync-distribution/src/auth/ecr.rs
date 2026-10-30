@@ -191,9 +191,8 @@ impl std::fmt::Debug for EcrAuth {
 }
 
 impl EcrAuth {
-    /// Create an ECR auth provider for the registry hostname. Fails when the
-    /// hostname names no region, or a configured endpoint URL is combined
-    /// with FIPS or dual-stack.
+    /// Create an ECR auth provider for the registry hostname. Fails under
+    /// the conditions listed on `BatchChecker::from_hostname`.
     ///
     /// `profile` scopes credential resolution to that named profile, `None`
     /// to the default chain. Credentials come from `aws_credentials`, shared
@@ -205,8 +204,7 @@ impl EcrAuth {
         aws_credentials: &crate::AwsCredentialProviders,
     ) -> Result<Self, Error> {
         let hostname = hostname.into();
-        let client = crate::ecr::api_client(&hostname, profile, aws_credentials)
-            .map_err(|e| Error::cloud_credentials(&hostname, CredentialFailure::Failed, e))?;
+        let client = crate::ecr::api_client(&hostname, profile, aws_credentials)?;
         let registry = hostname.clone();
 
         Ok(Self {
@@ -286,6 +284,19 @@ mod tests {
     /// A throttle that outlasts its retries is not an auth error, and an
     /// access denial is. Breaks if every AWS failure exits as refused
     /// credentials, or a denial stops counting as one.
+    /// A hostname that names no region fails construction with the config
+    /// error as the source. Breaks if `new` flattens the cause to text.
+    #[test]
+    fn new_keeps_the_config_error_as_source() {
+        let error =
+            EcrAuth::new("localhost", None, &crate::AwsCredentialProviders::default()).unwrap_err();
+        let source = std::error::Error::source(&error).expect("source");
+        assert_eq!(
+            source.to_string(),
+            "cannot extract AWS region from ECR hostname 'localhost'"
+        );
+    }
+
     #[tokio::test]
     async fn only_an_aws_refusal_is_an_auth_error() {
         for (answer, auth_error) in [
