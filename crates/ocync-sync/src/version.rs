@@ -6,6 +6,10 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
+use crate::Error;
+
 /// A token in a tokenized tag suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Token<'a> {
@@ -166,8 +170,15 @@ fn split_letter_digit(s: &str) -> Vec<&str> {
 }
 
 /// A parsed version range: one or more constraints joined by AND.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Range {
+///
+/// [`Range::parse`] is the only constructor, so a held `Range` is always
+/// valid. It deserializes from, serializes to, and displays as the original
+/// string, so config round-trips and log lines show what the user wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Range {
+    /// The text as written, kept for display; parsing never changes it.
+    source: String,
     constraints: Vec<Constraint>,
 }
 
@@ -201,24 +212,46 @@ impl std::fmt::Display for RangeParseError {
 
 impl std::error::Error for RangeParseError {}
 
+impl std::fmt::Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.source)
+    }
+}
+
+impl TryFrom<String> for Range {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self, Error> {
+        Range::parse(&s)
+    }
+}
+
+impl From<Range> for String {
+    fn from(r: Range) -> String {
+        r.source
+    }
+}
+
 impl Range {
     /// Parse comma-joined constraints such as `>=1.0, <2.0`.
     ///
     /// Operators: `>=`, `<=`, `>`, `<`, `=`, and bare (implies `=`).
     /// Caret, tilde, wildcards (`x`, `X`, `*`) and prerelease bounds are
     /// rejected.
-    pub(crate) fn parse(s: &str) -> Result<Self, RangeParseError> {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            return Err(RangeParseError {
-                reason: "empty range".into(),
-            });
-        }
-        let mut constraints = Vec::new();
-        for part in trimmed.split(',') {
-            constraints.push(parse_constraint(part.trim())?);
-        }
-        Ok(Range { constraints })
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidVersionRange`] naming the offending text and why.
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        parse_constraints(s)
+            .map(|constraints| Range {
+                source: s.to_owned(),
+                constraints,
+            })
+            .map_err(|e| Error::InvalidVersionRange {
+                range: s.to_owned(),
+                reason: e.to_string(),
+            })
     }
 
     /// `true` if every constraint matches `v.prefix`. Both sides are
@@ -226,6 +259,20 @@ impl Range {
     pub(crate) fn matches(&self, v: &TagVersion<'_>) -> bool {
         self.constraints.iter().all(|c| c.matches(&v.prefix))
     }
+}
+
+/// Split a range into its comma-joined constraints.
+fn parse_constraints(s: &str) -> Result<Vec<Constraint>, RangeParseError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(RangeParseError {
+            reason: "empty range".into(),
+        });
+    }
+    trimmed
+        .split(',')
+        .map(|part| parse_constraint(part.trim()))
+        .collect()
 }
 
 fn parse_constraint(s: &str) -> Result<Constraint, RangeParseError> {

@@ -259,7 +259,7 @@
           "type": "integer",
           "format": "uint",
           "default": 10,
-          "minimum": 0
+          "minimum": 1
         },
         "staging_size_limit": {
           "description": "Disk staging size limit as a human-readable size (e.g. \"2GB\", \"500MB\").\n\nUses SI decimal prefixes: 1 GB = 1,000,000,000 bytes.\n`0` disables disk staging. When absent, no eviction is performed.",
@@ -394,7 +394,7 @@
             "null"
           ],
           "format": "uint",
-          "minimum": 0
+          "minimum": 1
         },
         "token": {
           "description": "Bearer token for static token auth (`auth_type: static_token`).",

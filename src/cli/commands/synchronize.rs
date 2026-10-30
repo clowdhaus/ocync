@@ -2121,7 +2121,7 @@ mod tests {
     #[test]
     fn build_filter_defaults_exclude_reaches_mapping_with_own_tags() {
         let mapping = TagsConfig {
-            semver: Some(">=1.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=1.0").unwrap()),
             ..Default::default()
         };
         let defaults = TagsConfig {
@@ -2129,7 +2129,10 @@ mod tests {
             ..Default::default()
         };
         let filter = build_filter(Some(&mapping), Some(&defaults));
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(
+            filter.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=1.0")
+        );
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
         assert!(filter.exclude.is_empty(), "mapping had no exclude");
     }
@@ -2157,12 +2160,15 @@ mod tests {
     #[test]
     fn build_filter_inherits_defaults_when_mapping_unset() {
         let defaults = TagsConfig {
-            semver: Some(">=2.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=2.0").unwrap()),
             exclude: Some(GlobOrList::Single("*-dev".into())),
             ..Default::default()
         };
         let filter = build_filter(None, Some(&defaults));
-        assert_eq!(filter.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(
+            filter.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=2.0")
+        );
         assert_eq!(filter.defaults_exclude, vec!["*-dev"]);
         assert!(filter.exclude.is_empty());
     }
@@ -2204,7 +2210,7 @@ mod tests {
         let tags = TagsConfig {
             include: Some(GlobOrList::List(vec!["latest".into()])),
             glob: Some(GlobOrList::Single("*".into())),
-            semver: Some(">=1.0.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=1.0.0").unwrap()),
             exclude: Some(GlobOrList::Single("*-alpine".into())),
             sort: Some(SortOrder::Semver),
             latest: Some(5),
@@ -2215,7 +2221,10 @@ mod tests {
         let filter = build_filter(Some(&tags), None);
         assert_eq!(filter.include, vec!["latest"]);
         assert_eq!(filter.glob, vec!["*"]);
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0.0"));
+        assert_eq!(
+            filter.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=1.0.0")
+        );
         assert_eq!(filter.exclude, vec!["*-alpine"]);
         assert_eq!(filter.sort, Some(SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
@@ -2282,7 +2291,7 @@ latest: 5
         let defaults = TagsConfig {
             include: Some(GlobOrList::Single("latest".into())),
             glob: Some(GlobOrList::Single("v*".into())),
-            semver: Some(">=1.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=1.0").unwrap()),
             sort: Some(SortOrder::Semver),
             latest: Some(10),
             min_tags: Some(2),
@@ -2295,7 +2304,10 @@ latest: 5
         let inherited = build_filter(Some(&empty_mapping), Some(&defaults));
         assert_eq!(inherited.include, vec!["latest"]);
         assert_eq!(inherited.glob, vec!["v*"]);
-        assert_eq!(inherited.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(
+            inherited.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=1.0")
+        );
         assert_eq!(inherited.sort, Some(SortOrder::Semver));
         assert_eq!(inherited.latest, Some(10));
         assert_eq!(inherited.min_tags, Some(2));
@@ -2308,7 +2320,7 @@ latest: 5
         let override_mapping = TagsConfig {
             include: Some(GlobOrList::Single("override".into())),
             glob: Some(GlobOrList::Single("override*".into())),
-            semver: Some(">=2.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=2.0").unwrap()),
             sort: Some(SortOrder::Alpha),
             latest: Some(3),
             min_tags: Some(1),
@@ -2318,7 +2330,10 @@ latest: 5
         let overridden = build_filter(Some(&override_mapping), Some(&defaults));
         assert_eq!(overridden.include, vec!["override"]);
         assert_eq!(overridden.glob, vec!["override*"]);
-        assert_eq!(overridden.semver.as_deref(), Some(">=2.0"));
+        assert_eq!(
+            overridden.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=2.0")
+        );
         assert_eq!(overridden.sort, Some(SortOrder::Alpha));
         assert_eq!(overridden.latest, Some(3));
         assert_eq!(overridden.min_tags, Some(1));
@@ -2511,7 +2526,10 @@ exclude: ["*-slim"]
         // mapping.exclude is the hard tier, separate from defaults.
         assert_eq!(filter.exclude, vec!["*-slim"]);
         // mapping fields override; unset fields inherit from defaults.
-        assert_eq!(filter.semver.as_deref(), Some(">=1.0"));
+        assert_eq!(
+            filter.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=1.0")
+        );
         assert_eq!(filter.sort, Some(ocync_sync::filter::SortOrder::Semver));
         assert_eq!(filter.latest, Some(5));
 
@@ -2547,7 +2565,10 @@ include: ["*-dev"]
         // in the soft tier; semver/sort/latest inherit from defaults.
         assert_eq!(filter.include, vec!["*-dev"]);
         assert_eq!(filter.defaults_exclude, vec!["*-dev", "*-r[0-9]*"]);
-        assert_eq!(filter.semver.as_deref(), Some(">=8.0.0, <9.0.0"));
+        assert_eq!(
+            filter.semver.as_ref().map(|r| r.to_string()).as_deref(),
+            Some(">=8.0.0, <9.0.0")
+        );
         assert_eq!(filter.latest, Some(10));
 
         let tags = vec![
@@ -2669,7 +2690,7 @@ include: ["1.25.0-rc1"]
     #[test]
     fn describe_filter_combines_semver_and_latest() {
         let tags = TagsConfig {
-            semver: Some(">=1.0.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=1.0.0").unwrap()),
             latest: Some(5),
             ..TagsConfig::default()
         };
@@ -3053,7 +3074,7 @@ include: ["1.25.0-rc1"]
 
         let tags_config = TagsConfig {
             include: Some(GlobOrList::List(vec!["latest".into()])),
-            semver: Some(">=1.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=1.0").unwrap()),
             sort: Some(SortOrder::Semver),
             latest: Some(2),
             min_tags: Some(5),
@@ -4078,7 +4099,7 @@ mappings:
         use std::collections::HashSet as Set;
 
         let tags_config = TagsConfig {
-            semver: Some(">=2.0".into()),
+            semver: Some(ocync_sync::version::Range::parse(">=2.0").unwrap()),
             min_tags: Some(5),
             ..Default::default()
         };

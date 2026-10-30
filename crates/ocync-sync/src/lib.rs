@@ -26,7 +26,7 @@ pub(crate) mod shared;
 pub mod shutdown;
 /// Content-addressable disk staging for multi-target blob reuse.
 pub mod staging;
-pub(crate) mod version;
+pub mod version;
 
 use std::time::Duration;
 

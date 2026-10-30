@@ -2013,7 +2013,7 @@ async fn sync_committed_manifest_confirms_its_blobs() {
         &second.config_desc.digest,
         &first.layer_descs[0].digest,
     ]);
-    let report = SyncEngine::new(fast_retry(), 1)
+    let report = SyncEngine::new(fast_retry(), concurrency(1))
         .run(
             vec![mapping],
             Rc::clone(&cache),
@@ -2582,7 +2582,7 @@ async fn manifest_commit_wait_fires_only_when_enabled() {
             backoff_multiplier: 2,
             manifest_commit_wait: commit_wait,
         };
-        let report = SyncEngine::new(retry, 4)
+        let report = SyncEngine::new(retry, concurrency(4))
             .run(
                 vec![mapping],
                 empty_cache(),
@@ -2655,7 +2655,7 @@ async fn manifest_commit_wait_runs_once_for_tags_sharing_an_index() {
         backoff_multiplier: 2,
         manifest_commit_wait: std::time::Duration::from_millis(200),
     };
-    let report = SyncEngine::new(retry, 4)
+    let report = SyncEngine::new(retry, concurrency(4))
         .run(
             vec![mapping],
             empty_cache(),
@@ -2731,7 +2731,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
         backoff_multiplier: 2,
         manifest_commit_wait: std::time::Duration::from_millis(200),
     };
-    let report = SyncEngine::new(retry, 1)
+    let report = SyncEngine::new(retry, concurrency(1))
         .run(
             vec![mapping],
             empty_cache(),
@@ -2762,7 +2762,7 @@ async fn run_clears_repo_watches_without_cache_pruning() {
     let repo = RepositoryName::new("repo").unwrap();
     cache.borrow_mut().notify_repo_failed("target", &repo);
 
-    SyncEngine::new(fast_retry(), 50)
+    SyncEngine::new(fast_retry(), concurrency(50))
         .with_cache_pruning(false)
         .run(
             Vec::new(),

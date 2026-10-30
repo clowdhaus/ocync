@@ -72,7 +72,7 @@ async fn run_with_heartbeat(
     );
 
     let progress = RecordingProgress::default();
-    let report = SyncEngine::new(fast_retry(), 50)
+    let report = SyncEngine::new(fast_retry(), concurrency(50))
         .with_heartbeat_interval(interval)
         .run(
             vec![mapping],
@@ -169,8 +169,8 @@ async fn heartbeat_does_not_stall_shutdown_with_discovery_outstanding() {
 
     // An interval far longer than the test's patience: if the guard regresses,
     // the engine waits this out instead of exiting and the timeout fires.
-    let engine =
-        SyncEngine::new(fast_retry(), 10).with_heartbeat_interval(Duration::from_secs(600));
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
+        .with_heartbeat_interval(Duration::from_secs(600));
 
     let progress = RecordingProgress::default();
     let run = engine.run(

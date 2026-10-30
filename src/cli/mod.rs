@@ -370,7 +370,7 @@ pub(crate) async fn build_registry_client(
     };
 
     if let Some(n) = registry_config.and_then(|r| r.max_concurrent) {
-        builder = builder.max_concurrent(n);
+        builder = builder.max_concurrent(n.get());
     }
 
     builder

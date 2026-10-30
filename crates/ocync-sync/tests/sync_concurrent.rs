@@ -705,7 +705,7 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     );
 
     // max_concurrent = 10: both mappings run concurrently.
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b],
@@ -815,7 +815,7 @@ async fn sync_wave_promotion_three_images_shared_layer() {
     );
 
     // max_concurrent=10: all three run concurrently within their phase.
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b, mapping_c],
@@ -925,7 +925,7 @@ async fn sync_blob_concurrency_processes_multiple_blobs() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 1);
+    let engine = SyncEngine::new(fast_retry(), concurrency(1));
     let report = engine
         .run(
             vec![mapping],
@@ -1029,7 +1029,7 @@ async fn sync_blob_failure_cancels_remaining_blobs() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 1);
+    let engine = SyncEngine::new(fast_retry(), concurrency(1));
     let report = engine
         .run(
             vec![mapping],
@@ -1110,7 +1110,7 @@ async fn sync_staging_concurrent_write_no_collision() {
     );
 
     // max_concurrent=10: both images sync concurrently.
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b],
@@ -1235,7 +1235,7 @@ async fn sync_source_pull_dedup_with_staging() {
     );
 
     // max_concurrent=10: both images sync concurrently.
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b],
@@ -1434,7 +1434,7 @@ async fn sync_leader_commits_before_follower_subscribes() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b],
@@ -1533,7 +1533,7 @@ async fn sync_leader_manifest_push_fails_follower_falls_through() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let report = engine
         .run(
             vec![mapping_a, mapping_b],
@@ -1681,7 +1681,7 @@ async fn sync_multi_leader_shared_blobs_no_deadlock() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         engine.run(
@@ -1832,7 +1832,7 @@ async fn sync_cross_image_blob_claim_no_deadlock() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         engine.run(
@@ -1989,7 +1989,7 @@ async fn sync_mount_wait_on_an_uncommitted_repo_is_bounded() {
         })
         .collect();
 
-    let engine = SyncEngine::new(fast_retry(), 10)
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_mount_source_wait_deadline(std::time::Duration::from_millis(500));
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -2087,7 +2087,7 @@ async fn sync_shared_blob_present_at_one_repo_is_never_pushed_there() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         engine.run(
@@ -2260,7 +2260,7 @@ async fn mount_resolver_timeout_falls_back_to_push() {
     // Follower manifest PUT succeeds after deadline fallback push.
     mount_manifest_push(&target_server, "follower", "v1").await;
 
-    let engine = SyncEngine::new(fast_retry(), 10)
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_mount_source_wait_deadline(std::time::Duration::from_millis(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -2356,7 +2356,7 @@ async fn prior_run_cycle_breaks_via_deadline() {
         );
     }
 
-    let engine = SyncEngine::new(fast_retry(), 10)
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_mount_source_wait_deadline(std::time::Duration::from_millis(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -2458,7 +2458,7 @@ async fn two_leaders_sharing_blobs_no_deadlock() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 10);
+    let engine = SyncEngine::new(fast_retry(), concurrency(10));
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         engine.run(
@@ -2595,7 +2595,7 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
 
     let shutdown = ShutdownSignal::new();
     // Drain deadline << mount-source wait deadline so engine exits via drain.
-    let engine = SyncEngine::new(fast_retry(), 10)
+    let engine = SyncEngine::new(fast_retry(), concurrency(10))
         .with_drain_deadline(std::time::Duration::from_millis(100))
         .with_mount_source_wait_deadline(std::time::Duration::from_secs(60));
 

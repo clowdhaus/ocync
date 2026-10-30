@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::Error;
+use crate::version::Range;
 
 /// Sort order for the final tag list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -72,8 +73,9 @@ pub struct FilterConfig {
     pub include: Vec<String>,
     /// Glob patterns (OR semantics). An empty list passes all tags through.
     pub glob: Vec<String>,
-    /// Semver version range constraint (e.g. `>=1.18.0`).
-    pub semver: Option<String>,
+    /// Semver version range constraint (e.g. `>=1.18.0`), parsed once so a
+    /// bad range is refused when the config is read, not on every run.
+    pub semver: Option<Range>,
     /// Soft-tier exclude patterns inherited from a `defaults:` block,
     /// bypassed by [`include`](Self::include) like `SYSTEM_EXCLUDE`.
     pub defaults_exclude: Vec<String>,
@@ -237,13 +239,8 @@ impl FilterConfig {
             });
         }
 
-        if let Some(ref range) = self.semver {
+        if let Some(ref req) = self.semver {
             let before = pipeline.len();
-            let req =
-                crate::version::Range::parse(range).map_err(|e| Error::InvalidVersionRange {
-                    range: range.to_owned(),
-                    reason: e.to_string(),
-                })?;
             let (kept, dropped) = partition_with_drop(&pipeline, track, |t| {
                 if is_referrers_fallback_tag(t) {
                     return false;
@@ -260,14 +257,14 @@ impl FilterConfig {
                 &mut drop_reasons,
                 track,
                 DropKind::Semver {
-                    range: range.clone(),
+                    range: req.to_string(),
                 },
                 dropped,
             );
             pipeline = kept;
             if track {
                 pipeline_stages.push(StageDelta {
-                    label: format!("semver \"{range}\""),
+                    label: format!("semver \"{req}\""),
                     count_in: before,
                     count_out: pipeline.len(),
                 });
@@ -630,9 +627,13 @@ fn sort_tags_in_place(tags: &mut [&str], order: SortOrder) {
 mod tests {
     use super::*;
 
-    fn semver(range: &str) -> FilterConfig {
+    fn range(s: &str) -> Range {
+        Range::parse(s).expect("valid range")
+    }
+
+    fn semver(range_str: &str) -> FilterConfig {
         FilterConfig {
-            semver: Some(range.into()),
+            semver: Some(range(range_str)),
             ..FilterConfig::default()
         }
     }
@@ -841,7 +842,7 @@ mod tests {
                 "glob, semver, exclude, sort, latest together",
                 FilterConfig {
                     glob: strs(&["1.*"]),
-                    semver: Some(">=1.18.0".into()),
+                    semver: Some(range(">=1.18.0")),
                     exclude: strs(&["*-rc*"]),
                     sort: Some(SortOrder::Semver),
                     latest: Some(2),
@@ -915,11 +916,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_semver_range_is_rejected() {
-        for range in ["not_valid", ">= not_a_version"] {
-            let err = semver(range).apply(&["1.0.0"]).unwrap_err();
-            assert!(matches!(err, Error::InvalidVersionRange { .. }), "{range}");
+    fn invalid_semver_range_is_refused_at_parse() {
+        for bad in ["not_valid", ">= not_a_version"] {
+            let err = Range::parse(bad).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidVersionRange { range, .. } if range == bad),
+                "{bad}"
+            );
         }
+    }
+
+    #[test]
+    fn describe_prints_the_range_as_written() {
+        assert_eq!(
+            semver(" >=1.0 , <2.0 ").describe().as_deref(),
+            Some("semver  >=1.0 , <2.0 ")
+        );
     }
 
     #[test]
@@ -1052,7 +1064,7 @@ mod tests {
                 FilterConfig {
                     defaults_exclude: strs(&["*-dev"]),
                     glob: strs(&["*-dev"]),
-                    semver: Some(">=8.0.0, <9.0.0".into()),
+                    semver: Some(range(">=8.0.0, <9.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["8.0.0", "8.5.0-dev", "10.0.0-dev"],
@@ -1063,7 +1075,7 @@ mod tests {
                 "dev tags constrained by semver end to end",
                 FilterConfig {
                     defaults_exclude: strs(&["*-r[0-9]*"]),
-                    semver: Some(">=8.0.0, <9.0.0".into()),
+                    semver: Some(range(">=8.0.0, <9.0.0")),
                     sort: Some(SortOrder::Semver),
                     latest: Some(10),
                     ..FilterConfig::default()
@@ -1093,7 +1105,7 @@ mod tests {
                 "overrides system exclude",
                 FilterConfig {
                     include: strs(&["1.25.0-rc1"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     ..FilterConfig::default()
                 },
                 // 1.0.0-rc2 drops via system exclude; 1.25.0 passes the pipeline.
@@ -1105,7 +1117,7 @@ mod tests {
                 "overrides semver",
                 FilterConfig {
                     include: strs(&["latest"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     ..FilterConfig::default()
                 },
                 vec!["latest", "1.0.0", "0.9.0"],
@@ -1158,7 +1170,7 @@ mod tests {
                 "literal include is not capped by latest",
                 FilterConfig {
                     include: strs(&["latest", "latest-dev"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     sort: Some(SortOrder::Semver),
                     latest: Some(2),
                     ..FilterConfig::default()
@@ -1179,7 +1191,7 @@ mod tests {
                 "min_tags counts include and pipeline",
                 FilterConfig {
                     include: strs(&["latest"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     min_tags: Some(5),
                     ..FilterConfig::default()
                 },
@@ -1191,7 +1203,7 @@ mod tests {
                 FilterConfig {
                     defaults_exclude: strs(&["*-dev"]),
                     include: strs(&["latest-dev", "*-dev"]),
-                    semver: Some(">=2.0.0".into()),
+                    semver: Some(range(">=2.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["latest-dev", "8.5.0-dev"],
@@ -1203,7 +1215,7 @@ mod tests {
                 "pins a parseable RC outside the semver range",
                 FilterConfig {
                     include: strs(&["1.0.0-rc1"]),
-                    semver: Some(">=2.0.0".into()),
+                    semver: Some(range(">=2.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["1.0.0-rc1", "2.5.0", "3.0.0"],
@@ -1214,7 +1226,7 @@ mod tests {
                 FilterConfig {
                     defaults_exclude: strs(&["*-dev"]),
                     include: strs(&["latest", "*-dev"]),
-                    semver: Some(">=8.0.0, <9.0.0".into()),
+                    semver: Some(range(">=8.0.0, <9.0.0")),
                     ..FilterConfig::default()
                 },
                 // latest bypasses semver; 10.0.0-dev is rescued then fails it.
@@ -1262,7 +1274,7 @@ mod tests {
                 FilterConfig {
                     include: strs(&["*-dev"]),
                     defaults_exclude: strs(&["*-dev", "*-r[0-9]*"]),
-                    semver: Some(">=3.12.0".into()),
+                    semver: Some(range(">=3.12.0")),
                     sort: Some(SortOrder::Semver),
                     latest: Some(2),
                     ..FilterConfig::default()
@@ -1308,7 +1320,7 @@ mod tests {
                 FilterConfig {
                     defaults_exclude: strs(&["*-dev"]),
                     include: strs(&["*-dev"]),
-                    semver: Some(">=8.0.0, <9.0.0".into()),
+                    semver: Some(range(">=8.0.0, <9.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["8.5.0", "8.5.0-dev", "10.0.0", "10.0.0-dev"],
@@ -1320,7 +1332,7 @@ mod tests {
                 FilterConfig {
                     defaults_exclude: strs(&["*-dev"]),
                     include: strs(&["*-dev"]),
-                    semver: Some(">=2.0.0".into()),
+                    semver: Some(range(">=2.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["latest-dev", "8.5.0-dev"],
@@ -1330,7 +1342,7 @@ mod tests {
                 "pin by glob drops the RC at semver",
                 FilterConfig {
                     include: strs(&["1.0.0-*"]),
-                    semver: Some(">=2.0.0".into()),
+                    semver: Some(range(">=2.0.0")),
                     ..FilterConfig::default()
                 },
                 vec!["1.0.0-rc1", "2.5.0", "3.0.0"],
@@ -1349,7 +1361,7 @@ mod tests {
                         "*-snapshot*",
                         "*-nightly*",
                     ]),
-                    semver: Some(">=2.0".into()),
+                    semver: Some(range(">=2.0")),
                     ..FilterConfig::default()
                 },
                 vec!["1.5.0-rc1", "2.0.0-rc1", "2.5.0-alpha1", "2.5.0", "1.5.0"],
@@ -1382,7 +1394,7 @@ mod tests {
                 "mapping and built-in",
                 FilterConfig {
                     exclude: strs(&["*-musl"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     ..FilterConfig::default()
                 },
                 vec!["1.0.0", "1.0.0-musl", "1.1.0-rc1", "1.2.0"],
@@ -1414,7 +1426,7 @@ mod tests {
         ];
         let config = FilterConfig {
             glob: strs(&["1.*"]),
-            semver: Some(">=1.18.0".into()),
+            semver: Some(range(">=1.18.0")),
             sort: Some(SortOrder::Semver),
             latest: Some(2),
             ..FilterConfig::default()
@@ -1432,7 +1444,7 @@ mod tests {
         let tags = vec!["latest", "1.0.0", "1.1.0", "1.2.0", "0.9.0-rc1"];
         let config = FilterConfig {
             include: strs(&["latest"]),
-            semver: Some(">=1.0".into()),
+            semver: Some(range(">=1.0")),
             sort: Some(SortOrder::Semver),
             latest: Some(2),
             ..FilterConfig::default()
@@ -1462,7 +1474,7 @@ mod tests {
                 "carries rescued names in input order",
                 FilterConfig {
                     include: strs(&["latest", "latest-dev"]),
-                    semver: Some(">=1.0".into()),
+                    semver: Some(range(">=1.0")),
                     ..FilterConfig::default()
                 },
                 vec!["latest", "latest-dev", "1.0.0", "1.1.0", "0.9.0-rc1"],
@@ -1492,7 +1504,7 @@ mod tests {
         tag_refs.extend(["edge", "latest", "nightly", "1.0.0-rc1", "1.0.0-alpha"]);
         let config = FilterConfig {
             glob: strs(&["1.*"]),
-            semver: Some(">=1.10".into()),
+            semver: Some(range(">=1.10")),
             sort: Some(SortOrder::Semver),
             latest: Some(3),
             ..FilterConfig::default()
@@ -1565,7 +1577,7 @@ mod tests {
         let tags = vec!["1.0.0", "1.1.0", "1.2.0"];
         let config = FilterConfig {
             glob: strs(&["*"]),
-            semver: Some(">=1.0".into()),
+            semver: Some(range(">=1.0")),
             ..FilterConfig::default()
         };
         let filtered = config.apply_with_report(&tags).unwrap();
@@ -1582,7 +1594,7 @@ mod tests {
     fn describe_combines_clauses_in_pipeline_order() {
         let config = FilterConfig {
             glob: strs(&["1.*"]),
-            semver: Some(">=1.0.0".into()),
+            semver: Some(range(">=1.0.0")),
             exclude: strs(&["*-rc*"]),
             sort: Some(SortOrder::Semver),
             latest: Some(5),
@@ -1602,7 +1614,7 @@ mod tests {
         let cfg = FilterConfig {
             include: strs(&["latest"]),
             glob: strs(&["v*"]),
-            semver: Some("^1".into()),
+            semver: Some(range(">=1")),
             defaults_exclude: strs(&["*-dev"]),
             exclude: strs(&["nightly"]),
             sort: Some(SortOrder::Alpha),
@@ -1613,7 +1625,7 @@ mod tests {
         for needle in [
             "include latest",
             "glob v*",
-            "semver ^1",
+            "semver >=1",
             "exclude *-dev,nightly",
             "sort alpha",
             "latest=3",

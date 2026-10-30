@@ -2,6 +2,7 @@
 
 use ocync_distribution::RepositoryName;
 use ocync_sync::filter::FilterConfig;
+use ocync_sync::version::Range;
 
 use crate::TagsArgs;
 use crate::cli::config::load_config;
@@ -27,7 +28,7 @@ pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
 
     let filter = FilterConfig {
         glob: args.glob.clone(),
-        semver: args.semver.clone(),
+        semver: args.semver.as_deref().map(Range::parse).transpose()?,
         exclude: args.exclude.clone(),
         sort: args.sort.map(|s| s.into()),
         latest: args.latest,

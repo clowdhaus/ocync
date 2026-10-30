@@ -1,6 +1,7 @@
 //! Configuration file schema types and YAML deserialization.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use schemars::JsonSchema;
@@ -139,7 +140,7 @@ pub(crate) struct GlobalConfig {
     /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
     /// across major container registries).
     #[serde(default = "default_max_concurrent_transfers")]
-    pub max_concurrent_transfers: usize,
+    pub max_concurrent_transfers: NonZeroUsize,
 
     /// Cache directory for persistent cache and blob staging.
     ///
@@ -159,7 +160,7 @@ pub(crate) struct GlobalConfig {
     pub staging_size_limit: Option<String>,
 }
 
-fn default_max_concurrent_transfers() -> usize {
+fn default_max_concurrent_transfers() -> NonZeroUsize {
     // Mirror the engine's DEFAULT_MAX_CONCURRENT_TRANSFERS. The previous
     // value of 50 multiplied by BLOB_CONCURRENCY=6 (= 300 streams) blew
     // past the per-connection HTTP/2 stream budget on every major
@@ -224,7 +225,7 @@ pub(crate) struct RegistryConfig {
     /// Limits the total number of simultaneous in-flight HTTP requests to this
     /// registry across all action types. This is independent of the global
     /// `max_concurrent_transfers` (which caps image-level parallelism).
-    pub max_concurrent: Option<usize>,
+    pub max_concurrent: Option<NonZeroUsize>,
 
     /// Credentials for Basic auth (`auth_type: basic`).
     #[serde(default)]
@@ -422,7 +423,8 @@ pub(crate) struct TagsConfig {
 
     /// Include tags matching a semver range (e.g. `>=1.0, <2.0`).
     #[serde(default)]
-    pub semver: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub semver: Option<Range>,
 
     /// Always-include patterns. Behavior depends on pattern shape: literals
     /// (no `*`, `?`, `[`) bypass the entire pipeline and are kept verbatim
@@ -507,6 +509,7 @@ pub(crate) enum GlobOrList {
 }
 
 use ocync_sync::filter::{SortOrder, is_literal_pattern};
+use ocync_sync::version::Range;
 
 /// Placeholder type for the removed `tags.semver_prerelease` field. Triggers
 /// a custom Deserialize error if the field appears in user config, with a
@@ -644,11 +647,6 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
 
 /// Validate the global config section.
 fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
-    if global.max_concurrent_transfers < 1 {
-        return Err(ConfigError::Validation(
-            "global.max_concurrent_transfers must be >= 1".to_string(),
-        ));
-    }
     if let Some(ref ttl) = global.cache_ttl {
         if !is_valid_duration(ttl) {
             return Err(ConfigError::Validation(format!(
@@ -668,14 +666,6 @@ fn validate_global(global: &GlobalConfig) -> Result<(), ConfigError> {
 
 /// Validate per-registry settings.
 fn validate_registry(name: &str, registry: &RegistryConfig) -> Result<(), ConfigError> {
-    if let Some(max) = registry.max_concurrent {
-        if max < 1 {
-            return Err(ConfigError::Validation(format!(
-                "registries.{name}.max_concurrent must be >= 1"
-            )));
-        }
-    }
-
     if let Some(ref auth_type) = registry.auth_type {
         match auth_type {
             AuthType::Basic => {
@@ -1575,7 +1565,7 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let global = config.global.as_ref().unwrap();
-        assert_eq!(global.max_concurrent_transfers, 20);
+        assert_eq!(global.max_concurrent_transfers.get(), 20);
         assert_eq!(global.cache_dir.as_deref(), Some("/tmp/ocync-cache"));
         assert_eq!(global.cache_ttl.as_deref(), Some("6h"));
         assert_eq!(global.staging_size_limit.as_deref(), Some("1GB"));
@@ -1621,16 +1611,34 @@ mappings:
     }
 
     #[test]
-    fn global_max_concurrent_transfers_zero_is_invalid() {
-        let global = GlobalConfig {
-            max_concurrent_transfers: 0,
-            ..Default::default()
+    fn global_max_concurrent_transfers_zero_is_refused() {
+        let yaml = r#"
+global:
+  max_concurrent_transfers: 0
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_concurrent_transfers"), "{err}");
+    }
+
+    #[test]
+    fn semver_range_is_parsed_when_config_is_read() {
+        let yaml = |range: &str| {
+            format!("mappings:\n  - from: nginx\n    tags:\n      semver: \"{range}\"\n")
         };
-        let err = validate_global(&global).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => assert!(msg.contains("max_concurrent_transfers")),
-            other => panic!("wrong error: {other}"),
-        }
+        let config: Config = serde_yaml::from_str(&yaml(">=1.0, <2.0")).unwrap();
+        let tags = config.mappings[0].tags.as_ref().unwrap();
+        assert_eq!(tags.semver.as_ref().unwrap().to_string(), ">=1.0, <2.0");
+
+        let err = serde_yaml::from_str::<Config>(&yaml("not_valid"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid version range 'not_valid'"), "{err}");
     }
 
     #[test]
@@ -1698,7 +1706,7 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let reg = &config.registries["chainguard"];
-        assert_eq!(reg.max_concurrent, Some(10));
+        assert_eq!(reg.max_concurrent.map(NonZeroUsize::get), Some(10));
     }
 
     #[test]
@@ -1717,38 +1725,21 @@ mappings:
     }
 
     #[test]
-    fn registry_max_concurrent_zero_is_invalid() {
-        let registry = RegistryConfig {
-            url: "example.com".to_string(),
-            auth_type: None,
-            max_concurrent: Some(0),
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: None,
-        };
-        let err = validate_registry("example", &registry).unwrap_err();
-        match err {
-            ConfigError::Validation(msg) => {
-                assert!(msg.contains("example"));
-                assert!(msg.contains("max_concurrent"));
-            }
-            other => panic!("wrong error: {other}"),
-        }
-    }
-
-    #[test]
-    fn registry_max_concurrent_valid_passes() {
-        let registry = RegistryConfig {
-            url: "example.com".to_string(),
-            auth_type: None,
-            max_concurrent: Some(25),
-            credentials: None,
-            token: None,
-            head_first: false,
-            aws_profile: None,
-        };
-        validate_registry("example", &registry).unwrap();
+    fn registry_max_concurrent_zero_is_refused() {
+        let yaml = r#"
+registries:
+  example:
+    url: example.com
+    max_concurrent: 0
+mappings:
+  - from: nginx
+    tags:
+      glob: "*"
+"#;
+        let err = serde_yaml::from_str::<Config>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_concurrent"), "{err}");
     }
 
     // - Auth-type validation -------------------------------------------------
@@ -2036,7 +2027,7 @@ mappings:
     fn exact_tags_with_semver_returns_none() {
         let tags = TagsConfig {
             glob: Some(GlobOrList::Single("latest".into())),
-            semver: Some(">=1.0".into()),
+            semver: Some(Range::parse(">=1.0").unwrap()),
             ..Default::default()
         };
         assert!(tags.exact_tags().is_none());

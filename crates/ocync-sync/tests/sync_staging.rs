@@ -96,7 +96,7 @@ async fn sync_staging_pulls_once_pushes_twice() {
 
     // Use max_concurrent=1 so target-a completes and stages blobs before
     // target-b starts (reads from staging instead of pulling from source).
-    let engine = SyncEngine::new(fast_retry(), 1);
+    let engine = SyncEngine::new(fast_retry(), concurrency(1));
     let report = engine
         .run(vec![mapping], empty_cache(), staging, &NullProgress, None)
         .await;
@@ -183,7 +183,7 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
         signal.trigger();
     });
 
-    let engine = SyncEngine::new(fast_retry(), 50);
+    let engine = SyncEngine::new(fast_retry(), concurrency(50));
     let report = engine
         .run(
             vec![mapping],
@@ -272,8 +272,8 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     // 2-second drain deadline: shorter than the 5s blob delay, so the
     // engine should abandon the transfer. With the default 25s deadline,
     // the transfer would complete successfully.
-    let engine =
-        SyncEngine::new(fast_retry(), 50).with_drain_deadline(std::time::Duration::from_secs(2));
+    let engine = SyncEngine::new(fast_retry(), concurrency(50))
+        .with_drain_deadline(std::time::Duration::from_secs(2));
     let report = engine
         .run(
             vec![mapping],
@@ -366,7 +366,7 @@ async fn sync_staging_writes_blobs_to_disk() {
         vec![TagPair::same("v1")],
     );
 
-    let engine = SyncEngine::new(fast_retry(), 1);
+    let engine = SyncEngine::new(fast_retry(), concurrency(1));
     let report = engine
         .run(vec![mapping], empty_cache(), staging, &NullProgress, None)
         .await;

@@ -57,9 +57,15 @@ pub use registry2::*;
 // Engine run helpers
 // ---------------------------------------------------------------------------
 
+/// A non-zero image concurrency for `SyncEngine::new`, so call sites keep a
+/// plain number.
+pub fn concurrency(n: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(n).expect("test concurrency is non-zero")
+}
+
 /// Run the sync engine with default settings (`max_concurrent=50`, no cache, no staging, no shutdown).
 pub async fn run_sync(mappings: Vec<ResolvedMapping>) -> SyncReport {
-    SyncEngine::new(fast_retry(), 50)
+    SyncEngine::new(fast_retry(), concurrency(50))
         .run(
             mappings,
             empty_cache(),
@@ -72,7 +78,7 @@ pub async fn run_sync(mappings: Vec<ResolvedMapping>) -> SyncReport {
 
 /// Run the sync engine sequentially (`max_concurrent=1`) for deterministic ordering tests.
 pub async fn run_sync_sequential(mappings: Vec<ResolvedMapping>) -> SyncReport {
-    SyncEngine::new(fast_retry(), 1)
+    SyncEngine::new(fast_retry(), concurrency(1))
         .run(
             mappings,
             empty_cache(),
@@ -88,7 +94,7 @@ pub async fn run_sync_with_cache(
     mappings: Vec<ResolvedMapping>,
     cache: Rc<RefCell<TransferStateCache>>,
 ) -> SyncReport {
-    SyncEngine::new(fast_retry(), 50)
+    SyncEngine::new(fast_retry(), concurrency(50))
         .run(mappings, cache, BlobStage::disabled(), &NullProgress, None)
         .await
 }
@@ -98,7 +104,7 @@ pub async fn run_sync_with_shutdown(
     mappings: Vec<ResolvedMapping>,
     shutdown: &ShutdownSignal,
 ) -> SyncReport {
-    SyncEngine::new(fast_retry(), 50)
+    SyncEngine::new(fast_retry(), concurrency(50))
         .run(
             mappings,
             empty_cache(),
