@@ -516,6 +516,11 @@ mod tests {
     type Setup = fn(&mut TransferStateCache);
 
     #[test]
+    fn new_cache_is_empty() {
+        assert!(TransferStateCache::new().is_empty());
+    }
+
+    #[test]
     fn mount_sources_by_commit_and_run_state() {
         let cases: [(&str, Setup, &str, &[&str]); 8] = [
             (
