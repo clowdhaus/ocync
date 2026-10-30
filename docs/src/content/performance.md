@@ -28,7 +28,7 @@ Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit)
 > Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
 <!-- BENCH:END -->
 
-The 30 October 2026 run (ocync 0.8.2) was one run per tool, in the order ocync, dregsy, regsync. Its CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync, so the tools did not start from equally warm caches. The pre-warm meant to equalize them warmed only each image's first tag, and 11 images in the corpus sync more than one version; the [benchmark design](/design/benchmark) describes the fix, along with repeated rounds that replace single runs.
+The 30 October 2026 run (ocync 0.8.2) was one run per tool, in the order ocync, dregsy, regsync. It was made before the corpus lock and the per-tool content check existed, so whether the three tools copied identical content was not checked. Its CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync. Separately, the pre-warm read only each image's first tag, and 11 images in the corpus sync more than one version. The [benchmark design](/design/benchmark) describes the fixes, and repeated rounds that replace single runs.
 
 Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged, on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
 
@@ -40,7 +40,7 @@ Two comparison runs exist from code with the fix that ended ocync's 429s. The 26
 | Response bytes: ocync / dregsy / regsync | 55.4 / 55.3 / 65.3 GB | 55.0 / 54.9 / 65.1 GB |
 | 429s, any tool | 0 | 0 |
 
-ocync moved about 10 GB less than regsync and slightly more than dregsy, whose total leaves out the referrer artifacts only ocync syncs. Only ECR has been measured as a target.
+ocync moved about 10 GB less than regsync and slightly more than dregsy. Only ECR has been measured as a target.
 
 ## How tools compare
 

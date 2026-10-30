@@ -34,9 +34,9 @@ The harness is to enforce each rule. A rule marked Planned is not built yet, and
 
 ### A fixed corpus
 
-Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before a run, the harness resolves every source tag again and refuses to run if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
+Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before the run and again before every later scenario, the harness resolves every source tag again and stops if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
 
-> **Status: Planned.** Re-resolving the tags before each round, not only before the run, comes with repeated rounds.
+> **Status: Planned.** Re-resolving the tags before each round comes with repeated rounds.
 
 ### Content verified, not only tags
 
@@ -85,9 +85,9 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): unique blobs are fetched once, so the first tool does not meet a colder CDN than the last.
+- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): the unique blobs of each image's first tag are fetched once.
 
-  > **Status: Planned.** Today the pre-warm reads only each image's first tag, so the blobs of later versions of 11 images in the corpus are never warmed. The fix warms every tag the run syncs and warns, naming the registry, when any manifest or blob could not be warmed.
+  > **Status: Planned.** Warming every tag the run syncs, so the first tool does not meet a colder CDN than the last, and warning, naming the registry, when any manifest or blob could not be warmed. Today the blobs of later versions of 11 images in the corpus are never warmed.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.
