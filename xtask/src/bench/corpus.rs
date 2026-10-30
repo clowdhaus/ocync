@@ -3,10 +3,19 @@
 use serde::Deserialize;
 
 /// Docker Hub credentials for authenticated pulls (avoids 10 pulls/hr anon limit).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct DockerHubAuth {
     pub(crate) username: String,
     pub(crate) token: String,
+}
+
+impl std::fmt::Debug for DockerHubAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockerHubAuth")
+            .field("username", &self.username)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Top-level corpus configuration.
@@ -530,5 +539,16 @@ images:
             "every prepare-corpus tag must be a wildcard or the tag listing is \
              never issued; these are literals: {literal:?}"
         );
+    }
+
+    #[test]
+    fn dockerhub_auth_debug_redacts_token() {
+        let auth = DockerHubAuth {
+            username: "bench".to_string(),
+            token: "dckr_pat_secret".to_string(),
+        };
+        let debug_output = format!("{auth:?}");
+        assert!(debug_output.contains("bench"));
+        assert!(!debug_output.contains("dckr_pat_secret"), "{debug_output}");
     }
 }

@@ -170,15 +170,6 @@ pub(crate) struct ScenarioResult {
     pub(crate) tool_order: Vec<String>,
 }
 
-/// A single point on the scaling curve.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct ScalePoint {
-    /// Number of images at this scale point.
-    pub(crate) images: usize,
-    /// Wall-clock seconds keyed by tool name.
-    pub(crate) results: BTreeMap<String, f64>,
-}
-
 /// Instance metadata captured at benchmark runtime.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct InstanceInfo {
@@ -363,8 +354,6 @@ pub(crate) struct BenchReport {
     pub(crate) relay_versions: BTreeMap<String, String>,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioResult>,
-    /// Scaling curve data points (empty when the scale scenario was not run).
-    pub(crate) scale: Vec<ScalePoint>,
 }
 
 /// Formats a [`Duration`] as a human-readable string.
@@ -956,7 +945,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         }
     }
 
@@ -1092,7 +1080,6 @@ mod tests {
             relay_versions: BTreeMap::new(),
             tool_versions: BTreeMap::from([("ocync".to_string(), "0.1.0".to_string())]),
             scenarios: vec![],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
         assert!(!md.contains("## Cold"));
@@ -1124,7 +1111,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
         // dregsy column shows "--"; ocync is NOT bolded because there's
@@ -1296,7 +1282,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
         // Single tool -- nothing should be bolded.
@@ -1342,7 +1327,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let scenario = find_scenario(&report, "warm").unwrap();
         let md = scenario_markdown(&report, scenario, "Warm sync (no changes)");
@@ -1447,7 +1431,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         }
     }
 
@@ -1534,7 +1517,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
 
@@ -1591,7 +1573,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
 
@@ -1670,7 +1651,6 @@ mod tests {
                     tool_order: Vec::new(),
                 },
             ],
-            scale: vec![],
         };
         update_performance_page(&path, &report).unwrap();
 
@@ -1715,7 +1695,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         update_performance_page(&path, &report).unwrap();
 
@@ -1774,7 +1753,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
         assert!(
@@ -1808,7 +1786,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let md = summary_markdown(&report);
         assert!(
@@ -1845,7 +1822,6 @@ mod tests {
                 shuffle_seed: 0,
                 tool_order: Vec::new(),
             }],
-            scale: vec![],
         };
         let scenario = &report.scenarios[0];
         let md = scenario_markdown(&report, scenario, "Cold sync");

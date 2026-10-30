@@ -19,7 +19,7 @@ use clap::{Args, Subcommand};
 
 use corpus::Corpus;
 use regression::Baseline;
-use report::{BenchReport, ScalePoint, ScenarioResult, ToolRun};
+use report::{BenchReport, ScenarioResult, ToolRun};
 use runner::Tool;
 
 /// Arguments for the bench subcommand.
@@ -380,7 +380,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         tool_versions,
         relay_versions,
         scenarios: Vec::new(),
-        scale: Vec::new(),
     };
 
     // 6. Expand All into individual scenarios, then dispatch each.
@@ -461,7 +460,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     let ocync_only = vec![Tool::Ocync];
                     let points =
                         run_scale(&args, &corpus, &ocync_only, &ecr_client, &output_dir).await?;
-                    report.scale = points;
+                    report.scenarios.extend(points);
                 } else {
                     eprintln!("bench: scale scenario requires ocync (skipping)");
                 }
@@ -980,14 +979,15 @@ async fn run_partial(
     })
 }
 
-/// Scale scenario: run at increasing corpus sizes [10, 25, 50, all].
+/// Scale scenario: run at increasing corpus sizes [10, 25, 50, all], one
+/// scenario result per size so each carries the full metric table.
 async fn run_scale(
     args: &BenchArgs,
     corpus: &Corpus,
     tools: &[Tool],
     ecr_client: &aws_sdk_ecr::Client,
     output_dir: &Path,
-) -> Result<Vec<ScalePoint>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ScenarioResult>, Box<dyn std::error::Error>> {
     progress("bench: running scale scenario");
     let total = corpus.images.len();
     let mut sizes: Vec<usize> = [10, 25, 50, total]
@@ -1002,7 +1002,7 @@ async fn run_scale(
     for &size in &sizes {
         progress(&format!("  scale: {size} images"));
         let subset = corpus.limit(size);
-        let mut results: BTreeMap<String, f64> = BTreeMap::new();
+        let mut runs = Vec::new();
 
         for &tool in tools {
             prepare_clean_slate();
@@ -1029,7 +1029,7 @@ async fn run_scale(
                     )
                     .into());
                 }
-                results.insert(tool.to_string(), run.wall_clock_secs);
+                runs.push(run);
                 Ok(())
             }
             .await;
@@ -1041,9 +1041,11 @@ async fn run_scale(
             cooldown().await;
         }
 
-        points.push(ScalePoint {
-            images: size,
-            results,
+        points.push(ScenarioResult {
+            scenario: format!("Scale ({size} images)"),
+            runs,
+            shuffle_seed: 0,
+            tool_order: Vec::new(),
         });
     }
 

@@ -51,7 +51,8 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long)]
     pub(crate) fetch: bool,
 
-    /// Kill any running benchmark and start fresh.
+    /// Kill a benchmark still running on the instance and start fresh.
+    /// Without it, a live run is left alone and this command fails.
     #[arg(long)]
     pub(crate) force: bool,
 
@@ -165,13 +166,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // SHA, not the branch name. This makes the build immune to force-pushes
     // that land between our push and the instance's fetch -- the SHA is
     // immutable even if the branch ref moves.
-    let sha_output = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
-    if !sha_output.status.success() {
-        return Err("git rev-parse HEAD failed".into());
-    }
-    let git_sha = String::from_utf8_lossy(&sha_output.stdout)
-        .trim()
-        .to_owned();
+    let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // Build the bench command args. Shell-escape all user-supplied
@@ -206,24 +201,11 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         }
     };
 
-    let force_clause = if args.force {
-        r#"
-# --force: kill any running bench and all child processes.
-# The PID file tracks the subshell, not cargo/ocync directly.
-# Kill by name to catch orphaned children that survive subshell death.
-if [ -f "$PID_FILE" ]; then
-  echo "bench-remote: --force killing PID $(cat "$PID_FILE")"
-  kill -9 $(cat "$PID_FILE") 2>/dev/null || true
-  rm -f "$PID_FILE"
-fi
-pkill -9 -f "bench-proxy serve" 2>/dev/null || true
-pkill -9 -f "cargo xtask bench" 2>/dev/null || true
-pkill -9 -f "target/release/ocync" 2>/dev/null || true
-sleep 1
-"#
+    let existing_run = existing_run_guard(if args.force {
+        ExistingRun::Kill
     } else {
-        ""
-    };
+        ExistingRun::Refuse
+    });
 
     let escaped_git_ref = shell_escape(&git_ref);
     let escaped_git_sha = shell_escape(&git_sha);
@@ -252,19 +234,9 @@ fi
 cd ~/ocync
 PID_FILE=bench/.bench-run.pid
 LOG_FILE=bench/.bench-run.log
-{force_clause}
-# Check for existing run. Always kill stale processes and start fresh --
-# attaching to an in-progress run from a previous invocation risks using
-# a stale binary that was built from different source code.
-if [ -f "$PID_FILE" ]; then
-  OLD_PID=$(cat "$PID_FILE")
-  if kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "bench-remote: killing previous run (PID $OLD_PID)"
-    kill -9 "$OLD_PID" 2>/dev/null || true
-  fi
-  rm -f "$PID_FILE"
-fi
-# Kill any orphaned processes from previous runs regardless of PID file.
+{existing_run}
+# The PID file tracks the subshell, not cargo/ocync directly. Kill by name to
+# catch orphaned children that survive subshell death.
 pkill -9 -f "bench-proxy serve" 2>/dev/null || true
 pkill -9 -f "cargo xtask bench" 2>/dev/null || true
 pkill -9 -f "target/release/ocync" 2>/dev/null || true
@@ -344,6 +316,13 @@ exit $EXIT
     );
 
     let exit_code = ssh_stream(&config, &script)?;
+    if exit_code == RUN_IN_PROGRESS_EXIT {
+        return Err(
+            "a benchmark is still running on the instance; pass --force to kill it, \
+             or --fetch for the last finished run's results"
+                .into(),
+        );
+    }
 
     if exit_code != 0 {
         eprintln!("bench-remote: remote script exited with code {exit_code}");
@@ -517,6 +496,55 @@ fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// What to do with a benchmark still running on the instance.
+#[derive(Clone, Copy)]
+enum ExistingRun {
+    /// Stop with [`RUN_IN_PROGRESS_EXIT`], leaving it running.
+    Refuse,
+    /// Kill it and start fresh.
+    Kill,
+}
+
+/// Exit status of the remote script when it refuses to replace a live run.
+const RUN_IN_PROGRESS_EXIT: i32 = 3;
+
+/// Shell that handles a live run named by `$PID_FILE`, then removes the file.
+///
+/// A new run never attaches to an old one, since the old one may be running a
+/// binary built from different source.
+fn existing_run_guard(existing: ExistingRun) -> String {
+    let on_live = match existing {
+        ExistingRun::Refuse => format!(
+            r#"echo "bench-remote: a benchmark is still running (PID $OLD_PID)"
+    exit {RUN_IN_PROGRESS_EXIT}"#
+        ),
+        ExistingRun::Kill => r#"echo "bench-remote: --force killing PID $OLD_PID"
+    kill -9 "$OLD_PID" 2>/dev/null || true"#
+            .to_owned(),
+    };
+    format!(
+        r#"if [ -f "$PID_FILE" ]; then
+  OLD_PID=$(cat "$PID_FILE")
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    {on_live}
+  fi
+  rm -f "$PID_FILE"
+fi"#
+    )
+}
+
+/// Resolves `git_ref` to the commit it names in the repository at `repo`.
+fn resolve_commit(repo: &Path, git_ref: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git rev-parse {git_ref} failed").into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
 /// Get the current local git branch name.
 fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
@@ -579,5 +607,67 @@ mod tests {
             config_path("gcp"),
             PathBuf::from("bench/terraform/gcp/bench.json")
         );
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args([
+                "-c",
+                "user.name=bench",
+                "-c",
+                "user.email=bench@example.com",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn resolve_commit_follows_the_ref_not_head() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(repo.path(), &["branch", "other"]);
+        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let other = git(repo.path(), &["rev-parse", "other"]);
+
+        let resolved = resolve_commit(repo.path(), "other").unwrap();
+
+        assert_eq!(resolved, other);
+        assert_ne!(resolved, git(repo.path(), &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn existing_run_guard_refuses_or_kills_a_live_run() {
+        for (existing, want_exit, want_alive) in [
+            (ExistingRun::Refuse, RUN_IN_PROGRESS_EXIT, true),
+            (ExistingRun::Kill, 0, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("run.pid");
+            let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+            std::fs::write(&pid_file, live.id().to_string()).unwrap();
+
+            let status = Command::new("bash")
+                .arg("-c")
+                .arg(existing_run_guard(existing))
+                .env("PID_FILE", &pid_file)
+                .status()
+                .unwrap();
+
+            let alive = live.try_wait().unwrap().is_none();
+            live.kill().ok();
+            live.wait().unwrap();
+            assert_eq!(
+                status.code(),
+                Some(want_exit),
+                "exit, want_alive={want_alive}"
+            );
+            assert_eq!(alive, want_alive, "live run survived");
+            assert_eq!(pid_file.exists(), want_alive, "PID file kept");
+        }
     }
 }
