@@ -174,9 +174,7 @@ pub(in crate::aws) enum Error {
     /// An error document in place of credentials.
     #[error("{}", DocumentText { code, message })]
     Document {
-        /// The error code.
         code: Code,
-        /// The error message.
         message: String,
     },
     /// The credentials document does not read.

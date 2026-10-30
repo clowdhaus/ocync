@@ -4,12 +4,9 @@
 //! by one unit per successful response and halves on a 429 (Too Many Requests). A
 //! congestion epoch prevents multiple halvings from the same burst of 429s.
 //!
-//! [`AimdController`] manages one set of windows per registry host. The aggregate
-//! concurrency cap is enforced by a shared [`tokio::sync::Semaphore`]; the per-action
-//! windows refine that limit further. For registries with documented per-account TPS
-//! ceilings (ECR / ECR Public / GHCR / GAR / ACR), a per-window [`TokenBucket`] gates
-//! [`AimdController::acquire`] BEFORE either semaphore so paced actions do not occupy
-//! concurrency slots another window could service.
+//! [`AimdController`] manages one set of windows per registry host under an
+//! aggregate concurrency cap. Windows of registries with documented TPS
+//! ceilings are also paced by a [`TokenBucket`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,17 +41,13 @@ pub(crate) struct AimdWindow {
 }
 
 impl AimdWindow {
-    /// Create a new window with the given initial value and cap.
-    ///
-    /// Uses the default congestion epoch of 100 ms.
+    /// A window with the given initial value and cap and the default epoch.
     pub(crate) fn new(initial: f64, cap: usize) -> Self {
         Self::with_epoch(initial, cap, DEFAULT_EPOCH)
     }
 
-    /// Create a new window with a custom congestion epoch.
-    ///
-    /// The epoch controls how long after a halving before another halving can
-    /// occur. Shorter epochs are useful in tests.
+    /// A window with a custom congestion epoch: how long after a halving
+    /// before another can occur.
     pub(crate) fn with_epoch(initial: f64, cap: usize, epoch: Duration) -> Self {
         Self {
             window: initial,
@@ -69,27 +62,19 @@ impl AimdWindow {
         (self.window.ceil() as usize).min(self.cap)
     }
 
-    /// Record a successful response - additive increase.
-    ///
-    /// Increases the window by `1.0 / window`, which produces linear growth in
-    /// the number of round trips needed to double the window (TCP-style AIMD).
+    /// Record a successful response: additive increase by `1.0 / window`,
+    /// TCP-style.
     pub(crate) fn on_success(&mut self) {
         self.window += 1.0 / self.window;
     }
 
     /// The raw floating-point window value.
-    ///
-    /// Exposed for testing only - prefer [`limit`](Self::limit) in production code.
     #[cfg(test)]
     pub(crate) fn window_value(&self) -> f64 {
         self.window
     }
 
-    /// Record a 429 throttle response - multiplicative decrease.
-    ///
-    /// Halves the window (minimum 1.0). If a halving already occurred within the
-    /// current epoch, this call is ignored - a single burst of 429s only triggers
-    /// one halving.
+    /// Record a 429: halve the window (minimum 1.0), at most once per epoch.
     pub(crate) fn on_throttle(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_decrease) > self.epoch {
@@ -102,20 +87,12 @@ impl AimdWindow {
 /// Token-bucket rate limiter. Tokens refill at `rate_per_sec` up to `burst`;
 /// [`acquire`](Self::acquire) blocks until a token is available.
 ///
-/// Used alongside [`AimdWindow`] to bound TPS where AIMD's concurrency
-/// window cannot. AIMD discovers a healthy concurrency level via 429
-/// feedback; the bucket enforces a hard rate ceiling derived from
-/// documented registry quotas (see `bucket_config_for_window`).
+/// Enforces a documented registry rate ceiling (see
+/// `bucket_config_for_window`) that AIMD's concurrency window cannot.
 ///
-/// Uses [`tokio::time::Instant`] (not [`std::time::Instant`]) for the
-/// `last_refill` timestamp. Refill arithmetic and the internal
-/// [`tokio::time::sleep`] then share a single clock source, which is
-/// required for `#[tokio::test(start_paused = true)]` -- with mixed
-/// clocks the bucket would livelock under paused virtual time because
-/// the std clock never advances while `sleep` returns immediately.
-///
-/// The mutex is released before sleeping, so concurrent consumers do
-/// not serialize on lock contention.
+/// Refill and sleep must share tokio's clock: with `std::time::Instant` the
+/// bucket livelocks under paused test time, since the std clock never
+/// advances while `sleep` returns at once.
 #[derive(Debug)]
 pub(crate) struct TokenBucket {
     rate_per_sec: f64,
@@ -157,8 +134,8 @@ impl TokenBucket {
                 let need = 1.0 - s.tokens;
                 Duration::from_secs_f64(need / self.rate_per_sec)
             };
-            // IMPORTANT: lock released before sleep so other tasks make
-            // progress. A held lock here would serialize all consumers.
+            // The lock is released before sleeping, or every consumer
+            // would serialize on it.
             tokio::time::sleep(sleep_for).await;
         }
     }
@@ -191,19 +168,8 @@ pub enum RegistryAction {
     TagList,
 }
 
-/// Identifies a per-action AIMD window within an [`AimdController`].
-///
-/// Each provider declares its own enforcement granularity by selecting a
-/// nested grouping enum:
-/// - ECR private charges per [`RegistryAction`] -- one window per action.
-/// - ECR Public groups reads and splits writes via [`EcrPublicGroup`].
-/// - Docker Hub uses [`DockerHubGroup`] (HEADs unmetered, manifest reads
-///   quota'd, rest shared).
-/// - GAR / GCR and GHCR share one window across all actions.
-/// - ACR separates [`AcrGroup::Read`] and [`AcrGroup::Write`].
-/// - Anything not detected falls into [`UnknownGroup`]'s coarse grouping.
-///
-/// [`window_key_for_registry`] performs the (host, action) -> key mapping.
+/// Identifies a per-action AIMD window within an [`AimdController`], at
+/// each provider's own rate-limit granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WindowKey {
     /// ECR private: every API action has an independent per-region TPS cap.
@@ -274,18 +240,7 @@ pub enum UnknownGroup {
     TagList,
 }
 
-/// Map a registry host and action to an AIMD window key.
-///
-/// The mapping reflects each registry's actual rate-limit granularity:
-///
-/// - **ECR**: every action has an independent limit -- 9 distinct windows.
-/// - **ECR Public**: 5 windows (read paths share, plus 4 write windows).
-/// - **Docker Hub**: HEADs unmetered/shared; manifest reads quota'd; rest shared.
-/// - **GAR / GCR**: single shared project quota.
-/// - **GHCR**: single shared aggregate quota (2000 RPM across all actions).
-/// - **ACR**: separate `ReadOps` and `WriteOps` quotas per registry -- 2 windows.
-/// - **Unknown** (Chainguard, Quay, generic): coarse grouping -- HEADs / reads
-///   / uploads / manifest writes / tag listing.
+/// Map a registry host and action to its AIMD window key.
 pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey {
     use RegistryAction::*;
     match detect_provider_kind(host) {
@@ -302,8 +257,7 @@ pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey 
             ManifestRead => DockerHubGroup::ManifestRead,
             _ => DockerHubGroup::Other,
         }),
-        // GAR/GCR (GCR is an alias for GAR) and GHCR each enforce a single
-        // shared cap across all actions.
+        // GCR is an alias for GAR.
         Some(ProviderKind::Gar | ProviderKind::Gcr) => WindowKey::GarShared,
         Some(ProviderKind::Ghcr) => WindowKey::GhcrShared,
         Some(ProviderKind::Acr) => WindowKey::Acr(match action {
@@ -323,9 +277,6 @@ pub fn window_key_for_registry(host: &str, action: RegistryAction) -> WindowKey 
 }
 
 /// Token-bucket configuration for a [`WindowKey`].
-///
-/// Named-field struct (not a `(f64, f64)` tuple) to eliminate positional
-/// swap bugs at the construction and unpacking sites.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BucketConfig {
     pub(crate) rate_per_sec: f64,
@@ -335,17 +286,12 @@ pub(crate) struct BucketConfig {
 /// Token-bucket configuration for the given window key, or `None` if rate
 /// gating is not configured for this window (AIMD alone governs concurrency).
 ///
-/// Returned as a config struct rather than a constructed [`TokenBucket`] so
-/// this function is a pure lookup -- testable without instantiating tokio
-/// types and reusable from non-async contexts.
-///
 /// Values are at least 20% under documented caps to absorb tail bursts
 /// without artificial throttling at steady state. Caps verified against
 /// official registry documentation (AWS service quotas, Google quotas
 /// page, Microsoft historical SKU table) on 2026-04-26.
 fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
     use RegistryAction::*;
-    // Helper to keep the table readable.
     let cfg = |rate_per_sec: f64, burst: f64| BucketConfig {
         rate_per_sec,
         burst,
@@ -465,30 +411,21 @@ impl std::fmt::Debug for WindowState {
 
 /// Adaptive concurrency controller for a single registry host.
 ///
-/// Maintains an aggregate concurrency cap (shared across all operations) and
-/// per-action [`AimdWindow`]s that adapt to 429 feedback. The aggregate cap
-/// prevents thundering-herd on a single host; the per-action windows discover
-/// the fine-grained limits for each API endpoint.
+/// An aggregate cap bounds all requests to the host; per-action
+/// [`AimdWindow`]s find each endpoint's own limit from 429 feedback.
 ///
-/// Uses [`Mutex`] for interior mutability so the controller is `Sync` and can
-/// live inside `Arc<RegistryClient>`. The lock is never held across await
-/// points, so contention is impossible on `current_thread` and negligible on
-/// multi-thread runtimes.
+/// A [`Mutex`] keeps the controller `Sync` for `Arc<RegistryClient>`. It is
+/// never held across an await.
 #[derive(Debug)]
 pub struct AimdController {
     host: String,
-    /// Hard cap on total simultaneous in-flight requests to this registry.
     aggregate: Arc<Semaphore>,
-    /// Per-action windows, keyed by [`WindowKey`].
     windows: Mutex<HashMap<WindowKey, WindowState>>,
     max_concurrent: usize,
 }
 
 impl AimdController {
-    /// Create a new controller for the given registry host.
-    ///
-    /// `max_concurrent` is the hard aggregate limit. Per-action windows start
-    /// at the same initial value and grow/shrink independently.
+    /// A controller for `host` with `max_concurrent` as the aggregate limit.
     pub fn new(host: &str, max_concurrent: usize) -> Self {
         Self {
             host: host.to_owned(),
@@ -498,18 +435,11 @@ impl AimdController {
         }
     }
 
-    /// Acquire concurrency permits for the given operation.
-    ///
-    /// For windows with a documented per-account TPS cap (ECR / ECR Public /
-    /// GHCR / GAR / ACR), first blocks on a [`TokenBucket`] that enforces the
-    /// documented rate even when both semaphores have capacity. Then blocks
-    /// until both the aggregate semaphore and the per-action window semaphore
-    /// have capacity. Returns an [`AimdPermit`] that must be resolved via
-    /// [`AimdPermit::success`] or [`AimdPermit::throttled`].
+    /// Acquire the window's rate token, if paced, then its window and
+    /// aggregate permits.
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_registry(&self.host, op);
 
-        // Ensure the window entry exists, then capture the semaphore + bucket.
         let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
             let state = map
@@ -518,10 +448,8 @@ impl AimdController {
             (Arc::clone(&state.semaphore), state.bucket.clone())
         };
 
-        // Bucket gate: acquire BEFORE concurrency permits so a paced action
-        // does not occupy a slot that could service another window. Released
-        // to other tasks during sleep (lock is dropped before await inside
-        // TokenBucket::acquire).
+        // Paced before any permit, so a paced action holds no slot another
+        // window could use.
         if let Some(b) = &bucket {
             b.acquire().await;
         }
@@ -548,10 +476,7 @@ impl AimdController {
         }
     }
 
-    /// Current window limit for the given operation type.
-    ///
-    /// Returns the limit stored in the window, or the default initial value if
-    /// no window has been allocated for this operation yet.
+    /// Current window limit for `op`, the initial value before its first use.
     pub fn window_limit(&self, op: RegistryAction) -> usize {
         let key = window_key_for_registry(&self.host, op);
         let map = self.windows.lock().expect("aimd lock poisoned");
@@ -597,10 +522,8 @@ impl AimdPermit<'_> {
     /// Report a successful response and release both permits.
     pub fn success(self) {}
 
-    /// Report a 429 throttle response and release both permits.
-    ///
-    /// Triggers a multiplicative decrease in the per-action window (subject to
-    /// the congestion epoch).
+    /// Report a 429 throttle response and release both permits, halving
+    /// the window at most once per congestion epoch.
     pub fn throttled(mut self) {
         self.outcome = Outcome::Throttled;
     }

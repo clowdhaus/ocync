@@ -32,7 +32,7 @@ impl Sha256 {
         out
     }
 
-    /// Convenience: hash `data` in one shot and return the 32-byte digest.
+    /// Hash `data` in one shot.
     pub fn digest(data: &[u8]) -> [u8; 32] {
         let mut h = Self::new();
         h.update(data);

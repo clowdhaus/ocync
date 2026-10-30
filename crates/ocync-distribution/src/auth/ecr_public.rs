@@ -11,10 +11,6 @@
 //!
 //! ECR Public is a global service; the API endpoint is always in
 //! `us-east-1` regardless of where the caller runs.
-//!
-//! Registry credentials are cached with TTL and refreshed automatically
-//! when they approach expiry, matching [`super::ecr::EcrAuth`]'s
-//! behavior for long-running processes (watch mode).
 
 use std::fmt;
 use std::future::Future;
@@ -98,11 +94,8 @@ impl EcrApi for AwsEcrPublicApi {
     }
 }
 
-/// Decode an ECR authorization token into OCI registry credentials.
-///
-/// ECR tokens are base64-encoded `AWS:<password>`. This extracts the
-/// password and returns `Credentials::Basic` for use in OCI Bearer
-/// token exchange, along with the token's TTL.
+/// The Basic credentials for the token exchange that an ECR Public
+/// authorization token carries, with its lifetime.
 fn decode_ecr_credentials(
     encoded_token: String,
     ttl: Option<Duration>,
@@ -118,30 +111,13 @@ fn decode_ecr_credentials(
     ))
 }
 
-/// AWS ECR Public authentication provider.
-///
-/// Obtains AWS credentials via `ecr-public:GetAuthorizationToken` (always
-/// targeting `us-east-1`), then uses them as HTTP Basic credentials in
-/// the standard OCI Bearer token exchange flow.
-///
-/// Registry credentials are cached via [`CredentialCache`] as in
-/// [`super::ecr::EcrAuth`], supporting long-running processes (watch mode).
-///
-/// Bearer tokens are coalesced per scope via [`TokenCache`]: concurrent
-/// fetches for the same scope produce one token exchange while distinct
-/// scopes run in parallel.
+/// AWS ECR Public authentication provider. See the module docs.
 pub struct EcrPublicAuth {
-    /// The registry base URL.
     base_url: String,
-    /// HTTP client for OCI token exchange.
     http: reqwest::Client,
-    /// ECR Public API for credential refresh.
     api: Box<dyn EcrApi>,
-    /// Cached registry credentials (username/password) with TTL-based refresh.
     credential_cache: CredentialCache<Credentials, Error>,
-    /// Per-scope coalescing Bearer token cache.
     tokens: TokenCache,
-    /// What the token endpoint's refusals of the credentials come to.
     recovery: Recovery<Credentials>,
 }
 
@@ -154,13 +130,10 @@ impl fmt::Debug for EcrPublicAuth {
 }
 
 impl EcrPublicAuth {
-    /// Create a new ECR Public auth provider.
-    ///
-    /// Constructs the ECR Public client targeting `us-east-1`.
-    /// Credentials are fetched lazily on the first `get_token` call and
-    /// refreshed automatically when approaching expiry, and shared through
-    /// `aws_credentials` with other clients in `us-east-1` for the profile
-    /// `AWS_PROFILE` selects, or `default`.
+    /// Create an ECR Public auth provider. Credentials are fetched on the
+    /// first `get_token` call and shared through `aws_credentials` with other
+    /// clients in `us-east-1` for the profile `AWS_PROFILE` selects, or
+    /// `default`.
     pub fn new(
         http: reqwest::Client,
         aws_credentials: &crate::AwsCredentialProviders,
@@ -183,7 +156,7 @@ impl EcrPublicAuth {
         })
     }
 
-    /// Create an ECR Public auth provider with an injected API (test helper).
+    /// Create an ECR Public auth provider with an injected API.
     #[cfg(test)]
     fn with_api(
         base_url: impl Into<String>,

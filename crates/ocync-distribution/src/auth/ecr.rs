@@ -12,11 +12,7 @@ use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
 
-/// Default ECR token lifetime (12 hours).
-///
-/// Used as a fallback when the API response does not include an expiry
-/// timestamp. The actual `GetAuthorizationToken` response includes an
-/// `expiresAt` field that is preferred when available.
+/// ECR token lifetime when the answer carries no `expiresAt`.
 const ECR_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Response from an ECR `GetAuthorizationToken` call.
@@ -28,10 +24,7 @@ pub(super) struct EcrTokenResponse {
     pub expires_in: Option<Duration>,
 }
 
-/// Abstraction over ECR `GetAuthorizationToken` for testability.
-///
-/// Implementations are pre-configured with a specific registry. The default
-/// ([`AwsEcrApi`]) holds a client constructed once at [`EcrAuth::new`] time.
+/// ECR's `GetAuthorizationToken` for one registry, injectable for tests.
 pub(super) trait EcrApi: Send + Sync {
     /// Fetch an authorization token from ECR.
     fn get_authorization_token(
@@ -120,7 +113,6 @@ impl EcrApi for AwsEcrApi {
                 )
             })?;
 
-            // Prefer the API-provided expiry over the hardcoded default.
             let expires_in = auth_data.expires_at.map(remaining);
 
             Ok(EcrTokenResponse {
@@ -182,24 +174,11 @@ impl AuthorizationToken {
     }
 }
 
-/// AWS ECR authentication provider.
-///
-/// Obtains authorization tokens via `GetAuthorizationToken`, through a
-/// client created once at construction time. Tokens are cached via
-/// [`CredentialCache`] and refreshed when they approach expiry, one refresh
-/// shared by the callers that ask while it is in flight. The token lifetime
-/// is read from the API response, falling back to 12 hours.
-///
-/// Supports all AWS credential sources via the default credential chain:
-/// environment variables, shared config/credential files, IMDS/ECS
-/// container credentials, IRSA (IAM Roles for Service Accounts), and
-/// EKS Pod Identity.
+/// AWS ECR authentication provider: a `GetAuthorizationToken` token, cached
+/// until it nears expiry and sent as Basic auth.
 pub struct EcrAuth {
-    /// The ECR registry hostname.
     hostname: String,
-    /// Cached ECR token with TTL-based refresh.
     credential_cache: CredentialCache<Token, Error>,
-    /// ECR API implementation.
     api: Box<dyn EcrApi>,
 }
 
@@ -212,18 +191,14 @@ impl std::fmt::Debug for EcrAuth {
 }
 
 impl EcrAuth {
-    /// Create a new ECR auth provider for the given registry hostname.
+    /// Create an ECR auth provider for the registry hostname. Fails when the
+    /// hostname names no region, or a configured endpoint URL is combined
+    /// with FIPS or dual-stack.
     ///
-    /// Loads the AWS config and constructs the ECR client once. Returns
-    /// an error if the region cannot be extracted from the hostname, or if
-    /// a configured endpoint URL is combined with FIPS or dual-stack.
-    ///
-    /// When `profile` is `Some`, credential resolution is scoped to that
-    /// named profile in the shared credentials/config file. When `None`,
-    /// the ambient default credential chain is used unchanged. Credentials
-    /// come from `aws_credentials`, shared only with clients for the same profile and
-    /// region, such as this registry's batch checker, so a profile override
-    /// does not leak across registries.
+    /// `profile` scopes credential resolution to that named profile, `None`
+    /// to the default chain. Credentials come from `aws_credentials`, shared
+    /// only with clients for the same profile and region, so a profile
+    /// override does not leak across registries.
     pub fn new(
         hostname: impl Into<String>,
         profile: Option<&str>,
@@ -251,7 +226,7 @@ impl EcrAuth {
         }
     }
 
-    /// Replace the cached token (test helper).
+    /// Replace the cached token.
     #[cfg(test)]
     fn set_cached_token(&self, token: Token) {
         self.credential_cache.set(token, Duration::from_secs(10));
@@ -268,8 +243,7 @@ impl EcrAuth {
                 let token = AuthorizationToken::parse(response.encoded_token, &self.hostname)?;
                 let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
-                // ECR expects `Authorization: Basic <base64(AWS:password)>`. The encoded
-                // token from GetAuthorizationToken is already in the right format.
+                // The encoded token is already ECR's `Basic` credential.
                 let token = Token::with_ttl(token.into_encoded(), ttl).with_scheme(AuthScheme::Basic);
                 Ok((token, ttl))
             })

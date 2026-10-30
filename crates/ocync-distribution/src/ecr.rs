@@ -71,10 +71,7 @@ pub(crate) fn api_client(
     crate::aws::Client::from_env(region, profile, crate::aws::Service::Ecr, aws_credentials)
 }
 
-/// Maximum number of layer digests per `BatchCheckLayerAvailability` API call.
-///
-/// ECR enforces a limit of 100 digests per request. Larger batches are
-/// automatically split into multiple API calls.
+/// ECR's limit on layer digests per `BatchCheckLayerAvailability` call.
 const MAX_DIGESTS_PER_BATCH: usize = 100;
 
 /// Boxed future returned by [`BatchBlobChecker::check_blob_existence`].
@@ -125,19 +122,13 @@ type WaitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + 'a>>;
 /// converge. Doubles on each subsequent poll up to [`MAX_POLL_INTERVAL`].
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Upper bound on the poll interval used while waiting on the ECR
-/// consistency view. Keeps the worst-case stale period bounded so a
-/// blob that becomes available right after a long sleep is picked up
-/// quickly.
+/// Upper bound on the poll interval while waiting on the ECR consistency
+/// view, so a blob that turns available during a long sleep is seen soon.
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Async trait for batch blob existence checking.
-///
-/// Used by the sync engine to efficiently determine which blobs already exist
-/// at an ECR target registry before initiating transfers, and to gate manifest
-/// commits on blob visibility (see [`Self::wait_for_blobs_available`]).
-/// Implementations are intended to be held as `Rc<dyn BatchBlobChecker>` on a
-/// single-threaded tokio runtime, so no `Send` or `Sync` bounds are required.
+/// Batch blob existence checking at a target, ahead of transfers and
+/// manifest commits. Held as `Rc<dyn BatchBlobChecker>` on the
+/// single-threaded runtime, so it needs no `Send` or `Sync`.
 pub trait BatchBlobChecker {
     /// Check which blobs exist in the given repository.
     ///
@@ -150,38 +141,17 @@ pub trait BatchBlobChecker {
         digests: &'a [Digest],
     ) -> CheckFuture<'a>;
 
-    /// Wait until all `digests` are reported available by the target.
+    /// Wait until all `digests` are reported available, polling with
+    /// exponential backoff until `deadline`.
     ///
-    /// Polls [`Self::check_blob_existence`] with exponential backoff
-    /// (starting at [`INITIAL_POLL_INTERVAL`], doubling up to
-    /// [`MAX_POLL_INTERVAL`]) until either every digest is reported
-    /// available or `deadline` is reached.
+    /// ECR's manifest validation is eventually consistent with blob uploads:
+    /// a blob `PUT` returns 201 while the validator's view can lag hundreds
+    /// of milliseconds to several seconds at high concurrency, and a
+    /// manifest `PUT` in that window fails 404 `BLOB_UPLOAD_UNKNOWN`.
     ///
-    /// # Why this exists
-    ///
-    /// ECR's manifest-validation index is eventually consistent with
-    /// blob upload state. A blob `PUT /v2/.../blobs/...` returns
-    /// 201 Created while the validator's view can lag for hundreds of
-    /// milliseconds to several seconds at high concurrency. A manifest
-    /// `PUT` issued during this window fails with HTTP 404 carrying
-    /// `BLOB_UPLOAD_UNKNOWN`. Calling this method before manifest push
-    /// gates the commit on the consistency view directly rather than
-    /// relying on retry budget alone.
-    ///
-    /// # Error semantics
-    ///
-    /// Returns `Ok(())` once every digest is available. Returns an
-    /// `Err` with [`Error::EcrApi`] carrying the count of still-missing
-    /// digests when `deadline` expires; the caller is expected to log
-    /// and proceed with the standard retry path. Individual poll
-    /// failures (transient ECR API errors) are logged as warnings and
-    /// treated as "no progress this iteration" -- the loop continues
-    /// until `deadline`.
-    ///
-    /// # Default implementation
-    ///
-    /// The default polls `check_blob_existence` and returns early on
-    /// full availability. Tests may override to avoid real sleeping.
+    /// At `deadline` returns [`Error::EcrApi`] with the count still missing;
+    /// the caller logs it and proceeds on the standard retry path. A failed
+    /// poll is logged as a warning and counts as no progress.
     fn wait_for_blobs_available<'a>(
         &'a self,
         repo: &'a RepositoryName,
@@ -194,10 +164,8 @@ pub trait BatchBlobChecker {
     }
 }
 
-/// Default polling loop shared by every [`BatchBlobChecker`] impl.
-///
-/// Free function so the trait remains object-safe under `Rc<dyn ...>`
-/// while still factoring out the polling logic.
+/// Default polling loop shared by every [`BatchBlobChecker`] impl, a free
+/// function so the trait stays object-safe.
 async fn default_wait_for_blobs_available<T>(
     checker: &T,
     repo: &RepositoryName,
@@ -213,11 +181,8 @@ where
 
     let start = tokio::time::Instant::now();
     let mut interval = INITIAL_POLL_INTERVAL;
-    // Track the surface of "still missing" so we only re-query the
-    // shrinking remainder, not the full input on every poll. ECR
-    // BatchCheckLayerAvailability counts toward an account-level quota
-    // (10 TPS), so trimming the request size reduces blast radius when
-    // the wait spans several seconds.
+    // Only the shrinking remainder is re-queried: the call counts toward an
+    // account-level quota (10 TPS).
     let mut remaining: Vec<Digest> = digests.to_vec();
 
     loop {
@@ -248,19 +213,14 @@ where
             });
         }
 
-        // Cap sleep so we never overshoot the deadline by more than one
-        // interval, which would be observable as a wait noticeably
-        // longer than requested.
+        // Never sleep past the deadline.
         let sleep_for = interval.min(deadline.saturating_sub(elapsed));
         tokio::time::sleep(sleep_for).await;
         interval = interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
 }
 
-/// Abstraction over ECR batch API calls for testability.
-///
-/// Wraps `BatchCheckLayerAvailability` so tests can inject mock responses
-/// without a network.
+/// ECR's `BatchCheckLayerAvailability`, injectable for tests.
 trait EcrBatchApi {
     /// Call `BatchCheckLayerAvailability` for a single batch (up to 100 digests).
     fn batch_check_layer_availability<'a>(
@@ -397,12 +357,7 @@ impl EcrBatchApi for AwsEcrBatchApi {
     }
 }
 
-/// ECR batch checker.
-///
-/// Provides bulk blob existence checking via `BatchCheckLayerAvailability`,
-/// splitting large batches into chunks of 100 (the ECR API limit per call).
-///
-/// Construct via [`BatchChecker::from_hostname`] with an ECR hostname.
+/// ECR batch checker over `BatchCheckLayerAvailability`.
 pub struct BatchChecker {
     api: Box<dyn EcrBatchApi>,
 }
@@ -414,18 +369,13 @@ impl std::fmt::Debug for BatchChecker {
 }
 
 impl BatchChecker {
-    /// Create a batch checker from an ECR hostname.
+    /// Create a batch checker for an ECR hostname, failing when it names no
+    /// region.
     ///
-    /// Extracts the AWS region and 12-digit registry ID from the hostname,
-    /// then loads the AWS config and builds the ECR client. Returns an error
-    /// if the region cannot be determined from the hostname.
-    ///
-    /// `profile` must match the value passed to the corresponding
-    /// [`crate::auth::EcrAuth::new`]; otherwise the batch checker authenticates
-    /// as a different identity than the auth provider, which silently breaks
-    /// `BatchCheckLayerAvailability` for registries reachable only via the
-    /// named profile. Passing the same `aws_credentials` as the auth provider lets
-    /// the two share one credential load.
+    /// `profile` must match the one passed to [`crate::auth::ecr::EcrAuth::new`],
+    /// or the checker authenticates as another identity and silently fails
+    /// for registries reachable only through the named profile. The same
+    /// `aws_credentials` lets the two share one credential load.
     pub fn from_hostname(
         hostname: &str,
         profile: Option<&str>,
@@ -449,7 +399,7 @@ impl BatchChecker {
         Self { api: Box::new(api) }
     }
 
-    /// Check blob existence, splitting into batches of 100.
+    /// Check blob existence in batches of [`MAX_DIGESTS_PER_BATCH`].
     async fn check_batched(
         &self,
         repo: &RepositoryName,

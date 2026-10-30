@@ -27,9 +27,7 @@ const AUTHORIZATION: &str = "authorization";
 /// The AWS key to sign with, borrowed from the credential that holds it.
 #[derive(Clone, Copy)]
 pub(super) struct AccessKey<'a> {
-    /// The access key ID.
     pub(super) id: &'a str,
-    /// The secret access key.
     pub(super) secret: &'a str,
     /// The session token of a temporary credential.
     pub(super) session_token: Option<&'a str>,
@@ -45,7 +43,6 @@ impl fmt::Debug for AccessKey<'_> {
 
 /// The parts of an HTTP request that are signed.
 pub(super) struct Request<'a> {
-    /// The HTTP method.
     pub(super) method: &'a http::Method,
     /// The path as sent, already percent-encoded once.
     pub(super) path: &'a str,
@@ -54,7 +51,6 @@ pub(super) struct Request<'a> {
     /// The headers to sign, including `host`. The signer adds
     /// [`X_AMZ_DATE`], [`X_AMZ_SECURITY_TOKEN`] and `authorization` itself.
     pub(super) headers: &'a [(&'a str, &'a str)],
-    /// The request body.
     pub(super) body: &'a [u8],
 }
 

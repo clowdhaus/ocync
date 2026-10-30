@@ -18,10 +18,8 @@ const USER_AGENT_VALUE: &str = concat!("ocync/", env!("CARGO_PKG_VERSION"));
 
 /// Build a no-redirect HTTP client for token-bearing requests.
 ///
-/// Uses `redirect::Policy::none()` to prevent open-redirect SSRF: a
-/// 307 redirect from a malicious endpoint would forward credentials
-/// (realm auth headers, ACR exchange form bodies) to the redirect
-/// target. Also used by the ACR provider for exchange POSTs.
+/// Following a redirect would forward credentials (realm auth headers, ACR
+/// exchange form bodies) to whatever target a malicious endpoint names.
 pub(crate) fn no_redirect_http_client() -> reqwest::Client {
     no_redirect_builder()
         .build()
@@ -63,23 +61,17 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: usize = DEFAULT_BLOB_UPLOAD_CONCURRENCY
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
-/// The fallback upload paths (GHCR single-PATCH, ACR chunked PATCH) both
-/// buffer the entire blob in memory because the target
-/// registry cannot accept a streaming body. With
-/// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] = 64 and no byte cap, 64
-/// concurrent 1 GB layers (common for CUDA/ML images) would hold ~64 GB
-/// resident -- enough to OOM most hosts.
-///
-/// A 512 MB budget gives the engine ~32x the steady-state working set of
-/// a typical 16 MB layer image while keeping worst-case memory bounded.
-/// Sized large enough that uploads of multiple modest layers do not
-/// serialise on the semaphore, small enough that a single oversized layer
-/// (e.g. 2 GB GPU runtime) cannot run alongside any other buffered upload.
+/// The fallback upload paths (GHCR single-PATCH, ACR chunked PATCH) buffer
+/// the whole blob because the target cannot accept a streaming body. With
+/// 64 concurrent uploads and no byte cap, 1 GB layers (common for CUDA/ML
+/// images) would hold ~64 GB resident. 512 MB is ~32x a typical 16 MB
+/// layer, so modest layers do not serialise, while a single oversized layer
+/// (e.g. 2 GB GPU runtime) runs alone.
 const DEFAULT_BUFFERED_BLOB_BYTES: usize = 512 * 1024 * 1024;
 
 /// Fallback acquisition size when a fallback upload has no `known_size`
-/// hint. Equals `blob::MAX_BUFFER_PREALLOC` (the same defensive cap
-/// applied to the initial buffer allocation in `blob::buffer_stream`).
+/// hint. Equals `blob::MAX_BUFFER_PREALLOC`, the buffer's own initial
+/// allocation cap.
 const BUFFERED_BLOB_BYTES_FALLBACK_RESERVE: u32 = 16 * 1024 * 1024;
 
 /// Sentinel value stored in [`RegistryClient::rate_limit_remaining`] when no
@@ -93,32 +85,12 @@ pub struct RegistryClientBuilder {
     url: Url,
     auth: Option<Box<dyn AuthProvider>>,
     max_concurrent: usize,
-    /// Cap on concurrent blob uploads. Defaults to
-    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
     blob_upload_concurrency: usize,
-    /// Cap on concurrent blob downloads. Defaults to
-    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
     blob_download_concurrency: usize,
-    /// Byte budget for in-flight buffered blob bodies on fallback upload
-    /// paths (GHCR / ACR). Defaults to [`DEFAULT_BUFFERED_BLOB_BYTES`].
     buffered_blob_bytes: usize,
-    /// Static DNS overrides applied to the internal reqwest client.
-    /// Each entry maps a hostname to a fixed socket address, bypassing
-    /// DNS resolution. Used by integration tests to route ECR-hostname
-    /// requests at a local mock server without leaking `reqwest::Client`
-    /// into the public API.
     dns_overrides: Vec<(String, std::net::SocketAddr)>,
-    /// When `true`, the internal reqwest client accepts any server
-    /// certificate without validation. Test-only -- see
-    /// [`RegistryClientBuilder::allow_invalid_certs`].
     accept_invalid_certs: bool,
-    /// When `true`, the internal reqwest client refuses to negotiate
-    /// HTTP/2 via ALPN. Test-only -- see
-    /// [`RegistryClientBuilder::force_http1`].
     force_http1: bool,
-    /// When `true`, the internal reqwest client enables HTTP/2
-    /// adaptive-window sizing. Defaults to `true` -- see the comment in
-    /// [`RegistryClientBuilder::build`] for the motivation.
     h2_adaptive_window: bool,
 }
 
@@ -133,9 +105,7 @@ impl std::fmt::Debug for RegistryClientBuilder {
 }
 
 impl RegistryClientBuilder {
-    /// Create a new builder for the given registry URL.
-    ///
-    /// The URL should be the base registry URL (e.g. `https://registry-1.docker.io`).
+    /// A builder for the base registry URL (e.g. `https://registry-1.docker.io`).
     pub fn new(url: Url) -> Self {
         Self {
             url,
@@ -147,8 +117,6 @@ impl RegistryClientBuilder {
             dns_overrides: Vec::new(),
             accept_invalid_certs: false,
             force_http1: false,
-            // Default-on: see note in `build`. The builder method below
-            // can be used to disable for A/B testing.
             h2_adaptive_window: true,
         }
     }
@@ -159,128 +127,76 @@ impl RegistryClientBuilder {
         self
     }
 
-    /// Set the maximum number of concurrent requests.
-    ///
-    /// Values of `0` are clamped to `1` so the resulting semaphore can
-    /// always make forward progress. Pass at least `1` to opt out of the
-    /// clamp.
+    /// Set the maximum number of concurrent requests. `0` is clamped to `1`
+    /// so the semaphore always makes progress.
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n.max(1);
         self
     }
 
-    /// Set the cap on concurrent blob uploads.
-    ///
-    /// Each blob upload PUT holds an HTTP/2 stream open for the duration of
-    /// the transfer. Reqwest/hyper uses one h2
-    /// connection per origin, so this cap must stay under the server's
-    /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (typically 100-128 on
-    /// major registries) minus headroom for metadata operations
-    /// (manifest HEAD/GET, blob mount, auth refresh).
-    ///
-    /// Default: [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] (64).
+    /// Set the cap on concurrent blob uploads. It must stay under the
+    /// server's HTTP/2 stream limit; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`],
+    /// the default.
     pub fn blob_upload_concurrency(mut self, n: usize) -> Self {
         self.blob_upload_concurrency = n.max(1);
         self
     }
 
-    /// Set the cap on concurrent blob downloads, each its own HTTP/1.1
-    /// connection while its body is open.
-    ///
-    /// Default: [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
+    /// Set the cap on concurrent blob downloads. Default:
+    /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
     #[cfg(test)]
     pub(crate) fn blob_download_concurrency(mut self, n: usize) -> Self {
         self.blob_download_concurrency = n.max(1);
         self
     }
 
-    /// Set the byte budget for in-flight buffered blob bodies.
+    /// Set the byte budget for in-flight buffered blob bodies on the
+    /// fallback upload paths (GHCR / ACR); the streaming PUT path does not
+    /// buffer and is unaffected. Uploads that would exceed the budget queue.
     ///
-    /// Caps total resident memory across the fallback upload paths
-    /// (GHCR / ACR) that must buffer a blob before sending. Each
-    /// fallback upload acquires permits equal to its declared blob size
-    /// (capped at the budget) and releases them when the upload
-    /// completes; concurrent uploads that would exceed the budget queue.
+    /// `n` is clamped to at least 1. A budget below
+    /// [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] still admits unknown-size
+    /// uploads, since each request is capped at the budget.
     ///
-    /// The streaming PUT default path does not buffer and is unaffected.
-    ///
-    /// `n` is clamped to a minimum of 1 (so the semaphore can always
-    /// make forward progress) but is otherwise honored verbatim. Values
-    /// smaller than [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] are valid:
-    /// the permit acquisition logic caps requests at the configured
-    /// budget, so unknown-size uploads (which would otherwise request
-    /// the full fallback reserve) still admit on a small-budget client.
-    ///
-    /// Default: [`DEFAULT_BUFFERED_BLOB_BYTES`] (512 MB).
+    /// Default: [`DEFAULT_BUFFERED_BLOB_BYTES`].
     pub fn buffered_blob_bytes(mut self, n: usize) -> Self {
         self.buffered_blob_bytes = n.max(1);
         self
     }
 
-    // -----------------------------------------------------------------
-    // Diagnostic / perf-harness test hooks
-    //
-    // The three builder methods below (`allow_invalid_certs`,
-    // `force_http1`, `http2_adaptive_window`) are deliberately kept on
-    // the public builder surface even though no production code path
-    // reaches them. They exist for in-repo perf and A/B harnesses --
-    // primarily `crates/ocync-sync/tests/perf_profile.rs`, which:
-    //   - terminates TLS at a `testcontainers` `registry:2` instance
-    //     with a generated self-signed cert (needs `allow_invalid_certs`),
-    //   - compares HTTP/2 vs HTTP/1.1 throughput by toggling
-    //     `force_http1` between runs,
-    //   - and A/Bs the HTTP/2 adaptive flow-control window via
-    //     `http2_adaptive_window(false)`.
-    //
-    // Each is `#[doc(hidden)]` so it never appears in published rustdoc,
-    // and the production CLI deliberately does NOT expose any flag or
-    // env var that toggles them. They are **intentionally retained** so
-    // future perf investigations can reproduce the experiments without
-    // re-introducing the plumbing from scratch. DO NOT delete as
-    // "unused" -- they are referenced from the perf harness and are
-    // load-bearing for repeatability.
-    // -----------------------------------------------------------------
+    // The three hooks below have no production caller and no CLI flag or
+    // env var reaches them. They stay public for the perf harness,
+    // `crates/ocync-sync/tests/perf_profile.rs`; do not delete as unused.
 
-    /// Accept any server certificate without validation.
-    ///
-    /// Test-only escape hatch for the perf profile harness, which
-    /// terminates TLS at a local `registry:2` instance with a generated
-    /// self-signed cert. Hidden from public docs; never use in
-    /// production code.
+    /// Accept any server certificate without validation, for the perf
+    /// harness's self-signed local registry. Never use in production.
     #[doc(hidden)]
     pub fn allow_invalid_certs(mut self, allow: bool) -> Self {
         self.accept_invalid_certs = allow;
         self
     }
 
-    /// Refuse to negotiate HTTP/2 via ALPN for every request but blob
-    /// downloads, which always use HTTP/1.1. Test-only escape hatch for the
-    /// perf profile harness, used to isolate HTTP/2-multiplexing stalls on
-    /// metadata and uploads. Hidden from public docs; never use in
-    /// production code.
+    /// Refuse to negotiate HTTP/2 via ALPN (blob downloads always use
+    /// HTTP/1.1), to isolate HTTP/2 multiplexing stalls in the perf harness.
+    /// Never use in production.
     #[doc(hidden)]
     pub fn force_http1(mut self, force: bool) -> Self {
         self.force_http1 = force;
         self
     }
 
-    /// Configure HTTP/2 adaptive-window sizing via reqwest's
-    /// `http2_adaptive_window`. Defaults to enabled -- see the note in
-    /// `build` for motivation. This setter is for A/B testing the
-    /// disabled path; production callers should not need to touch it.
+    /// Toggle HTTP/2 adaptive-window sizing (enabled by default), for A/B
+    /// testing the disabled path.
     #[doc(hidden)]
     pub fn http2_adaptive_window(mut self, enable: bool) -> Self {
         self.h2_adaptive_window = enable;
         self
     }
 
-    /// Pin DNS resolution for `host` to `addr`, bypassing the system
-    /// resolver for that hostname only.
+    /// Pin DNS resolution for `host` to `addr`. Multiple calls stack.
     ///
-    /// Used by integration tests to route a real-looking hostname (e.g.
-    /// `123456789012.dkr.ecr.us-east-1.amazonaws.com`) at a local mock
-    /// server, so the client exercises the same provider-detection path
-    /// it would against the real registry. Multiple calls stack.
+    /// Lets tests route a real registry hostname at a mock server so
+    /// provider detection runs as it would in production.
     pub fn resolve(mut self, host: impl Into<String>, addr: std::net::SocketAddr) -> Self {
         self.dns_overrides.push((host.into(), addr));
         self
@@ -303,13 +219,9 @@ impl RegistryClientBuilder {
         if self.force_http1 {
             http_builder = http_builder.http1_only();
         }
-        // Enable HTTP/2 adaptive flow-control window sizing for the
-        // responses this client receives (everything but blob downloads).
-        // Hyper's fixed defaults are 2 MiB per stream and 5 MiB per
-        // connection; adaptive sizing starts both at 65,535 bytes and grows
-        // them with measured throughput. Off by default in reqwest.
-        //
-        // Test hook: `http2_adaptive_window(false)` disables for A/B.
+        // Adaptive flow-control windows (off by default in reqwest) start at
+        // 65,535 bytes and grow with measured throughput, instead of hyper's
+        // fixed 2 MiB per stream and 5 MiB per connection.
         if self.h2_adaptive_window {
             http_builder = http_builder.http2_adaptive_window(true);
         }
@@ -351,38 +263,22 @@ pub struct RegistryClient {
     pub(crate) blob_download_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
-    /// Cap on concurrent blob uploads. Acquired by
-    /// [`Self::blob_push_stream`] to keep the per-connection HTTP/2 stream
-    /// usage below the server's
-    /// advertised `SETTINGS_MAX_CONCURRENT_STREAMS`. See the constant
-    /// `DEFAULT_BLOB_UPLOAD_CONCURRENCY` for the rationale and probed
-    /// numbers per registry.
+    /// Cap on concurrent blob uploads; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
     pub(crate) blob_upload_sem: Arc<Semaphore>,
     /// Cap on concurrent blob downloads, held by [`Self::blob_pull`]'s
     /// stream until it is dropped. Never shared with uploads: a copy holds
     /// one while its upload waits for an upload permit, which would
     /// deadlock if both came from one semaphore.
     pub(crate) blob_download_sem: Arc<Semaphore>,
-    /// Byte-budget semaphore for in-flight buffered blob bodies. One
-    /// permit == one byte. Acquired by the GHCR / ACR fallback
-    /// upload paths (which buffer the entire blob) before
-    /// `buffer_stream`, released when the buffered upload completes. The
-    /// total permit count caps cross-call resident bytes regardless of
-    /// per-call concurrency.
+    /// Byte budget for buffered blob bodies, one permit per byte, held by
+    /// the fallback upload paths from before `buffer_stream` until the
+    /// upload completes.
     pub(crate) buffered_blob_bytes_sem: Arc<Semaphore>,
-    /// Configured byte budget passed to `buffered_blob_bytes_sem`. Held
-    /// so [`Self::acquire_buffered_bytes_permit`] can cap a single
-    /// oversized blob at the entire budget instead of permanently
-    /// blocking; without this cap, a blob larger than the configured
-    /// budget would request more permits than the semaphore can ever
-    /// hold.
+    /// Total permits in `buffered_blob_bytes_sem`, so one oversized blob
+    /// can be capped at the whole budget instead of blocking forever.
     pub(crate) buffered_blob_bytes_budget: usize,
-    /// Last observed rate-limit remaining value from response headers.
-    ///
-    /// Updated atomically on every response that carries a `ratelimit-remaining`
-    /// (Docker Hub) or `x-ratelimit-remaining` (GHCR) header. Stores
-    /// [`RATE_LIMIT_UNKNOWN`] until the first such header is seen. The engine
-    /// reads this to decide whether to pause discovery (budget circuit breaker).
+    /// Last observed rate-limit remaining value, [`RATE_LIMIT_UNKNOWN`] until
+    /// a header carries one.
     rate_limit_remaining: AtomicU64,
 }
 
@@ -396,12 +292,8 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 }
 
 impl RegistryClient {
-    /// Acquire a permit gating concurrent blob uploads.
-    ///
-    /// Held by blob upload paths for the duration of the streaming HTTP/2
-    /// PUT body. Released automatically when the returned permit is
-    /// dropped. See [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] for the
-    /// rationale.
+    /// Acquire a permit gating concurrent blob uploads, held for the whole
+    /// upload body. See [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
     pub(crate) async fn acquire_blob_upload_permit(&self) -> OwnedSemaphorePermit {
         acquire_permit(&self.blob_upload_sem).await
     }
@@ -415,17 +307,9 @@ impl RegistryClient {
     /// Acquire both the per-target count permit and the byte-budget
     /// permit for a fallback (buffered) blob upload, in the right order.
     ///
-    /// Returns `(bytes_permit, upload_permit)`. Both are held by the
-    /// caller for the duration of the buffered upload; Rust tuples drop
-    /// fields in declaration order, so `bytes_permit` is released
-    /// FIRST on scope exit. Releasing the contested byte budget ahead
-    /// of the count cap is the right order: a fallback that completes
-    /// freeing 6 MB lets queued buffered uploads admit immediately,
-    /// while the upload cap (default 64) is rarely the bottleneck
-    /// at typical workloads. See the per-cap docs on
-    /// [`Self::acquire_blob_upload_permit`] and
-    /// [`Self::acquire_buffered_bytes_permit`] for the semantics of
-    /// each.
+    /// Returns `(bytes_permit, upload_permit)`. Tuples drop in field order,
+    /// so the contested byte budget is released before the count cap,
+    /// letting queued buffered uploads admit at once.
     pub(crate) async fn acquire_buffered_upload_permits(
         &self,
         known_size: Option<u64>,
@@ -437,36 +321,22 @@ impl RegistryClient {
 
     /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
     ///
-    /// `expected` is the manifest-declared blob size when known, or
-    /// `None` when the upload is driven by an opaque stream (rare in
-    /// practice; manifests always declare layer size). Acquisition rules:
+    /// `expected` is the manifest-declared blob size, `None` for an opaque
+    /// stream.
     ///
-    /// - If `expected` is `Some(n)`: acquire `min(n, budget, u32::MAX)`
-    ///   permits. The cap at `budget` ensures a single oversized blob
-    ///   never requests more permits than the semaphore can hold
-    ///   (which would deadlock the entire fallback path). When this
-    ///   cap fires, the oversized blob occupies the entire budget and
-    ///   other fallback uploads queue until it completes -- correct
-    ///   semantics, even though the actual memory used exceeds the
-    ///   budget for that one upload.
-    /// - If `expected` is `None`: acquire
-    ///   [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`] permits as a defensive
-    ///   reserve. This matches `blob::MAX_BUFFER_PREALLOC` so we
-    ///   conservatively budget the same up-front allocation the buffer
-    ///   itself reserves; actual buffered bytes may exceed this if the
-    ///   blob is larger than the reserve, but the count cap
-    ///   (`blob_upload_sem`) still bounds total in-flight count.
+    /// - `Some(n)`: acquire `min(n, budget)` permits. An oversized blob
+    ///   takes the whole budget and others queue until it completes, though
+    ///   its memory exceeds the budget.
+    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`]. The blob
+    ///   may buffer more; the upload count cap still bounds how many.
     pub(crate) async fn acquire_buffered_bytes_permit(
         &self,
         expected: Option<u64>,
     ) -> OwnedSemaphorePermit {
         let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE as u64);
         let budget = self.buffered_blob_bytes_budget as u64;
-        // Cap at the configured budget so a single oversized blob never
-        // requests more permits than the semaphore can hold (which
-        // would deadlock the fallback path). Cap at u32::MAX because
-        // `acquire_many_owned` takes a u32. `.max(1)` guarantees forward
-        // progress when both request and budget round to zero.
+        // Above the budget the semaphore could never grant the request.
+        // `acquire_many_owned` takes a u32.
         let permits: u32 = request.min(budget).min(u32::MAX as u64).max(1) as u32;
         Arc::clone(&self.buffered_blob_bytes_sem)
             .acquire_many_owned(permits)
@@ -493,24 +363,19 @@ impl std::fmt::Debug for RegistryClient {
 }
 
 impl RegistryClient {
-    /// Create a builder for this client.
+    /// A builder for this client.
     pub fn builder(url: Url) -> RegistryClientBuilder {
         RegistryClientBuilder::new(url)
     }
 
-    /// Return the configured auth provider's name, or `None` if no auth was set.
-    ///
-    /// Exposes [`AuthProvider::name`] from the boxed provider. Used by dispatch
-    /// tests to assert that the right provider was selected for a given config
-    /// without needing to inspect the boxed trait object directly.
+    /// The configured auth provider's [`AuthProvider::name`], or `None`
+    /// without auth.
     pub fn auth_name(&self) -> Option<&'static str> {
         self.auth.as_ref().map(|a| a.name())
     }
 
-    /// Ping the registry's `/v2/` endpoint.
-    ///
-    /// Returns `Ok(())` if the registry responds with 200 or 401 (which confirms
-    /// the endpoint exists and speaks the OCI Distribution protocol).
+    /// Ping the registry's `/v2/` endpoint. A 200 or 401 is success: either
+    /// confirms it speaks the OCI Distribution protocol.
     pub async fn ping(&self) -> Result<(), Error> {
         let url = build_v2_url(&self.base_url)?;
         let resp = self.http.get(url).send().await?;
@@ -524,9 +389,7 @@ impl RegistryClient {
         }
     }
 
-    /// Return the registry authority as `host:port` for use as a cache key.
-    ///
-    /// Returns `Err` if the URL has no host (a bug in client construction).
+    /// The registry authority as `host:port`, for use as a cache key.
     pub fn registry_authority(&self) -> Result<RegistryAuthority, Error> {
         let host = self
             .base_url
@@ -539,13 +402,9 @@ impl RegistryClient {
         Ok(RegistryAuthority::new(format!("{host}:{port}")))
     }
 
-    /// Return the last observed rate-limit remaining value, or `None` if no
-    /// rate-limit header has been seen yet.
-    ///
-    /// Updated automatically by [`send_with_aimd`](Self::send_with_aimd)
-    /// from `ratelimit-remaining` (Docker Hub) or `x-ratelimit-remaining`
-    /// (GHCR) response headers. The engine reads this on source clients to
-    /// pause discovery when the budget is low (budget circuit breaker).
+    /// The last observed rate-limit remaining value, or `None` before any
+    /// rate-limit header. The engine pauses discovery on a source when this
+    /// runs low.
     pub fn rate_limit_remaining(&self) -> Option<u64> {
         let v = self.rate_limit_remaining.load(Ordering::Relaxed);
         if v == RATE_LIMIT_UNKNOWN {
@@ -555,10 +414,7 @@ impl RegistryClient {
         }
     }
 
-    /// Extract and store the rate-limit remaining value from response headers.
-    ///
-    /// Called by [`send_with_aimd`](Self::send_with_aimd) on every successful
-    /// response.
+    /// Store the rate-limit remaining value from response headers.
     fn record_rate_limit(&self, headers: &HeaderMap) {
         if let Some(remaining) = parse_rate_limit_remaining(headers) {
             self.rate_limit_remaining
@@ -566,11 +422,8 @@ impl RegistryClient {
         }
     }
 
-    /// Perform an authenticated GET request.
-    ///
-    /// Acquires an AIMD permit for the given operation, attaches auth headers,
-    /// and retries once on 401 (refusing the token sent first). Reports
-    /// throttle on 429 so the AIMD window adapts.
+    /// Perform an authenticated GET under an AIMD permit, retrying once on
+    /// 401 with the sent token refused.
     pub async fn get(
         &self,
         repository: &RepositoryName,
@@ -612,11 +465,8 @@ impl RegistryClient {
         }
     }
 
-    /// Perform an authenticated HEAD request.
-    ///
-    /// Same AIMD and retry logic as [`get`](Self::get). Pass `accept` to
-    /// set an `Accept` header, ensuring content negotiation matches what
-    /// [`get`](Self::get) would return for the same resource.
+    /// Perform an authenticated HEAD, as [`get`](Self::get). Pass the same
+    /// `accept` a GET would use so content negotiation matches.
     pub async fn head(
         &self,
         repository: &RepositoryName,
@@ -641,11 +491,8 @@ impl RegistryClient {
         classify_response(resp, &self.base_url, repository).await
     }
 
-    /// Send a request with AIMD permit tracking and 401 retry.
-    ///
-    /// Combines permit acquisition, the authenticated retry loop, and AIMD
-    /// feedback reporting into a single call. Also extracts rate-limit
-    /// remaining values from response headers (budget circuit breaker).
+    /// Send a request under an AIMD permit with one 401 retry, reporting the
+    /// outcome to AIMD and recording the rate-limit header.
     pub(crate) async fn send_with_aimd(
         &self,
         action: RegistryAction,
@@ -662,12 +509,9 @@ impl RegistryClient {
         result
     }
 
-    /// Send a request with 401 retry and token refusal.
-    ///
-    /// Builds the request via `build_request` (called with fresh auth headers),
-    /// sends it, and if a 401 is returned, refuses the token it sent and
-    /// retries once. Does NOT acquire an AIMD permit - callers manage their
-    /// own permits.
+    /// Send a request, and on 401 refuse the sent token and retry once.
+    /// `build_request` is called with fresh auth headers each time. Takes no
+    /// AIMD permit; callers hold their own.
     async fn send_with_retry(
         &self,
         scopes: &[Scope],
@@ -690,9 +534,8 @@ impl RegistryClient {
     /// Tell the auth provider the registry refused `refused` with 401, if a
     /// token was sent.
     ///
-    /// Call this before retrying a request after a 401 response so the auth
-    /// provider fetches a fresh token instead of returning the stale one.
-    /// The provider keeps any token that has replaced `refused`.
+    /// Call before retrying after a 401 so the provider fetches a fresh
+    /// token. The provider keeps any token that has replaced `refused`.
     pub(crate) async fn refuse_auth(&self, refused: Option<Token>) {
         if let (Some(auth), Some(refused)) = (&self.auth, refused) {
             auth.refuse(refused).await;
@@ -729,11 +572,9 @@ pub(crate) fn auth_headers(token: Option<&Token>) -> Result<HeaderMap, Error> {
     Ok(headers)
 }
 
-/// Report AIMD permit outcome based on the HTTP response.
-///
-/// Calls [`AimdPermit::throttled`] on 429, [`AimdPermit::success`] otherwise.
-/// Transport errors (no response at all) are treated as success by the permit's
-/// drop impl, so we only need to handle the `Ok` case explicitly.
+/// Report the AIMD permit outcome: [`AimdPermit::throttled`] on 429,
+/// [`AimdPermit::success`] otherwise. The permit's drop treats a transport
+/// error as success.
 pub(crate) fn report_permit(
     permit: crate::aimd::AimdPermit<'_>,
     result: &Result<reqwest::Response, Error>,
@@ -744,23 +585,18 @@ pub(crate) fn report_permit(
     }
 }
 
-/// Extract the rate-limit remaining value from response headers.
-///
-/// Docker Hub sends `ratelimit-remaining: N;w=21600` (N remaining in a 6-hour
-/// window). GHCR sends `x-ratelimit-remaining: N`. Returns the parsed integer
-/// from whichever header is present, preferring `ratelimit-remaining`.
+/// The rate-limit remaining value from response headers, preferring
+/// Docker Hub's `ratelimit-remaining: N;w=21600` over GHCR's
+/// `x-ratelimit-remaining: N`.
 fn parse_rate_limit_remaining(headers: &HeaderMap) -> Option<u64> {
-    // Docker Hub: `ratelimit-remaining: 99;w=21600`
     if let Some(val) = headers.get("ratelimit-remaining") {
         if let Ok(s) = val.to_str() {
-            // Take the integer before the first semicolon.
             let num_part = s.split(';').next().unwrap_or(s).trim();
             if let Ok(n) = num_part.parse::<u64>() {
                 return Some(n);
             }
         }
     }
-    // GHCR: `x-ratelimit-remaining: 99`
     if let Some(val) = headers.get("x-ratelimit-remaining") {
         if let Ok(s) = val.to_str() {
             if let Ok(n) = s.trim().parse::<u64>() {
@@ -804,13 +640,10 @@ fn build_v2_url(base: &Url) -> Result<Url, Error> {
 
 /// Construct a URL for `/v2/{repository}/{path}`.
 ///
-/// # Safety contract
-///
-/// `repository` is interpolated directly into the URL path without
-/// percent-encoding. Callers MUST pass validated repository names
-/// (e.g. via [`RepositoryName`] or a parsed [`Reference`](crate::Reference))
-/// which reject characters like `?`, `#`, and whitespace that would
-/// corrupt the URL structure.
+/// `repository` is interpolated without percent-encoding, so callers must
+/// pass a validated name ([`RepositoryName`] or a parsed
+/// [`Reference`](crate::Reference)) that cannot contain `?`, `#` or
+/// whitespace.
 pub(crate) fn build_url(base: &Url, repository: &str, path: &str) -> Result<Url, Error> {
     let full_path = format!("/v2/{repository}/{path}");
     base.join(&full_path).map_err(|e| Error::UrlConstruction {

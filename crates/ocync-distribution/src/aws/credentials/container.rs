@@ -96,19 +96,15 @@ pub(in crate::aws) enum EndpointError {
     /// The relative URI does not parse.
     #[error("invalid relative URI for ECS provider ({err}): {uri}")]
     Relative {
-        /// Why.
         #[source]
         err: InvalidUri,
-        /// The setting.
         uri: String,
     },
     /// The full URI is refused.
     #[error("invalid full URI for ECS provider ({err}): {uri}")]
     Full {
-        /// Why.
         #[source]
         err: FullUriError,
-        /// The setting.
         uri: String,
     },
 }
@@ -122,9 +118,7 @@ pub(in crate::aws) enum Error {
     /// The token file does not read.
     #[error("could not read the auth token file {}", path.display())]
     TokenFile {
-        /// The file.
         path: PathBuf,
-        /// Why.
         source: io::Error,
     },
     /// The token is not a header value.
@@ -148,9 +142,7 @@ pub(in crate::aws) enum Error {
     /// An error document in place of credentials.
     #[error("failed to load credentials [{code}]: {message}")]
     Document {
-        /// The error code.
         code: Code,
-        /// The error message.
         message: String,
     },
 }

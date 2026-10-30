@@ -11,9 +11,7 @@ use crate::error::Error;
 use crate::sha256::Sha256;
 use crate::spec::{ImageIndex, ManifestKind, MediaType, RepositoryName};
 
-/// OCI-specific header returned by registries to provide the content-addressable
-/// digest of a manifest. Not part of the HTTP standard, so no constant exists in
-/// the `http` crate.
+/// The header in which a registry reports a manifest's digest.
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
 /// Result of a manifest HEAD request.
@@ -62,13 +60,11 @@ fn referrers_path(digest: &Digest) -> String {
 }
 
 impl RegistryClient {
-    /// Check whether a manifest exists and retrieve its metadata.
+    /// Check whether a manifest exists and retrieve its metadata, `None` on
+    /// 404.
     ///
-    /// Returns `None` if the manifest is not found (404).
-    ///
-    /// The `size` field in [`ManifestHead`] is extracted from `Content-Length`.
-    /// If the header is missing or unparseable, size defaults to `0`. Callers
-    /// that need the exact manifest size should treat `0` as "unknown".
+    /// `size` comes from `Content-Length` and is `0`, meaning unknown, when
+    /// the header is missing or unparseable.
     pub async fn manifest_head(
         &self,
         repository: &RepositoryName,
@@ -121,10 +117,8 @@ impl RegistryClient {
         }
     }
 
-    /// Pull a manifest from the registry.
-    ///
-    /// Issues a GET with all supported media types in the Accept header, parses
-    /// the manifest, and computes the digest from the raw bytes.
+    /// Pull a manifest, accepting every supported media type, with its digest
+    /// computed from the raw bytes.
     pub async fn manifest_pull(
         &self,
         repository: &RepositoryName,
@@ -163,10 +157,7 @@ impl RegistryClient {
         })
     }
 
-    /// Push a manifest to the registry.
-    ///
-    /// Issues a PUT to `/v2/{repository}/manifests/{reference}` with the raw bytes
-    /// exactly as provided. Returns the digest computed from those bytes.
+    /// Push a manifest's bytes exactly as given, returning their digest.
     pub async fn manifest_push(
         &self,
         repository: &RepositoryName,
@@ -211,11 +202,8 @@ impl RegistryClient {
         Ok(digest)
     }
 
-    /// Query the referrers API for a given digest.
-    ///
-    /// Returns `None` if the registry does not support the referrers API (404).
-    /// Optionally filters by `artifact_type` (an OCI artifact MIME type string,
-    /// e.g. `application/vnd.dev.cosign.simplesigning.v1+json`).
+    /// Query the referrers API for `digest`, optionally filtered by
+    /// `artifact_type`. `None` when the registry lacks the API (404).
     pub async fn referrers(
         &self,
         repository: &RepositoryName,
@@ -225,7 +213,6 @@ impl RegistryClient {
         let path = referrers_path(digest);
         let accept = MediaType::OciIndex.as_str();
 
-        // Build URL with optional artifactType filter.
         let mut url = build_url(&self.base_url, repository, &path)?;
         if let Some(at) = artifact_type {
             url.query_pairs_mut().append_pair("artifactType", at);

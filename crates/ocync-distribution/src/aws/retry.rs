@@ -235,9 +235,8 @@ impl Default for Partition {
 type Partitions = HashMap<(ServiceId, Region), Arc<Partition>>;
 
 /// Every partition in the process. Synchronized, not `Rc<RefCell<_>>`,
-/// because the AWS client is a `Send + Sync` leaf like `RegistryClient`:
-/// the ECR auth provider holding it must be. No lock is held across an
-/// `.await`.
+/// because the AWS client is a `Send + Sync` leaf. No lock is held across
+/// an `.await`.
 static PARTITIONS: LazyLock<Mutex<Partitions>> = LazyLock::new(Mutex::default);
 
 /// The partition of `service` in `region`, shared by every client for it.
@@ -325,10 +324,9 @@ pub(super) struct CallPolicy<'a> {
     strategy: &'a Strategy,
     partition: &'a Partition,
     /// What this call's latest retry spent, returned to the quota if the
-    /// call succeeds. A newer retry replaces it and leaves the older cost
-    /// spent. The SDK keeps one permit per client, so concurrent calls
-    /// overwrite each other's and the overwritten costs never return; kept
-    /// per call, each success returns exactly what its own retry spent.
+    /// call succeeds; a newer retry replaces it. Kept per call, not per
+    /// client as in the SDK, so concurrent calls cannot overwrite each
+    /// other's and leak the cost.
     permit: Option<u32>,
 }
 

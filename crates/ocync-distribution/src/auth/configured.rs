@@ -43,11 +43,8 @@ impl SignIn {
 pub struct Auth {
     /// The registry base URL (e.g. `https://registry-1.docker.io`).
     base_url: String,
-    /// HTTP client for token requests.
     http: reqwest::Client,
-    /// The credentials sent to the token endpoint.
     sign_in: SignIn,
-    /// Per-scope coalescing token cache.
     tokens: TokenCache,
 }
 

@@ -18,28 +18,24 @@ use crate::spec::RepositoryName;
 /// Content type for raw blob data in OCI upload requests.
 const OCTET_STREAM: &str = "application/octet-stream";
 
-/// Per-PATCH chunk size for the ACR upload fallback. ACR rejects
-/// streaming PUT bodies above ~20 MB; 16 MB stays comfortably under that
-/// while keeping the round-trip count low.
+/// Per-PATCH chunk size for the ACR upload fallback, under ACR's ~20 MB
+/// limit on a streaming PUT body.
 const ACR_PATCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Upper bound on the `Vec::with_capacity` hint used by [`buffer_stream`].
 ///
-/// The hint comes from a manifest's declared blob size, which is
-/// attacker-controllable. Without a cap, a single malicious manifest can
-/// trigger a multi-GB allocation per concurrent fallback upload. Capping
-/// at 16 MB keeps the up-front allocation modest; larger streams grow the
-/// Vec organically through amortised doubling.
+/// The hint is a manifest's declared blob size, which an attacker
+/// controls: uncapped, one malicious manifest could allocate gigabytes per
+/// concurrent fallback upload. Larger streams grow the `Vec` as they arrive.
 const MAX_BUFFER_PREALLOC: usize = 16 * 1024 * 1024;
 
 /// Result of a cross-repository blob mount attempt.
 #[derive(Debug)]
 pub enum MountResult {
-    /// Registry fulfilled the mount (201 Created). The blob is now
-    /// referenced from the target repo without a data transfer.
+    /// Registry fulfilled the mount (201 Created) without a data transfer.
     Mounted,
-    /// Mount did not happen - the registry returned 202 without
-    /// fulfilling the mount. Callers fall through to push.
+    /// The registry answered 202 without mounting. Callers fall through to
+    /// push.
     NotMounted,
 }
 
@@ -48,12 +44,8 @@ fn blob_path(digest: &Digest) -> String {
     format!("blobs/{digest}")
 }
 
-/// Check an HTTP response status, returning an error with the response body
-/// if the status does not match `expected`.
-///
-/// Error messages include `registry/repository` context so operators can
-/// identify which endpoint failed, matching the format used by
-/// [`classify_response`](crate::client) for GET/HEAD errors.
+/// Check an HTTP response status, returning an error naming
+/// `registry/repository` with the response body if it is not `expected`.
 async fn expect_status(
     resp: reqwest::Response,
     expected: StatusCode,
@@ -75,22 +67,12 @@ async fn expect_status(
     }
 }
 
-/// Buffer an entire byte stream into a `Vec<u8>`.
-///
-/// When `capacity_hint` is `Some(n)`, the buffer is pre-allocated to
-/// `min(n, MAX_BUFFER_PREALLOC)` bytes -- the manifest-declared size
-/// is capped at [`MAX_BUFFER_PREALLOC`] because the hint is
-/// attacker-controllable; larger streams grow the `Vec` organically via
-/// amortised doubling. Used by fallback upload paths (GHCR, ACR)
-/// that cannot stream chunks to the registry.
+/// Buffer an entire byte stream, pre-allocating `capacity_hint` up to
+/// [`MAX_BUFFER_PREALLOC`].
 async fn buffer_stream(
     stream: impl Stream<Item = Result<Bytes, Error>>,
     capacity_hint: Option<u64>,
 ) -> Result<Vec<u8>, Error> {
-    // Cap the pre-allocation. capacity_hint comes from the manifest's
-    // declared blob size, which is attacker-controllable; an unbounded
-    // `with_capacity` plus the per-target blob upload concurrency
-    // budget multiplies into arbitrary memory pressure.
     let cap = capacity_hint
         .map(|s| (s as usize).min(MAX_BUFFER_PREALLOC))
         .unwrap_or(0);
@@ -103,16 +85,11 @@ async fn buffer_stream(
 }
 
 impl RegistryClient {
-    /// Check whether a blob exists in the given repository.
+    /// Check whether a blob exists: `Some(size)` if it does, `None` if not
+    /// found.
     ///
-    /// Issues a HEAD request to `/v2/{repository}/blobs/{digest}`.
-    /// Returns `Some(size)` if the blob exists, `None` if not found.
-    ///
-    /// The size is extracted from the `Content-Length` header. If the header
-    /// is missing or unparseable, size defaults to `0`. Callers that only
-    /// need an existence check should use `is_some()`; callers that need the
-    /// actual byte count should treat `0` as "unknown" and fall back to a
-    /// GET-based size discovery if needed.
+    /// `size` comes from `Content-Length` and is `0`, meaning unknown, when
+    /// the header is missing or unparseable.
     pub async fn blob_exists(
         &self,
         repository: &RepositoryName,
@@ -137,10 +114,7 @@ impl RegistryClient {
         }
     }
 
-    /// Pull a blob as a streaming response.
-    ///
-    /// Issues a GET request to `/v2/{repository}/blobs/{digest}` and returns
-    /// a byte stream for the response body. The GET and any redirect it
+    /// Pull a blob as a streaming response. The GET and any redirect it
     /// follows go over HTTP/1.1, so a body left unread holds back only its
     /// own connection. A download permit is held by the returned stream
     /// until it is dropped, bounding open download connections; it is never
@@ -162,11 +136,7 @@ impl RegistryClient {
         }))
     }
 
-    /// Attempt a cross-repository blob mount.
-    ///
-    /// Issues a POST to `/v2/{repository}/blobs/uploads/?mount={digest}&from={from_repo}`.
-    /// Returns [`MountResult::Mounted`] on 201 and [`MountResult::NotMounted`] on 202.
-    /// On 202 the caller falls through to the normal push path.
+    /// Attempt a cross-repository blob mount from `from_repo`.
     pub async fn blob_mount(
         &self,
         repository: &RepositoryName,
@@ -198,12 +168,8 @@ impl RegistryClient {
         classify_mount_response(resp, &self.base_url, repository).await
     }
 
-    /// Push a blob to the given repository using a monolithic upload.
-    ///
-    /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate the upload.
-    /// 2. PUT the entire data with the computed digest.
-    ///
-    /// Returns the digest of the uploaded blob.
+    /// Push a blob with a monolithic upload (POST, then one PUT), returning
+    /// its digest.
     pub async fn blob_push(
         &self,
         repository: &RepositoryName,
@@ -239,22 +205,9 @@ impl RegistryClient {
         Ok(digest)
     }
 
-    /// Push a blob to the given repository using a streaming upload.
-    ///
-    /// Default path (2 requests, zero buffering):
-    /// 1. POST `/v2/{repository}/blobs/uploads/` to initiate.
-    /// 2. PUT with the stream as request body - the blob flows from source
-    ///    to target without buffering in memory. The registry verifies the
-    ///    digest provided in the `?digest=` query param.
-    ///
-    /// **GHCR fallback**: GitHub Container Registry's multi-PATCH chunked
-    /// upload is broken - each PATCH overwrites all previous chunks. Blobs
-    /// pushed to `ghcr.io` use a single PATCH with no `Content-Range` header.
-    ///
-    /// **ACR fallback**: Azure Container Registry rejects streaming PUT bodies
-    /// above ~20 MB. Hosts on `*.azurecr.io` buffer the stream and upload via
-    /// multiple chunked `PATCHes` under [`ACR_PATCH_CHUNK_SIZE`] each, then PUT
-    /// to finalize.
+    /// Push a blob with a streaming upload: a POST, then a PUT whose body is
+    /// the stream, unbuffered, with the digest for the registry to verify.
+    /// GHCR and ACR take buffered fallbacks instead.
     pub async fn blob_push_stream<E>(
         &self,
         repository: &RepositoryName,
@@ -265,38 +218,22 @@ impl RegistryClient {
     where
         E: Into<Error> + Send,
     {
-        // Map stream errors to our Error type at the boundary so all
-        // internal code works uniformly with `Result<Bytes, Error>`.
         let stream = stream.map(|r| r.map_err(Into::into));
 
-        // Registry-specific upload fallbacks, detected via the canonical
-        // provider detection (handles case-insensitivity, ports, trailing dots).
-        //
-        // A `match` (rather than an `if`-chain) so that adding a new
-        // `ProviderKind` with its own upload quirks fails to compile until
-        // the dispatch is updated, instead of silently falling into the
-        // default streaming-PUT path.
+        // Exhaustive, so a new `ProviderKind` fails to compile until its
+        // upload path is chosen here.
         let provider = self.base_url.host_str().and_then(detect_provider_kind);
         match provider {
-            // GHCR: single PATCH (no Content-Range) to avoid the
-            // multi-PATCH corruption bug.
             Some(ProviderKind::Ghcr) => {
                 return self
                     .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
                     .await;
             }
-            // ACR: chunked PATCH under ACR's ~20 MB streaming-PUT body
-            // limit. Buffers the stream so the digest can be verified
-            // before any PATCH fires (avoids wasted upload bandwidth on
-            // corruption), then splits into ACR_PATCH_CHUNK_SIZE chunks.
             Some(ProviderKind::Acr) => {
                 return self
                     .blob_push_stream_acr(repository, expected_digest, known_size, stream)
                     .await;
             }
-            // Default: streaming PUT below. Every other ProviderKind
-            // (Ecr, EcrPublic, Gar, Gcr, DockerHub, Chainguard) uses the
-            // default path; new variants must be added here explicitly.
             // Artifact Registry answers a second PATCH in one session with
             // 405 and a monolithic POST with 502, but takes the streaming
             // PUT.
@@ -322,19 +259,12 @@ impl RegistryClient {
             .initiate_blob_upload(repository, &scopes, "blob push stream initiate")
             .await?;
 
-        // Bound concurrent long-lived h2 streams. The streaming PUT body
-        // is the long-lived part; the POST above completes quickly.
+        // Held for the long-lived PUT body only; the POST is brief.
         let _upload_permit = self.acquire_blob_upload_permit().await;
 
-        // Streaming PUT - send the blob body through a single HTTP request.
-        // Uses Transfer-Encoding: chunked (no Content-Length), so the body
-        // flows from source to registry without buffering in memory.
-        //
-        // Cannot use send_with_aimd here: the stream is consumed once, so
-        // the 401-retry closure pattern (which rebuilds the request) does
-        // not work. Auth was validated by the POST above; a 401 on this PUT
-        // drops the token and is returned as `UploadTokenRefused`, for the
-        // caller to send the upload again under a new one.
+        // Not `send_with_aimd`: the stream is consumed once, so the request
+        // cannot be rebuilt for a 401 retry. A 401 here drops the token and
+        // returns `UploadTokenRefused` for the caller to restart the upload.
         let permit = self.aimd.acquire(RegistryAction::BlobUploadComplete).await;
         let sent = self.auth_token(&scopes).await?;
         let headers = auth_headers(sent.as_ref())?;
@@ -365,12 +295,8 @@ impl RegistryClient {
         }
     }
 
-    /// POST `/v2/{repository}/blobs/uploads/` to initiate an upload session.
-    ///
-    /// Returns the upload URL extracted from the response's `Location` header.
-    /// Shared by every blob upload path (monolithic, streaming, GHCR/ACR
-    /// fallbacks) so the response-classification, expected-status, and
-    /// Location-extraction sequence has a single implementation.
+    /// POST `/v2/{repository}/blobs/uploads/` to initiate an upload session,
+    /// returning the upload URL from its `Location` header.
     async fn initiate_blob_upload(
         &self,
         repository: &RepositoryName,
@@ -389,10 +315,9 @@ impl RegistryClient {
 
     /// GHCR fallback: single PATCH upload to avoid multi-PATCH corruption.
     ///
-    /// GitHub Container Registry's chunked upload is broken: each PATCH
-    /// request overwrites all previous chunks, so only the last chunk is
-    /// stored. This fallback buffers the entire stream and sends a single
-    /// PATCH with no `Content-Range` header, followed by a PUT to finalize.
+    /// GHCR's chunked upload keeps only the last chunk, as each PATCH
+    /// overwrites the previous ones. This buffers the stream and sends one
+    /// PATCH with no `Content-Range`, then a PUT to finalize.
     async fn blob_push_stream_ghcr(
         &self,
         repository: &RepositoryName,
@@ -405,8 +330,6 @@ impl RegistryClient {
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
         );
 
-        // Count cap (h2-stream) + byte cap (cross-call memory budget).
-        // See `acquire_buffered_upload_permits` for the layering rationale.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
         let scopes = [Scope::pull_push(repository.as_str())];
         let upload_url = self
@@ -469,13 +392,9 @@ impl RegistryClient {
     /// ACR fallback: chunked PATCH under Azure Container Registry's
     /// ~20 MB streaming-PUT body limit.
     ///
-    /// Buffers the full stream so the digest can be verified before any
-    /// PATCH is sent (avoiding wasted bandwidth on corruption), then
-    /// uploads via [`ACR_PATCH_CHUNK_SIZE`]-byte PATCH requests with the
-    /// OCI Content-Range format `{start}-{end}` (NOT RFC 7233), followed
-    /// by a PUT to finalize with the digest query param. Each PATCH
-    /// response carries a fresh `Location` header that is used as the
-    /// upload URL for the next PATCH (or the finalize PUT).
+    /// Buffers the stream so the digest is verified before any PATCH is
+    /// sent, then sends [`ACR_PATCH_CHUNK_SIZE`] PATCHes and a finalize PUT,
+    /// each to the `Location` the previous response named.
     async fn blob_push_stream_acr(
         &self,
         repository: &RepositoryName,
@@ -488,8 +407,6 @@ impl RegistryClient {
             "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
         );
 
-        // Count cap (h2-stream) + byte cap (cross-call memory budget).
-        // See `acquire_buffered_upload_permits` for the layering rationale.
         let _permits = self.acquire_buffered_upload_permits(known_size).await;
 
         let raw = buffer_stream(stream, known_size).await?;
@@ -507,15 +424,8 @@ impl RegistryClient {
         let mut upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push acr initiate")
             .await?;
-        // `extract_location` enforces same-origin against base_url on
-        // every upload-chain response (POST initiate, each PATCH, and
-        // the finalize PUT), so no separate per-PATCH host check is
-        // needed here.
-
-        // Chunked PATCH. For a zero-byte blob the loop never executes; the
-        // finalize PUT below carries the digest of the empty blob and
-        // completes the upload session per the OCI distribution spec
-        // (PUT-without-prior-PATCH on an empty blob is valid).
+        // An empty blob sends no PATCH: the OCI distribution spec accepts
+        // the finalize PUT alone.
         let mut offset: u64 = 0;
         while offset < total_len {
             let chunk_len = (ACR_PATCH_CHUNK_SIZE as u64).min(total_len - offset);
@@ -547,7 +457,6 @@ impl RegistryClient {
             offset += chunk_len;
         }
 
-        // Finalize.
         let digest_str = expected_digest.to_string();
         let resp = self
             .send_with_aimd(
@@ -573,11 +482,8 @@ impl RegistryClient {
 /// Extract and resolve the `Location` header from an upload response,
 /// enforcing same-origin against `base_url`.
 ///
-/// Used at every step of the blob-upload chain (POST initiate, PATCH
-/// chunk, finalize PUT). The chain is authenticated with the registry's
-/// bearer token; a `Location` pointing to a different host would leak
-/// the bearer on the next request. Reject any cross-host hand-off
-/// regardless of which step returned it.
+/// The upload chain carries the registry's bearer token, so a `Location`
+/// on another host would leak it on the next request.
 fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<String, Error> {
     let raw = resp
         .headers()
@@ -616,10 +522,8 @@ fn extract_location(resp: &reqwest::Response, base_url: &url::Url) -> Result<Str
 
 /// Classify a mount response into [`MountResult`].
 ///
-/// The 202 response carries a fresh upload URL that the engine could
-/// in principle chain on; in practice it falls through to a fresh
-/// HEAD + push, so the URL is discarded and only the binary outcome
-/// is surfaced.
+/// A 202's upload URL is discarded: the engine falls through to a fresh
+/// HEAD and push.
 async fn classify_mount_response(
     resp: reqwest::Response,
     base_url: &url::Url,

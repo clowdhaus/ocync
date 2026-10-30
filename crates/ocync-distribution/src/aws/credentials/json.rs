@@ -14,7 +14,6 @@ pub(super) enum Document {
     Credentials(Credentials),
     /// An error, by its `Code` and `Message`.
     Error {
-        /// The `Code` field.
         code: Code,
         /// The `Message` field, or `no message`.
         message: String,

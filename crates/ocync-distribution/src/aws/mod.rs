@@ -448,10 +448,9 @@ impl fmt::Display for ClockSkew {
 /// Why one attempt at a call failed.
 #[derive(Debug, thiserror::Error)]
 enum Failure {
-    /// No credentials could be loaded. The credential errors leave their
-    /// causes to `source`, and this text is all a caller keeps, so it names
-    /// every cause, and is not a source itself.
-    /// Shared, because clients waiting on one failed load all report it.
+    /// No credentials could be loaded. Callers keep only this text, so it
+    /// names every cause and is not a source itself. Shared, because every
+    /// client waiting on one failed load reports it.
     #[error("failed to load AWS credentials: {}", crate::error::error_chain(&**.0))]
     Credentials(Arc<credentials::Error>),
     /// The request did not complete.
@@ -894,12 +893,10 @@ struct ProviderKey {
     region: Region,
 }
 
-/// The AWS credentials one run's clients share, by profile and region, so
-/// the ECR auth provider and the batch checker for a registry load them per
-/// profile and region rather than per client, reloading them shortly before
-/// they expire. Create one per run: the next run, such as the next watch
-/// cycle, then reads the shared AWS files again and drops credentials AWS may
-/// have revoked.
+/// The AWS credentials one run's clients share, by profile and region,
+/// rather than one load per client. Create one per run, so the next watch
+/// cycle reads the shared AWS files again and drops credentials AWS may have
+/// revoked.
 #[derive(Default)]
 pub struct AwsCredentialProviders(RefCell<HashMap<ProviderKey, Arc<SharedCredentials>>>);
 
@@ -1192,9 +1189,8 @@ impl Client {
         Self::new(&Host::current(), region, profile, service, aws_credentials)
     }
 
-    /// A client for `service` in `region`, with the endpoint, retry,
-    /// clock-skew and credential settings `host` holds for `profile`, taking
-    /// the credentials for that profile and region from `aws_credentials`.
+    /// A client for `service` in `region`, configured from `host` for
+    /// `profile`.
     fn new(
         host: &Host,
         region: &str,

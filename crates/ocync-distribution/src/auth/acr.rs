@@ -1,7 +1,6 @@
 //! Azure Container Registry authentication provider.
 //!
-//! Acquires Azure AD credentials via a four-source credential chain
-//! (extracted from `azure_identity` patterns, zero external deps), then
+//! Acquires Azure AD credentials via a four-source credential chain, then
 //! exchanges them through ACR's proprietary OAuth2 endpoints:
 //!
 //! 1. AAD credential -> access token (client secret, workload identity,
@@ -71,9 +70,8 @@ fn ttl_from_unix_exp(exp: i64) -> Duration {
 /// Map ACR registry hostname to the matching Azure AD authority and
 /// container registry resource endpoint.
 ///
-/// Sovereign clouds use different AAD login endpoints and resource URIs.
-/// Expects a DNS hostname (not an IP address) -- enforced by the ACR
-/// regex in `detect_provider_kind()`.
+/// Expects a DNS hostname, as the ACR regex in `detect_provider_kind()`
+/// enforces.
 fn azure_endpoints(host: &str) -> (&'static str, &'static str) {
     if host.ends_with(".azurecr.cn") {
         (
@@ -94,16 +92,12 @@ fn azure_endpoints(host: &str) -> (&'static str, &'static str) {
 }
 
 /// Azure AD token response from the Entra ID v2.0 token endpoint.
-///
-/// Used by `ClientSecretCredential` and `WorkloadIdentityCredential`.
 #[derive(Deserialize)]
 struct EntraTokenResponse {
     access_token: String,
 }
 
 /// Azure AD token response from the IMDS metadata endpoint.
-///
-/// Used by `ManagedIdentityCredential`.
 #[derive(Deserialize)]
 struct ImdsTokenResponse {
     access_token: String,
@@ -116,20 +110,16 @@ struct CliTokenResponse {
     access_token: String,
 }
 
-/// Abstraction over Azure AD token acquisition for testability.
-///
-/// The real implementation chains four credential sources (extracted from
-/// `azure_identity` patterns). Tests inject a mock that returns canned tokens.
+/// Azure AD token acquisition, injectable for tests.
 trait AzureTokenSource: Send + Sync + fmt::Debug {
     /// Acquire an Azure AD access token string.
     fn get_token(&self) -> Pin<Box<dyn Future<Output = Result<String, Error>> + Send + '_>>;
 
-    /// Reset cached credential source so the chain re-probes.
-    /// Called when ACR refuses what the chain gave: the Azure AD token at
+    /// Reset the cached credential source so the chain re-probes, when ACR
+    /// refuses what the chain gave: the Azure AD token at
     /// `/oauth2/exchange`, or a refresh token made from it at
-    /// `/oauth2/token`. Supports credential rotation in watch mode. Default
-    /// no-op for test mocks. Exceeds upstream which never resets the cached
-    /// source.
+    /// `/oauth2/token`. Upstream `azure_identity` never resets, which would
+    /// miss a credential rotated during watch mode.
     fn reset(&self) {}
 }
 
@@ -171,10 +161,8 @@ impl From<Error> for ExchangeError {
 }
 
 /// POST a form to an ACR `OAuth2` endpoint and deserialize the response.
-///
-/// Shared by both `/oauth2/exchange` (AAD -> refresh) and `/oauth2/token`
-/// (refresh -> access). Uses the no-redirect HTTP client to prevent
-/// credential forwarding via 307 redirects.
+/// `http` must not follow redirects, or a 307 forwards the form's
+/// credentials.
 async fn exchange_post<T: serde::de::DeserializeOwned>(
     http: &reqwest::Client,
     base_url: &str,
@@ -184,18 +172,14 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
 ) -> Result<T, ExchangeError> {
     let url = format!("{base_url}{endpoint}");
 
-    // Retried like the other prepare-phase auth paths. A dropped connection,
-    // a throttle or a server error here fails every mapping on this
-    // registry, not one, and nothing above the prepare phase would re-send it.
-    //
-    // The last response is returned rather than raised, so the non-success
-    // branch below still reads the body: ACR names an exhausted quota there.
+    // A failure here fails every mapping on this registry, and nothing
+    // above the prepare phase re-sends it. The last response is returned
+    // rather than raised, so the branch below reads the body, where ACR
+    // names an exhausted quota.
     let response =
         crate::retry::send_retrying(http.post(&url).form(form), &format!("ACR {endpoint}"))
             .await
-            // Unwrapped: `Error::Http` Displays as "HTTP request failed: ..."
-            // and would double the prefix this line already writes. The chain names the cause,
-            // such as a refused connection.
+            // Unwrapped: `Error::Http`'s own prefix would double this one.
             .map_err(|e| match &e {
                 Error::Http(inner) => Error::cloud_credentials(
                     service,
@@ -237,11 +221,8 @@ async fn exchange_post<T: serde::de::DeserializeOwned>(
         })
 }
 
-/// Exchange an AAD access token for an ACR refresh token.
-///
-/// `POST /oauth2/exchange` with `grant_type=access_token`.
-/// The `tenant` parameter is omitted -- ACR derives it from the AAD
-/// token's `tid` claim server-side.
+/// Exchange an AAD access token for an ACR refresh token. `tenant` is
+/// omitted: ACR reads it from the AAD token's `tid` claim.
 async fn exchange_refresh_token(
     http: &reqwest::Client,
     base_url: &str,
@@ -259,8 +240,6 @@ async fn exchange_refresh_token(
 }
 
 /// Exchange an ACR refresh token for a scoped access token.
-///
-/// `POST /oauth2/token` with `grant_type=refresh_token`.
 async fn exchange_access_token(
     http: &reqwest::Client,
     base_url: &str,
@@ -320,24 +299,16 @@ enum CredentialError {
     Failed(CredentialFailure, String),
 }
 
-/// Source index constants for the credential chain.
+/// Source indexes in the credential chain.
 const SOURCE_CLIENT_SECRET: usize = 0;
 const SOURCE_WORKLOAD_IDENTITY: usize = 1;
 const SOURCE_MANAGED_IDENTITY: usize = 2;
 const SOURCE_AZURE_CLI: usize = 3;
-/// Sentinel for "no cached source". Uses `usize::MAX` rather than
-/// `Option<usize>` because `AtomicUsize` cannot hold `Option`.
+/// No cached source, in an `AtomicUsize` that cannot hold an `Option`.
 const SOURCE_NONE: usize = usize::MAX;
 
-/// Azure credential chain that tries four credential sources in order.
-///
-/// Extracted from `azure_identity` crate patterns (zero external deps).
-/// On first success, caches the winning source index and uses only that
-/// source for subsequent calls.
-///
-/// Unlike upstream `azure_identity` which never resets the cached source,
-/// `reset_cached_source()` allows re-probing after a refused refresh token --
-/// needed for credential rotation in watch mode.
+/// Azure credential chain that tries four credential sources in order and
+/// keeps using the first that succeeds until reset.
 struct AzureCredentialChain {
     authority: &'static str,
     resource: &'static str,
@@ -460,10 +431,8 @@ impl AzureCredentialChain {
     }
 
     async fn try_managed_identity(&self) -> Result<String, CredentialError> {
-        // Safety: `resource` is always one of three hardcoded `&'static str`
-        // values from `azure_endpoints()` -- none contain `&` or `#`, so
-        // string interpolation into the query string is safe. IMDS accepts
-        // the unencoded form (matching the Azure SDK's behavior).
+        // `resource` is one of `azure_endpoints()`'s constants, none holding
+        // `&` or `#`, so it needs no encoding.
         let resource = self.resource;
         let url = format!(
             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2019-08-01&resource={resource}"
@@ -640,13 +609,7 @@ const ACR_REFRESH_TOKEN_DEFAULT_TTL: Duration = Duration::from_secs(3 * 60 * 60)
 /// Default ACR access token TTL fallback (60 minutes).
 const ACR_ACCESS_TOKEN_DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// ACR authentication provider.
-///
-/// Acquires an Azure AD token via [`AzureTokenSource`], exchanges it for an
-/// ACR refresh token (~3h TTL), then exchanges the refresh token for a
-/// scoped ACR access token per registry scope. Access tokens are coalesced
-/// per scope via [`TokenCache`]: concurrent fetches for the same scope
-/// produce one exchange while distinct scopes run in parallel.
+/// ACR authentication provider. See the module docs.
 pub struct AcrAuth {
     base_url: String,
     service: String,
