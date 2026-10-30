@@ -188,4 +188,7 @@ resource "azurerm_role_assignment" "bench_push" {
   scope                = azurerm_container_registry.bench.id
   role_definition_name = "AcrPush"
   principal_id         = azurerm_linux_virtual_machine.bench.identity[0].principal_id
+  # Skips the directory lookup that fails while a new identity is still
+  # replicating.
+  principal_type = "ServicePrincipal"
 }

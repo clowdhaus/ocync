@@ -101,6 +101,8 @@ cargo xtask bench --tools ocync,dregsy,regsync sync
 
 Managed by Terraform in `bench/terraform/aws/`. `user_data_replace_on_change = true` -- bootstrap changes recreate the instance.
 
+`bench/terraform/gcp/` and `bench/terraform/azure/` hold a host that runs ocync as that cloud's own identity (the Compute Engine metadata server, an Azure managed identity), for measuring sign-in by hand over SSH (`terraform output connect`). `bench-remote` cannot drive them yet: they write no `bench.json`, install nothing at boot, and their disks are too small to stage the corpus. The Azure stack has never been applied.
+
 A benchmark run is a point in time, not a fixed rig. Nothing is pinned: competitor tools install at `@latest` and the image is the current AL2023 default release. What makes two runs comparable is the record of what each used, so the run record carries the tool versions, the relay versions and the image id.
 
 **Versions are fixed at instance creation, not per run.** The `go install` calls live in user-data, and `bench-remote` only rebuilds ocync. An instance built in March still runs March's dregsy in September. To benchmark against current competitor releases, replace the instance. Read the versions out of the run record rather than assuming they match what is current today.
