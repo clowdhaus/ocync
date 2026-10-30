@@ -502,7 +502,7 @@ fn summary_markdown(report: &BenchReport) -> String {
     for (tool, version) in &report.tool_versions {
         out.push_str(&format!("- **{tool}**: {version}\n"));
     }
-    // The marker leads, since a version can now carry a parenthesised reason
+    // The marker leads, since a version can carry a parenthesised reason
     // and a trailing "(relay)" would read as part of it.
     for (binary, version) in &report.relay_versions {
         out.push_str(&format!("- **{binary}** (relay): {version}\n"));
@@ -1033,7 +1033,7 @@ mod tests {
         let md_content = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert_eq!(md_content, summary_markdown(&report));
 
-        // Per-scenario JSON files are no longer generated.
+        // No per-scenario JSON file is written.
         assert!(!dir.path().join("cold_sync__median_.json").exists());
     }
 
@@ -1365,7 +1365,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let report = sample_report();
-        // Missing markers now warn instead of failing (both are optional).
+        // Missing markers warn instead of failing: both are optional.
         update_performance_page(&path, &report).unwrap();
         // File should be unchanged.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);

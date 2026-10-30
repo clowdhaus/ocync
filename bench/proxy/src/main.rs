@@ -1,9 +1,8 @@
 //! MITM HTTPS forward proxy for benchmark HTTP traffic capture.
 //!
-//! Replaces `mitmproxy`/`mitmdump` in the ocync benchmark suite with a
-//! pure-Rust, multi-threaded equivalent that scales with available cores
-//! (mitmdump's single-threaded Python TLS caps at ~250 Mbps, which made
-//! multi-GB benchmark corpora impractical).
+//! Pure-Rust and multi-threaded, so it scales with available cores (a
+//! single-threaded Python TLS proxy caps at ~250 Mbps, which makes multi-GB
+//! benchmark corpora impractical).
 //!
 //! The proxy:
 //! - Listens on `127.0.0.1:<port>` for HTTP/1.1 CONNECT requests

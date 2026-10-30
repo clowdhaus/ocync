@@ -1,11 +1,9 @@
 //! `bench-proxy` lifecycle management and log parsing for benchmark
 //! HTTP traffic capture.
 //!
-//! The benchmark used to spawn `mitmdump` (Python, single-threaded TLS)
-//! here. That capped throughput at ~250 Mbps regardless of instance
-//! size, which made multi-GB corpora painful to iterate on. We now
-//! spawn our own `bench-proxy` binary (pure-Rust, tokio + rustls) that
-//! scales with CPU cores and writes the same JSONL schema.
+//! Spawns our own `bench-proxy` binary (pure-Rust, tokio + rustls), which
+//! scales with CPU cores; a single-threaded Python TLS proxy capped
+//! throughput near 250 Mbps whatever the instance size.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

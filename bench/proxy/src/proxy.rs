@@ -528,8 +528,7 @@ fn forward_request_headers(incoming: &http::HeaderMap, target_host: &str) -> htt
     out
 }
 
-/// Current UTC time formatted as ISO-8601 with second precision,
-/// matching the mitmproxy addon's format for backward compatibility.
+/// Current UTC time formatted as ISO-8601.
 fn now_iso8601() -> String {
     let now = time::OffsetDateTime::now_utc();
     now.format(&time::format_description::well_known::Iso8601::DEFAULT)

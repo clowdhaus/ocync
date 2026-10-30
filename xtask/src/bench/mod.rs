@@ -335,8 +335,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     // Inject Docker Hub auth from env vars (cloud-init) or SSM (local dev).
-    // Note: SSM fallback requires IAM permissions not in the current Terraform
-    // (removed when migrating to SSH). Kept for local dev with personal creds.
+    // The SSM fallback needs IAM permissions the bench instance's Terraform
+    // does not grant; it serves local dev with personal credentials.
     if let Some(auth) = docker_hub_auth_from_env() {
         eprintln!(
             "bench: Docker Hub auth configured (username={})",
