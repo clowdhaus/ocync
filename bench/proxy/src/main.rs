@@ -103,13 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let (cert_pem, key_pem) = ca::generate_ca(&common_name)?;
             tokio::fs::write(&out, cert_pem.as_bytes()).await?;
-            tokio::fs::write(&key, key_pem.as_bytes()).await?;
-            // Key file must not be world-readable.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                tokio::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).await?;
-            }
+            ca::write_private_key(&key, &key_pem).await?;
             tracing::info!(cert = %out.display(), "CA certificate written");
             tracing::info!(key = %key.display(), "CA private key written");
             Ok(())

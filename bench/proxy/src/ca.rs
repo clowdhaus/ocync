@@ -123,6 +123,28 @@ pub(crate) fn generate_ca(common_name: &str) -> Result<(String, String), Error> 
     Ok((cert.pem(), key.serialize_pem()))
 }
 
+/// Write the CA private key so no other user can read it at any point: a new
+/// file is created owner-only, and an existing one is restricted before the
+/// key goes into it.
+pub(crate) async fn write_private_key(path: &Path, key_pem: &str) -> Result<(), Error> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
+    }
+    file.write_all(key_pem.as_bytes()).await?;
+    file.flush().await?;
+    Ok(())
+}
+
 /// Load a CA keypair from PEM files on disk.
 pub(crate) async fn load_ca(cert_path: &Path, key_path: &Path) -> Result<CaSigner, Error> {
     let cert_pem = tokio::fs::read_to_string(cert_path).await?;
@@ -223,6 +245,25 @@ mod tests {
         // Different host returns a different leaf.
         let c = signer.leaf_for("other.example").unwrap();
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_key_is_owner_only_whether_or_not_the_file_existed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, existing) in [("new file", None), ("world-readable file", Some(0o644))] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ca.key");
+            if let Some(mode) = existing {
+                std::fs::write(&path, "old key").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            write_private_key(&path, "new key").await.unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new key", "{name}");
+        }
     }
 
     #[tokio::test]
