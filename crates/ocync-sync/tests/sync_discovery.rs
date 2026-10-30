@@ -68,17 +68,27 @@ enum Head<'a> {
     Index(&'a Digest),
     /// The given status with no digest.
     Status(u16),
+    /// 200 naming `digest` as an OCI image manifest, after 3s, past [`HEAD_TIMEOUT`].
+    TimesOut(&'a Digest),
+}
+
+/// A manifest HEAD on `repo`/`reference` answering `head`.
+fn head_mock(repo: &str, reference: &str, head: Head<'_>) -> Mock {
+    let response = match head {
+        Head::Manifest(digest) => digest_response(digest, MediaType::OciManifest),
+        Head::Index(digest) => digest_response(digest, MediaType::OciIndex),
+        Head::Status(code) => ResponseTemplate::new(code),
+        Head::TimesOut(digest) => {
+            digest_response(digest, MediaType::OciManifest).set_delay(Duration::from_secs(3))
+        }
+    };
+    manifest_head_mock(repo, reference, response)
 }
 
 /// Mount a manifest HEAD on `repo`/`reference` answering `head` that must be
 /// requested exactly once.
 async fn mount_head_once(server: &MockServer, repo: &str, reference: &str, head: Head<'_>) {
-    let response = match head {
-        Head::Manifest(digest) => digest_response(digest, MediaType::OciManifest),
-        Head::Index(digest) => digest_response(digest, MediaType::OciIndex),
-        Head::Status(code) => ResponseTemplate::new(code),
-    };
-    manifest_head_mock(repo, reference, response)
+    head_mock(repo, reference, head)
         .expect(1)
         .mount(server)
         .await;
@@ -91,25 +101,6 @@ async fn forbid_get(server: &MockServer, repo: &str, reference: &str, row: &str)
         .named(format!("{row}: no GET {reference}"))
         .mount(server)
         .await;
-}
-
-/// How the source answers the discovery HEAD.
-enum SourceHead {
-    Digest,
-    Status(u16),
-    /// Answers after 3s, past [`HEAD_TIMEOUT`].
-    TimesOut,
-}
-
-fn source_head(kind: &SourceHead, digest: &Digest) -> Mock {
-    let response = match kind {
-        SourceHead::Digest => digest_response(digest, MediaType::OciManifest),
-        SourceHead::Status(code) => ResponseTemplate::new(*code),
-        SourceHead::TimesOut => {
-            digest_response(digest, MediaType::OciManifest).set_delay(Duration::from_secs(3))
-        }
-    };
-    manifest_head_mock("src/repo", "v1", response)
 }
 
 fn image(name: &str) -> ManifestParts {
@@ -305,9 +296,9 @@ async fn discovery_skips_without_source_get() {
 /// GET and a full push.
 #[tokio::test]
 async fn discovery_falls_through_to_full_pull() {
-    struct Case {
+    struct Case<'a> {
         name: &'static str,
-        source_head: SourceHead,
+        source_head: Head<'a>,
         seed: Seed,
         target_heads: u64,
         want: Discovery,
@@ -315,10 +306,11 @@ async fn discovery_falls_through_to_full_pull() {
         /// source HEAD must not invent one).
         snapshot: bool,
     }
+    let parts = image("pull");
     let cases = [
         Case {
             name: "cold cache",
-            source_head: SourceHead::Digest,
+            source_head: Head::Manifest(&parts.digest),
             seed: Seed::Cold,
             target_heads: 1,
             want: MISS,
@@ -326,7 +318,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "source digest changed since the snapshot: a miss, not a head failure",
-            source_head: SourceHead::Digest,
+            source_head: Head::Manifest(&parts.digest),
             seed: Seed::OldDigest,
             target_heads: 1,
             want: MISS,
@@ -334,7 +326,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "target stale: discovery and the pre-push check both HEAD the target",
-            source_head: SourceHead::Digest,
+            source_head: Head::Manifest(&parts.digest),
             seed: Seed::Current,
             target_heads: 2,
             want: Discovery {
@@ -345,7 +337,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "source HEAD 500",
-            source_head: SourceHead::Status(500),
+            source_head: Head::Status(500),
             seed: Seed::Cold,
             target_heads: 1,
             want: Discovery {
@@ -356,7 +348,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "source HEAD 404 is no usable digest",
-            source_head: SourceHead::Status(404),
+            source_head: Head::Status(404),
             seed: Seed::Cold,
             target_heads: 1,
             want: Discovery {
@@ -367,7 +359,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "source HEAD times out",
-            source_head: SourceHead::TimesOut,
+            source_head: Head::TimesOut(&parts.digest),
             seed: Seed::Cold,
             target_heads: 1,
             want: Discovery {
@@ -378,7 +370,7 @@ async fn discovery_falls_through_to_full_pull() {
         },
         Case {
             name: "source HEAD 500 must not fall back to a valid snapshot",
-            source_head: SourceHead::Status(500),
+            source_head: Head::Status(500),
             seed: Seed::Current,
             target_heads: 1,
             want: Discovery {
@@ -392,9 +384,8 @@ async fn discovery_falls_through_to_full_pull() {
     for c in cases {
         let source = MockServer::start().await;
         let target = MockServer::start().await;
-        let parts = image("pull");
 
-        source_head(&c.source_head, &parts.digest)
+        head_mock("src/repo", "v1", c.source_head)
             .expect(1)
             .named(format!("{}: source HEAD", c.name))
             .mount(&source)
@@ -1052,28 +1043,29 @@ async fn budget_circuit_breaker_multi_source_all_or_nothing() {
 /// and another before the push, so no count is pinned on it.
 #[tokio::test]
 async fn head_first_falls_through_to_full_pull() {
-    struct Case {
+    struct Case<'a> {
         name: &'static str,
-        source_head: SourceHead,
+        source_head: Head<'a>,
         target_head_status: u16,
         want: Discovery,
     }
+    let parts = image("hf");
     let cases = [
         Case {
             name: "target HEAD 404 is a mismatch",
-            source_head: SourceHead::Digest,
+            source_head: Head::Manifest(&parts.digest),
             target_head_status: 404,
             want: MISS,
         },
         Case {
             name: "target HEAD 500 degrades to a mismatch instead of failing discovery",
-            source_head: SourceHead::Digest,
+            source_head: Head::Manifest(&parts.digest),
             target_head_status: 500,
             want: MISS,
         },
         Case {
             name: "source HEAD 500 is a head failure",
-            source_head: SourceHead::Status(500),
+            source_head: Head::Status(500),
             target_head_status: 404,
             want: Discovery {
                 head_failures: 1,
@@ -1085,9 +1077,8 @@ async fn head_first_falls_through_to_full_pull() {
     for c in cases {
         let source = MockServer::start().await;
         let target = MockServer::start().await;
-        let parts = image("hf");
 
-        source_head(&c.source_head, &parts.digest)
+        head_mock("src/repo", "v1", c.source_head)
             .expect(1)
             .named(format!("{}: source HEAD", c.name))
             .mount(&source)

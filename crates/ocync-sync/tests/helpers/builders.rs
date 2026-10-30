@@ -175,17 +175,20 @@ impl ManifestParts {
         mount_manifest_push(server, repo, reference).await;
     }
 
-    /// As [`mount_target`](Self::mount_target), and the target accepts a
-    /// cross-repo mount of every blob.
-    pub async fn mount_target_accepting_mounts(
+    /// As [`mount_target`](Self::mount_target), and every cross-repo mount of
+    /// one of its blobs answers `mount_status`.
+    pub async fn mount_target_answering_mounts(
         &self,
         server: &MockServer,
         repo: &str,
         reference: &str,
+        mount_status: u16,
     ) {
         self.mount_target(server, repo, reference).await;
         for digest in self.blob_digests() {
-            mount_blob_mount_accepted(server, repo, &digest).await;
+            blob_mount_mock(repo, &digest, mount_status)
+                .mount(server)
+                .await;
         }
     }
 }

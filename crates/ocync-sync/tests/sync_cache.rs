@@ -533,10 +533,14 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         cache: Cache,
         tags: &'static [&'static str],
         batch_calls: usize,
-        /// Blob counts and bytes of each tag's image.
+        /// Totals across every tag's image.
         skipped: u64,
         transferred: u64,
         bytes: u64,
+        /// Source blob GETs, target blob HEADs and target blob upload PUTs.
+        blob_gets: usize,
+        blob_heads: usize,
+        uploads: usize,
     }
     use Answer::{Exists, Missing, Unknown};
     let single = Case {
@@ -548,6 +552,9 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         skipped: 3,
         transferred: 0,
         bytes: 0,
+        blob_gets: 0,
+        blob_heads: 0,
+        uploads: 0,
     };
     let cases = [
         Case {
@@ -558,6 +565,7 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             name: "two tags share the checker, one call per tag",
             tags: &["v1", "v2"],
             batch_calls: 2,
+            skipped: 6,
             ..single
         },
         Case {
@@ -571,6 +579,20 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 2,
             transferred: 1,
             bytes: 14,
+            blob_gets: 1,
+            uploads: 1,
+            ..single
+        },
+        Case {
+            name: "two tags, one layer missing: copied once, the other tag skips it",
+            check: Check::Answers([Exists, Missing, Exists]),
+            tags: &["v1", "v2"],
+            batch_calls: 2,
+            skipped: 5,
+            transferred: 1,
+            bytes: 14,
+            blob_gets: 1,
+            uploads: 1,
             ..single
         },
         Case {
@@ -579,6 +601,9 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 2,
             transferred: 1,
             bytes: 14,
+            blob_gets: 1,
+            blob_heads: 1,
+            uploads: 1,
             ..single
         },
         Case {
@@ -587,17 +612,21 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
             skipped: 0,
             transferred: 3,
             bytes: 42,
+            blob_gets: 3,
+            uploads: 3,
             ..single
         },
         Case {
             name: "no checker: per-blob HEAD",
             check: Check::Absent,
             batch_calls: 0,
+            blob_heads: 3,
             ..single
         },
         Case {
             name: "failing checker: per-blob HEAD",
             check: Check::Fails,
+            blob_heads: 3,
             ..single
         },
     ];
@@ -616,8 +645,6 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         ];
         // Unequal repo names show the engine passes the target repo to the checker.
         let (src, tgt) = ("src/nginx", "tgt/nginx");
-        // Mock counts are per image, like the stats checks below.
-        let images = case.tags.len() as u64;
         let answers = match case.check {
             Check::Answers(answers) => answers,
             Check::Absent | Check::Fails => [Unknown; 3],
@@ -636,24 +663,13 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                 .mount(&target_server)
                 .await;
         }
-        for ((digest, data), answer) in digests.into_iter().zip(BATCH_BLOBS).zip(answers) {
-            let (pulls, heads) = match answer {
-                Exists => (0, 0),
-                Missing => (1, 0),
-                Unknown => (0, 1),
-            };
+        for (digest, data) in digests.into_iter().zip(BATCH_BLOBS) {
             blob_pull_mock(src, digest, data)
-                .expect(pulls * images)
-                .named(format!("{name}: blob GET {digest}"))
                 .mount(&source_server)
                 .await;
-            blob_head_mock(tgt, digest, 200)
-                .expect(heads * images)
-                .named(format!("{name}: blob HEAD {digest}"))
-                .mount(&target_server)
-                .await;
+            blob_head_mock(tgt, digest, 200).mount(&target_server).await;
         }
-        mount_blob_push_expecting(&target_server, tgt, case.transferred * images, name).await;
+        mount_blob_push(&target_server, tgt).await;
 
         let (target, calls) = match case.check {
             Check::Absent => (
@@ -661,9 +677,9 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                 Calls::default(),
             ),
             Check::Fails => {
-                let (checker, calls) = MockChecker::new(tgt, HashSet::new());
+                let (checker, calls) = MockChecker::failing(tgt);
                 (
-                    batch_target("target", mock_client(&target_server), checker.failing()),
+                    batch_target("target", mock_client(&target_server), checker),
                     calls,
                 )
             }
@@ -676,13 +692,9 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
                         .map(|(d, _)| d.clone())
                         .collect()
                 };
-                let (checker, calls) = MockChecker::new(tgt, pick(Exists));
+                let (checker, calls) = MockChecker::leaving_out(tgt, pick(Exists), pick(Unknown));
                 (
-                    batch_target(
-                        "target",
-                        mock_client(&target_server),
-                        checker.unknown(pick(Unknown)),
-                    ),
+                    batch_target("target", mock_client(&target_server), checker),
                     calls,
                 )
             }
@@ -704,38 +716,34 @@ async fn sync_batch_checker_answers_decide_what_transfers() {
         let report = run_sync_with_cache(vec![mapping], cache).await;
 
         assert_eq!(calls.checks.get(), case.batch_calls, "{name}: batch calls");
-        assert_eq!(report.images.len(), case.tags.len(), "{name}");
-        for (i, image) in report.images.iter().enumerate() {
-            assert_status!(report, i, ImageStatus::Synced, "{name}");
-            assert_eq!(
-                image.blob_stats.skipped, case.skipped,
-                "{name}: image {i} skipped"
-            );
-            assert_eq!(
-                image.blob_stats.transferred, case.transferred,
-                "{name}: image {i} transferred"
-            );
-            assert_eq!(
-                image.bytes_transferred, case.bytes,
-                "{name}: image {i} bytes"
-            );
-        }
-        assert_eq!(report.stats.images_synced, images, "{name}");
+        assert_all_synced(&report, case.tags.len(), name);
+        assert_eq!(report.stats.blobs_skipped, case.skipped, "{name}: skipped");
         assert_eq!(
-            report.stats.blobs_skipped,
-            case.skipped * images,
-            "{name}: skipped"
-        );
-        assert_eq!(
-            report.stats.blobs_transferred,
-            case.transferred * images,
+            report.stats.blobs_transferred, case.transferred,
             "{name}: transferred"
         );
-        assert_eq!(
-            report.stats.bytes_transferred,
-            case.bytes * images,
-            "{name}: bytes"
-        );
+        assert_eq!(report.stats.bytes_transferred, case.bytes, "{name}: bytes");
+        let blob_gets = count_requests(
+            &source_server,
+            Some(&Method::GET),
+            PathMatch::Contains("/blobs/"),
+        )
+        .await;
+        assert_eq!(blob_gets, case.blob_gets, "{name}: source blob GETs");
+        let blob_heads = count_requests(
+            &target_server,
+            Some(&Method::HEAD),
+            PathMatch::Contains("/blobs/"),
+        )
+        .await;
+        assert_eq!(blob_heads, case.blob_heads, "{name}: target blob HEADs");
+        let uploads = count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains("/blobs/uploads/"),
+        )
+        .await;
+        assert_eq!(uploads, case.uploads, "{name}: blob upload PUTs");
     }
 }
 
@@ -885,11 +893,14 @@ async fn sync_batch_checker_overrides_an_earlier_runs_cache() {
         mount_blob_push(&target_server, "repo").await;
         mount_manifest_push(&target_server, "repo", "v1").await;
 
-        let (checker, calls) = MockChecker::new("repo", HashSet::new());
-        let checker = match answer {
-            BatchAnswer::Missing => checker,
-            BatchAnswer::Unknown => checker.unknown(digests.into_iter().cloned().collect()),
-            BatchAnswer::Fails => checker.failing(),
+        let (checker, calls) = match answer {
+            BatchAnswer::Missing => MockChecker::new("repo", HashSet::new()),
+            BatchAnswer::Unknown => MockChecker::leaving_out(
+                "repo",
+                HashSet::new(),
+                digests.into_iter().cloned().collect(),
+            ),
+            BatchAnswer::Fails => MockChecker::failing("repo"),
         };
         let mapping = resolved_mapping(
             mock_client(&source_server),
@@ -1358,14 +1369,12 @@ async fn sync_mixed_batch_and_no_batch_multi_target() {
         1,
         "batch checker must be called once, for target-a only"
     );
-    assert_eq!(report.images.len(), 2);
+    assert_all_synced(&report, 2, "two targets");
     for img in &report.images {
-        assert!(matches!(img.status, ImageStatus::Synced));
         assert_eq!(img.blob_stats.skipped, 2);
         assert_eq!(img.blob_stats.transferred, 0);
         assert_eq!(img.bytes_transferred, 0);
     }
-    assert_eq!(report.stats.images_synced, 2);
     assert_eq!(report.stats.blobs_skipped, 4);
     assert_eq!(report.stats.blobs_transferred, 0);
     assert_eq!(report.stats.bytes_transferred, 0);

@@ -113,23 +113,33 @@ pub async fn run_sync_with_shutdown(
     .await
 }
 
-/// Trigger `shutdown` once `received` counts `want` requests, so it lands
-/// mid-transfer however slow the host is. Run it joined with the engine.
-/// Panics after 10s of wall-clock time, which also bounds `start_paused` runs.
-pub async fn trigger_shutdown_at(
+/// Drive `run` to completion, triggering `shutdown` once `received` counts
+/// `want` requests so it lands mid-transfer however slow the host is. When
+/// `run` returns first the trigger is dropped, so the caller's assertions name
+/// the failure. Panics after 10s of wall-clock time if `run` is still going and
+/// `want` was never reached, which also bounds `start_paused` runs.
+pub async fn run_with_shutdown_at<T>(
+    run: impl Future<Output = T>,
     shutdown: &ShutdownSignal,
     want: usize,
     received: impl AsyncFn() -> usize,
-) {
-    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while received().await < want {
-        assert!(
-            std::time::Instant::now() < give_up,
-            "the server never received {want} requests to trigger shutdown on"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+) -> T {
+    let trigger = async {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while received().await < want {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the server never received {want} requests to trigger shutdown on"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        shutdown.trigger();
+        std::future::pending::<()>().await;
+    };
+    tokio::select! {
+        out = run => out,
+        () = trigger => unreachable!("the trigger never completes"),
     }
-    shutdown.trigger();
 }
 
 /// Assert the report holds exactly `want` images, all `Synced`; `name` labels a failure.

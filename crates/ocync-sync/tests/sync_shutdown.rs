@@ -46,6 +46,15 @@ impl DelayedPull {
         )]
     }
 
+    /// Run `run`, triggering `shutdown` once both blob GETs are in flight.
+    async fn run_shutting_down_in_flight<T>(
+        &self,
+        run: impl Future<Output = T>,
+        shutdown: &ShutdownSignal,
+    ) -> T {
+        run_with_shutdown_at(run, shutdown, 2, async || self.blob_gets().await).await
+    }
+
     /// Blob GETs the source has received.
     async fn blob_gets(&self) -> usize {
         count_requests(
@@ -98,15 +107,21 @@ async fn sync_shutdown_drains_in_flight() {
     let pull = DelayedPull::new(Duration::from_secs(2)).await;
     let shutdown = ShutdownSignal::new();
 
-    let (report, ()) = tokio::join!(
-        run_sync_with_shutdown(pull.mappings(), &shutdown),
-        trigger_shutdown_at(&shutdown, 2, async || pull.blob_gets().await),
-    );
+    let report = pull
+        .run_shutting_down_in_flight(
+            run_sync_with_shutdown(pull.mappings(), &shutdown),
+            &shutdown,
+        )
+        .await;
 
     assert_eq!(report.images.len(), 1);
     assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.stats.images_synced, 1);
     assert_eq!(report.stats.blobs_transferred, 2);
+    assert!(
+        shutdown.is_triggered(),
+        "the run finished before shutdown was triggered"
+    );
 }
 
 /// Shutdown fires while blob GETs are delayed 60s. The 25s drain deadline
@@ -118,15 +133,21 @@ async fn sync_shutdown_deadline_abandons_stuck_transfers() {
     let pull = DelayedPull::new(Duration::from_secs(60)).await;
     let shutdown = ShutdownSignal::new();
 
-    let (report, ()) = tokio::join!(
-        run_sync_with_shutdown(pull.mappings(), &shutdown),
-        trigger_shutdown_at(&shutdown, 2, async || pull.blob_gets().await),
-    );
+    let report = pull
+        .run_shutting_down_in_flight(
+            run_sync_with_shutdown(pull.mappings(), &shutdown),
+            &shutdown,
+        )
+        .await;
 
     // A 60s blob that completed would sync the image: the deadline must cut it.
     assert_eq!(
         report.stats.images_synced, 0,
         "the drain deadline should abandon the stuck transfer"
+    );
+    assert!(
+        shutdown.is_triggered(),
+        "the run finished before shutdown was triggered"
     );
 }
 
@@ -141,20 +162,26 @@ async fn sync_custom_drain_deadline_abandons_before_default_would() {
     let engine =
         SyncEngine::new(fast_retry(), concurrency(50)).with_drain_deadline(Duration::from_secs(1));
 
-    let (report, ()) = tokio::join!(
-        engine.run(
-            pull.mappings(),
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            Some(&shutdown),
-        ),
-        trigger_shutdown_at(&shutdown, 2, async || pull.blob_gets().await),
-    );
+    let report = pull
+        .run_shutting_down_in_flight(
+            engine.run(
+                pull.mappings(),
+                empty_cache(),
+                BlobStage::disabled(),
+                &NullProgress,
+                Some(&shutdown),
+            ),
+            &shutdown,
+        )
+        .await;
 
     assert_eq!(
         report.stats.images_synced, 0,
         "no images should succeed when drain deadline expires before blob transfer"
+    );
+    assert!(
+        shutdown.is_triggered(),
+        "the run finished before shutdown was triggered"
     );
 }
 

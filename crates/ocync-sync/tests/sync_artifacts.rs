@@ -30,7 +30,7 @@ fn artifact_mapping(
 }
 
 /// Mount a referrers API that answers `parent_digest` with `status`.
-async fn mount_referrers_error(server: &MockServer, parent_digest: &Digest, status: u16) {
+async fn mount_referrers_status(server: &MockServer, parent_digest: &Digest, status: u16) {
     Mock::given(method("GET"))
         .and(path(format!("/v2/repo/referrers/{parent_digest}")))
         .respond_with(ResponseTemplate::new(status))
@@ -138,7 +138,7 @@ async fn artifact_sync_tag_fallback_transfers_referrer() {
     let (sig_bytes, sig_digest) = serialize_manifest(&sig_manifest);
     let sig_digest_str = sig_digest.to_string();
 
-    mount_referrers_error(&source_server, &parent.digest, 404).await;
+    mount_referrers_status(&source_server, &parent.digest, 404).await;
     let referrers = ReferrersIndexBuilder::new()
         .descriptor(Descriptor {
             artifact_type: Some(COSIGN_SIGNATURE.into()),
@@ -361,7 +361,7 @@ async fn artifact_transient_error_sets_artifacts_skipped() {
 
         let parent = ManifestBuilder::new(b"err-cfg").layer(b"err-layer").build();
         parent.mount_source(&source_server, "repo", "v1.0.0").await;
-        mount_referrers_error(&source_server, &parent.digest, 500).await;
+        mount_referrers_status(&source_server, &parent.digest, 500).await;
         parent.mount_target(&target_server, "repo", "v1.0.0").await;
 
         let mapping = artifact_mapping(
@@ -544,7 +544,7 @@ async fn artifact_transient_error_propagates_to_all_targets() {
 
     let parent = ManifestBuilder::new(b"mt-cfg").layer(b"mt-layer").build();
     parent.mount_source(&source_server, "repo", "v1.0.0").await;
-    mount_referrers_error(&source_server, &parent.digest, 500).await;
+    mount_referrers_status(&source_server, &parent.digest, 500).await;
     for target in [&target_a, &target_b] {
         parent.mount_target(target, "repo", "v1.0.0").await;
     }

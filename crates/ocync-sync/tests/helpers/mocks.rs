@@ -343,38 +343,33 @@ pub struct MockChecker {
 impl MockChecker {
     /// A checker reporting `existing` present and every other digest missing.
     pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
+        Self::leaving_out(expected_repo, existing, HashSet::new())
+    }
+
+    /// As [`new`](Self::new), but `unknown` is left out of the answer.
+    pub fn leaving_out(
+        expected_repo: &str,
+        existing: HashSet<Digest>,
+        unknown: HashSet<Digest>,
+    ) -> (Self, Calls) {
+        Self::with_mode(expected_repo, Mode::Answers { existing, unknown })
+    }
+
+    /// A checker whose every `check_blob_existence` call fails.
+    pub fn failing(expected_repo: &str) -> (Self, Calls) {
+        Self::with_mode(expected_repo, Mode::Fails)
+    }
+
+    fn with_mode(expected_repo: &str, mode: Mode) -> (Self, Calls) {
         let calls = Calls::default();
         (
             Self {
                 expected_repo: expected_repo.to_owned(),
-                mode: Mode::Answers {
-                    existing,
-                    unknown: HashSet::new(),
-                },
+                mode,
                 calls: calls.clone(),
             },
             calls,
         )
-    }
-
-    /// Leave `unknown` out of the answer. Panics on a failing checker, which
-    /// has no answer to leave them out of.
-    pub fn unknown(mut self, unknown: HashSet<Digest>) -> Self {
-        match &mut self.mode {
-            Mode::Answers {
-                unknown: left_out, ..
-            } => *left_out = unknown,
-            Mode::Fails => panic!("a failing checker has no answer to leave digests out of"),
-        }
-        self
-    }
-
-    /// Fail every `check_blob_existence` call.
-    pub fn failing(self) -> Self {
-        Self {
-            mode: Mode::Fails,
-            ..self
-        }
     }
 
     fn assert_repo(&self, repo: &RepositoryName) {
@@ -413,13 +408,16 @@ impl BatchBlobChecker for MockChecker {
 /// A [`MockChecker`] that also overrides `wait_for_blobs_available` to count
 /// the manifest-commit gate's calls apart from the pre-discovery
 /// `check_blob_existence` calls. Every other checker keeps the trait default.
-pub struct WaitTrackingChecker(MockChecker);
+pub struct WaitTrackingChecker {
+    checker: MockChecker,
+    existing: HashSet<Digest>,
+}
 
 impl WaitTrackingChecker {
     /// A checker reporting `existing` present and every other digest missing.
     pub fn new(expected_repo: &str, existing: HashSet<Digest>) -> (Self, Calls) {
-        let (checker, calls) = MockChecker::new(expected_repo, existing);
-        (Self(checker), calls)
+        let (checker, calls) = MockChecker::new(expected_repo, existing.clone());
+        (Self { checker, existing }, calls)
     }
 }
 
@@ -429,7 +427,7 @@ impl BatchBlobChecker for WaitTrackingChecker {
         repo: &'a RepositoryName,
         digests: &'a [Digest],
     ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
-        self.0.check_blob_existence(repo, digests)
+        self.checker.check_blob_existence(repo, digests)
     }
 
     fn wait_for_blobs_available<'a>(
@@ -438,13 +436,11 @@ impl BatchBlobChecker for WaitTrackingChecker {
         digests: &'a [Digest],
         _deadline: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ocync_distribution::Error>> + 'a>> {
-        self.0.assert_repo(repo);
-        let Mode::Answers { existing, .. } = &self.0.mode else {
-            unreachable!("a wait-tracking checker always answers");
-        };
-        let all_known = digests.iter().all(|d| existing.contains(d));
+        self.checker.assert_repo(repo);
+        let all_known = digests.iter().all(|d| self.existing.contains(d));
+        let waits = &self.checker.calls.waits;
         Box::pin(async move {
-            self.0.calls.waits.set(self.0.calls.waits.get() + 1);
+            waits.set(waits.get() + 1);
             if all_known {
                 Ok(())
             } else {

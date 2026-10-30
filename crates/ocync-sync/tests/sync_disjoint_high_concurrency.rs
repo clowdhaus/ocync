@@ -12,9 +12,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocync_sync::ImageStatus;
 use ocync_sync::engine::TagPair;
 use wiremock::MockServer;
+use wiremock::http::Method;
 
 use helpers::*;
 
@@ -23,7 +23,7 @@ use helpers::*;
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
     let fixture = build_ten_image_fixture(Sharing::OnePair).await;
-    let report = run_engine_default(&fixture, Checking::HeadPerBlob).await;
+    let (report, _) = run_engine_default(&fixture, Checking::HeadPerBlob).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
 }
 
@@ -32,15 +32,17 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_high_concurrency() {
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
     let fixture = build_ten_image_fixture(Sharing::OnePair).await;
-    let report = run_engine_default(&fixture, Checking::BatchChecker).await;
+    let (report, checkers) = run_engine_default(&fixture, Checking::BatchChecker).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
+    let checks: Vec<usize> = checkers.iter().map(|c| c.checks.get()).collect();
+    assert_eq!(checks, [1; 10], "each mapping asks its checker once");
 }
 
 /// Baseline with zero shared blobs: no leader, every image independent.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_fully_disjoint_mappings_high_concurrency() {
     let fixture = build_ten_image_fixture(Sharing::Disjoint).await;
-    let report = run_engine_default(&fixture, Checking::HeadPerBlob).await;
+    let (report, _) = run_engine_default(&fixture, Checking::HeadPerBlob).await;
     assert_report_matches_target_receipts(&fixture, &report).await;
     // No shared blobs -> no mount candidates -> no mount POSTs at all.
     assert_eq!(report.stats.blobs_mounted, 0);
@@ -131,10 +133,13 @@ async fn build_ten_image_fixture(sharing: Sharing) -> TenImageFixture {
     }
 }
 
+/// Run the ten mappings; the second value holds each batch checker's call
+/// counter, empty without one.
 async fn run_engine_default(
     fixture: &TenImageFixture,
     checking: Checking,
-) -> ocync_sync::SyncReport {
+) -> (ocync_sync::SyncReport, Vec<Calls>) {
+    let mut checkers = Vec::new();
     let mappings: Vec<_> = fixture
         .repos
         .iter()
@@ -143,7 +148,8 @@ async fn run_engine_default(
             let entry = match checking {
                 Checking::HeadPerBlob => target_entry("target", client),
                 Checking::BatchChecker => {
-                    let (checker, _) = MockChecker::new(tgt, HashSet::new());
+                    let (checker, calls) = MockChecker::new(tgt, HashSet::new());
+                    checkers.push(calls);
                     batch_target("target", client, checker)
                 }
             };
@@ -160,25 +166,17 @@ async fn run_engine_default(
     // Above the engine default of 10 on purpose: it oversubscribes the
     // per-target upload semaphore (cap 64) with 50 * BLOB_CONCURRENCY(6) = 300
     // wanted streams.
-    tokio::time::timeout(Duration::from_secs(30), run_sync(mappings))
+    let report = tokio::time::timeout(Duration::from_secs(30), run_sync(mappings))
         .await
-        .expect("engine hung past 30s: leader/follower stall or auth deadlock")
+        .expect("engine hung past 30s: leader/follower stall or auth deadlock");
+    (report, checkers)
 }
 
 async fn assert_report_matches_target_receipts(
     fixture: &TenImageFixture,
     report: &ocync_sync::SyncReport,
 ) {
-    assert_eq!(report.images.len(), 10, "expected 10 image results");
-    for r in &report.images {
-        assert!(
-            matches!(r.status, ImageStatus::Synced),
-            "{} -> {} not Synced: {:#?}",
-            r.source,
-            r.target,
-            r.status,
-        );
-    }
+    assert_all_synced(report, 10, "ten mappings");
 
     let declared: Vec<u64> = fixture
         .images
@@ -195,19 +193,20 @@ async fn assert_report_matches_target_receipts(
         );
     }
 
-    let target_requests = fixture.target_server.received_requests().await.unwrap();
-
-    let blob_puts: u64 = target_requests
-        .iter()
-        .filter(|r| {
-            r.method == wiremock::http::Method::PUT && r.url.path().contains("/blobs/uploads/")
-        })
-        .count() as u64;
-    let blob_mounts = count_mount_posts(&fixture.target_server).await as u64;
-    let manifest_puts: u64 = target_requests
-        .iter()
-        .filter(|r| r.method == wiremock::http::Method::PUT && r.url.path().contains("/manifests/"))
-        .count() as u64;
+    let target = &fixture.target_server;
+    let blob_puts = count_requests(
+        target,
+        Some(&Method::PUT),
+        PathMatch::Contains("/blobs/uploads/"),
+    )
+    .await as u64;
+    let blob_mounts = count_mount_posts(target).await as u64;
+    let manifest_puts = count_requests(
+        target,
+        Some(&Method::PUT),
+        PathMatch::Contains("/manifests/"),
+    )
+    .await as u64;
 
     let stats_transferred: u64 = report.images.iter().map(|r| r.blob_stats.transferred).sum();
     let stats_mounted: u64 = report.images.iter().map(|r| r.blob_stats.mounted).sum();

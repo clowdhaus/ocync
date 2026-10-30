@@ -606,7 +606,7 @@ async fn sync_cross_repo_mount_success() {
     for repo in ["repo-a", "repo-b"] {
         parts.mount_source(&source_server, repo, "v1").await;
         parts
-            .mount_target_accepting_mounts(&target_server, repo, "v1")
+            .mount_target_answering_mounts(&target_server, repo, "v1", 201)
             .await;
     }
 
@@ -642,21 +642,17 @@ async fn sync_cross_repo_mount_falls_back_to_pull_push() {
         // both refuse.
         for repo in ["repo-a", "repo-b"] {
             parts.mount_source(&source_server, repo, "v1").await;
-            parts.mount_target(&target_server, repo, "v1").await;
-            for digest in parts.blob_digests() {
-                blob_mount_mock(repo, &digest, mount_status)
-                    .mount(&target_server)
-                    .await;
-            }
+            parts
+                .mount_target_answering_mounts(&target_server, repo, "v1", mount_status)
+                .await;
         }
 
         let report = sync_two_repos_one_at_a_time(&source_server, &target_server).await;
 
-        assert_eq!(report.images.len(), 2, "{name}");
-        assert_status!(report, 0, ImageStatus::Synced, "{name}");
-        assert_status!(report, 1, ImageStatus::Synced, "{name}");
-        assert_eq!(report.images[1].blob_stats.mounted, 0, "{name}");
-        assert_eq!(report.images[1].blob_stats.transferred, 2, "{name}");
+        assert_all_synced(&report, 2, name);
+        assert_eq!(report.stats.blobs_mounted, 0, "{name}");
+        // The leader pushes its 2 blobs and the follower, refused, pushes its own 2.
+        assert_eq!(report.stats.blobs_transferred, 4, "{name}");
         assert_eq!(
             count_mount_posts(&target_server).await,
             2,

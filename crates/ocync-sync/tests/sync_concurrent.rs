@@ -15,7 +15,7 @@ use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
-use ocync_sync::{ImageStatus, RunOutcome, SyncReport};
+use ocync_sync::{ErrorKind, ImageStatus, RunOutcome, SyncReport};
 use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -1444,10 +1444,19 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         )
         .await
     };
+    let manifest_puts = async || {
+        count_requests(
+            &target_server,
+            Some(&Method::PUT),
+            PathMatch::Contains("/manifests/"),
+        )
+        .await
+    };
 
     let started = std::time::Instant::now();
-    // Triggered once the shared layer is uploaded: inside the commit and the wait.
-    let (report, ()) = tokio::join!(
+    // The manifest PUT is sent after every blob upload and answers after 30s,
+    // so shutdown lands inside the commit and the other image's wait.
+    let report = run_with_shutdown_at(
         tokio::time::timeout(
             Duration::from_secs(10),
             engine.run(
@@ -1458,8 +1467,11 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
                 Some(&shutdown),
             ),
         ),
-        trigger_shutdown_at(&shutdown, 1, &shared_uploads),
-    );
+        &shutdown,
+        1,
+        manifest_puts,
+    )
+    .await;
     let report = report.expect("engine must drain on shutdown during the resolver wait");
 
     assert!(
@@ -1472,6 +1484,10 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         shared_uploads().await,
         1,
         "the shared layer is uploaded once; its waiter had not pushed it"
+    );
+    assert!(
+        shutdown.is_triggered(),
+        "the run finished before shutdown was triggered"
     );
 }
 
@@ -1667,17 +1683,32 @@ async fn mount_resolver_timeout_falls_back_to_push() {
     )
     .await;
 
-    let synced = report
-        .images
-        .iter()
-        .filter(|r| matches!(r.status, ImageStatus::Synced))
-        .count();
-    assert_eq!(
-        synced,
-        1,
-        "only the follower syncs, via push fallback after deadline: {:#?}",
-        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
+    assert_eq!(report.images.len(), 2);
+    let status_of = |repo: &str| {
+        let source = format!("{repo}:v1");
+        let image = report.images.iter().find(|r| r.source == source);
+        &image
+            .unwrap_or_else(|| panic!("no result for {source}"))
+            .status
+    };
+    assert!(
+        matches!(status_of("follower"), ImageStatus::Synced),
+        "the follower syncs via push fallback after the deadline: {:?}",
+        status_of("follower")
     );
+    assert!(
+        matches!(
+            status_of("leader"),
+            ImageStatus::Failed {
+                kind: ErrorKind::ManifestPush,
+                ..
+            }
+        ),
+        "the leader's manifest PUT answers 500: {:?}",
+        status_of("leader")
+    );
+    assert_eq!(report.stats.images_synced, 1);
+    assert_eq!(report.stats.images_failed, 1);
     assert_eq!(
         report.stats.blobs_mounted, 0,
         "no mounts should succeed when leader never commits"
