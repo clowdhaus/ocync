@@ -121,3 +121,84 @@ pub(crate) fn test_client(url: &str) -> Arc<RegistryClient> {
             .expect("client builds"),
     )
 }
+
+/// Write `content` to a named file in the temp dir and return its path.
+pub(crate) fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
+    std::fs::write(&path, content).expect("temp config writes");
+    path
+}
+
+/// A single-target mapping over `tags` carrying `filter_report`, for
+/// formatter and wiring tests. The clients are placeholders that issue no
+/// requests.
+pub(crate) fn mapping_with_tags_and_report(
+    tags: Vec<ocync_sync::engine::TagPair>,
+    filter_report: Option<ocync_sync::filter::FilterReport>,
+) -> ocync_sync::engine::ResolvedMapping {
+    use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
+    use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TargetEntry};
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    let client = test_client("http://127.0.0.1");
+
+    ResolvedMapping {
+        source_authority: RegistryAuthority::new("source.test:443"),
+        source_client: client.clone(),
+        source_repo: RepositoryName::new("repo").unwrap(),
+        target_repo: RepositoryName::new("repo").unwrap(),
+        targets: vec![TargetEntry {
+            name: RegistryAlias::new("target"),
+            client,
+            batch_checker: None,
+            existing_tags: HashSet::new(),
+        }],
+        tags,
+        platforms: None,
+        head_first: false,
+        immutable_glob: None,
+        artifacts_config: Rc::new(ResolvedArtifacts::default()),
+        candidate_count: filter_report.as_ref().map(|r| r.candidate_count),
+        filter_report,
+    }
+}
+
+/// A registry that answers tag listings and manifest pulls after `delay`,
+/// recording each separately, with the config and clients pointed at it.
+pub(crate) async fn slow_registry(
+    repos: &[String],
+    tags: &[&str],
+    delay: Duration,
+) -> (
+    MockServer,
+    crate::cli::config::Config,
+    crate::cli::commands::synchronize::ClientMap,
+    Arrivals,
+    Arrivals,
+) {
+    use wiremock::matchers::{method, path_regex};
+
+    let server = MockServer::start().await;
+    let tag_arrivals = arrivals();
+    let manifest_arrivals = arrivals();
+
+    wiremock::Mock::given(method("GET"))
+        .and(path_regex(r"^/v2/repo/img\d+/tags/list$"))
+        .respond_with(SlowRecorder::tag_list(&tag_arrivals, delay, tags))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path_regex(r"^/v2/repo/img\d+/manifests/.+$"))
+        .respond_with(SlowRecorder::image_manifest(&manifest_arrivals, delay))
+        .mount(&server)
+        .await;
+
+    let yaml = config_yaml(&server, repos, "      glob: [\"*\"]\n");
+    let config = serde_yaml::from_str(&yaml).expect("generated config parses");
+    let clients = crate::cli::commands::synchronize::ClientMap::from([
+        ("src".to_string(), Ok(test_client(&server.uri()))),
+        ("dst".to_string(), Ok(test_client(&server.uri()))),
+    ]);
+    (server, config, clients, tag_arrivals, manifest_arrivals)
+}

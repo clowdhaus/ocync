@@ -1,27 +1,32 @@
 //! The `expand` subcommand: shows resolved config with env var expansion.
 
 use crate::ExpandArgs;
-use crate::cli::config::expand_config_for_display;
+use crate::cli::config::{SecretVars, expand_config_for_display};
 use crate::cli::{CliError, ExitCode};
 
+/// Print the config with `${VAR}` expressions expanded.
 pub(crate) fn run(args: &ExpandArgs) -> Result<ExitCode, CliError> {
-    let yaml = expand_config_for_display(&args.config, args.show_secrets)?;
-    print!("{yaml}");
+    print!("{}", expand(args)?);
     Ok(ExitCode::Success)
+}
+
+/// The expanded config text; secret-pattern variables are rejected unless
+/// `--show-secrets` is set.
+fn expand(args: &ExpandArgs) -> Result<String, CliError> {
+    let secrets = if args.show_secrets {
+        SecretVars::Allow
+    } else {
+        SecretVars::Block
+    };
+    Ok(expand_config_for_display(&args.config, secrets)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use crate::cli::config::expand_config_for_display;
-
-    fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        path
-    }
+    use super::expand;
+    use crate::ExpandArgs;
+    use crate::cli::commands::test_support::write_temp_config;
+    use crate::cli::config::{SecretVars, expand_config_for_display};
 
     #[test]
     fn expand_resolves_env_vars() {
@@ -44,7 +49,7 @@ mappings:
                 "123456.dkr.ecr.us-east-1.amazonaws.com",
             )
         };
-        let expanded = expand_config_for_display(&path, true).unwrap();
+        let expanded = expand_config_for_display(&path, SecretVars::Allow).unwrap();
         assert!(expanded.contains("123456.dkr.ecr.us-east-1.amazonaws.com"));
         assert!(!expanded.contains("OCYNC_TEST_ECR_URL"));
         unsafe { std::env::remove_var("OCYNC_TEST_ECR_URL") };
@@ -52,51 +57,37 @@ mappings:
     }
 
     #[test]
-    fn expand_blocks_secret_vars_without_show_secrets() {
+    fn show_secrets_flag_controls_secret_variables() {
         let path = write_temp_config(
-            "expand_blocked",
-            r#"
-registries:
-  hub:
-    url: "${OCYNC_EXPAND_SECRET_BLOCKED}"
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#,
+            "expand_show_secrets",
+            "token: \"${OCYNC_EXPAND_FLAG_SECRET}\"\n",
         );
-        unsafe { std::env::set_var("OCYNC_EXPAND_SECRET_BLOCKED", "s3cret") };
-        let result = expand_config_for_display(&path, false);
-        assert!(result.is_err());
-        unsafe { std::env::remove_var("OCYNC_EXPAND_SECRET_BLOCKED") };
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn expand_allows_secret_vars_with_show_secrets() {
-        let path = write_temp_config(
-            "expand_allowed",
-            r#"
-registries:
-  hub:
-    url: "${OCYNC_EXPAND_SECRET_ALLOWED}"
-mappings:
-  - from: nginx
-    tags:
-      glob: "*"
-"#,
-        );
-        unsafe { std::env::set_var("OCYNC_EXPAND_SECRET_ALLOWED", "s3cret") };
-        let expanded = expand_config_for_display(&path, true).unwrap();
-        assert!(expanded.contains("s3cret"));
-        unsafe { std::env::remove_var("OCYNC_EXPAND_SECRET_ALLOWED") };
+        unsafe { std::env::set_var("OCYNC_EXPAND_FLAG_SECRET", "s3cret") };
+        let cases = [
+            ("flag off blocks", false, false),
+            ("flag on shows", true, true),
+        ];
+        for (name, show_secrets, shown) in cases {
+            let result = expand(&ExpandArgs {
+                config: path.clone(),
+                show_secrets,
+            });
+            if shown {
+                assert_eq!(result.unwrap(), "token: \"s3cret\"\n", "{name}");
+            } else {
+                assert!(result.is_err(), "{name}");
+            }
+        }
+        unsafe { std::env::remove_var("OCYNC_EXPAND_FLAG_SECRET") };
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn expand_nonexistent_file() {
-        let result =
-            expand_config_for_display(std::path::Path::new("/tmp/ocync_test_missing.yaml"), false);
+        let result = expand_config_for_display(
+            std::path::Path::new("/tmp/ocync_test_missing.yaml"),
+            SecretVars::Block,
+        );
         assert!(result.is_err());
     }
 }

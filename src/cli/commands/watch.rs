@@ -26,7 +26,7 @@ pub(crate) async fn run(
 
     let health_state = Rc::new(RefCell::new(HealthState::new(interval)));
 
-    // Re-resolved each cycle so config edits take effect.
+    // Startup load; the loop below re-resolves the cache settings each cycle.
     let config = load_config(&args.config)?;
     let (_cache_dir, cache_path) = synchronize::resolve_cache_path(&config, &args.config);
     let cache_ttl = synchronize::resolve_cache_ttl(&config);
@@ -49,12 +49,10 @@ pub(crate) async fn run(
     let local = tokio::task::LocalSet::new();
     let exit_code = local
         .run_until(async {
-            // Warm start from the prior session.
             let cache = Rc::new(RefCell::new(TransferStateCache::load(
                 &cache_path,
                 cache_ttl,
             )));
-            // To detect a changed `cache_dir`.
             let mut active_cache_path = cache_path;
 
             let health_handle = {
@@ -75,7 +73,7 @@ pub(crate) async fn run(
 
             let mut config_failures: u32 = 0;
             const BACKOFF_THRESHOLD: u32 = 3;
-            const MAX_BACKOFF_SECS: u64 = 300;
+            const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
             let exit_code = loop {
                 // Re-resolve the cache path each cycle so a moved `cache_dir` takes
@@ -110,11 +108,11 @@ pub(crate) async fn run(
 
                         // Exponential backoff after repeated failures avoids log spam.
                         if config_failures >= BACKOFF_THRESHOLD {
-                            let backoff_secs = interval
-                                .as_secs()
-                                .saturating_mul(1 << (config_failures - BACKOFF_THRESHOLD).min(4))
-                                .min(MAX_BACKOFF_SECS);
-                            let backoff = Duration::from_secs(backoff_secs);
+                            let backoff =
+                                Duration::from_secs(interval.as_secs().saturating_mul(
+                                    1 << (config_failures - BACKOFF_THRESHOLD).min(4),
+                                ))
+                                .min(MAX_BACKOFF);
                             tracing::warn!(
                                 backoff_secs = backoff.as_secs(),
                                 "config reload failing repeatedly, applying backoff"

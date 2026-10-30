@@ -109,6 +109,13 @@ mod tests {
         state
     }
 
+    /// A state that has just recorded a success through the production path.
+    fn succeeded(interval: Duration) -> HealthState {
+        let mut state = HealthState::new(interval);
+        state.record_success();
+        state
+    }
+
     const MINUTE: Duration = Duration::from_secs(60);
 
     /// Cases shared by the handler and TCP tests:
@@ -132,7 +139,7 @@ mod tests {
             ),
             (
                 "healthz after success",
-                state(MINUTE, Some(Duration::ZERO)),
+                succeeded(MINUTE),
                 "/healthz",
                 OK,
                 "ok\n",
@@ -153,7 +160,7 @@ mod tests {
             ),
             (
                 "readyz after success",
-                state(MINUTE, Some(Duration::ZERO)),
+                succeeded(MINUTE),
                 "/readyz",
                 OK,
                 "ok\n",
@@ -195,7 +202,6 @@ mod tests {
     fn is_ready_requires_a_success_within_twice_the_interval() {
         let cases = [
             ("no success", MINUTE, None, false),
-            ("recent success", MINUTE, Some(Duration::ZERO), true),
             (
                 "stale success",
                 Duration::from_millis(10),
@@ -220,6 +226,7 @@ mod tests {
         for (name, interval, age, want) in cases {
             assert_eq!(state(interval, age).is_ready(), want, "{name}");
         }
+        assert!(succeeded(MINUTE).is_ready(), "recent success");
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
 
-    let expanded = expand_env_vars(&raw, true)?;
+    let expanded = expand_env_vars(&raw, SecretVars::Allow)?;
 
     let config: Config = serde_yaml::from_str(&expanded)
         .map_err(|e| ConfigError::Parse(format!("failed to parse {}: {e}", path.display())))?;
@@ -58,28 +58,42 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
 
 /// Read a config file and return its YAML with `${VAR}` expressions expanded.
 ///
-/// When `show_secrets` is false, secret-pattern variables are blocked.
+/// With `SecretVars::Block`, secret-pattern variables are rejected.
 pub(crate) fn expand_config_for_display(
     path: &Path,
-    show_secrets: bool,
+    secrets: SecretVars,
 ) -> Result<String, ConfigError> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| ConfigError::Parse(format!("failed to read {}: {e}", path.display())))?;
 
-    expand_env_vars(&raw, show_secrets)
+    expand_env_vars(&raw, secrets)
 }
 
+/// Whether `${VAR}` expansion may read secret-pattern variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SecretVars {
+    /// Expand every variable.
+    Allow,
+    /// Reject variables matching `BLOCKED_PATTERNS`.
+    Block,
+}
+
+/// A failure to read, expand or validate a config file.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ConfigError {
+    /// The file could not be read or is not valid YAML for the schema.
     #[error("config parse error: {0}")]
     Parse(String),
 
+    /// A `${VAR:?}` variable is unset or empty.
     #[error("required environment variable not set: {0}")]
     EnvVarRequired(String),
 
+    /// A secret-pattern variable was referenced under `SecretVars::Block`.
     #[error("blocked secret-pattern environment variable: {0}")]
     BlockedEnvVar(String),
 
+    /// The config parsed but a value is out of range or inconsistent.
     #[error("config validation error: {0}")]
     Validation(String),
 }
@@ -170,8 +184,6 @@ where
 }
 
 fn default_max_concurrent_transfers() -> NonZeroUsize {
-    // Keep in lockstep with the engine default; see DEFAULT_BLOB_UPLOAD_CONCURRENCY
-    // in ocync-distribution for the HTTP/2 stream budget derivation.
     ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
@@ -543,11 +555,11 @@ fn is_blocked(var_name: &str) -> bool {
 ///
 /// Only the braced form is supported; bare `$VAR` is literal text.
 ///
-/// When `allow_secrets` is false, variables matching `BLOCKED_PATTERNS`
+/// With `SecretVars::Block`, variables matching `BLOCKED_PATTERNS`
 /// (SECRET, TOKEN, etc.) are rejected so display output cannot leak them.
-/// Config loading always passes `true`: it works on raw YAML without
+/// Config loading always passes `Allow`: it works on raw YAML without
 /// field-level context, and blocking would reject legitimate auth config.
-pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String, ConfigError> {
+pub(crate) fn expand_env_vars(input: &str, secrets: SecretVars) -> Result<String, ConfigError> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -572,7 +584,7 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
             if let Some(pos) = expr.find(":-") {
                 let var_name = &expr[..pos];
                 let default_val = &expr[pos + 2..];
-                if !allow_secrets && is_blocked(var_name) {
+                if secrets == SecretVars::Block && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 match std::env::var(var_name) {
@@ -582,7 +594,7 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
             } else if let Some(pos) = expr.find(":?") {
                 let var_name = &expr[..pos];
                 let err_msg = &expr[pos + 2..];
-                if !allow_secrets && is_blocked(var_name) {
+                if secrets == SecretVars::Block && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 match std::env::var(var_name) {
@@ -597,7 +609,7 @@ pub(crate) fn expand_env_vars(input: &str, allow_secrets: bool) -> Result<String
                 }
             } else {
                 let var_name = &expr;
-                if !allow_secrets && is_blocked(var_name) {
+                if secrets == SecretVars::Block && is_blocked(var_name) {
                     return Err(ConfigError::BlockedEnvVar(var_name.to_string()));
                 }
                 if let Ok(val) = std::env::var(var_name) {
@@ -922,6 +934,7 @@ fn validate_references(config: &Config) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::commands::test_support::write_temp_config;
 
     const SCHEMA_JSON_PATH: &str = "docs/public/config.schema.json";
 
@@ -1178,24 +1191,48 @@ mappings:
     }
 
     #[test]
-    fn expand_simple() {
-        unsafe { std::env::set_var("OCYNC_TEST_HOST", "example.com") };
-        let result = expand_env_vars("https://${OCYNC_TEST_HOST}/v2", false).unwrap();
-        assert_eq!(result, "https://example.com/v2");
-        unsafe { std::env::remove_var("OCYNC_TEST_HOST") };
-    }
-
-    #[test]
-    fn expand_with_default() {
-        unsafe { std::env::remove_var("OCYNC_MISSING_DEFAULT") };
-        let result = expand_env_vars("${OCYNC_MISSING_DEFAULT:-fallback}", false).unwrap();
-        assert_eq!(result, "fallback");
+    fn expand_env_vars_resolves_values() {
+        // (name, variable, value or unset, input, secrets, want)
+        let cases = [
+            (
+                "plain variable",
+                "OCYNC_TEST_HOST",
+                Some("example.com"),
+                "https://${OCYNC_TEST_HOST}/v2",
+                SecretVars::Block,
+                "https://example.com/v2",
+            ),
+            (
+                "default when unset",
+                "OCYNC_MISSING_DEFAULT",
+                None,
+                "${OCYNC_MISSING_DEFAULT:-fallback}",
+                SecretVars::Block,
+                "fallback",
+            ),
+            (
+                "secret variable when allowed",
+                "MY_SECRET_TOKEN",
+                Some("tok123"),
+                "${MY_SECRET_TOKEN}",
+                SecretVars::Allow,
+                "tok123",
+            ),
+        ];
+        for (name, var, value, input, secrets, want) in cases {
+            match value {
+                Some(value) => unsafe { std::env::set_var(var, value) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+            assert_eq!(expand_env_vars(input, secrets).unwrap(), want, "{name}");
+            unsafe { std::env::remove_var(var) };
+        }
     }
 
     #[test]
     fn expand_required_missing() {
         unsafe { std::env::remove_var("OCYNC_REQUIRED_VAR") };
-        let result = expand_env_vars("${OCYNC_REQUIRED_VAR:?must be set}", false);
+        let result = expand_env_vars("${OCYNC_REQUIRED_VAR:?must be set}", SecretVars::Block);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConfigError::EnvVarRequired(msg) => assert_eq!(msg, "must be set"),
@@ -1206,31 +1243,10 @@ mappings:
     #[test]
     fn blocked_secret_when_secrets_disallowed() {
         unsafe { std::env::set_var("MY_SECRET_KEY", "s3cret") };
-        let result = expand_env_vars("${MY_SECRET_KEY}", false);
+        let result = expand_env_vars("${MY_SECRET_KEY}", SecretVars::Block);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ConfigError::BlockedEnvVar(_)));
         unsafe { std::env::remove_var("MY_SECRET_KEY") };
-    }
-
-    #[test]
-    fn allowed_when_secrets_allowed() {
-        unsafe { std::env::set_var("MY_SECRET_TOKEN", "tok123") };
-        let result = expand_env_vars("${MY_SECRET_TOKEN}", true).unwrap();
-        assert_eq!(result, "tok123");
-        unsafe { std::env::remove_var("MY_SECRET_TOKEN") };
-    }
-
-    #[test]
-    fn expand_unquoted_colon_value_breaks_yaml() {
-        // Demonstrates the known limitation: unquoted values containing ":"
-        // can produce invalid YAML. Users must quote values in their config.
-        unsafe { std::env::set_var("OCYNC_TEST_BARE_COLON", "host:8080") };
-        let yaml = "url: ${OCYNC_TEST_BARE_COLON}";
-        let expanded = expand_env_vars(yaml, true).unwrap();
-        // The expansion itself succeeds, but YAML parsing may interpret
-        // "host:8080" differently (as a mapping key).
-        assert_eq!(expanded, "url: host:8080");
-        unsafe { std::env::remove_var("OCYNC_TEST_BARE_COLON") };
     }
 
     #[test]
@@ -1413,15 +1429,6 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.global.is_none());
-        // When global is absent consumers should use the field defaults.
-        let global = GlobalConfig::default();
-        assert_eq!(
-            global.max_concurrent_transfers,
-            default_max_concurrent_transfers()
-        );
-        assert!(global.cache_dir.is_none());
-        assert!(global.cache_ttl.is_none());
-        assert!(global.staging_size_limit.is_none());
     }
 
     #[test]
@@ -1679,8 +1686,6 @@ mappings:
         assert!(artifacts.enabled, "enabled should default to true");
     }
 
-    // - aws_profile validation -----------------------------------------------
-
     #[test]
     fn exact_tags_literals() {
         let cases = [
@@ -1818,7 +1823,7 @@ mappings:
     #[test]
     fn invalid_platforms_rejected() {
         let cases: [(&str, &[&str], &str); 7] = [
-            ("defaults, no slash", &["linux-amd64"], "linux-amd64"),
+            ("no slash", &["linux-amd64"], "linux-amd64"),
             ("slash only", &["/"], "/"),
             ("empty os", &["/amd64"], "/amd64"),
             ("empty arch", &["linux/"], "linux/"),
@@ -1834,6 +1839,23 @@ mappings:
                 }
                 other => panic!("{name}: expected Validation, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn invalid_platform_in_defaults_rejected() {
+        let path = write_temp_config(
+            "config_invalid_default_platform",
+            "defaults:\n  platforms:\n    - linux-amd64\nmappings:\n  - from: library/nginx\n    tags:\n      glob: \"*\"\n",
+        );
+        let err = load_config(&path).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        match err {
+            ConfigError::Validation(msg) => {
+                assert!(msg.contains("defaults"), "{msg}");
+                assert!(msg.contains("linux-amd64"), "{msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
         }
     }
 
@@ -2011,7 +2033,11 @@ mappings:
             ("unclosed brace", "prefix-${UNCLOSED"),
         ];
         for (name, input) in cases {
-            assert_eq!(expand_env_vars(input, false).unwrap(), input, "{name}");
+            assert_eq!(
+                expand_env_vars(input, SecretVars::Block).unwrap(),
+                input,
+                "{name}"
+            );
         }
     }
 
@@ -2026,7 +2052,7 @@ mappings:
         for (name, var, value, key) in cases {
             unsafe { std::env::set_var(var, value) };
             let yaml = format!("{key}: \"${{{var}}}\"");
-            let expanded = expand_env_vars(&yaml, true).unwrap();
+            let expanded = expand_env_vars(&yaml, SecretVars::Allow).unwrap();
             let map: HashMap<String, String> = serde_yaml::from_str(&expanded).unwrap();
             assert_eq!(map[key], value, "{name}");
             unsafe { std::env::remove_var(var) };

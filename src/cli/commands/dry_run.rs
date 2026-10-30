@@ -233,6 +233,7 @@ fn render_samples(samples: &[String], verbose: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::commands::test_support::mapping_with_tags_and_report;
     use ocync_sync::filter::{DropReason, FilterReport, StageDelta};
 
     fn report_fixture() -> FilterReport {
@@ -317,10 +318,19 @@ mod tests {
         }
     }
 
+    /// (name, rescued tags, verbose, expected substrings, absent substrings)
+    type IncludeCase = (
+        &'static str,
+        Vec<String>,
+        bool,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+
     #[test]
     fn include_path_renders_count_and_rescued_names() {
         let ten: Vec<String> = (0..10).map(|i| format!("pin-{i}")).collect();
-        let cases: [(&str, Vec<String>, bool, &[&str], &[&str]); 3] = [
+        let cases: [IncludeCase; 3] = [
             (
                 "count and names",
                 vec!["latest".into(), "latest-dev".into(), "edge".into()],
@@ -376,9 +386,18 @@ mod tests {
         }
     }
 
+    /// (name, kept, `min_tags`, expected substrings, absent substrings)
+    type MinTagsCase = (
+        &'static str,
+        usize,
+        usize,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+
     #[test]
     fn min_tags_status_reports_whether_it_is_satisfied() {
-        let cases: [(&str, usize, usize, &[&str], &[&str]); 2] = [
+        let cases: [MinTagsCase; 2] = [
             (
                 "satisfied",
                 5,
@@ -463,9 +482,6 @@ mod tests {
         );
     }
 
-    /// `min_tags: N` configured with kept >= N renders a "satisfied" line.
-    /// `min_tags: N` configured with kept < N renders a hard FAIL warning so
-    /// the user knows real-sync will reject this configuration.
     #[test]
     fn min_tags_status_absent_when_not_configured() {
         let out = capture(|w| write_min_tags_status(w, 5, None, false));
@@ -540,45 +556,5 @@ mod tests {
     fn mapping_with_kept_and_report(n: usize, report: Option<FilterReport>) -> ResolvedMapping {
         let tags: Vec<TagPair> = (0..n).map(|i| TagPair::same(format!("v{i}"))).collect();
         mapping_with_tags_and_report(tags, report)
-    }
-
-    fn mapping_with_tags_and_report(
-        tags: Vec<TagPair>,
-        filter_report: Option<FilterReport>,
-    ) -> ResolvedMapping {
-        use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
-        use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, TargetEntry};
-        use std::collections::HashSet;
-        use std::rc::Rc;
-        use std::sync::Arc;
-
-        // Placeholder client: formatter tests issue no requests.
-        let client = Arc::new(
-            ocync_distribution::RegistryClientBuilder::new(
-                url::Url::parse("http://127.0.0.1").unwrap(),
-            )
-            .build()
-            .unwrap(),
-        );
-
-        ResolvedMapping {
-            source_authority: RegistryAuthority::new("source.test:443"),
-            source_client: client.clone(),
-            source_repo: RepositoryName::new("repo").unwrap(),
-            target_repo: RepositoryName::new("repo").unwrap(),
-            targets: vec![TargetEntry {
-                name: RegistryAlias::new("target"),
-                client,
-                batch_checker: None,
-                existing_tags: HashSet::new(),
-            }],
-            tags,
-            platforms: None,
-            head_first: false,
-            immutable_glob: None,
-            artifacts_config: Rc::new(ResolvedArtifacts::default()),
-            candidate_count: filter_report.as_ref().map(|r| r.candidate_count),
-            filter_report,
-        }
     }
 }

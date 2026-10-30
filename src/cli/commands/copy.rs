@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{
@@ -17,9 +16,10 @@ use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
 
 use crate::CopyArgs;
-use crate::cli::config::{AuthType, load_config};
+use crate::cli::config::load_config;
 use crate::cli::{
     CliError, ExitCode, Registry, RunCredentials, bare_hostname, build_registry_client,
+    is_ecr_registry,
 };
 
 /// Transfer a single image from source to destination; `shutdown`, if given,
@@ -35,7 +35,6 @@ pub(crate) async fn run(
         .ok_or_else(|| CliError::Input(format!("source '{}' has no tag", args.source)))?;
     let dst_tag = args.destination.tag().unwrap_or(src_tag);
 
-    // Without `--config`, auth is auto-detected.
     let registries = if let Some(ref config_path) = args.config {
         let config = load_config(config_path)?;
         config.registries.into_values().collect::<Vec<_>>()
@@ -56,14 +55,12 @@ pub(crate) async fn run(
 
     // ECR batch checker for the destination: ECR's per-blob HEAD returns
     // false-positive 200s under concurrency; only `BatchCheckLayerAvailability`
-    // is authoritative. An explicit non-ECR `auth_type` is a hard opt-out even
-    // when the hostname matches; hostname detection applies only without one.
+    // is authoritative.
     let dst_hostname = bare_hostname(args.destination.registry());
-    let dst_is_ecr = match dst_reg_config.and_then(|r| r.auth_type.as_ref()) {
-        Some(AuthType::Ecr) => true,
-        Some(_) => false,
-        None => detect_provider_kind(dst_hostname) == Some(ProviderKind::Ecr),
-    };
+    let dst_is_ecr = is_ecr_registry(
+        dst_reg_config.and_then(|r| r.auth_type.as_ref()),
+        dst_hostname,
+    );
     let batch_checker: Option<Rc<dyn BatchBlobChecker>> = if dst_is_ecr {
         let profile = dst_reg_config.and_then(|r| r.aws_profile.as_deref());
         let checker = BatchChecker::from_hostname(dst_hostname, profile, &credentials.aws)?;

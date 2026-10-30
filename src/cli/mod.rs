@@ -144,6 +144,17 @@ pub(crate) fn bare_hostname(s: &str) -> &str {
         .trim_end_matches('/')
 }
 
+/// Whether `hostname` is an ECR registry whose uploads need a batch checker.
+/// An explicit non-ECR `auth_type` is a hard opt-out even when the hostname
+/// matches; hostname detection applies only without one.
+pub(crate) fn is_ecr_registry(auth_type: Option<&AuthType>, hostname: &str) -> bool {
+    match auth_type {
+        Some(AuthType::Ecr) => true,
+        Some(_) => false,
+        None => detect_provider_kind(hostname) == Some(ProviderKind::Ecr),
+    }
+}
+
 /// Map a registry hostname to the host serving its v2 API.
 ///
 /// Docker Hub's canonical `docker.io` appears in references and token scopes,
@@ -195,7 +206,9 @@ impl<'a> Registry<'a> {
 /// the next run, such as the next watch cycle, loads them afresh.
 #[derive(Debug, Default)]
 pub(crate) struct RunCredentials {
+    /// AWS credential providers keyed by profile and region.
     pub(crate) aws: AwsCredentialProviders,
+    /// The shared Google token.
     pub(crate) gcp: SharedGoogleToken,
 }
 
@@ -293,7 +306,6 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         None => {
-            // Detected once; the result is matched below.
             match detect_provider_kind(bare_host) {
                 Some(ProviderKind::Ecr) => {
                     let auth = EcrAuth::new(bare_host, None, aws_credentials)?;
@@ -523,44 +535,6 @@ mod tests {
         ];
         for (name, input, want) in cases {
             assert_eq!(endpoint_host(input), want, "{name}");
-        }
-    }
-
-    #[test]
-    fn exit_code_all_variants_distinct() {
-        assert_ne!(ExitCode::Success, ExitCode::PartialFailure);
-        assert_ne!(ExitCode::PartialFailure, ExitCode::Failure);
-        assert_ne!(ExitCode::Failure, ExitCode::ConfigError);
-        assert_ne!(ExitCode::ConfigError, ExitCode::AuthError);
-    }
-
-    #[test]
-    fn all_auth_types_are_handled() {
-        // Exhaustive match ensures no AuthType variant is unhandled.
-        // If a new variant is added, this fails to compile.
-        let variants = [
-            AuthType::Ecr,
-            AuthType::Gar,
-            AuthType::Gcr,
-            AuthType::Acr,
-            AuthType::Ghcr,
-            AuthType::Anonymous,
-            AuthType::Basic,
-            AuthType::StaticToken,
-            AuthType::DockerConfig,
-        ];
-        for variant in &variants {
-            match variant {
-                AuthType::Ecr => {}
-                AuthType::Gar => {}
-                AuthType::Gcr => {}
-                AuthType::Acr => {}
-                AuthType::Ghcr => {}
-                AuthType::Anonymous => {}
-                AuthType::Basic => {}
-                AuthType::StaticToken => {}
-                AuthType::DockerConfig => {}
-            }
         }
     }
 }

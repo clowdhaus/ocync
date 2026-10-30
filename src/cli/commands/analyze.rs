@@ -18,9 +18,9 @@ use ocync_sync::ShutdownSignal;
 use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
-    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, UnresolvedMapping,
-    build_clients, log_unresolved_mapping, referenced_registries, resolve_mapping,
-    shared_failure_code, with_prepare_progress,
+    ClientMap, DroppedTarget, MappingResolution, PreparePhase, PrepareTracker, Selection,
+    UnresolvedMapping, build_clients, log_unresolved_mapping, referenced_registries,
+    resolve_mapping, shared_failure_code, with_prepare_progress,
 };
 use crate::cli::config::{Config, load_config};
 use crate::cli::output::format_bytes;
@@ -169,7 +169,10 @@ async fn collect_analysis(
                 let _item = tracker.track(&mapping.from);
                 (
                     idx,
-                    Some(resolve_mapping(mapping, config, clients, no_checkers, false).await),
+                    Some(
+                        resolve_mapping(mapping, config, clients, no_checkers, Selection::Sync)
+                            .await,
+                    ),
                 )
             }
         }))
@@ -561,14 +564,6 @@ mod tests {
         }
     }
 
-    /// An image missing one platform still contributed the others, so the
-    /// report is partial, not empty. Counting it as a total failure reported a
-    /// mostly-complete run as zero images analyzed and exited 2.
-    /// A run cut short by SIGINT is a truncated report, not a clean one.
-    /// A mapping the analysis could not resolve is as much a hole in the
-    /// estimate as an image it could not read.
-    /// An unreachable target changes the mount-savings answer even when every
-    /// image read cleanly, so it cannot report as a clean run.
     fn unresolved_mapping() -> UnresolvedMapping {
         UnresolvedMapping {
             from: "repo/one".into(),
@@ -603,6 +598,7 @@ mod tests {
                 },
                 ExitCode::PartialFailure,
             ),
+            // As much a hole in the estimate as an image it could not read.
             (
                 "unresolved mapping alone",
                 Analysis {
@@ -623,50 +619,14 @@ mod tests {
         }
     }
 
-    use crate::cli::commands::test_support::{
-        Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names, test_client,
-    };
+    use crate::cli::commands::test_support::{max_in_flight, repo_names, slow_registry};
 
-    /// A registry that answers tag listings and manifest pulls after `delay`,
-    /// recording each separately.
-    async fn slow_registry(
-        repos: &[String],
-        tags: &[&str],
-        delay: std::time::Duration,
-    ) -> (wiremock::MockServer, Config, ClientMap, Arrivals, Arrivals) {
-        let server = wiremock::MockServer::start().await;
-        let tag_arrivals = arrivals();
-        let manifest_arrivals = arrivals();
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/v2/repo/img\d+/tags/list$",
-            ))
-            .respond_with(SlowRecorder::tag_list(&tag_arrivals, delay, tags))
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/v2/repo/img\d+/manifests/.+$",
-            ))
-            .respond_with(SlowRecorder::image_manifest(&manifest_arrivals, delay))
-            .mount(&server)
-            .await;
-
-        let yaml = config_yaml(&server, repos, "      glob: [\"*\"]\n");
-        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
-        let clients = ClientMap::from([
-            ("src".to_string(), Ok(test_client(&server.uri()))),
-            ("dst".to_string(), Ok(test_client(&server.uri()))),
-        ]);
-        (server, config, clients, tag_arrivals, manifest_arrivals)
-    }
-
+    /// Many mappings with few tags each: a per-mapping walk would stay serial.
     #[tokio::test]
-    async fn collect_analysis_resolves_mappings_concurrently() {
+    async fn collect_analysis_overlaps_tag_listings_and_manifest_pulls() {
         let delay = std::time::Duration::from_millis(250);
         let repos = repo_names(8);
-        let (_server, config, clients, tag_arrivals, _) =
+        let (_server, config, clients, tag_arrivals, manifest_arrivals) =
             slow_registry(&repos, &["v1"], delay).await;
 
         let analysis = collect_analysis(
@@ -685,27 +645,6 @@ mod tests {
             observed > 1,
             "tag listings must overlap; saw at most {observed} in flight"
         );
-    }
-
-    /// Many mappings with few tags each: a per-mapping walk would stay serial.
-    #[tokio::test]
-    async fn collect_analysis_pulls_images_concurrently_across_mappings() {
-        let delay = std::time::Duration::from_millis(250);
-        let repos = repo_names(8);
-        let (_server, config, clients, _, manifest_arrivals) =
-            slow_registry(&repos, &["v1"], delay).await;
-
-        let analysis = collect_analysis(
-            &config,
-            &clients,
-            &HashMap::new(),
-            &ShutdownSignal::new(),
-            &PrepareTracker::default(),
-            ANALYZE_CONCURRENCY,
-        )
-        .await;
-
-        assert_eq!(analysis.analyzed, 8);
         let observed = max_in_flight(&manifest_arrivals, delay);
         assert!(
             observed > 1,

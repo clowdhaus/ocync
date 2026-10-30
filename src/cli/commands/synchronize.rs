@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use ocync_distribution::AwsCredentialProviders;
-use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::ecr::{BatchBlobChecker, BatchChecker};
 use ocync_distribution::{RegistryClient, RepositoryName};
 use ocync_sync::SyncReport;
@@ -28,12 +27,13 @@ use serde::Serialize;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    AuthType, CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, StagingLimit,
-    TagsConfig, load_config, resolve_target_names,
+    CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, StagingLimit, TagsConfig,
+    load_config, resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{
     CliError, ExitCode, Registry, RunCredentials, bare_hostname, build_registry_client,
+    is_ecr_registry,
 };
 
 /// Default cache TTL: 12 hours.
@@ -208,8 +208,7 @@ impl Drop for InFlightGuard<'_> {
 /// [`PREPARE_PROGRESS_INTERVAL`].
 ///
 /// The ticker fires on wall-clock, not on item boundaries, so a single slow
-/// mapping still reports. A boundary-driven throttle emitted nothing across an
-/// 8.6 second run on a three-mapping config.
+/// mapping still reports.
 pub(crate) async fn with_prepare_progress<F: Future>(
     tracker: &PrepareTracker,
     what: &'static str,
@@ -299,7 +298,9 @@ impl fmt::Display for RegistryRole {
 /// into `Vec<ResolvedMapping>`, so boxing it would add an allocation per success.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum MappingResolution {
+    /// Ready for the engine.
     Resolved(ResolvedMapping),
+    /// No source tag survived filtering.
     NoMatchingTags(NoTagsInfo),
 }
 
@@ -410,6 +411,17 @@ impl fmt::Display for NoTagsInfo {
     }
 }
 
+/// How a mapping's outcome compares with the prior cycle's.
+#[derive(Debug, PartialEq, Eq)]
+enum OutcomeChange {
+    /// Identical to the prior cycle: suppress the line.
+    Unchanged,
+    /// New or different: emit the line.
+    Changed,
+    /// `failed` went from nonzero to zero: emit with `[recovered]`.
+    Recovered,
+}
+
 /// Cross-cycle state that lets watch mode log on transitions instead of every
 /// cycle. Sync mode passes `None`; `watch::run` owns the state across loop
 /// iterations.
@@ -505,26 +517,26 @@ impl WatchLogState {
     }
 
     /// Record `outcome` as the latest result for `from`.
-    ///
-    /// Returns `None` when identical to the prior cycle (suppress),
-    /// `Some(false)` on a non-recovery transition, and `Some(true)` when
-    /// `failed` went from nonzero to zero (emit with `[recovered]`).
-    fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> Option<bool> {
+    fn observe_mapping_outcome(&mut self, from: &str, outcome: &MappingOutcome) -> OutcomeChange {
         use std::collections::hash_map::Entry;
         match self.last_outcomes.entry(from.to_string()) {
             Entry::Occupied(mut slot) => {
                 let prev = *slot.get();
                 if &prev == outcome {
-                    return None;
+                    return OutcomeChange::Unchanged;
                 }
                 slot.insert(*outcome);
                 self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
-                Some(prev.failed > 0 && outcome.failed == 0)
+                if prev.failed > 0 && outcome.failed == 0 {
+                    OutcomeChange::Recovered
+                } else {
+                    OutcomeChange::Changed
+                }
             }
             Entry::Vacant(slot) => {
                 slot.insert(*outcome);
                 self.cycle_emit_count = self.cycle_emit_count.saturating_add(1);
-                Some(false)
+                OutcomeChange::Changed
             }
         }
     }
@@ -636,7 +648,11 @@ pub(crate) async fn run(
             &config,
             &clients,
             &batch_checkers,
-            args.dry_run,
+            if args.dry_run {
+                Selection::DryRun
+            } else {
+                Selection::Sync
+            },
             watch_log.as_deref_mut(),
             &tracker,
             PREPARE_MAPPING_CONCURRENCY,
@@ -879,8 +895,9 @@ fn emit_mapping_outcomes(
         }
         let recovered = match watch_log.as_deref_mut() {
             Some(state) => match state.observe_mapping_outcome(&d.from, &outcome) {
-                Some(r) => r,
-                None => continue,
+                OutcomeChange::Unchanged => continue,
+                OutcomeChange::Changed => false,
+                OutcomeChange::Recovered => true,
             },
             None => false,
         };
@@ -1181,15 +1198,7 @@ fn build_batch_checkers(
         // Held for the whole body so every `continue` still retires the item.
         let _item = tracker.track(name);
         let hostname = bare_hostname(&reg.url);
-        // An explicit non-Ecr auth_type is a hard opt-out, even when the
-        // hostname matches; auto-detect only when no `auth_type` is set.
-        let is_ecr = match reg.auth_type.as_ref() {
-            Some(AuthType::Ecr) => true,
-            Some(_) => false,
-            None => detect_provider_kind(hostname) == Some(ProviderKind::Ecr),
-        };
-
-        if !is_ecr {
+        if !is_ecr_registry(reg.auth_type.as_ref(), hostname) {
             continue;
         }
 
@@ -1240,7 +1249,7 @@ async fn resolve_all(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    with_report: bool,
+    selection: Selection,
     mut watch_log: Option<&mut WatchLogState>,
     tracker: &PrepareTracker,
     concurrency: usize,
@@ -1253,8 +1262,7 @@ async fn resolve_all(
 
     // `buffer_unordered`, not `buffered`: an ordered queue frees a slot only
     // when the head yields, so one mapping listing tens of thousands of tags
-    // pins its slot and every finished mapping behind it keeps its own. On a
-    // 95-mapping run that held the window at 2 or 3 of 16 for minutes.
+    // pins its slot and every finished mapping behind it keeps its own.
     //
     // The bookkeeping below needs config order, so each outcome carries its
     // index and is re-sorted. That keeps `watch_log`, the counters and the
@@ -1272,7 +1280,7 @@ async fn resolve_all(
                 let _item = tracker.track(&mapping.from);
                 (
                     idx,
-                    resolve_mapping(mapping, config, clients, batch_checkers, with_report).await,
+                    resolve_mapping(mapping, config, clients, batch_checkers, selection).await,
                 )
             }
         }))
@@ -1452,7 +1460,7 @@ pub(crate) async fn resolve_mapping(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    with_report: bool,
+    selection: Selection,
 ) -> (Result<MappingResolution, CliError>, Vec<DroppedTarget>) {
     // Returned unconditionally: a `?` in the rest of resolution would discard
     // them, and a mapping that loses a mirror and then hits a rate limit would
@@ -1463,7 +1471,7 @@ pub(crate) async fn resolve_mapping(
         config,
         clients,
         batch_checkers,
-        with_report,
+        selection,
         &mut dropped,
     )
     .await;
@@ -1475,7 +1483,7 @@ async fn resolve_mapping_inner(
     config: &Config,
     clients: &ClientMap,
     batch_checkers: &HashMap<String, Rc<dyn BatchBlobChecker>>,
-    with_report: bool,
+    selection: Selection,
     dropped: &mut Vec<DroppedTarget>,
 ) -> Result<MappingResolution, CliError> {
     // --- Source registry ---
@@ -1561,7 +1569,7 @@ async fn resolve_mapping_inner(
             samples,
         };
         let (kept, count, report) =
-            select_filtered_tags(mapping_tags, defaults_tags, all_tags, with_report)?;
+            select_filtered_tags(mapping_tags, defaults_tags, all_tags, selection)?;
         (kept, count, report, Some(template))
     };
 
@@ -1755,26 +1763,34 @@ type SelectionResult = (
     Option<ocync_sync::filter::FilterReport>,
 );
 
+/// How tag selection treats `min_tags`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Selection {
+    /// A real sync: [`FilterConfig::apply`] returns `BelowMinTags` when
+    /// `min_tags` is violated, and no filter trace is built.
+    Sync,
+    /// `--dry-run`: [`FilterConfig::apply_with_report`] does NOT enforce
+    /// `min_tags`; the report carries the configured value so the gap can be
+    /// rendered.
+    DryRun,
+}
+
 /// Apply the filter pipeline to `all_tags`.
-///
-/// `with_report = true` (dry-run) uses [`FilterConfig::apply_with_report`],
-/// which does NOT enforce `min_tags`: the report carries the configured value
-/// so the gap can be rendered. `with_report = false` uses
-/// [`FilterConfig::apply`], which returns `BelowMinTags` when violated.
 fn select_filtered_tags(
     mapping_tags: Option<&TagsConfig>,
     defaults_tags: Option<&TagsConfig>,
     all_tags: Vec<String>,
-    with_report: bool,
+    selection: Selection,
 ) -> Result<SelectionResult, CliError> {
     let n_candidates = all_tags.len();
     let filter = build_filter(mapping_tags, defaults_tags);
     let tag_refs: Vec<&str> = all_tags.iter().map(String::as_str).collect();
-    if with_report {
-        let result = filter.apply_with_report(&tag_refs)?;
-        Ok((result.kept, Some(n_candidates), Some(result.report)))
-    } else {
-        Ok((filter.apply(&tag_refs)?, Some(n_candidates), None))
+    match selection {
+        Selection::DryRun => {
+            let result = filter.apply_with_report(&tag_refs)?;
+            Ok((result.kept, Some(n_candidates), Some(result.report)))
+        }
+        Selection::Sync => Ok((filter.apply(&tag_refs)?, Some(n_candidates), None)),
     }
 }
 
@@ -2613,18 +2629,27 @@ include: ["1.25.0-rc1"]
 
         assert_eq!(
             state.observe_mapping_outcome("repo-a", &steady),
-            Some(false)
+            OutcomeChange::Changed
         );
-        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
-        assert_eq!(state.observe_mapping_outcome("repo-a", &steady), None);
-        assert_eq!(
-            state.observe_mapping_outcome("repo-a", &active),
-            Some(false)
-        );
-        assert_eq!(state.observe_mapping_outcome("repo-a", &active), None);
         assert_eq!(
             state.observe_mapping_outcome("repo-a", &steady),
-            Some(false)
+            OutcomeChange::Unchanged
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            OutcomeChange::Unchanged
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &active),
+            OutcomeChange::Changed
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &active),
+            OutcomeChange::Unchanged
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("repo-a", &steady),
+            OutcomeChange::Changed
         );
     }
 
@@ -2642,8 +2667,14 @@ include: ["1.25.0-rc1"]
             ..MappingOutcome::default()
         };
 
-        assert_eq!(state.observe_mapping_outcome("r", &failing), Some(false));
-        assert_eq!(state.observe_mapping_outcome("r", &healthy), Some(true));
+        assert_eq!(
+            state.observe_mapping_outcome("r", &failing),
+            OutcomeChange::Changed
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("r", &healthy),
+            OutcomeChange::Recovered
+        );
         assert_eq!(state.cycle_emit_count(), 2);
     }
 
@@ -2661,8 +2692,14 @@ include: ["1.25.0-rc1"]
 
         state.retain_active(["keep"]);
 
-        assert_eq!(state.observe_mapping_outcome("drop", &outcome), Some(false));
-        assert_eq!(state.observe_mapping_outcome("keep", &outcome), None);
+        assert_eq!(
+            state.observe_mapping_outcome("drop", &outcome),
+            OutcomeChange::Changed
+        );
+        assert_eq!(
+            state.observe_mapping_outcome("keep", &outcome),
+            OutcomeChange::Unchanged
+        );
     }
 
     /// Omits zero counts and the bytes clause when nothing transferred, tags
@@ -2738,10 +2775,10 @@ include: ["1.25.0-rc1"]
         }
     }
 
-    /// `with_report = true` yields a `FilterReport` carrying the configured
-    /// `min_tags` and `include_kept`; hardcoding `with_report` to `false` fails this.
+    /// A dry run yields a `FilterReport` carrying the configured `min_tags`
+    /// and `include_kept`; selecting `Selection::Sync` instead fails this.
     #[test]
-    fn select_filtered_tags_with_report_populates_min_tags_and_include() {
+    fn select_filtered_tags_dry_run_populates_min_tags_and_include() {
         use ocync_sync::filter::SortOrder;
 
         let tags_config = TagsConfig {
@@ -2760,10 +2797,10 @@ include: ["1.25.0-rc1"]
             "0.9.0-rc1".into(),
         ];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun).unwrap();
 
         assert_eq!(candidate_count, Some(5));
-        let report = report.expect("report present when with_report=true");
+        let report = report.expect("report present for a dry run");
         assert_eq!(report.min_tags, Some(5));
         // `latest` fails semver but is rescued by `include:`.
         assert_eq!(report.include_kept, vec!["latest".to_string()]);
@@ -2773,43 +2810,50 @@ include: ["1.25.0-rc1"]
         assert!(kept.contains(&"latest".to_string()));
     }
 
-    /// `with_report = false` yields no report, avoiding drop-attribution cost
-    /// on every watch cycle.
+    /// A real sync yields no report, avoiding drop-attribution cost on every
+    /// watch cycle.
     #[test]
-    fn select_filtered_tags_without_report_returns_none() {
+    fn select_filtered_tags_sync_returns_no_report() {
         let tags_config = TagsConfig {
             glob: Some(GlobOrList::Single("*".into())),
             ..Default::default()
         };
         let all_tags = vec!["1.0".into(), "2.0".into()];
         let (kept, candidate_count, report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, false).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::Sync).unwrap();
         assert_eq!(candidate_count, Some(2));
         assert_eq!(kept.len(), 2);
         assert!(report.is_none());
     }
 
-    /// Real sync (`with_report = false`) enforces `min_tags`; the dry run does
-    /// not, so its formatter can surface the gap instead of suppressing the report.
+    /// A real sync rejects a tag set smaller than `min_tags`.
     #[test]
-    fn select_filtered_tags_enforces_min_tags_only_without_report() {
+    fn select_filtered_tags_sync_enforces_min_tags() {
         let tags_config = TagsConfig {
             min_tags: Some(10),
             ..Default::default()
         };
-        for (name, with_report) in [("real sync", false), ("dry run", true)] {
-            let all_tags = vec!["1.0".into(), "2.0".into()];
-            let result = select_filtered_tags(Some(&tags_config), None, all_tags, with_report);
-            if with_report {
-                let (kept, candidate_count, report) = result.expect(name);
-                assert_eq!(kept.len(), 2, "{name}");
-                assert_eq!(candidate_count, Some(2), "{name}");
-                let report = report.expect("dry run returns a report despite min_tags");
-                assert_eq!(report.min_tags, Some(10), "{name}");
-            } else {
-                assert!(result.is_err(), "{name}: expected BelowMinTags");
-            }
-        }
+        let all_tags = vec!["1.0".into(), "2.0".into()];
+        let result = select_filtered_tags(Some(&tags_config), None, all_tags, Selection::Sync);
+        assert!(result.is_err(), "expected BelowMinTags");
+    }
+
+    /// The dry run does not enforce `min_tags`, so its formatter can surface
+    /// the gap instead of suppressing the report.
+    #[test]
+    fn select_filtered_tags_dry_run_reports_instead_of_enforcing_min_tags() {
+        let tags_config = TagsConfig {
+            min_tags: Some(10),
+            ..Default::default()
+        };
+        let all_tags = vec!["1.0".into(), "2.0".into()];
+        let (kept, candidate_count, report) =
+            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun)
+                .expect("a dry run does not enforce min_tags");
+        assert_eq!(kept.len(), 2);
+        assert_eq!(candidate_count, Some(2));
+        let report = report.expect("dry run returns a report despite min_tags");
+        assert_eq!(report.min_tags, Some(10));
     }
 
     /// Three mappings; the middle one names a registry that does not exist.
@@ -2841,14 +2885,6 @@ mappings:
         .expect("config yaml parses")
     }
 
-    fn test_client(url: &str) -> Arc<RegistryClient> {
-        Arc::new(
-            ocync_distribution::RegistryClientBuilder::new(url::Url::parse(url).unwrap())
-                .build()
-                .unwrap(),
-        )
-    }
-
     fn working_clients() -> ClientMap {
         ClientMap::from([
             ("src".to_string(), Ok(test_client("https://source.test"))),
@@ -2870,7 +2906,7 @@ mappings:
             config,
             clients,
             &HashMap::new(),
-            false,
+            Selection::Sync,
             None,
             &PrepareTracker::default(),
             PREPARE_MAPPING_CONCURRENCY,
@@ -3208,9 +3244,8 @@ mappings:
         assert_eq!(used.len(), 2);
     }
 
-    /// The ticker fires on wall-clock, not on item boundaries (a boundary
-    /// throttle scored one item outlasting an interval as silent), and work
-    /// that finishes inside one interval stays silent.
+    /// The ticker fires on wall-clock, not on item boundaries, and work that
+    /// finishes inside one interval stays silent.
     #[tokio::test(start_paused = true)]
     async fn prepare_ticker_cadence() {
         let cases = [
@@ -3415,24 +3450,21 @@ mappings:
             failed: 0,
             bytes: 0,
         };
-        assert!(
-            state
-                .observe_mapping_outcome("repo/one", &outcome)
-                .is_some()
+        assert_eq!(
+            state.observe_mapping_outcome("repo/one", &outcome),
+            OutcomeChange::Changed
         );
-        assert!(
-            state
-                .observe_mapping_outcome("repo/one", &outcome)
-                .is_none()
+        assert_eq!(
+            state.observe_mapping_outcome("repo/one", &outcome),
+            OutcomeChange::Unchanged
         );
 
         state.observe_mapping_unresolved("repo/one");
         state.observe_mapping_resolved("repo/one");
 
-        assert!(
-            state
-                .observe_mapping_outcome("repo/one", &outcome)
-                .is_some(),
+        assert_eq!(
+            state.observe_mapping_outcome("repo/one", &outcome),
+            OutcomeChange::Changed,
             "recovery must report even when the counts are unchanged"
         );
     }
@@ -3504,7 +3536,7 @@ mappings:
             &config,
             &working_clients(),
             &HashMap::new(),
-            false,
+            Selection::Sync,
             None,
             &PrepareTracker::default(),
             PREPARE_MAPPING_CONCURRENCY,
@@ -3699,10 +3731,6 @@ mappings:
     /// `ResolvedMapping` to the `dry_run::write_to` output.
     #[test]
     fn dry_run_full_wire_up_renders_min_tags_failure() {
-        use ocync_distribution::spec::RegistryAuthority;
-        use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TargetEntry};
-        use std::collections::HashSet as Set;
-
         let tags_config = TagsConfig {
             semver: Some(range(">=2.0")),
             min_tags: Some(5),
@@ -3710,36 +3738,15 @@ mappings:
         };
         let all_tags: Vec<String> = (0..10).map(|i| format!("1.{i}.0")).collect();
         let (kept, candidate_count, filter_report) =
-            select_filtered_tags(Some(&tags_config), None, all_tags, true).unwrap();
+            select_filtered_tags(Some(&tags_config), None, all_tags, Selection::DryRun).unwrap();
         assert_eq!(kept.len(), 0); // all dropped by semver >=2.0
         assert!(filter_report.is_some());
 
-        let client = Arc::new(
-            ocync_distribution::RegistryClientBuilder::new(
-                url::Url::parse("http://127.0.0.1").unwrap(),
-            )
-            .build()
-            .unwrap(),
-        );
-        let mapping = ResolvedMapping {
-            source_authority: RegistryAuthority::new("source.test:443"),
-            source_client: client.clone(),
-            source_repo: RepositoryName::new("repo").unwrap(),
-            target_repo: RepositoryName::new("repo").unwrap(),
-            targets: vec![TargetEntry {
-                name: RegistryAlias::new("target"),
-                client,
-                batch_checker: None,
-                existing_tags: Set::new(),
-            }],
-            tags: kept.into_iter().map(TagPair::same).collect(),
-            platforms: None,
-            head_first: false,
-            immutable_glob: None,
-            artifacts_config: Rc::new(ResolvedArtifacts::default()),
-            candidate_count,
+        let mut mapping = mapping_with_tags_and_report(
+            kept.into_iter().map(TagPair::same).collect(),
             filter_report,
-        };
+        );
+        mapping.candidate_count = candidate_count;
 
         let mut buf: Vec<u8> = Vec::new();
         crate::cli::commands::dry_run::write_to(&mut buf, &[mapping], &[], &[], false).unwrap();
@@ -3753,47 +3760,22 @@ mappings:
     }
 
     use crate::cli::commands::test_support::{
-        Arrivals, SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names,
+        SlowRecorder, arrivals, config_yaml, mapping_with_tags_and_report, max_in_flight,
+        repo_names, slow_registry, test_client,
     };
 
-    /// A source registry that answers every mapping's tag listing after
-    /// `delay`, plus the config and clients pointed at it.
-    async fn slow_tag_registry(
-        mappings: usize,
-        delay: Duration,
-    ) -> (wiremock::MockServer, Config, ClientMap, Arrivals) {
-        let server = wiremock::MockServer::start().await;
-        let arrivals = arrivals();
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path_regex(
-                r"^/v2/repo/img\d+/tags/list$",
-            ))
-            .respond_with(SlowRecorder::tag_list(&arrivals, delay, &["v1"]))
-            .mount(&server)
-            .await;
-
-        let yaml = config_yaml(&server, &repo_names(mappings), "      glob: [\"*\"]\n");
-        let config: Config = serde_yaml::from_str(&yaml).expect("generated config parses");
-        let clients = ClientMap::from([
-            ("src".to_string(), Ok(test_client(&server.uri()))),
-            ("dst".to_string(), Ok(test_client(&server.uri()))),
-        ]);
-        (server, config, clients, arrivals)
-    }
-
-    /// Mapping resolution must overlap its network waits: serial resolution on
-    /// a 95-mapping config took 11 minutes before the engine started.
+    /// Mapping resolution must overlap its network waits.
     #[tokio::test]
     async fn resolve_all_resolves_mappings_concurrently() {
         let delay = Duration::from_millis(250);
-        let (_server, config, clients, arrivals) = slow_tag_registry(8, delay).await;
+        let (_server, config, clients, arrivals, _) =
+            slow_registry(&repo_names(8), &["v1"], delay).await;
 
         let resolution = resolve_all(
             &config,
             &clients,
             &HashMap::new(),
-            false,
+            Selection::Sync,
             None,
             &PrepareTracker::default(),
             PREPARE_MAPPING_CONCURRENCY,
@@ -3815,13 +3797,14 @@ mappings:
     async fn resolve_all_never_exceeds_its_concurrency_limit() {
         let delay = Duration::from_millis(250);
         let limit = 2;
-        let (_server, config, clients, arrivals) = slow_tag_registry(8, delay).await;
+        let (_server, config, clients, arrivals, _) =
+            slow_registry(&repo_names(8), &["v1"], delay).await;
 
         resolve_all(
             &config,
             &clients,
             &HashMap::new(),
-            false,
+            Selection::Sync,
             None,
             &PrepareTracker::default(),
             limit,
@@ -3840,14 +3823,14 @@ mappings:
     /// run hangs before the engine starts.
     #[tokio::test]
     async fn resolve_all_treats_a_zero_limit_as_one() {
-        let (_server, config, clients, _arrivals) =
-            slow_tag_registry(2, Duration::from_millis(1)).await;
+        let (_server, config, clients, ..) =
+            slow_registry(&repo_names(2), &["v1"], Duration::from_millis(1)).await;
 
         let resolution = resolve_all(
             &config,
             &clients,
             &HashMap::new(),
-            false,
+            Selection::Sync,
             None,
             &PrepareTracker::default(),
             0,
@@ -3939,7 +3922,15 @@ mappings:
         let starved: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
         let checkers = HashMap::new();
 
-        let work = resolve_all(&config, &clients, &checkers, false, None, &tracker, limit);
+        let work = resolve_all(
+            &config,
+            &clients,
+            &checkers,
+            Selection::Sync,
+            None,
+            &tracker,
+            limit,
+        );
 
         let observer = {
             let starved = Rc::clone(&starved);
@@ -4029,7 +4020,7 @@ mappings:
             &config,
             &clients,
             &HashMap::new(),
-            false,
+            Selection::Sync,
         )
         .await;
         assert!(matches!(
@@ -4191,14 +4182,15 @@ mappings:
         for concurrency in [1usize, 4, 8, 16, 32] {
             // Fresh server and clients per row: reused AIMD windows would give
             // later rows a head start.
-            let (_server, config, clients, arrivals) = slow_tag_registry(mappings, delay).await;
+            let (_server, config, clients, arrivals, _) =
+                slow_registry(&repo_names(mappings), &["v1"], delay).await;
 
             let started = std::time::Instant::now();
             let resolution = resolve_all(
                 &config,
                 &clients,
                 &HashMap::new(),
-                false,
+                Selection::Sync,
                 None,
                 &PrepareTracker::default(),
                 concurrency,
@@ -4257,7 +4249,7 @@ mappings:
                 &config,
                 &clients,
                 &HashMap::new(),
-                false,
+                Selection::Sync,
                 None,
                 &PrepareTracker::default(),
                 concurrency,

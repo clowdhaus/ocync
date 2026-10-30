@@ -106,9 +106,12 @@ async fn assert_dispatch(cases: Vec<(&str, RegistryConfig, &str)>) {
     }
 }
 
-/// No docker config is read: these dispatch on `auth_type` or hostname alone.
+/// These dispatch on `auth_type` or hostname alone, so a docker config
+/// directory with no `config.json` must not matter.
 #[tokio::test]
 async fn dispatches_without_a_docker_config() {
+    let dir = tempdir_without_config();
+    let _g = EnvGuard::set_docker_config(dir.path());
     // `token` is a serde alias for `static_token`; the docs promise both spellings.
     let token_alias: AuthType = serde_yaml::from_str("token").expect("alias parses");
     assert_eq!(token_alias, AuthType::StaticToken);

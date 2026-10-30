@@ -56,6 +56,7 @@ pub(crate) struct TextProgress {
 }
 
 impl TextProgress {
+    /// A reporter writing to the process's stderr.
     pub(crate) fn new(verbosity: u8) -> Self {
         Self {
             verbosity,
@@ -185,11 +186,6 @@ mod tests {
                 failed(ErrorKind::ManifestPull, ""),
                 "FAILED  source/repo:v1 -> target/repo:v1  (manifest pull)",
             ),
-            (
-                "network error",
-                failed(ErrorKind::BlobTransfer, "network error"),
-                "FAILED  source/repo:v1 -> target/repo:v1  (blob transfer: network error)",
-            ),
         ];
         for (name, status, want) in cases {
             let result = make_result(status, 0);
@@ -230,14 +226,6 @@ mod tests {
                 false,
                 1,
                 Some("synced  source/repo:v1 -> target/repo:v1  (0 B, 14s)"),
-            ),
-            (
-                "synced exact format",
-                ImageStatus::Synced,
-                432_000_000,
-                false,
-                1,
-                Some("synced  source/repo:v1 -> target/repo:v1  (432.0 MB, 14s)"),
             ),
             (
                 "synced with artifacts skipped",

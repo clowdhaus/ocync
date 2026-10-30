@@ -6,6 +6,7 @@ use crate::TagsArgs;
 use crate::cli::config::load_config;
 use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_client};
 
+/// Print the repository's tags that pass the given filters, one per line.
 pub(crate) async fn run(args: &TagsArgs) -> Result<ExitCode, CliError> {
     let registry = args.repository.registry();
     // Without `--config`, auth is auto-detected.

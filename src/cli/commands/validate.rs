@@ -4,6 +4,7 @@ use crate::ValidateArgs;
 use crate::cli::config::load_config;
 use crate::cli::{CliError, ExitCode};
 
+/// Load and validate the config without contacting any registry.
 pub(crate) fn run(args: &ValidateArgs) -> Result<ExitCode, CliError> {
     let config = load_config(&args.config)?;
     let n_mappings = config.mappings.len();
@@ -17,16 +18,8 @@ pub(crate) fn run(args: &ValidateArgs) -> Result<ExitCode, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
-
-    fn write_temp_config(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("ocync_test_{name}.yaml"));
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        path
-    }
+    use crate::cli::commands::test_support::write_temp_config;
 
     #[test]
     fn validate_valid_config() {
