@@ -698,6 +698,10 @@ mod tests {
             "stub"
         }
 
+        fn presents(&self) -> Presents {
+            Presents::Credentials
+        }
+
         fn get_token(
             &self,
             _scopes: &[Scope],

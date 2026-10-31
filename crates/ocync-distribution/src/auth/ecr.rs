@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
-use crate::auth::{AuthProvider, AuthScheme, Scope, Token};
+use crate::auth::{AuthProvider, AuthScheme, Presents, Scope, Token};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
 
@@ -252,6 +252,10 @@ impl EcrAuth {
 impl AuthProvider for EcrAuth {
     fn name(&self) -> &'static str {
         "ecr"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(

@@ -162,35 +162,6 @@ mod tests {
         assert!(Worst::Failed > Worst::Clean);
     }
 
-    /// Points `DOCKER_CONFIG` at a directory and restores it on drop, holding
-    /// the shared environment lock meanwhile.
-    struct DockerConfigGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl DockerConfigGuard {
-        fn set(dir: &std::path::Path) -> Self {
-            let lock = crate::cli::test_support::lock_env();
-            let prior = std::env::var_os("DOCKER_CONFIG");
-            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
-            unsafe { std::env::set_var("DOCKER_CONFIG", dir) };
-            Self { _lock: lock, prior }
-        }
-    }
-
-    impl Drop for DockerConfigGuard {
-        fn drop(&mut self) {
-            // SAFETY: as in `set`.
-            unsafe {
-                match &self.prior {
-                    Some(v) => std::env::set_var("DOCKER_CONFIG", v),
-                    None => std::env::remove_var("DOCKER_CONFIG"),
-                }
-            }
-        }
-    }
-
     /// A registry read anonymously says so, and one with credentials does
     /// not: `ping` accepts 401, so a bare OK would imply credentials were
     /// checked. Breaks if an anonymous registry prints a plain OK, or one
@@ -223,7 +194,7 @@ mod tests {
         let docker = tempfile::tempdir().expect("tempdir");
         std::fs::write(docker.path().join("config.json"), "{}").expect("write config.json");
 
-        let _docker_config = DockerConfigGuard::set(docker.path());
+        let _docker_config = crate::cli::test_support::EnvGuard::set_docker_config(docker.path());
         let mut out = Vec::new();
         let code = run_check_to(&[config], &mut out).await.expect("runs");
         let out = String::from_utf8(out).expect("utf8");

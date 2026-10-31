@@ -32,8 +32,14 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
     read: Duration::from_secs(10),
 };
 
+/// The server `env` names with [`HOST_VARIABLE`], where an empty value is
+/// unset, as in Go.
+fn named_host(env: &Env) -> Option<String> {
+    env.get(HOST_VARIABLE).filter(|host| !host.is_empty())
+}
+
 /// The file where Linux reports the machine's product name.
-pub(super) const PRODUCT_NAME_FILE: &str = "/sys/class/dmi/id/product_name";
+const PRODUCT_NAME_FILE: &str = "/sys/class/dmi/id/product_name";
 
 /// The address Google's Go library `cloud.google.com/go/compute/metadata`
 /// probes to tell whether a machine is on Google Cloud: the metadata server
@@ -61,7 +67,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Functions, whose DMI is not Google's: see [`probe`]. A host whose name is
 /// not read, as on Windows here, is probed like any other.
 pub(crate) async fn is_on_google_cloud(host: &Host) -> bool {
-    if host.env.get(HOST_VARIABLE).is_some_and(|h| !h.is_empty()) {
+    if named_host(&host.env).is_some() {
         return true;
     }
     let named = match host.platform {
@@ -71,19 +77,19 @@ pub(crate) async fn is_on_google_cloud(host: &Host) -> bool {
             .read(std::path::Path::new(PRODUCT_NAME_FILE))
             .is_ok_and(|name| matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")),
     };
-    named || probe(host, PROBE_TIMEOUT).await
+    named || probe(host).await
 }
 
-/// Whether a metadata server answers `host`'s network within `timeout`:
-/// one request, not sent again, whose answer carries `Metadata-Flavor:
+/// Whether a metadata server answers `host`'s network within
+/// [`PROBE_TIMEOUT`]: one request, not sent again, whose answer carries `Metadata-Flavor:
 /// Google`, as Go's `metadataRequestStrategy` requires. The EC2 instance
 /// metadata service answers on the same IP without that header, so on EC2
 /// this is `false`, as it is for a timeout, a refusal or any other answer.
 /// No proxy and no redirect, so nothing leaves for another host.
-async fn probe(host: &Host, timeout: Duration) -> bool {
+async fn probe(host: &Host) -> bool {
     let client = crate::aws::credential_endpoint_client(Timeouts {
-        connect: timeout,
-        read: timeout,
+        connect: PROBE_TIMEOUT,
+        read: PROBE_TIMEOUT,
     });
     let Ok(transport) = host.network.transport(client) else {
         return false;
@@ -96,12 +102,44 @@ async fn probe(host: &Host, timeout: Duration) -> bool {
         .headers_mut()
         .insert(FLAVOR.0, http::HeaderValue::from_static(FLAVOR.1));
     matches!(
-        tokio::time::timeout(timeout, transport.send(request)).await,
+        tokio::time::timeout(PROBE_TIMEOUT, transport.send(request)).await,
         Ok(Ok(response)) if response
             .headers()
             .get(FLAVOR.0)
             .is_some_and(|flavor| flavor == FLAVOR.1)
     )
+}
+
+/// A replay answering the probe once with `headers`, as a host whose network
+/// is it sees: the probe must carry `Metadata-Flavor: Google`.
+#[cfg(test)]
+pub(crate) fn probe_answer(headers: serde_json::Value) -> std::sync::Arc<crate::aws::Replay> {
+    std::sync::Arc::new(crate::aws::Replay::of([crate::aws::record(
+        0,
+        &http::Method::GET,
+        PROBE_URL,
+        serde_json::json!({ FLAVOR.0: [FLAVOR.1] }),
+        http::StatusCode::OK,
+        headers,
+        b"",
+    )]))
+}
+
+/// `platform` with `vars` and the DMI `name`, whose network is `replay`.
+#[cfg(test)]
+pub(crate) fn probing(
+    platform: Platform,
+    vars: &[(&str, &str)],
+    name: Option<&[u8]>,
+    replay: &std::sync::Arc<crate::aws::Replay>,
+) -> Host {
+    let files: Vec<(&str, Vec<u8>)> = name
+        .map(|name| (PRODUCT_NAME_FILE, name.to_vec()))
+        .into_iter()
+        .collect();
+    let mut host = crate::google::tests::host(platform, vars, &files);
+    host.network = crate::aws::Network::Replay(std::sync::Arc::clone(replay));
+    host
 }
 
 /// The metadata server's token endpoint.
@@ -126,7 +164,7 @@ impl Server {
     /// default, asking for `scopes`. A value that is not a bare
     /// `host[:port]`, such as one with a path or user info, is an error.
     pub(super) fn new(env: &Env, scopes: Scopes) -> Result<Self, Error> {
-        let host = env.get(HOST_VARIABLE).filter(|host| !host.is_empty());
+        let host = named_host(env);
         let mut token_url = Url::parse(&format!(
             "http://{}",
             host.as_deref().unwrap_or(DEFAULT_HOST)
@@ -176,7 +214,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::aws::{Network, Replay, record};
+    use crate::aws::{Replay, record};
     use crate::google::REGISTRY_SCOPE;
 
     const NOW: Duration = Duration::from_secs(1_700_000_000);
@@ -225,35 +263,6 @@ mod tests {
                 "{not_a_host}: {error}"
             );
         }
-    }
-
-    /// A replay answering the probe once with `headers`.
-    fn probe_answer(headers: serde_json::Value) -> Arc<Replay> {
-        Arc::new(Replay::of([record(
-            0,
-            &http::Method::GET,
-            PROBE_URL,
-            serde_json::json!({}),
-            http::StatusCode::OK,
-            headers,
-            b"",
-        )]))
-    }
-
-    /// `platform` with `vars` and the DMI `name`, whose network is `replay`.
-    fn probing(
-        platform: Platform,
-        vars: &[(&str, &str)],
-        name: Option<&[u8]>,
-        replay: &Arc<Replay>,
-    ) -> Host {
-        let files: Vec<(&str, Vec<u8>)> = name
-            .map(|name| (PRODUCT_NAME_FILE, name.to_vec()))
-            .into_iter()
-            .collect();
-        let mut host = crate::google::tests::host(platform, vars, &files);
-        host.network = Network::Replay(Arc::clone(replay));
-        host
     }
 
     /// `GCE_METADATA_HOST` that is not empty, or a Google DMI product name,
@@ -317,7 +326,7 @@ mod tests {
                 0,
                 &http::Method::GET,
                 PROBE_URL,
-                serde_json::json!({}),
+                serde_json::json!({ FLAVOR.0: [FLAVOR.1] }),
                 http::StatusCode::OK,
                 serde_json::json!({"Metadata-Flavor": ["Google"]}),
                 b"",

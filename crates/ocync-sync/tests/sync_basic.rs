@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ocync_distribution::RegistryClientBuilder;
-use ocync_distribution::auth::{AuthProvider, Scope, Token};
+use ocync_distribution::auth::{AuthProvider, Presents, Scope, Token};
 use ocync_distribution::spec::MediaType;
 use ocync_sync::engine::TagPair;
 use ocync_sync::{ImageStatus, RunOutcome, SkipReason, SyncReport};
@@ -244,6 +244,10 @@ struct RotatingAuth(AtomicU32);
 impl AuthProvider for RotatingAuth {
     fn name(&self) -> &'static str {
         "rotating"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(

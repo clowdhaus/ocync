@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use super::detect::AzureCloud;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Refusal, Scope, Token, registry_origin, scopes_cache_key};
+use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::CredentialCache;
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
@@ -767,6 +767,10 @@ impl AcrAuth {
 impl AuthProvider for AcrAuth {
     fn name(&self) -> &'static str {
         "acr"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(

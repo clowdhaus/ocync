@@ -14,8 +14,9 @@ use serde_json::json;
 
 use super::credentials::imds::TOKEN_HEADER;
 
-/// The request headers compared, as upstream compares them.
-const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER];
+/// The request headers compared, as upstream compares them, and the one
+/// header a Google metadata probe must carry.
+const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER, "metadata-flavor"];
 
 /// One exchange as a traffic file records it: the request, the answer's
 /// head and the answer's body.

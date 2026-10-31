@@ -20,7 +20,7 @@ use tokio::sync::OnceCell;
 
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
+use super::{AuthProvider, Credentials, Presents, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
@@ -51,10 +51,58 @@ pub struct SharedGoogleToken {
     file: OnceCell<Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>>>,
     /// Whether the machine is on Google Cloud, asked only for a registry
     /// chosen by its hostname.
-    on_google_cloud: OnceCell<bool>,
+    residency: Residency,
     /// The metadata server's token, for a registry that goes there when
     /// there is no file.
     metadata: OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>,
+}
+
+/// Whether the machine is on Google Cloud, asked at most once for as long
+/// as the value or its clones live. A machine does not move between the runs
+/// of a process, so [`Self::process`] is the one every run of the process
+/// shares, and a watch loop does not ask again each cycle.
+#[derive(Debug, Clone, Default)]
+pub struct Residency(Arc<OnceCell<bool>>);
+
+impl Residency {
+    /// The answer shared by every run of this process.
+    pub fn process() -> Self {
+        static PROCESS: std::sync::LazyLock<Residency> =
+            std::sync::LazyLock::new(Residency::default);
+        PROCESS.clone()
+    }
+
+    /// An answer already known, so the machine is not asked.
+    pub fn known(on_google_cloud: bool) -> Self {
+        Self(Arc::new(OnceCell::new_with(Some(on_google_cloud))))
+    }
+
+    async fn get(&self, host: &crate::aws::Host) -> bool {
+        *self
+            .0
+            .get_or_init(|| async {
+                let on_google_cloud = google::is_on_google_cloud(host).await;
+                if !on_google_cloud {
+                    tracing::info!(
+                        "no Google credentials found and not on Google Cloud, reading Google \
+                         registries with docker config or anonymously"
+                    );
+                }
+                on_google_cloud
+            })
+            .await
+    }
+}
+
+impl SharedGoogleToken {
+    /// Credentials for one run that ask `residency` whether the machine is
+    /// on Google Cloud, so runs sharing it ask once.
+    pub fn with_residency(residency: Residency) -> Self {
+        Self {
+            residency,
+            ..Self::default()
+        }
+    }
 }
 
 impl fmt::Debug for SharedGoogleToken {
@@ -120,11 +168,7 @@ impl SharedGoogleToken {
         if let Some(token) = self.file(host, aws_credentials).await? {
             return Ok(Some(token));
         }
-        if !*self
-            .on_google_cloud
-            .get_or_init(|| google::is_on_google_cloud(host))
-            .await
-        {
+        if !self.residency.get(host).await {
             return Ok(None);
         }
         self.metadata(host).await.map(Some)
@@ -428,6 +472,10 @@ impl GcpAuth {
 impl AuthProvider for GcpAuth {
     fn name(&self) -> &'static str {
         "gcp"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(
@@ -1094,26 +1142,6 @@ mod tests {
         auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
     }
 
-    /// A host with no Google file whose metadata IP answers the probe once
-    /// with `headers`.
-    fn probed_host(
-        vars: &[(&str, &str)],
-        headers: serde_json::Value,
-    ) -> (crate::aws::Host, Arc<crate::aws::Replay>) {
-        let replay = Arc::new(crate::aws::Replay::of([crate::aws::record(
-            0,
-            &http::Method::GET,
-            "http://169.254.169.254/",
-            serde_json::json!({}),
-            http::StatusCode::OK,
-            headers,
-            b"",
-        )]));
-        let mut host = google::tests::host(crate::aws::Platform::Unix, vars, &[]);
-        host.network = crate::aws::Network::Replay(Arc::clone(&replay));
-        (host, replay)
-    }
-
     /// A provider for a registry chosen by its hostname.
     async fn detected(
         registry: &str,
@@ -1138,7 +1166,8 @@ mod tests {
     /// registry probes.
     #[tokio::test]
     async fn a_detected_registry_with_no_source_gets_no_provider() {
-        let (host, replay) = probed_host(&[], serde_json::json!({"Server": ["EC2ws"]}));
+        let replay = google::probe_answer(serde_json::json!({"Server": ["EC2ws"]}));
+        let host = google::probing(crate::aws::Platform::Unix, &[], None, &replay);
         let shared = SharedGoogleToken::default();
 
         for registry in ["https://us-docker.pkg.dev", "https://gcr.io"] {

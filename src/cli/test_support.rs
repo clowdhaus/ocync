@@ -2,6 +2,7 @@
 //! the process-wide environment lock, a placeholder client and a resolved
 //! mapping.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -18,6 +19,51 @@ static ENV_GUARD: Mutex<()> = Mutex::new(());
 /// the variables it reads.
 pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
     ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sets or removes environment variables and restores their prior values on
+/// drop, holding the environment lock meanwhile.
+pub(crate) struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    prior: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl EnvGuard {
+    /// Set each variable to its value, or remove it for `None`.
+    pub(crate) fn set(vars: &[(&'static str, Option<&OsStr>)]) -> Self {
+        let lock = lock_env();
+        let mut prior = Vec::new();
+        for (name, value) in vars {
+            prior.push((*name, std::env::var_os(name)));
+            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        Self { _lock: lock, prior }
+    }
+
+    /// Point `DOCKER_CONFIG` at `dir`.
+    pub(crate) fn set_docker_config(dir: &std::path::Path) -> Self {
+        Self::set(&[("DOCKER_CONFIG", Some(dir.as_os_str()))])
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, prior) in &self.prior {
+            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
+            unsafe {
+                match prior {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }
 
 /// A config file holding `content`, deleted when the returned handle drops.

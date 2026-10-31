@@ -602,6 +602,8 @@ impl SourceAuth {
 }
 
 pub(crate) use self::metadata::is_on_google_cloud;
+#[cfg(test)]
+pub(crate) use self::metadata::{probe_answer, probing};
 
 /// Credentials that obtain access tokens.
 #[derive(Debug)]
@@ -619,10 +621,9 @@ enum Kind {
 
 impl Credentials {
     /// The credentials the file of `host` holds, asking for the registry
-    /// scope, or `None` when it has no file: the one `GOOGLE_APPLICATION_CREDENTIALS`
-    /// names, which must exist, else gcloud's well-known file if it does.
-    /// An external account with an AWS subject token takes its AWS
-    /// credentials from `aws_credentials`.
+    /// scope, or `None` when it has no file (see [`find_file`]). An external
+    /// account with an AWS subject token takes its AWS credentials from
+    /// `aws_credentials`.
     pub(crate) async fn load(
         host: &Host,
         clients: &Clients,
@@ -745,8 +746,9 @@ struct Setup<'a> {
     aws_credentials: &'a AwsCredentialProviders,
 }
 
-/// The contents of the credentials file, or `None` when there is none: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
-/// exist, else gcloud's well-known file if it does.
+/// The contents of the credentials file, or `None` when there is none. The
+/// file `GOOGLE_APPLICATION_CREDENTIALS` names must exist. Without that
+/// variable, gcloud's well-known file is used if it exists.
 fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
     if let Some(path) = host.env.get_os(CREDENTIALS_VARIABLE) {
         let path = PathBuf::from(path);
