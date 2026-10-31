@@ -9,7 +9,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
-use crate::aimd::{AimdController, RegistryAction};
+use crate::aimd::{AimdController, GooglePacing, RegistryAction};
 use crate::auth::{AuthProvider, Presents, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
@@ -92,6 +92,7 @@ pub struct RegistryClientBuilder {
     accept_invalid_certs: bool,
     force_http1: bool,
     h2_adaptive_window: bool,
+    google_pacing: Option<GooglePacing>,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -118,6 +119,7 @@ impl RegistryClientBuilder {
             accept_invalid_certs: false,
             force_http1: false,
             h2_adaptive_window: true,
+            google_pacing: None,
         }
     }
 
@@ -131,6 +133,13 @@ impl RegistryClientBuilder {
     /// zero-permit semaphore never admits a request.
     pub fn max_concurrent(mut self, n: NonZeroUsize) -> Self {
         self.max_concurrent = n;
+        self
+    }
+
+    /// Pace a Google host's requests together with the other hosts of the
+    /// same run in its location. Default: the host is paced alone.
+    pub fn google_pacing(mut self, pacing: GooglePacing) -> Self {
+        self.google_pacing = Some(pacing);
         self
     }
 
@@ -235,10 +244,13 @@ impl RegistryClientBuilder {
         let http = http_builder.build()?;
         let blob_download_http = base_builder().http1_only().build()?;
 
-        let aimd = AimdController::new(
+        let mut aimd = AimdController::new(
             self.url.host_str().unwrap_or("unknown"),
             self.max_concurrent,
         );
+        if let Some(pacing) = &self.google_pacing {
+            aimd = aimd.with_google_pacing(pacing);
+        }
         Ok(RegistryClient {
             base_url: self.url,
             authority,
@@ -822,6 +834,36 @@ mod tests {
         // requests, the window limit equals ceil(DEFAULT_INITIAL_WINDOW) capped
         // at max_concurrent. DEFAULT_INITIAL_WINDOW is 1.0, so ceil(1.0) = 1.
         assert_eq!(client.aimd.window_limit(RegistryAction::BlobRead), 1);
+    }
+
+    /// Clients of one Google location built with one run's pacing draw on
+    /// one bucket. Breaks if the builder drops the pacing, so each client
+    /// keeps a full bucket of its own.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn builder_google_pacing_shares_a_bucket_across_clients() {
+        let pacing = GooglePacing::default();
+        let client = |url: &str| {
+            RegistryClient::builder(Url::parse(url).unwrap())
+                .google_pacing(pacing.clone())
+                .build()
+                .unwrap()
+        };
+        let (gcr, gar) = (
+            client("https://gcr.io"),
+            client("https://us-docker.pkg.dev"),
+        );
+        for _ in 0..30 {
+            gcr.aimd.acquire(RegistryAction::BlobHead).await.success();
+        }
+        let held = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            gar.aimd.acquire(RegistryAction::BlobHead),
+        )
+        .await;
+        assert!(
+            held.is_err(),
+            "us-docker.pkg.dev must wait on the burst gcr.io drained"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod auth_dispatch_tests;
 #[cfg(test)]
 mod test_support;
 
+use ocync_distribution::aimd::GooglePacing;
 use ocync_distribution::auth::Credentials;
 use ocync_distribution::auth::acr::AcrAuth;
 use ocync_distribution::auth::configured;
@@ -203,8 +204,9 @@ impl<'a> Registry<'a> {
     }
 }
 
-/// The credentials one run's clients share: AWS credentials by profile and
-/// region, and Google's Application Default Credentials. Create one per run:
+/// What one run's clients share: AWS credentials by profile and region,
+/// Google's Application Default Credentials, and the pacing of Google
+/// hosts in one location. Create one per run:
 /// the next run, such as the next watch cycle, loads them afresh, except
 /// whether the machine is on Google Cloud, which every run of the process
 /// shares.
@@ -214,6 +216,8 @@ pub(crate) struct RunCredentials {
     pub(crate) aws: AwsCredentialProviders,
     /// The shared Google token.
     pub(crate) gcp: SharedGoogleToken,
+    /// The rate buckets Google hosts of one location share.
+    pub(crate) google_pacing: GooglePacing,
 }
 
 impl Default for RunCredentials {
@@ -221,6 +225,7 @@ impl Default for RunCredentials {
         Self {
             aws: AwsCredentialProviders::default(),
             gcp: SharedGoogleToken::with_residency(Residency::process()),
+            google_pacing: GooglePacing::default(),
         }
     }
 }
@@ -355,6 +360,7 @@ pub(crate) async fn build_registry_client(
         }
     };
 
+    builder = builder.google_pacing(credentials.google_pacing.clone());
     if let Some(n) = registry_config.and_then(|r| r.max_concurrent) {
         builder = builder.max_concurrent(n);
     }
