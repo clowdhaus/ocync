@@ -15,6 +15,7 @@ pub(crate) mod stats;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::rc::Rc;
@@ -104,6 +105,12 @@ pub(crate) struct ToolSelection {
     /// multiply the run time.
     #[arg(long, default_value_t = Rounds::DEFAULT)]
     pub(crate) rounds: Rounds,
+
+    /// Cap on the images ocync transfers at once, written to the generated
+    /// config as `global.max_concurrent_transfers` for `ocync` and the
+    /// `--baseline-ref` build alike. Unset leaves ocync's own default.
+    #[arg(long)]
+    pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
 }
 
 impl ToolSelection {
@@ -573,8 +580,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         runner::build_baseline(commit).await?;
         let config_dir = tempfile::tempdir()?;
         let config = config_dir.path().join("baseline-check.yaml");
-        std::fs::write(&config, config_gen::ocync_config(&corpus))
-            .map_err(|e| format!("write config {}: {e}", config.display()))?;
+        std::fs::write(
+            &config,
+            config_gen::ocync_config(&corpus, args.tool_selection.max_concurrent_transfers),
+        )
+        .map_err(|e| format!("write config {}: {e}", config.display()))?;
         runner::check_baseline(commit, &config)?;
     }
 
@@ -654,6 +664,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         relay_versions,
         prewarm,
         baseline: args.tool_selection.baseline_ref.clone(),
+        max_concurrent_transfers: args.tool_selection.max_concurrent_transfers,
         rounds: args.tool_selection.rounds,
         repeated,
         scenarios: Vec::new(),
@@ -988,6 +999,7 @@ fn cold_ocync_runs(scenarios: &[ScenarioResult]) -> Vec<&ToolRun> {
 fn cold_ocync_median(
     scenarios: &[ScenarioResult],
     corpus: report::CorpusInfo,
+    max_concurrent_transfers: Option<NonZeroUsize>,
     corpus_locked_at: Option<&lock::LockedAt>,
 ) -> Option<Baseline> {
     let runs = cold_ocync_runs(scenarios);
@@ -1007,6 +1019,7 @@ fn cold_ocync_median(
             as u64,
         corpus_locked_at: corpus_locked_at.cloned(),
         corpus,
+        max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
     })
 }
@@ -1025,7 +1038,12 @@ fn check_regression(
         images: report.corpus_size,
         tags: report.total_tags,
     };
-    if let Some(current) = cold_ocync_median(&report.scenarios, corpus, corpus_locked_at) {
+    if let Some(current) = cold_ocync_median(
+        &report.scenarios,
+        corpus,
+        report.max_concurrent_transfers,
+        corpus_locked_at,
+    ) {
         if baseline_path.exists() {
             let baseline = regression::load_baseline(&baseline_path)?;
             let result = regression::compare(&current, &baseline, threshold, &baseline_path)?;
@@ -1095,7 +1113,9 @@ async fn run_single_tool(
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     let config_content = match tool {
-        Tool::Ocync | Tool::OcyncBaseline => config_gen::ocync_config(corpus),
+        Tool::Ocync | Tool::OcyncBaseline => {
+            config_gen::ocync_config(corpus, args.tool_selection.max_concurrent_transfers)
+        }
         Tool::Dregsy => config_gen::dregsy_config(corpus),
         Tool::Regsync => config_gen::regsync_config(corpus),
     };
@@ -2355,13 +2375,13 @@ mod tests {
         ];
         let corpus = || report::CorpusInfo { images: 2, tags: 2 };
 
-        let median = cold_ocync_median(&scenarios, corpus(), None).unwrap();
+        let median = cold_ocync_median(&scenarios, corpus(), None, None).unwrap();
 
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
         assert_eq!(median.total_bytes, 300_000);
         assert_eq!(median.rounds, 3);
-        assert!(cold_ocync_median(&[], corpus(), None).is_none());
+        assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
     }
 
     #[test]
@@ -2374,7 +2394,7 @@ mod tests {
         };
         let corpus = report::CorpusInfo { images: 2, tags: 2 };
 
-        assert!(cold_ocync_median(&[scenario], corpus, None).is_none());
+        assert!(cold_ocync_median(&[scenario], corpus, None, None).is_none());
     }
 
     /// What a fake pass returns for one run of `tool`.

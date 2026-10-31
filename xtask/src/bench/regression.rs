@@ -4,6 +4,7 @@
 //! Exits non-zero if wall-clock time or request count regresses beyond
 //! a configurable threshold.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,12 @@ pub(crate) struct Baseline {
     /// was recorded, which therefore compare against no run.
     #[serde(default)]
     pub(crate) corpus: CorpusInfo,
+    /// The cap on concurrent image transfers the run set, `None` when it kept
+    /// ocync's default. Two caps move the figures for a reason other than the
+    /// code, so runs under different ones are not compared. Absent from
+    /// baselines saved before the option, which ran at the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
     /// Rounds the figures are the median of. A median over other rounds has
     /// another spread, so two are not compared. One in baselines saved before
     /// rounds, which were a single run.
@@ -59,7 +66,7 @@ pub(crate) struct RegressionResult {
 /// Refuses when the two were recorded under different corpus locks, the
 /// baseline under none, or over a different number of images or tags: they
 /// synced different content, so a delta is not a regression. Refuses a
-/// different number of rounds too. `baseline_path` names the file to replace.
+/// different cap on concurrent transfers or number of rounds too. `baseline_path` names the file to replace.
 ///
 /// Returns percentage deltas computed as `(current - baseline) / baseline * 100`.
 /// Zero baselines return a delta of `0.0` to avoid division by zero.
@@ -85,6 +92,21 @@ pub(crate) fn compare(
             show(&current.corpus_locked_at),
             current.corpus.images,
             current.corpus.tags,
+            baseline_path.display()
+        ));
+    }
+    if current.max_concurrent_transfers != baseline.max_concurrent_transfers {
+        let show = |cap: Option<NonZeroUsize>| {
+            cap.map_or("the default transfer cap".to_owned(), |cap| {
+                format!("a transfer cap of {cap}")
+            })
+        };
+        return Err(format!(
+            "{} was recorded with {}, this run with {}; record a \
+             new baseline by deleting {} and rerunning",
+            baseline_path.display(),
+            show(baseline.max_concurrent_transfers),
+            show(current.max_concurrent_transfers),
             baseline_path.display()
         ));
     }
@@ -210,6 +232,7 @@ mod tests {
                 images: 40,
                 tags: 55,
             },
+            max_concurrent_transfers: None,
             rounds: 5,
         }
     }
@@ -332,6 +355,7 @@ mod tests {
                 images: 40,
                 tags: 55,
             },
+            max_concurrent_transfers: NonZeroUsize::new(20),
             rounds: 5,
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
@@ -340,6 +364,7 @@ mod tests {
         assert_eq!(loaded.wall_clock_secs, 47.5);
         assert_eq!(loaded.requests, 847);
         assert_eq!(loaded.total_bytes, 2_100_000_000);
+        assert_eq!(loaded.max_concurrent_transfers, NonZeroUsize::new(20));
         assert_eq!(
             loaded.corpus_locked_at,
             Some(locked_at("2026-10-30-214340"))
@@ -402,6 +427,40 @@ mod tests {
                 assert!(e.contains("deleting results/b.json"), "{e}");
             }
         }
+    }
+
+    #[test]
+    fn a_baseline_under_another_transfer_cap_is_not_compared() {
+        // Catches: a cold sync at a cap of 10 judged a regression, or an
+        // improvement, against one taken at 50, and a baseline saved before
+        // the option failing to load or counting as capped.
+        let at = |cap: Option<usize>| Baseline {
+            max_concurrent_transfers: cap.and_then(NonZeroUsize::new),
+            ..baseline(1.0, 1, 1)
+        };
+        let compared = |current: Option<usize>, stored: Option<usize>| {
+            compare(&at(current), &at(stored), 20, Path::new("results/b.json"))
+        };
+
+        assert_eq!(
+            compared(Some(10), Some(50)).err().unwrap(),
+            "results/b.json was recorded with a transfer cap of 50, this run with a transfer \
+             cap of 10; record a new baseline by deleting results/b.json and rerunning"
+        );
+        assert_eq!(
+            compared(Some(10), None).err().unwrap(),
+            "results/b.json was recorded with the default transfer cap, this run with a \
+             transfer cap of 10; record a new baseline by deleting results/b.json and rerunning"
+        );
+        assert!(compared(None, Some(10)).is_err());
+        assert!(compared(Some(10), Some(10)).is_ok());
+        assert!(compared(None, None).is_ok());
+
+        let old = r#"{"wall_clock_secs": 1.0, "requests": 1, "total_bytes": 1}"#;
+        let old: Baseline = serde_json::from_str(old).unwrap();
+        assert_eq!(old.max_concurrent_transfers, None);
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("max_concurrent_transfers"), "{json}");
     }
 
     #[test]

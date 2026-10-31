@@ -1,6 +1,7 @@
 //! Generate equivalent config files for ocync, dregsy, and regsync from a corpus.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
@@ -76,8 +77,18 @@ fn registry_key(hostname: &str) -> String {
 /// and the target ECR registry (ecr auth), followed by a `mappings:` section.
 /// Each mapping uses `source:` and `targets:` to reference registries by name,
 /// and `tags: glob:` with a list of exact tag globs.
-pub(crate) fn ocync_config(corpus: &Corpus) -> String {
+///
+/// A `max_concurrent_transfers` writes a leading `global:` block carrying it;
+/// without one the config has no `global:` block and ocync keeps its default.
+pub(crate) fn ocync_config(
+    corpus: &Corpus,
+    max_concurrent_transfers: Option<NonZeroUsize>,
+) -> String {
     let mut out = String::new();
+
+    if let Some(cap) = max_concurrent_transfers {
+        out.push_str(&format!("global:\n  max_concurrent_transfers: {cap}\n\n"));
+    }
 
     let mut source_registries: Vec<&str> = corpus
         .images
@@ -278,6 +289,58 @@ images:
     }
 
     #[test]
+    fn a_transfer_cap_writes_a_global_block_and_no_cap_writes_none() {
+        // Catches: the cap silently dropped (ocync then runs at its default
+        // and the measurement is of the wrong cap), and a `global:` block
+        // written when none was asked for (changing every run without it).
+        let corpus: Corpus = serde_yaml::from_str(
+            r#"
+corpus:
+  target_registry: "111111111111.dkr.ecr.us-east-1.amazonaws.com"
+  target_prefix: "bench"
+
+images:
+  - source: "cgr.dev/chainguard/static"
+    tags: ["latest"]
+"#,
+        )
+        .unwrap();
+
+        let capped = ocync_config(&corpus, NonZeroUsize::new(20));
+        assert_eq!(
+            capped,
+            "\
+global:
+  max_concurrent_transfers: 20
+
+registries:
+  cgr-dev:
+    url: cgr.dev
+  ecr:
+    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+
+mappings:
+  - from: \"chainguard/static\"
+    to: \"bench/chainguard-static\"
+    source: cgr-dev
+    targets: [ecr]
+    tags:
+      glob:
+        - \"latest\"
+"
+        );
+
+        let uncapped = ocync_config(&corpus, None);
+        assert!(!uncapped.contains("global:"), "{uncapped}");
+        assert!(uncapped.starts_with("registries:\n"), "{uncapped}");
+        assert_eq!(
+            capped.strip_prefix("global:\n  max_concurrent_transfers: 20\n\n"),
+            Some(uncapped.as_str())
+        );
+    }
+
+    #[test]
     fn generated_configs_match_exactly() {
         use crate::bench::corpus::DockerHubAuth;
 
@@ -291,7 +354,7 @@ images:
         for (name, config, expected) in [
             (
                 "ocync_config_exact_output",
-                ocync_config(&plain),
+                ocync_config(&plain, None),
                 "\
 registries:
   cgr-dev:
@@ -397,7 +460,7 @@ sync:
             ),
             (
                 "ocync_config_with_dockerhub_auth",
-                ocync_config(&with_auth),
+                ocync_config(&with_auth, None),
                 "\
 registries:
   cgr-dev:
