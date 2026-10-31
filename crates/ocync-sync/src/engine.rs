@@ -16,7 +16,7 @@
 //! state (`TransferStateCache`) is accessed via `Rc<RefCell<>>` with borrows
 //! never held across `.await` points.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
@@ -684,13 +684,11 @@ struct PromoteContext<'a> {
 
 /// Default cap for concurrent image transfers (the global image semaphore).
 ///
-/// Per-target `RegistryClient::blob_upload_sem` caps long-lived HTTP/2 blob
-/// streams at 64 (registries advertise `SETTINGS_MAX_CONCURRENT_STREAMS` of
-/// 100-128, less metadata headroom). With `BLOB_CONCURRENCY` = 6 per image,
-/// 10 images gives 10 * 6 = 60 streams at saturation, inside that budget.
-/// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
-/// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
-/// value only helps workloads that mostly skip or mount, via config.
+/// Higher caps are measured only against ECR, where 50 ran without a stall
+/// and, with the mount wait, kept every mount; other registries are
+/// unmeasured there. The cap does not bound HTTP/2 upload streams: the
+/// per-target `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution` does,
+/// whatever the image cap.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Maximum concurrent blob transfers within a single image (skopeo's default).
@@ -699,6 +697,14 @@ const BLOB_CONCURRENCY: usize = 6;
 
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
+
+/// Default per-blob wait for a source repo's manifest commit before a
+/// cross-repo mount.
+///
+/// Must outlast the source image's commit, which includes the source's own
+/// large layer uploads; a shorter wait pushes the blob again instead of
+/// mounting it.
+const DEFAULT_MOUNT_SOURCE_WAIT: Duration = Duration::from_secs(180);
 
 /// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
 ///
@@ -735,7 +741,7 @@ impl SyncEngine {
             max_concurrent,
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
             source_head_timeout: Duration::from_secs(5),
-            mount_source_wait_deadline: Duration::from_secs(60),
+            mount_source_wait_deadline: DEFAULT_MOUNT_SOURCE_WAIT,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
             prune_cache: true,
         }
@@ -755,7 +761,7 @@ impl SyncEngine {
         self
     }
 
-    /// Configure the per-blob mount-source wait deadline (default 60 seconds).
+    /// Configure the per-blob mount-source wait deadline (default 180 seconds).
     ///
     /// A follower waiting on a leader's manifest-commit watch falls back to
     /// push on expiry instead of hanging.
@@ -1637,11 +1643,6 @@ async fn execute_item(
 
     if let Some(err) = outcome.error.take() {
         warn!(target_name = %item.target_entry.id().alias(), error = %err, "blob transfer failed");
-        // Unblock followers waiting on this repo's manifest commit; they
-        // fall through to HEAD+push.
-        cache
-            .borrow_mut()
-            .notify_repo_failed(item.target_entry.id(), &item.target.repo);
         let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
@@ -1977,6 +1978,17 @@ impl<'a> BlobIoContext<'a> {
         }
     }
 
+    /// Give up a claimed blob because the image was cancelled: record it as
+    /// failed and wake the claim's waiters.
+    fn abandon_claim(&self, digest: &Digest) {
+        self.sink.fail(
+            digest.clone(),
+            self.target_repo.to_owned(),
+            "cancelled".into(),
+        );
+        self.sink.release_claim(digest);
+    }
+
     /// The failure recorded in this run for this task's copy of `digest`.
     fn recorded_failure(&self, digest: &Digest) -> Option<Arc<crate::Error>> {
         let failures = self.blob_failures.borrow();
@@ -2136,7 +2148,7 @@ async fn transfer_image_blobs(
     };
 
     let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
-    let cancel = Cell::new(false);
+    let cancel = ShutdownSignal::new();
     let mut blob_futures = FuturesUnordered::new();
 
     for blob in &blobs {
@@ -2155,18 +2167,37 @@ async fn transfer_image_blobs(
                 BlobClaim::Failed(err) => return BlobResult::Failed(crate::Error::Shared(err)),
                 BlobClaim::Claimed => {}
             }
-            let mount_source = resolve_mount_source(ctx, &digest).await;
-            let staging_claim = resolve_staging(ctx.staging, &digest).await;
+            // A cancel at any wait below gives the claim up at once: holding
+            // it would keep other images' copies of this blob waiting.
+            let abandon = || {
+                BlobIoContext::from_ctx(ctx).abandon_claim(&digest);
+                BlobResult::Cancelled
+            };
+            let mount_source = match resolve_mount_source(ctx, &digest, cancel).await {
+                MountSource::From(repo) => Some(repo),
+                MountSource::Push => None,
+                MountSource::Cancelled => return abandon(),
+            };
+            let staging_claim = tokio::select! {
+                biased;
+                () = cancel.notified() => return abandon(),
+                claim = resolve_staging(ctx.staging, &digest) => claim,
+            };
 
-            // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
-            // so `ctx` is unreachable inside the permit scope.
-            let _permit = sem.acquire().await.unwrap();
-            run_under_semaphore(
+            // `transfer_claimed_blob` takes `BlobIoContext`, not
+            // `TransferContext`, so `ctx` is unreachable inside the permit
+            // scope. No await separates the permit from the transfer, so the
+            // cancel checked here cannot change before I/O starts.
+            let _permit = tokio::select! {
+                biased;
+                () = cancel.notified() => return abandon(),
+                permit = sem.acquire() => permit.unwrap(),
+            };
+            transfer_claimed_blob(
                 &BlobIoContext::from_ctx(ctx),
                 &digest,
                 size,
                 batch,
-                cancel,
                 mount_source,
                 staging_claim,
             )
@@ -2185,7 +2216,13 @@ async fn transfer_image_blobs(
             }
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
-                cancel.set(true);
+                cancel.trigger();
+                // Followers waiting to mount from this repo stop now, not
+                // after the in-flight uploads drain; they fall through to
+                // HEAD+push.
+                ctx.cache
+                    .borrow_mut()
+                    .notify_repo_failed(ctx.target_id, ctx.target_repo);
                 outcome.error = Some(err);
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
@@ -2233,7 +2270,7 @@ fn is_local_io(err: &crate::Error) -> bool {
 async fn wait_for_blob_claim(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-    cancel: &Cell<bool>,
+    cancel: &ShutdownSignal,
 ) -> BlobClaim {
     let skip = {
         let c = ctx.cache.borrow();
@@ -2246,7 +2283,7 @@ async fn wait_for_blob_claim(
     // A copy that already failed between the same repos fails this one too,
     // unless a mount can avoid the copy.
     loop {
-        if cancel.get() {
+        if cancel.is_triggered() {
             return BlobClaim::Cancelled;
         }
         if let Some(err) = BlobIoContext::from_ctx(ctx).recorded_failure(digest) {
@@ -2272,7 +2309,10 @@ async fn wait_for_blob_claim(
                     target = %ctx.target_id.alias(),
                     "waiting for in-flight upload of this blob to finish",
                 );
-                notify.notified().await;
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    () = cancel.notified() => return BlobClaim::Cancelled,
+                }
                 // A batch check may have populated our repo's state during the wait.
                 let skip = {
                     let c = ctx.cache.borrow();
@@ -2306,18 +2346,30 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
     }
 }
 
+/// What [`resolve_mount_source`] decided for a blob.
+enum MountSource {
+    /// Attempt a mount from this repository.
+    From(RepositoryName),
+    /// No mount source: push the blob.
+    Push,
+    /// The image was cancelled while waiting; the blob must not be transferred.
+    Cancelled,
+}
+
 /// Cross-repo mount-source resolver with bounded deadline.
 ///
-/// Loops until (a) a mount source emerges, (b) all candidate repos resolve
-/// without committing, or (c) the deadline expires. Returns the mount source
-/// to attempt, or `None` if the caller should fall back to push.
+/// Loops until (a) a mount source emerges ([`MountSource::From`]), (b) all
+/// candidate repos resolve without committing or (c) the deadline expires
+/// (both [`MountSource::Push`]), or (d) the image is cancelled
+/// ([`MountSource::Cancelled`]).
 ///
 /// Runs OUTSIDE the per-image blob semaphore (see [`BlobSink`]). `select_all`
 /// is cancel-safe: dropping the per-blob future releases all watches.
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-) -> Option<RepositoryName> {
+    cancel: &ShutdownSignal,
+) -> MountSource {
     let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
     loop {
         let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
@@ -2327,12 +2379,12 @@ async fn resolve_mount_source(
                 .next()
                 .cloned()
             {
-                return Some(r);
+                return MountSource::From(r);
             }
             c.unresolved_watches_for(ctx.target_id, digest, ctx.target_repo)
         };
         if receivers.is_empty() {
-            return None;
+            return MountSource::Push;
         }
 
         let wait = wait_any_fired(receivers);
@@ -2345,8 +2397,9 @@ async fn resolve_mount_source(
                     target = %ctx.target_id.alias(),
                     "mount-source wait deadline reached, falling back to push"
                 );
-                return None;
+                return MountSource::Push;
             }
+            () = cancel.notified() => return MountSource::Cancelled,
         }
     }
 }
@@ -2367,35 +2420,12 @@ async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
     let _ = futures_util::future::select_all(futures).await;
 }
 
-/// Entry point for the semaphore-bounded phase of blob transfer.
-///
-/// Takes [`BlobIoContext`], not [`TransferContext`]: this signature is the
-/// compile-time boundary that keeps cache wait methods out of the semaphore scope.
-async fn run_under_semaphore(
-    io: &BlobIoContext<'_>,
-    digest: &Digest,
-    size: u64,
-    batch_checked: &HashSet<Digest>,
-    cancel: &Cell<bool>,
-    mount_source: Option<RepositoryName>,
-    staging: StagingClaim<'_>,
-) -> BlobResult {
-    if cancel.get() {
-        io.sink.fail(
-            digest.clone(),
-            io.target_repo.to_owned(),
-            "cancelled".into(),
-        );
-        io.sink.release_claim(digest);
-        return BlobResult::Cancelled;
-    }
-    transfer_claimed_blob(io, digest, size, batch_checked, mount_source, staging).await
-}
-
 /// Transfer a claimed blob to one target: mount, HEAD, pull+push.
 ///
 /// The blob MUST already be claimed via [`wait_for_blob_claim`]. Runs under
-/// the per-image blob semaphore, reached through [`run_under_semaphore`].
+/// the per-image blob semaphore. Takes [`BlobIoContext`], not
+/// [`TransferContext`]: this signature is the compile-time boundary that keeps
+/// cache wait methods out of the semaphore scope.
 async fn transfer_claimed_blob(
     io: &BlobIoContext<'_>,
     digest: &Digest,

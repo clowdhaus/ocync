@@ -41,7 +41,7 @@ Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is 
 
 `ocync` is `main` at 67c1676; `ocync@7634416` is ocync as of April 2026. The fifth round stopped when a source tag was republished mid-round. CDN misses the medians above do not show: ocync 69 in round 1, when it also made 320 mount attempts against 355 to 356 in the other rounds, and the April build 4 in round 3.
 
-The two ocync builds differ in six months of code. One difference is the cap on images synced at once: 50 in April, 10 today. On today's code, raising it from 10 to 50 shortened a cold sync by 11% but uploaded more, because fewer blobs were mounted ([#230](https://github.com/clowdhaus/ocync/issues/230)).
+The two ocync builds differ in six months of code. One difference is the cap on images synced at once: 50 in April, 10 today. On today's code, with a mount waiting up to 180 s for the image it mounts from, raising it from 10 to 50 shortens a cold sync by 14 to 19% with the same uploaded bytes and requests ([#230](https://github.com/clowdhaus/ocync/issues/230)). The default stays 10, since only ECR has been measured at 50.
 
 dregsy is left out because its run did not pass the content check, which requires every image to arrive at the digest the corpus lock names. Earlier dregsy figures predate that check. Only ECR has been measured as a target.
 
