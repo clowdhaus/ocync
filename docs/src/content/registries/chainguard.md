@@ -18,6 +18,7 @@ Notable behaviors:
 
 - cgr.dev returns **403** on cross-scope token reuse where most registries silently accept it. ocync's per-scope token cache (universal, not Chainguard-specific) issues a fresh exchange per `repository:<name>:<actions>` scope and avoids this.
 - Anonymous tag visibility is restricted: only `:latest` and `:latest-dev` are listable / resolvable. Other tags need a pull-token even for public-catalog images.
+- **Blob downloads are not served through a cache.** Measured 2026-10-30: a blob GET answers 307 with a signed Cloudflare R2 object-storage URL that expires after an hour, and the download carries no cache-status header. A blob fetched once is not known to be faster the second time, so the benchmark's CDN pre-warm reports no hits for this registry.
 
 ## CLI examples
 

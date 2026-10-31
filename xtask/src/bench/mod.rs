@@ -12,18 +12,19 @@ pub(crate) mod report;
 pub(crate) mod runner;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
+use ocync_distribution::Digest;
 use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
 use regression::Baseline;
-use report::{BenchReport, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
+use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, find_scenario};
 use runner::Tool;
 
 /// Which tools a benchmark runs, shared by `bench` and `bench-remote`.
@@ -381,15 +382,15 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
-    let http = lock::http_client()?;
+    let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
+    let refs: BTreeSet<_> = transfers
+        .iter()
+        .flat_map(|transfer| scenario_refs(transfer, &corpus))
+        .collect();
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a moved source costs
         // seconds rather than a wasted run.
-        let refs = transfers
-            .iter()
-            .flat_map(|transfer| scenario_refs(transfer, &corpus))
-            .collect();
         lock::ensure_unmoved(&http, lock, &refs, auth)
             .await
             .map_err(|e| match e {
@@ -455,6 +456,22 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         instance.region,
     );
 
+    // Pre-warm CDN so all tools see identically cached source blobs.
+    //
+    // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
+    // and reads a different corpus than the one warmed here, so warming for it
+    // is hundreds of pointless requests against registries that rate-limit.
+    // A mixed run still warms, because the scenarios beside it do transfer.
+    let prewarm = if args.skip_prewarm {
+        eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
+        (!transfers.is_empty()).then_some(Prewarm::Skipped)
+    } else if let Some(lock) = &lock {
+        Some(cdn_prewarm(&http, auth, lock, &refs).await)
+    } else {
+        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
+        None
+    };
+
     let mut report = BenchReport {
         timestamp,
         instance,
@@ -462,22 +479,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         total_tags: corpus.total_tags(),
         tool_versions,
         relay_versions,
+        prewarm,
         scenarios: Vec::new(),
     };
-
-    // Pre-warm CDN so all tools see identically cached source manifests.
-    //
-    // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
-    // and reads a different corpus than the one warmed here, so warming for it
-    // is hundreds of pointless requests against registries that rate-limit.
-    // A mixed run still warms, because the scenarios beside it do transfer.
-    if args.skip_prewarm {
-        eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
-    } else if transfers.is_empty() {
-        eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
-    } else {
-        cdn_prewarm(&corpus, &http).await;
-    }
 
     // A scenario after the first re-checks the sources, so a move during a long
     // run cannot put different content under later numbers. The first was
@@ -592,51 +596,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let registry = RegistryKind::of(target_registry);
     let reg_key = registry.archive_stem();
     let git_ref = git_ref();
-    let record = report::RunRecord {
-        timestamp: report.timestamp.clone(),
+    let record = report::RunRecord::of(
+        &report,
         git_ref,
-        corpus_locked_at: corpus_locked_at.clone(),
-        machine: report::MachineInfo {
-            provider: registry.provider(),
-            instance_type: report.instance.instance_type.clone(),
-            arch: report.instance.arch.clone(),
-            vcpus: report.instance.vcpus,
-            memory_gib: report.instance.memory_mib as f64 / 1024.0,
-            network: report.instance.network_performance.clone(),
-            region: report.instance.region.clone(),
-            image_id: report.instance.image_id.clone(),
-        },
-        relays: report.relay_versions.clone(),
-        corpus: report::CorpusInfo {
-            images: report.corpus_size,
-            tags: report.total_tags,
-        },
-        scenarios: report
-            .scenarios
-            .iter()
-            .map(|s| report::ScenarioRecord {
-                name: s.kind.label(),
-                shuffle_seed: s.shuffle_seed,
-                tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
-                tools: s
-                    .runs
-                    .iter()
-                    .map(|r| report::ToolRecord {
-                        tool: r.tool.to_string(),
-                        version: report
-                            .tool_versions
-                            .get(&r.tool)
-                            .cloned()
-                            .unwrap_or_default(),
-                        wall_clock_secs: r.wall_clock_secs,
-                        peak_rss_kb: r.peak_rss_kb,
-                        metrics: r.proxy_metrics.clone().unwrap_or_default(),
-                        phase_timing_ms: r.phase_timing_ms.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    };
+        registry.provider(),
+        corpus_locked_at.clone(),
+    );
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
@@ -1273,75 +1238,88 @@ fn prepare_clean_slate() {
     clean_staging_tmpdir();
 }
 
-/// Per-registry rate controller for CDN blob pre-warm.
-///
-/// Uses multiplicative increase / multiplicative decrease (MIMD) with
-/// congestion epoch suppression. Each registry gets its own controller
-/// so a slow registry doesn't throttle fast ones.
-struct PrewarmRateController {
-    /// Minimum delay between requests to this registry.
-    interval: Duration,
-    /// Last time a request was issued to this registry.
-    last_request: Instant,
-    /// Last time a throttle (429) was processed.
-    last_throttle: Instant,
-    /// Congestion epoch -- prevents cascade halvings from burst 429s.
-    epoch: Duration,
+/// How one blob's pre-warm ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlobOutcome {
+    /// Served from the CDN cache.
+    Hit,
+    /// Served from the origin, which warms the cache.
+    Miss,
+    /// Refused, unreachable or still failing after the attempts.
+    Failed,
+    /// Not warmed by the deadline: not sent, or not finished.
+    PastDeadline,
 }
 
-impl PrewarmRateController {
-    /// Floor: 20 req/sec max.
-    const MIN_INTERVAL: Duration = Duration::from_millis(50);
-    /// Ceiling: never wait longer than 30s between requests.
-    const MAX_INTERVAL: Duration = Duration::from_secs(30);
-    /// Congestion epoch: 100ms (matches AIMD design).
-    const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
+/// Classify the final response to a blob request. A hit is what `CloudFront`
+/// (`X-Cache`) or Cloudflare (`CF-Cache-Status`: `HIT`, `REVALIDATED`,
+/// `UPDATING` or `STALE`, each served from its cache) says it is; any other
+/// success is a miss. A status that is not 2xx, an unfollowed redirect
+/// included, warmed nothing.
+fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> BlobOutcome {
+    if !status.is_success() {
+        return BlobOutcome::Failed;
+    }
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let hit = header("x-cache").is_some_and(|v| v.to_ascii_lowercase().contains("hit"))
+        || header("cf-cache-status").is_some_and(|v| {
+            ["HIT", "REVALIDATED", "UPDATING", "STALE"]
+                .iter()
+                .any(|state| v.eq_ignore_ascii_case(state))
+        });
+    if hit {
+        BlobOutcome::Hit
+    } else {
+        BlobOutcome::Miss
+    }
+}
 
-    /// Create a new controller with the given initial interval.
-    fn new(initial_interval: Duration) -> Self {
-        let now = Instant::now();
-        Self {
-            interval: initial_interval,
-            last_request: now - initial_interval,
-            last_throttle: now - Self::DEFAULT_EPOCH - Duration::from_millis(1),
-            epoch: Self::DEFAULT_EPOCH,
+/// Read a response body to its end and discard it, a chunk at a time so a
+/// large layer is never held whole.
+async fn drain(mut response: reqwest::Response) -> Result<(), reqwest::Error> {
+    while response.chunk().await?.is_some() {}
+    Ok(())
+}
+
+/// Warm one blob, `what` naming it in notices. `send` makes the request and
+/// waits out what is transient, so an error from it is final. A body that
+/// fails mid-read repeats the whole attempt, up to [`PREWARM_MAX_ATTEMPTS`].
+/// All of it, retries and waits included, runs under `deadline`: a blob not
+/// finished by then is [`BlobOutcome::PastDeadline`], even one that was sent.
+async fn warm_blob(
+    deadline: Instant,
+    what: &str,
+    send: impl AsyncFn() -> Result<reqwest::Response, String>,
+) -> BlobOutcome {
+    let attempts = async {
+        for attempt in 1..=PREWARM_MAX_ATTEMPTS {
+            let response = match send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    eprintln!("  {what}: {e}");
+                    return BlobOutcome::Failed;
+                }
+            };
+            let outcome = outcome_of(response.status(), response.headers());
+            if outcome == BlobOutcome::Failed {
+                eprintln!("  {what}: {}", response.status());
+                return outcome;
+            }
+            match drain(response).await {
+                Ok(()) => return outcome,
+                Err(e) => eprintln!("  {what}: body failed (attempt {attempt}): {e}"),
+            }
         }
+        BlobOutcome::Failed
+    };
+    // The timeout polls `attempts` once even when the deadline has passed, so
+    // a blob that never started is dropped before it.
+    if Instant::now() > deadline {
+        return BlobOutcome::PastDeadline;
     }
-
-    /// Returns how long to sleep before the next request, or `None` if ready.
-    fn delay(&self) -> Option<Duration> {
-        let elapsed = self.last_request.elapsed();
-        if elapsed < self.interval {
-            Some(self.interval - elapsed)
-        } else {
-            None
-        }
-    }
-
-    /// Mark that a request was just issued.
-    fn mark_sent(&mut self) {
-        self.last_request = Instant::now();
-    }
-
-    /// Record a successful response -- multiplicative increase.
-    ///
-    /// Decreases interval by 10% (floor [`MIN_INTERVAL`](Self::MIN_INTERVAL)).
-    fn on_success(&mut self) {
-        self.interval = self.interval.mul_f64(0.9).max(Self::MIN_INTERVAL);
-    }
-
-    /// Record a 429 throttle -- multiplicative decrease.
-    ///
-    /// Doubles interval (cap [`MAX_INTERVAL`](Self::MAX_INTERVAL)). If a
-    /// throttle already occurred within the congestion epoch, this call is
-    /// suppressed.
-    fn on_throttle(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_throttle) > self.epoch {
-            self.interval = (self.interval * 2).min(Self::MAX_INTERVAL);
-            self.last_throttle = now;
-        }
-    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), attempts)
+        .await
+        .unwrap_or(BlobOutcome::PastDeadline)
 }
 
 /// Per-registry CDN pre-warm statistics.
@@ -1349,7 +1327,100 @@ impl PrewarmRateController {
 struct PrewarmStats {
     hits: u64,
     misses: u64,
-    errors: u64,
+    /// Blobs that could not be warmed.
+    failed: u64,
+    /// Blobs not finished because the deadline came first.
+    past_deadline: u64,
+}
+
+impl PrewarmStats {
+    /// Count one blob.
+    fn record(&mut self, outcome: BlobOutcome) {
+        let count = match outcome {
+            BlobOutcome::Hit => &mut self.hits,
+            BlobOutcome::Miss => &mut self.misses,
+            BlobOutcome::Failed => &mut self.failed,
+            BlobOutcome::PastDeadline => &mut self.past_deadline,
+        };
+        *count += 1;
+    }
+}
+
+/// The (repository, digest) of every blob the pre-warm fetches: all those the
+/// lock records for the refs the run syncs, deduplicated, so every tag is
+/// covered. In a fixed order, so a pre-warm cut by the deadline leaves the
+/// same blobs warm each run.
+fn blobs_to_warm<'a>(
+    lock: &'a lock::Lock,
+    refs: &'a BTreeSet<lock::ImageRef>,
+) -> Vec<(registry::Repository<'a>, &'a Digest)> {
+    let mut blobs = Vec::new();
+    for image in refs {
+        let repo = registry::split_source(&image.source)
+            .expect("ensure_unmoved refuses a source with no registry");
+        let entry = lock
+            .images
+            .get(image)
+            .expect("ensure_unmoved refuses a ref the lock lacks");
+        blobs.extend(entry.blobs.iter().map(|blob| (repo, blob)));
+    }
+    blobs.sort_by_cached_key(|(repo, blob)| (repo.to_string(), blob.to_string()));
+    blobs.dedup();
+    blobs
+}
+
+/// Registries with a blob that was not warmed, and how many.
+fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> BTreeMap<String, u64> {
+    stats
+        .iter()
+        .map(|(host, s)| ((*host).to_owned(), s.failed + s.past_deadline))
+        .filter(|(_, blobs)| *blobs > 0)
+        .collect()
+}
+
+/// How long from the start of the pre-warm a blob has to be warmed. A blob not
+/// finished by then is dropped, mid-download if need be.
+const PREWARM_DEADLINE: Duration = Duration::from_secs(480);
+
+/// Concurrent blob requests to one registry. Each registry has its own, so a
+/// slow one cannot hold the slots another needs.
+const PREWARM_PER_REGISTRY: usize = 8;
+
+/// Attempts at one blob whose body fails mid-read.
+const PREWARM_MAX_ATTEMPTS: u32 = 2;
+
+/// Warm every blob, at most [`PREWARM_PER_REGISTRY`] at a time per registry,
+/// each by `deadline`, and count the outcomes by registry. `send` requests one
+/// blob, `what` naming it in notices.
+async fn warm_blobs<'a>(
+    blobs: &[(registry::Repository<'a>, &'a Digest)],
+    deadline: Instant,
+    send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
+) -> BTreeMap<&'a str, PrewarmStats> {
+    let permits: HashMap<&str, tokio::sync::Semaphore> = blobs
+        .iter()
+        .map(|(repo, _)| {
+            let host = repo.host.api_host();
+            (host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY))
+        })
+        .collect();
+    let outcomes = futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
+        let (permits, send) = (&permits, &send);
+        async move {
+            let host = repo.host.api_host();
+            let _permit = permits[host].acquire().await.unwrap();
+            let what = format!("blob pre-warm {repo}@{digest}");
+            let outcome =
+                warm_blob(deadline, &what, async || send(repo, digest, &what).await).await;
+            (host, outcome)
+        }
+    }))
+    .await;
+    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
+    for (host, outcome) in outcomes {
+        stats.entry(host).or_default().record(outcome);
+    }
+    stats
 }
 
 /// Pull every unique source blob once to warm CDN edge caches.
@@ -1357,330 +1428,57 @@ struct PrewarmStats {
 /// Runs before any tool so all tools see identically warm CDN. Uses
 /// OCI token exchange for authentication so requests succeed (2xx) and
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
-/// NOT cached by CDN and would warm nothing. The source manifests need no pass
-/// of their own: the lock check has just requested every one.
-async fn cdn_prewarm(corpus: &Corpus, client: &reqwest::Client) {
-    let auth = corpus.dockerhub_auth.as_ref();
-    let tokens = registry::Tokens::default();
-    eprintln!("bench: manifests were warmed by the lock check; pre-warming blob CDN...");
-
-    // Blob URLs are served via 302 redirects to CloudFront -- completely
-    // different cache keys from manifests. Without this pass the first
-    // tool to run pays a CDN miss penalty on every blob.
-
-    // Redirect-following client with a generous timeout for large blobs.
-    let blob_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap();
-
-    // (repository, digest) pairs -- deduped so shared layers are fetched
-    // exactly once.
-    let mut unique_blobs: HashSet<(registry::RepoKey, String)> = HashSet::new();
-
-    for image in &corpus.images {
-        let Some(source) = registry::split_source(&image.source) else {
-            continue;
-        };
-        let key = registry::RepoKey::from(&source);
-        let (registry, repo) = (source.host.api_host(), source.path);
-
-        // GET one manifest per image to discover blob digests.
-        // All tags for the same image reference the same layers, so the
-        // first tag is sufficient.
-        if let Some(tag) = image.tags.first() {
-            let url = format!("https://{registry}/v2/{repo}/manifests/{tag}");
-            let resp = tokens
-                .send(client, &source, auth, None, |token| {
-                    client
-                        .get(&url)
-                        .bearer_auth(token)
-                        .header("Accept", registry::MANIFEST_ACCEPT)
-                })
-                .await;
-
-            match resp {
-                Ok(r) => {
-                    if let Ok(body) = r.text().await {
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "a public image manifest; a parse error is dropped unread"
-                        )]
-                        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&body) {
-                            extract_blob_digests(
-                                client,
-                                &manifest,
-                                &key,
-                                &tokens,
-                                auth,
-                                &mut unique_blobs,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                Err(e) => eprintln!("  CDN pre-warm: {registry}/{repo}:{tag}: {e}, skipping"),
-            }
-        }
-    }
-
-    let blob_count = unique_blobs.len();
-    eprintln!(
-        "bench: warming {blob_count} unique blobs (20 concurrent, per-registry rate limited)..."
-    );
-
-    // Warm blobs concurrently (20 at a time) to avoid waiting 15-30 minutes
-    // on a sequential 55 GB download. Uses a semaphore to bound concurrency
-    // within a single-threaded tokio runtime.
-    let blobs_vec: Vec<_> = unique_blobs.into_iter().collect();
-
-    // Per-registry rate controllers and stats, initialized in a single pass.
-    let rate_controllers: std::cell::RefCell<HashMap<String, PrewarmRateController>> =
-        std::cell::RefCell::new(HashMap::new());
-    let per_registry_stats: std::cell::RefCell<HashMap<String, PrewarmStats>> =
-        std::cell::RefCell::new(HashMap::new());
-    for (key, _) in &blobs_vec {
-        rate_controllers
-            .borrow_mut()
-            .entry(key.host.clone())
-            .or_insert_with(|| PrewarmRateController::new(Duration::from_millis(500)));
-        per_registry_stats
-            .borrow_mut()
-            .entry(key.host.clone())
-            .or_default();
-    }
-
-    // Total pre-warm timeout: 8 minutes (leaves 2 min headroom in 10-min budget).
-    let prewarm_deadline = Instant::now() + Duration::from_secs(480);
-
-    let sem = tokio::sync::Semaphore::new(20);
-    const MAX_RETRIES: u32 = 3;
-
-    let futs: Vec<_> = blobs_vec
-        .iter()
-        .map(|(key, digest)| {
-            let sem = &sem;
-            let blob_client = &blob_client;
-            let per_registry_stats = &per_registry_stats;
-            let rate_controllers = &rate_controllers;
-            let tokens = &tokens;
-            let registry = key.host.clone();
-            let digest = digest.clone();
-            async move {
-                // Check pre-warm timeout before starting.
-                if Instant::now() > prewarm_deadline {
-                    return;
-                }
-
-                // Rate limit: compute delay, drop borrow, sleep, re-borrow.
-                let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
-                }
-                rate_controllers
-                    .borrow_mut()
-                    .get_mut(&registry)
-                    .unwrap()
-                    .mark_sent();
-
-                // Acquire semaphore AFTER rate-controller wait.
-                let _permit = sem.acquire().await.unwrap();
-
-                let mut retries = 0u32;
-                loop {
-                    let url = format!("https://{}/v2/{}/blobs/{digest}", key.host, key.path);
-                    let resp = tokens
-                        .send(client, &key.repository(), auth, None, |token| {
-                            blob_client.get(&url).bearer_auth(token)
-                        })
-                        .await;
-                    match resp {
-                        Ok(r) if r.status().as_u16() == 429 => {
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .on_throttle();
-                            retries += 1;
-                            if retries >= MAX_RETRIES {
-                                eprintln!(
-                                    "  blob pre-warm: {registry} {digest}: max retries on 429"
-                                );
-                                per_registry_stats
-                                    .borrow_mut()
-                                    .entry(registry.clone())
-                                    .or_default()
-                                    .errors += 1;
-                                break;
-                            }
-                            let delay = rate_controllers.borrow().get(&registry).unwrap().delay();
-                            if let Some(d) = delay {
-                                tokio::time::sleep(d).await;
-                            }
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .mark_sent();
-                            continue;
-                        }
-                        Ok(r) if r.status().is_success() || r.status().is_redirection() => {
-                            let x_cache = r
-                                .headers()
-                                .get("x-cache")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            {
-                                let mut stats = per_registry_stats.borrow_mut();
-                                let entry = stats.entry(registry.clone()).or_default();
-                                if x_cache.to_ascii_lowercase().contains("hit") {
-                                    entry.hits += 1;
-                                } else {
-                                    entry.misses += 1;
-                                }
-                            }
-                            // Consume body to complete the transfer.
-                            let _ = r.bytes().await;
-                            rate_controllers
-                                .borrow_mut()
-                                .get_mut(&registry)
-                                .unwrap()
-                                .on_success();
-                            break;
-                        }
-                        Ok(r) => {
-                            let status = r.status();
-                            eprintln!("  blob pre-warm: {registry} {digest}: {status}");
-                            per_registry_stats
-                                .borrow_mut()
-                                .entry(registry.clone())
-                                .or_default()
-                                .errors += 1;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("  blob pre-warm: {registry} {digest}: {e}");
-                            per_registry_stats
-                                .borrow_mut()
-                                .entry(registry.clone())
-                                .or_default()
-                                .errors += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .collect();
-    futures_util::future::join_all(futs).await;
-
-    let (total_hits, total_misses, total_errors) = {
-        let stats = per_registry_stats.borrow();
-        let mut hits_sum = 0u64;
-        let mut misses_sum = 0u64;
-        let mut errors_sum = 0u64;
-        for (registry, s) in stats.iter() {
-            hits_sum += s.hits;
-            misses_sum += s.misses;
-            errors_sum += s.errors;
-            let rate_ms = rate_controllers
-                .borrow()
-                .get(registry)
-                .unwrap()
-                .interval
-                .as_millis();
-            eprintln!(
-                "  blob pre-warm: {registry}: {} hits, {} misses, {} errors, {rate_ms}ms/req",
-                s.hits, s.misses, s.errors
-            );
-        }
-        (hits_sum, misses_sum, errors_sum)
-    };
-    eprintln!(
-        "bench: blob CDN pre-warm done ({total_hits} hits, {total_misses} misses, {total_errors} errors)"
-    );
-
-    // Wait for CDN propagation. CloudFront edges need time to fully
-    // populate after the first request hits the origin.
-    let wait_secs = 360; // 6 minutes
-    eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
-    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-}
-
-/// Collect layer and config blob digests from a manifest JSON value.
-///
-/// Works for both image manifests (`layers` + `config`) and index manifests
-/// (`manifests` array -- fetches each child to discover its layers).
-async fn extract_blob_digests(
+/// NOT cached by CDN and would warm nothing. The blobs come from the lock,
+/// so every tag the run syncs is warmed and no manifest is read.
+async fn cdn_prewarm(
     client: &reqwest::Client,
-    manifest: &serde_json::Value,
-    repo: &registry::RepoKey,
-    tokens: &registry::Tokens,
     auth: Option<&corpus::DockerHubAuth>,
-    blobs: &mut HashSet<(registry::RepoKey, String)>,
-) {
-    // Image manifest: has `layers` array.
-    if collect_image_blobs(manifest, repo, blobs) {
-        return;
-    }
+    lock: &lock::Lock,
+    refs: &BTreeSet<lock::ImageRef>,
+) -> Prewarm {
+    let deadline = Instant::now() + PREWARM_DEADLINE;
+    let access = registry::Access::new(client, auth);
+    let blobs = blobs_to_warm(lock, refs);
 
-    // Index manifest: has `manifests` array. Fetch each child to discover
-    // its layers.
-    if let Some(children) = manifest.get("manifests").and_then(|m| m.as_array()) {
-        for child in children {
-            let digest = match child.get("digest").and_then(|d| d.as_str()) {
-                Some(d) => d,
-                None => continue,
-            };
-            let url = format!("https://{}/v2/{}/manifests/{digest}", repo.host, repo.path);
-            let resp = tokens
-                .send(client, &repo.repository(), auth, None, |token| {
-                    client.get(&url).bearer_auth(token).header(
-                        "Accept",
-                        "application/vnd.oci.image.manifest.v1+json,\
-                         application/vnd.docker.distribution.manifest.v2+json",
-                    )
-                })
-                .await;
-            if let Ok(r) = resp {
-                if let Ok(body) = r.text().await {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "a public image manifest; a parse error is dropped unread"
-                    )]
-                    if let Ok(child_manifest) = serde_json::from_str::<serde_json::Value>(&body) {
-                        collect_image_blobs(&child_manifest, repo, blobs);
-                    }
-                }
-            }
-        }
+    eprintln!(
+        "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} at a time per registry)...",
+        blobs.len()
+    );
+    let stats = warm_blobs(&blobs, deadline, async |repo, digest, what| {
+        let url = repo.url(&format!("blobs/{digest}"));
+        access.send(repo, what, |client| client.get(&url)).await
+    })
+    .await;
+    for (registry, s) in &stats {
+        eprintln!(
+            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline",
+            s.hits + s.misses,
+            s.hits,
+            s.misses,
+            s.failed,
+            s.past_deadline
+        );
     }
-}
-
-/// Extract layer and config digests from an image manifest JSON.
-///
-/// Returns `true` if this is an image manifest (has `layers`), `false`
-/// otherwise (caller should try index parsing).
-fn collect_image_blobs(
-    manifest: &serde_json::Value,
-    repo: &registry::RepoKey,
-    blobs: &mut HashSet<(registry::RepoKey, String)>,
-) -> bool {
-    let layers = match manifest.get("layers").and_then(|l| l.as_array()) {
-        Some(l) => l,
-        None => return false,
+    eprintln!("bench: blob CDN pre-warm done");
+    let outcome = Prewarm::Done {
+        unwarmed: unwarmed(&stats),
     };
-    for layer in layers {
-        if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
-            blobs.insert((repo.clone(), digest.to_owned()));
-        }
+    if let Some(note) = outcome.note() {
+        eprintln!(
+            "WARNING: {note}; the tool that runs first may pay the CDN misses and tool order matters"
+        );
     }
-    if let Some(config) = manifest.get("config") {
-        if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
-            blobs.insert((repo.clone(), digest.to_owned()));
-        }
+
+    // A miss is an origin fetch, which CloudFront edges need time to settle
+    // after; all hits leave nothing to wait for.
+    if stats.values().any(|s| s.misses > 0) {
+        let wait_secs = 360; // 6 minutes
+        eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
+        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+    } else {
+        eprintln!("bench: no blob missed the CDN cache, so not waiting for it");
     }
-    true
+    outcome
 }
 
 /// Parses an ocync timing JSONL file into a phase-name to milliseconds map.
@@ -2038,6 +1836,79 @@ images:
     }
 
     #[test]
+    fn the_pre_warm_fetches_the_locked_blobs_of_every_tag_once_per_repository() {
+        use lock::fixtures::{digest, entry, lock_of};
+        let blobs = |fills: &str| fills.chars().map(digest).collect();
+        let with = |fills: &str| lock::Entry {
+            blobs: blobs(fills),
+            ..entry('a', &[])
+        };
+        let lock = lock_of(&[
+            ("docker.io/library/alpine:3", with("12")),
+            // A second tag naming other blobs: also fetched, so a first-tag-only
+            // pre-warm fails here.
+            ("docker.io/library/alpine:3.20", with("23")),
+            // Shared with the other tags of the image and with another image.
+            ("quay.io/org/app:1", with("12")),
+            ("quay.io/org/app:2", with("2")),
+            ("quay.io/org/other:1", with("4")),
+            // Not a ref the run syncs.
+            ("quay.io/org/unsynced:1", with("9")),
+        ]);
+        let refs = lock
+            .images
+            .keys()
+            .filter(|image| !image.source.ends_with("unsynced"))
+            .cloned()
+            .collect();
+        let got: Vec<(String, String)> = blobs_to_warm(&lock, &refs)
+            .into_iter()
+            .map(|(repo, digest)| (repo.to_string(), digest.hex()[..1].to_owned()))
+            .collect();
+        // Already in order: the same blobs go first each run.
+        let want = [
+            ("quay.io/org/app", "1"),
+            ("quay.io/org/app", "2"),
+            ("quay.io/org/other", "4"),
+            ("registry-1.docker.io/library/alpine", "1"),
+            ("registry-1.docker.io/library/alpine", "2"),
+            ("registry-1.docker.io/library/alpine", "3"),
+        ]
+        .map(|(repo, digest)| (repo.to_owned(), digest.to_owned()));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_pre_warm_names_the_registries_it_did_not_warm() {
+        // Catches: a failed or dropped blob passing as a warm source.
+        let warm = PrewarmStats {
+            hits: 3,
+            misses: 2,
+            ..PrewarmStats::default()
+        };
+        let mut stats = BTreeMap::new();
+        stats.insert("warm.example", warm);
+        stats.insert("failed.example", {
+            let mut s = PrewarmStats::default();
+            s.record(BlobOutcome::Hit);
+            s.record(BlobOutcome::Failed);
+            s
+        });
+        stats.insert("late.example", {
+            let mut s = PrewarmStats::default();
+            s.record(BlobOutcome::PastDeadline);
+            s
+        });
+        assert_eq!(
+            unwarmed(&stats),
+            BTreeMap::from([
+                ("failed.example".to_owned(), 1),
+                ("late.example".to_owned(), 1)
+            ])
+        );
+    }
+
+    #[test]
     fn only_a_partial_scenario_reads_the_overrides() {
         // Catches: a run without a partial scenario refusing to start for want
         // of an overrides file, and a partial run starting without one.
@@ -2228,56 +2099,178 @@ images:
     }
 
     #[test]
-    fn prewarm_rate_controller_ramps_up() {
-        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
-        let initial = ctrl.interval;
-        for _ in 0..10 {
-            ctrl.on_success();
+    fn a_blob_response_is_classified_by_status_and_cache_headers() {
+        // Catches: an error page or an unfollowed redirect counted as a warmed
+        // blob, and a hit read off the wrong header.
+        type Headers<'a> = &'a [(&'a str, &'a str)];
+        let cases: [(u16, Headers<'_>, BlobOutcome); 16] = [
+            (200, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
+            (
+                200,
+                &[("x-cache", "RefreshHit from cloudfront")],
+                BlobOutcome::Hit,
+            ),
+            (200, &[("cf-cache-status", "HIT")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "REVALIDATED")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "UPDATING")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "STALE")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "EXPIRED")], BlobOutcome::Miss),
+            (200, &[("cf-cache-status", "DYNAMIC")], BlobOutcome::Miss),
+            (
+                200,
+                &[("x-cache", "Miss from cloudfront")],
+                BlobOutcome::Miss,
+            ),
+            (200, &[("cf-cache-status", "MISS")], BlobOutcome::Miss),
+            (200, &[], BlobOutcome::Miss),
+            (206, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
+            (
+                302,
+                &[("x-cache", "Hit from cloudfront")],
+                BlobOutcome::Failed,
+            ),
+            (404, &[], BlobOutcome::Failed),
+            (
+                403,
+                &[("x-cache", "Hit from cloudfront")],
+                BlobOutcome::Failed,
+            ),
+            (503, &[], BlobOutcome::Failed),
+        ];
+        for (status, headers, expected) in cases {
+            let status = reqwest::StatusCode::from_u16(status).unwrap();
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(*name, value.parse().unwrap());
+            }
+            assert_eq!(outcome_of(status, &map), expected, "{status} {headers:?}");
         }
-        // 10 successes: 500 * 0.9^10 ~= 174ms
-        assert!(ctrl.interval < initial);
-        assert!(ctrl.interval > PrewarmRateController::MIN_INTERVAL);
+    }
+
+    fn served(x_cache: &str) -> Result<reqwest::Response, String> {
+        let response = http::Response::builder()
+            .header("x-cache", x_cache)
+            .body("blob bytes");
+        Ok(reqwest::Response::from(response.unwrap()))
+    }
+
+    fn reset_mid_body() -> Result<reqwest::Response, String> {
+        // Some bytes, then a reset.
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter([
+            Ok(b"part".to_vec()),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+        let response = http::Response::builder().body(body);
+        Ok(reqwest::Response::from(response.unwrap()))
+    }
+
+    /// Warm a blob whose sends answer `script` in turn, and report the
+    /// outcome and how many sends were made.
+    fn warmed(
+        script: Vec<Result<reqwest::Response, String>>,
+        deadline: Instant,
+    ) -> (BlobOutcome, usize) {
+        let sends = script.len();
+        let script = std::cell::RefCell::new(std::collections::VecDeque::from(script));
+        let outcome = block_on(warm_blob(deadline, "blob", async || {
+            script.borrow_mut().pop_front().expect("no send left")
+        }));
+        (outcome, sends - script.borrow().len())
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// Run `future` to completion, failing rather than hanging if it takes
+    /// over five seconds.
+    fn block_on_within_five_seconds<T>(future: impl Future<Output = T>) -> T {
+        block_on(async { tokio::time::timeout(Duration::from_secs(5), future).await })
+            .expect("the future hung instead of ending at the deadline")
     }
 
     #[test]
-    fn prewarm_rate_controller_backs_off() {
-        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
-        let before = ctrl.interval;
-        ctrl.on_throttle();
-        assert_eq!(ctrl.interval, before * 2);
+    fn a_registry_that_never_answers_does_not_hold_back_another() {
+        // Catches: one concurrency limit shared by all registries, so a
+        // registry whose requests hang keeps another's blobs waiting for a slot.
+        use registry::{Host, Repository};
+        let digest = lock::fixtures::digest('1');
+        // Many blobs of each, so that under one shared limit some of the
+        // good registry's are sure to queue behind hung ones.
+        let hung_paths: Vec<String> = (0..4 * PREWARM_PER_REGISTRY)
+            .map(|i| format!("a{i}"))
+            .collect();
+        let fine_paths: Vec<String> = (0..4).map(|i| format!("b{i}")).collect();
+        let blobs: Vec<_> = hung_paths
+            .iter()
+            .map(|path| (Host::Other("hung.example"), path))
+            .chain(
+                fine_paths
+                    .iter()
+                    .map(|path| (Host::Other("fine.example"), path)),
+            )
+            .map(|(host, path)| (Repository { host, path }, &digest))
+            .collect();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let stats = block_on_within_five_seconds(warm_blobs(
+            &blobs,
+            deadline,
+            async |repo, _, _| match repo.host {
+                Host::Other("hung.example") => std::future::pending().await,
+                _ => served("Hit from cloudfront"),
+            },
+        ));
+        assert_eq!(stats["fine.example"].hits, fine_paths.len() as u64);
+        assert_eq!(stats["hung.example"].past_deadline, hung_paths.len() as u64);
     }
 
     #[test]
-    fn prewarm_rate_controller_caps_backoff() {
-        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
-        // Throttle repeatedly to hit the cap.
-        for _ in 0..20 {
-            ctrl.on_throttle();
-            // Reset epoch so each throttle fires.
-            ctrl.last_throttle = Instant::now() - ctrl.epoch - Duration::from_millis(1);
-        }
-        assert_eq!(ctrl.interval, PrewarmRateController::MAX_INTERVAL);
-    }
-
-    #[test]
-    fn prewarm_rate_controller_epoch_suppresses_burst() {
-        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
-        ctrl.on_throttle();
-        let after_first = ctrl.interval;
-        // Second throttle within epoch -- should be suppressed.
-        ctrl.on_throttle();
+    fn a_blob_is_warmed_only_by_a_response_read_in_full() {
+        let open = Instant::now() + Duration::from_secs(10);
+        // Catches: a 2xx that says hit not being counted as one.
         assert_eq!(
-            ctrl.interval, after_first,
-            "second throttle within epoch should be suppressed"
+            warmed(vec![served("Hit from cloudfront")], open),
+            (BlobOutcome::Hit, 1)
         );
-    }
-
-    #[test]
-    fn prewarm_rate_controller_floor() {
-        let mut ctrl = PrewarmRateController::new(Duration::from_millis(500));
-        for _ in 0..200 {
-            ctrl.on_success();
-        }
-        assert_eq!(ctrl.interval, PrewarmRateController::MIN_INTERVAL);
+        // Catches: a body that fails mid-read counted as warmed, or given up on
+        // without the second attempt.
+        assert_eq!(
+            warmed(vec![reset_mid_body(), served("Miss from cloudfront")], open),
+            (BlobOutcome::Miss, 2)
+        );
+        // Catches: a body that keeps failing passing as a hit or miss, or being
+        // attempted more than the limit.
+        assert_eq!(
+            warmed(
+                vec![
+                    reset_mid_body(),
+                    reset_mid_body(),
+                    served("Hit from cloudfront")
+                ],
+                open
+            ),
+            (BlobOutcome::Failed, 2)
+        );
+        // Catches: a send error, which already waited out its retries, being
+        // sent again.
+        assert_eq!(
+            warmed(
+                vec![Err("returned 503 (5 attempts)".into()), served("Hit")],
+                open
+            ),
+            (BlobOutcome::Failed, 1)
+        );
+        // Catches: a request sent after the deadline.
+        assert_eq!(
+            warmed(
+                vec![served("Hit from cloudfront")],
+                Instant::now() - Duration::from_secs(1)
+            ),
+            (BlobOutcome::PastDeadline, 0)
+        );
     }
 }

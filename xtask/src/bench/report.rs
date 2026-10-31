@@ -42,13 +42,110 @@ pub(crate) struct RunRecord {
     ///
     /// dregsy transfers nothing itself, so skopeo's version moves dregsy's
     /// numbers. Recorded here rather than only in the per-run summary, which
-    /// is not tracked in git and dies with the instance.
-    #[serde(default)]
-    pub(crate) relays: BTreeMap<String, String>,
+    /// is not tracked in git and dies with the instance. Empty for a run that
+    /// used no relay; `None` when the record does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) relays: Option<BTreeMap<String, String>>,
+    /// How the CDN pre-warm went. A source that was not warmed changes what the
+    /// numbers mean. `None` when no pre-warm was decided or the record does
+    /// not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+impl RunRecord {
+    /// The record of a finished live run, `report` as measured on a registry of
+    /// `provider`, synced against the lock written at `corpus_locked_at`.
+    pub(crate) fn of(
+        report: &BenchReport,
+        git_ref: String,
+        provider: Option<Provider>,
+        corpus_locked_at: Option<LockedAt>,
+    ) -> Self {
+        Self {
+            timestamp: report.timestamp.clone(),
+            git_ref,
+            corpus_locked_at,
+            machine: MachineInfo {
+                provider,
+                instance_type: report.instance.instance_type.clone(),
+                arch: report.instance.arch.clone(),
+                vcpus: report.instance.vcpus,
+                memory_gib: report.instance.memory_mib as f64 / 1024.0,
+                network: report.instance.network_performance.clone(),
+                region: report.instance.region.clone(),
+                image_id: Some(report.instance.image_id.clone()),
+            },
+            relays: Some(report.relay_versions.clone()),
+            prewarm: report.prewarm.clone(),
+            corpus: CorpusInfo {
+                images: report.corpus_size,
+                tags: report.total_tags,
+            },
+            scenarios: report
+                .scenarios
+                .iter()
+                .map(|s| ScenarioRecord {
+                    name: s.kind.label(),
+                    shuffle_seed: s.shuffle_seed,
+                    tool_order: s.tool_order.iter().map(ToString::to_string).collect(),
+                    tools: s
+                        .runs
+                        .iter()
+                        .map(|r| ToolRecord {
+                            tool: r.tool.to_string(),
+                            version: report
+                                .tool_versions
+                                .get(&r.tool)
+                                .cloned()
+                                .unwrap_or_default(),
+                            wall_clock_secs: r.wall_clock_secs,
+                            peak_rss_kb: r.peak_rss_kb,
+                            metrics: r.proxy_metrics.clone().unwrap_or_default(),
+                            phase_timing_ms: r.phase_timing_ms.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What happened to the CDN pre-warm of a run that transfers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Prewarm {
+    /// Skipped with `--skip-prewarm`.
+    Skipped,
+    /// Ran.
+    Done {
+        /// For each registry with a blob that failed or was not finished by
+        /// the deadline, started or not, how many; empty when every blob was
+        /// warmed.
+        unwarmed: BTreeMap<String, u64>,
+    },
+}
+
+impl Prewarm {
+    /// The line the summary carries, when the pre-warm was skipped or left a
+    /// registry unwarmed.
+    pub(crate) fn note(&self) -> Option<String> {
+        match self {
+            Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
+            Self::Done { unwarmed } if unwarmed.is_empty() => None,
+            Self::Done { unwarmed } => {
+                let counts: Vec<String> = unwarmed
+                    .iter()
+                    .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
+                    .collect();
+                Some(format!("Pre-warm: not warmed for {}", counts.join(", ")))
+            }
+        }
+    }
 }
 
 /// Machine metadata for a benchmark run.
@@ -71,18 +168,14 @@ pub(crate) struct MachineInfo {
     /// Cloud region (e.g. `us-east-1`).
     pub(crate) region: String,
     /// Machine image the instance booted (e.g. `ami-0742fcde83639b335`), or
-    /// `"unknown"` outside a cloud instance.
+    /// `"unknown"` when a live run could not read it. Absent when the
+    /// record does not carry it.
     ///
     /// The image carries the kernel, glibc and NIC driver, so two runs on
     /// different images are not directly comparable however identical the rest
     /// of the metadata looks.
-    #[serde(default = "unknown_string")]
-    pub(crate) image_id: String,
-}
-
-/// Default for record fields added after runs were already archived.
-fn unknown_string() -> String {
-    "unknown".to_string()
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image_id: Option<String>,
 }
 
 /// Reads an instance metadata field, warning when it cannot be resolved.
@@ -97,7 +190,7 @@ fn imds_or_unknown(path: &str) -> String {
             "WARNING: instance metadata {path} unavailable, recording \"unknown\". \
              Runs cannot be compared on it."
         );
-        unknown_string()
+        "unknown".to_owned()
     })
 }
 
@@ -263,9 +356,7 @@ impl InstanceInfo {
     /// and network specs. Falls back to `"unknown"` / 0 outside EC2.
     pub(crate) fn collect() -> Self {
         // Announced rather than silently recorded: the image and instance type
-        // are what decide whether two runs are comparable, and a bare
-        // "unknown" in the archive is indistinguishable from an older record
-        // that predates the field.
+        // are what decide whether two runs are comparable.
         let instance_type = imds_or_unknown("instance-type");
         let region = imds_or_unknown("placement/region");
         let image_id = imds_or_unknown("ami-id");
@@ -397,6 +488,8 @@ pub(crate) struct BenchReport {
     /// Kept apart from [`Self::tool_versions`] because these are not
     /// benchmarked tools and must not become columns in the metric tables.
     pub(crate) relay_versions: BTreeMap<String, String>,
+    /// How the CDN pre-warm went; `None` when no scenario transfers.
+    pub(crate) prewarm: Option<Prewarm>,
     /// Per-scenario results.
     pub(crate) scenarios: Vec<ScenarioResult>,
 }
@@ -500,6 +593,9 @@ fn summary_markdown(report: &BenchReport) -> String {
         "Corpus: {} images, {} total tags\n\n",
         report.corpus_size, report.total_tags
     ));
+    if let Some(note) = report.prewarm.as_ref().and_then(Prewarm::note) {
+        out.push_str(&format!("{note}\n\n"));
+    }
 
     out.push_str("## Tool Versions\n\n");
     for (tool, version) in &report.tool_versions {
@@ -941,6 +1037,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1072,6 +1169,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![],
         };
@@ -1115,67 +1213,21 @@ mod tests {
     }
 
     #[test]
-    fn run_record_roundtrip() {
-        let record = RunRecord {
-            timestamp: "2026-04-18-021040".into(),
-            git_ref: "d121864".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c6in.4xlarge".into(),
-                arch: "x86_64".into(),
-                vcpus: 16,
-                memory_gib: 32.0,
-                network: "Up to 50 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: "unknown".into(),
-            },
-            relays: BTreeMap::new(),
-            corpus: CorpusInfo {
-                images: 42,
-                tags: 55,
-            },
-            scenarios: vec![ScenarioRecord {
-                name: "Cold sync".into(),
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-                tools: vec![ToolRecord {
-                    tool: "ocync".into(),
-                    version: "0.1.0".into(),
-                    wall_clock_secs: 273.0,
-                    peak_rss_kb: Some(59468),
-                    metrics: ProxyMetrics {
-                        requests: 4131,
-                        response_bytes: 16_900_000_000,
-                        source_blob_gets: 726,
-                        source_blob_bytes: 77200,
-                        mount_successes: 362,
-                        mount_attempts: 379,
-                        ..Default::default()
-                    },
-                    phase_timing_ms: BTreeMap::new(),
-                }],
-            }],
-        };
-        let json = serde_json::to_string_pretty(&record).unwrap();
-        let parsed: RunRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.timestamp, "2026-04-18-021040");
-        assert_eq!(parsed.git_ref, "d121864");
-        assert_eq!(parsed.machine.provider, Some(Provider::Aws));
-        assert_eq!(parsed.machine.memory_gib, 32.0);
-        assert_eq!(parsed.corpus.images, 42);
-        assert_eq!(parsed.scenarios[0].tools[0].metrics.requests, 4131);
-    }
-
-    #[test]
     fn the_tracked_archive_still_parses() {
         let archive = include_str!("../../../bench/results/ecr.json");
         let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
         assert!(!records.is_empty());
+        // Catches: a record that does not rewrite as it was read, as when a
+        // field an old run never had is written as an empty value. Compared
+        // as values because the archive spells one float longer than Rust's
+        // shortest form.
+        let rewritten = serde_json::to_string_pretty(&records).unwrap();
+        let as_value = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(as_value(&rewritten), as_value(archive));
     }
 
     #[test]
-    fn corpus_locked_at_is_written_only_when_set_and_old_records_read_as_unset() {
+    fn corpus_locked_at_is_written_when_set() {
         let mut record: RunRecord = serde_json::from_str(
             r#"{
                 "timestamp": "2026-10-30-120000",
@@ -1190,10 +1242,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(record.corpus_locked_at, None, "a record with no field");
-        let without = serde_json::to_string(&record).unwrap();
-        assert!(!without.contains("corpus_locked_at"), "{without}");
-
         record.corpus_locked_at =
             Some(crate::bench::lock::fixtures::locked_at("2026-10-30-120000"));
         let with = serde_json::to_string(&record).unwrap();
@@ -1206,29 +1254,59 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_notes_a_pre_warm_only_when_it_was_skipped_or_left_a_registry_unwarmed() {
+        // Catches: an unwarmed registry recorded nowhere a reader of the
+        // numbers would see it.
+        let unwarmed = Prewarm::Done {
+            unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
+        };
+        let cases = [
+            (
+                Prewarm::Done {
+                    unwarmed: BTreeMap::new(),
+                },
+                None,
+            ),
+            (Prewarm::Skipped, Some("Pre-warm: skipped (--skip-prewarm)")),
+            (unwarmed, Some("Pre-warm: not warmed for quay.io (3 blobs)")),
+        ];
+        for (outcome, line) in cases {
+            let mut report = sample_report();
+            report.prewarm = Some(outcome);
+            let summary = summary_markdown(&report);
+            assert_eq!(summary.contains("Pre-warm:"), line.is_some(), "{summary}");
+            if let Some(line) = line {
+                assert!(summary.contains(line), "{summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_run_record_carries_the_pre_warm_and_no_relay_as_an_empty_map() {
+        // Catches: a record written with the pre-warm or the relays dropped,
+        // which reads as "not recorded" instead of the run's own answer.
+        let mut report = sample_report();
+        report.prewarm = Some(Prewarm::Done {
+            unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
+        });
+        let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(written["relays"], serde_json::json!({}));
+        assert_eq!(
+            written["prewarm"],
+            serde_json::json!({"done": {"unwarmed": {"quay.io": 3}}})
+        );
+    }
+
+    #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
-        let record = RunRecord {
-            timestamp: "2026-04-18-100000".into(),
-            git_ref: "abc1234".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c6in.4xlarge".into(),
-                arch: "x86_64".into(),
-                vcpus: 16,
-                memory_gib: 32.0,
-                network: "Up to 50 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: "unknown".into(),
-            },
-            relays: BTreeMap::new(),
-            corpus: CorpusInfo {
-                images: 10,
-                tags: 15,
-            },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         append_record(dir.path(), "ecr", record).unwrap();
 
         let path = dir.path().join("ecr.json");
@@ -1236,7 +1314,7 @@ mod tests {
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].timestamp, "2026-04-18-100000");
+        assert_eq!(records[0].timestamp, "2026-04-15-100000");
     }
 
     #[test]
@@ -1245,30 +1323,18 @@ mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "[]").unwrap();
 
-        let record = RunRecord {
-            timestamp: "2026-04-18-110000".into(),
-            git_ref: "def5678".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c7g.xlarge".into(),
-                arch: "aarch64".into(),
-                vcpus: 4,
-                memory_gib: 8.0,
-                network: "Up to 12.5 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: "unknown".into(),
-            },
-            relays: BTreeMap::new(),
-            corpus: CorpusInfo { images: 5, tags: 8 },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         append_record(dir.path(), "ecr", record).unwrap();
 
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].git_ref, "def5678");
+        assert_eq!(records[0].git_ref, "abc1234");
     }
 
     #[test]
@@ -1277,24 +1343,12 @@ mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "not json").unwrap();
 
-        let record = RunRecord {
-            timestamp: "2026-04-18-120000".into(),
-            git_ref: "aaa1111".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "unknown".into(),
-                arch: "unknown".into(),
-                vcpus: 0,
-                memory_gib: 0.0,
-                network: "unknown".into(),
-                region: "unknown".into(),
-                image_id: "unknown".into(),
-            },
-            relays: BTreeMap::new(),
-            corpus: CorpusInfo { images: 0, tags: 0 },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         assert!(append_record(dir.path(), "ecr", record).is_err());
     }
 
@@ -1306,6 +1360,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
@@ -1348,6 +1403,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Warm,
@@ -1424,6 +1480,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1515,6 +1572,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1570,6 +1628,7 @@ mod tests {
             corpus_size: 42,
             total_tags: 55,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".to_string()),
                 (Tool::Dregsy, "0.5.0".to_string()),
@@ -1648,6 +1707,7 @@ mod tests {
             corpus_size: 39,
             total_tags: 51,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![
                 ScenarioResult::unshuffled(
@@ -1701,6 +1761,7 @@ mod tests {
             corpus_size: 39,
             total_tags: 51,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Warm,
@@ -1731,6 +1792,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([
                 (Tool::Ocync, "0.1.0".into()),
                 (Tool::Dregsy, "0.5.0".into()),
@@ -1784,6 +1846,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Dregsy, "0.5.0".into())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
@@ -1814,6 +1877,7 @@ mod tests {
             corpus_size: 28,
             total_tags: 40,
             relay_versions: BTreeMap::new(),
+            prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".into())]),
             scenarios: vec![ScenarioResult::unshuffled(
                 ScenarioKind::Cold,
