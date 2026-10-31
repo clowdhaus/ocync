@@ -700,6 +700,14 @@ const BLOB_CONCURRENCY: usize = 6;
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
+/// Default per-blob wait for a source repo's manifest commit before a
+/// cross-repo mount.
+///
+/// Measured on the 55 GB benchmark corpus to ECR at caps 20 and 50: an image
+/// needed up to 149 s for the repo it mounts from to commit, because that repo
+/// also uploads its own large layers. A shorter wait uploads the blob again.
+const DEFAULT_MOUNT_SOURCE_WAIT: Duration = Duration::from_secs(180);
+
 /// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
 ///
 /// Discovery and execution can each run for minutes without an image reaching
@@ -735,7 +743,7 @@ impl SyncEngine {
             max_concurrent,
             drain_deadline: Duration::from_secs(DEFAULT_DRAIN_DEADLINE_SECS),
             source_head_timeout: Duration::from_secs(5),
-            mount_source_wait_deadline: Duration::from_secs(60),
+            mount_source_wait_deadline: DEFAULT_MOUNT_SOURCE_WAIT,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
             prune_cache: true,
         }
@@ -755,7 +763,7 @@ impl SyncEngine {
         self
     }
 
-    /// Configure the per-blob mount-source wait deadline (default 60 seconds).
+    /// Configure the per-blob mount-source wait deadline (default 180 seconds).
     ///
     /// A follower waiting on a leader's manifest-commit watch falls back to
     /// push on expiry instead of hanging.
@@ -3047,6 +3055,15 @@ mod tests {
     use ocync_distribution::spec::{Descriptor, MediaType};
 
     use super::*;
+
+    /// The default mount-source wait outlasts the longest commit wait measured
+    /// on the benchmark corpus (149 s); a shorter one uploads blobs a mount
+    /// would have saved.
+    #[test]
+    fn default_mount_source_wait_outlasts_the_longest_measured_commit_wait() {
+        let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);
+        assert!(engine.mount_source_wait_deadline > Duration::from_secs(149));
+    }
 
     /// A transferred image reports its own byte count, blob stats and elapsed
     /// time, not the zeroed defaults of a skip.
