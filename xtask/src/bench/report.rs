@@ -1207,8 +1207,9 @@ impl PageBlocks {
     /// Writes the blocks into the page at `path`, replacing what is between
     /// each marker pair, so applying the same blocks twice leaves the page as
     /// applying them once. A pair missing from the page is skipped with a
-    /// warning; a page with no block to write is left untouched.
-    pub(crate) fn apply(&self, path: &Path) -> Result<(), String> {
+    /// warning; a page with no block to write is left untouched. Returns
+    /// whether the page was written.
+    pub(crate) fn apply(&self, path: &Path) -> Result<bool, String> {
         let mut content =
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
 
@@ -1236,7 +1237,7 @@ impl PageBlocks {
             std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
         }
 
-        Ok(())
+        Ok(updated)
     }
 }
 
@@ -1298,8 +1299,10 @@ impl Deferred {
     }
 
     /// Appends the record to the archive in `archive_dir` and writes the
-    /// blocks into `page`, as a local run does. Safe to repeat, see
-    /// [`append_record`]. A `page` that does not exist is left alone.
+    /// blocks into `page`; the one step a local run and a fetched run share.
+    /// Safe to repeat, see [`append_record`]. A record that cannot be appended
+    /// is an error. A `page` that does not exist is left alone, and one that
+    /// cannot be updated (broken markers, say) is a warning, never an error.
     pub(crate) fn apply(self, archive_dir: &Path, page: &Path) -> Result<(), String> {
         if let Some(record) = self.record {
             append_record(archive_dir, &self.archive_key, record)?;
@@ -1311,8 +1314,11 @@ impl Deferred {
             );
         }
         if page.exists() {
-            self.page.apply(page)?;
-            eprintln!("bench: updated {}", page.display());
+            match self.page.apply(page) {
+                Ok(true) => eprintln!("bench: updated {}", page.display()),
+                Ok(false) => {}
+                Err(e) => eprintln!("WARNING: failed to update {}: {e}", page.display()),
+            }
         }
         Ok(())
     }
@@ -1361,7 +1367,7 @@ pub(crate) fn append_record(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn test_instance() -> InstanceInfo {
@@ -1377,7 +1383,8 @@ mod tests {
         }
     }
 
-    fn sample_report() -> BenchReport {
+    /// A finished cold-sync report to build records and page blocks from.
+    pub(crate) fn sample_report() -> BenchReport {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
@@ -1769,6 +1776,22 @@ mod tests {
     }
 
     #[test]
+    fn a_page_that_cannot_be_updated_is_a_warning_not_an_error() {
+        let local = tempfile::tempdir().unwrap();
+        let page = local.path().join("performance.md");
+        // End marker before the start marker: the page cannot take the block.
+        let broken = "<!-- BENCH:END -->\n<!-- BENCH:START -->\n";
+        std::fs::write(&page, broken).unwrap();
+
+        Deferred::new("ecr", Some(sample_record()), &sample_report())
+            .apply(local.path(), &page)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), broken);
+        assert!(local.path().join("ecr.json").exists(), "the record is kept");
+    }
+
+    #[test]
     fn a_deferred_run_not_comparable_to_the_archive_appends_no_record() {
         let local = tempfile::tempdir().unwrap();
         let page = local.path().join("performance.md");
@@ -1883,7 +1906,7 @@ mod tests {
         .unwrap();
 
         let report = sample_report();
-        PageBlocks::of(&report).apply(&path).unwrap();
+        assert!(PageBlocks::of(&report).apply(&path).unwrap());
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("<!-- BENCH:START -->"));

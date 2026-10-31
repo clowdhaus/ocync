@@ -102,21 +102,12 @@ impl LockedAt {
     /// Accept the run timestamp's shape: 17 characters, digits with dashes
     /// after the year, month and day.
     fn parse(raw: &str) -> Result<Self, String> {
-        let shaped = raw.len() == 17
-            && raw.bytes().enumerate().all(|(i, b)| match i {
-                4 | 7 | 10 => b == b'-',
-                _ => b.is_ascii_digit(),
-            });
-        if shaped {
-            Ok(Self(raw.to_owned()))
-        } else {
-            Err(format!("{raw:?} is not a timestamp like 2026-10-30-214340"))
-        }
+        crate::bench::RunTimestamp::parse(raw).map(|at| Self(at.to_string()))
     }
 
     /// The current time.
     fn now() -> Self {
-        Self(crate::bench::utc_timestamp())
+        Self(crate::bench::RunTimestamp::now().to_string())
     }
 }
 
@@ -778,7 +769,7 @@ mod tests {
             assert_eq!(LockedAt::parse(raw).is_ok(), accepted, "{raw}");
         }
         assert!(
-            LockedAt::parse(&crate::bench::utc_timestamp()).is_ok(),
+            LockedAt::parse(&crate::bench::RunTimestamp::now().to_string()).is_ok(),
             "what the run stamps must be what the lock accepts"
         );
     }
