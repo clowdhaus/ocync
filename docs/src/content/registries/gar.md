@@ -15,7 +15,7 @@ ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any 
 
 Workload Identity Federation takes its subject token from a file (such as a projected Kubernetes service account token), a URL, or AWS. On EKS, the AWS source signs with the pod's AWS credentials (IRSA or Pod Identity), so `ocync` reaches Artifact Registry with no service account key. The executable source is not supported. See the [security design](/design/security#owned-google-authentication) for how this matches Google's own library.
 
-With no Google credentials at all, ocync reads public Google registries anonymously, including `mirror.gcr.io`, `gcr.io/distroless` and `k8s.gcr.io`. Credentials that exist but fail to load or are refused are an error, never a silent anonymous read. When the registry refuses an anonymous read, the error says no Google credentials were found.
+With no Google credentials at all, on a machine that is not on Google Cloud, ocync reads Google registries it detects by hostname anonymously, so public ones work: `mirror.gcr.io`, `gcr.io/distroless` and public Artifact Registry repositories were read this way on 2026-10-31. Credentials that exist but fail to load or are refused are an error, never an anonymous read, and so is a metadata server that fails on Google Cloud. A registry set with `auth_type: gar` or `gcr` never reads anonymously. When the registry refuses an anonymous read, the error says no Google credentials were found. The run logs once at INFO that it is reading anonymously.
 
 See the [GCP ADC docs](https://cloud.google.com/docs/authentication/application-default-credentials) for the full precedence chain.
 

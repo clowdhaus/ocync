@@ -19,7 +19,7 @@ use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::DockerConfig;
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
-use ocync_distribution::auth::gcp::{GcpAuth, SharedGoogleToken};
+use ocync_distribution::auth::gcp::{GcpAuth, Selection, SharedGoogleToken};
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 use ocync_sync::RunOutcome;
@@ -281,7 +281,14 @@ pub(crate) async fn build_registry_client(
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Gar | AuthType::Gcr) => {
-            let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp).await?;
+            let auth = GcpAuth::new(
+                &url,
+                http,
+                aws_credentials,
+                &credentials.gcp,
+                Selection::Configured,
+            )
+            .await?;
             RegistryClient::builder(url).auth(auth)
         }
         Some(AuthType::Acr) => {
@@ -318,7 +325,14 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
-                    let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp).await?;
+                    let auth = GcpAuth::new(
+                        &url,
+                        http,
+                        aws_credentials,
+                        &credentials.gcp,
+                        Selection::Detected,
+                    )
+                    .await?;
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Acr) => {

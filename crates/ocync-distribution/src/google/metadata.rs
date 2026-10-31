@@ -9,7 +9,7 @@ use serde::de::IgnoredAny;
 use url::Url;
 
 use super::{AccessToken, Call, Clients, Error, Scopes, expiring, send_json};
-use crate::aws::{Clock, Env, Timeouts};
+use crate::aws::{Clock, Env, Host, Platform, Timeouts};
 
 /// The variable naming the metadata server's `host[:port]`, without a
 /// scheme.
@@ -32,17 +32,38 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
     read: Duration::from_secs(10),
 };
 
+/// The file where Linux reports the machine's product name.
+pub(super) const PRODUCT_NAME_FILE: &str = "/sys/class/dmi/id/product_name";
+
+/// Whether `host` is on Google Cloud, judged without a network request, as
+/// Google's Go library `cloud.google.com/go/compute/metadata` does in
+/// `OnGCE`: `GCE_METADATA_HOST` set means the user said so, and otherwise
+/// the DMI product name, `Google` or `Google Compute Engine` (every Compute
+/// Engine and GKE node), suggests it. Go goes on to probe the network when
+/// the name does not, which would make every run off Google Cloud wait, so
+/// this does not: a machine whose name is not Google's is off Google Cloud.
+/// Go reads no `K_SERVICE` or `FUNCTION_TARGET` either. Windows, where this
+/// does not read the registry, is taken to be on it so the metadata server
+/// is asked, as upstream does.
+pub(super) fn is_on_google_cloud(host: &Host) -> bool {
+    if host.env.get(HOST_VARIABLE).is_some() {
+        return true;
+    }
+    match host.platform {
+        Platform::Windows => true,
+        Platform::Unix => host
+            .fs
+            .read(std::path::Path::new(PRODUCT_NAME_FILE))
+            .is_ok_and(|name| matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")),
+    }
+}
+
 /// The metadata server's token endpoint.
 #[derive(Debug)]
 pub(super) struct Server {
     /// The token URL, with the comma-joined scopes as its query unless the
     /// server's default is wanted.
     token_url: Url,
-    /// Whether the address is the default one rather than one
-    /// [`HOST_VARIABLE`] names. Only a default address that never connects
-    /// means there is no metadata server; a named one that does not is a
-    /// source that failed.
-    ambient: bool,
 }
 
 /// The token endpoint's answer.
@@ -60,7 +81,6 @@ impl Server {
     /// `host[:port]`, such as one with a path or user info, is an error.
     pub(super) fn new(env: &Env, scopes: Scopes) -> Result<Self, Error> {
         let host = env.get(HOST_VARIABLE);
-        let ambient = host.is_none();
         let mut token_url = Url::parse(&format!(
             "http://{}",
             host.as_deref().unwrap_or(DEFAULT_HOST)
@@ -80,12 +100,10 @@ impl Server {
                 .query_pairs_mut()
                 .append_pair("scopes", &scopes.joined(","));
         }
-        Ok(Self { token_url, ambient })
+        Ok(Self { token_url })
     }
 
-    /// The default service account's token. A default address that never
-    /// connects, after the retries every metadata call gets, is
-    /// [`Error::NoSource`]: nothing here is a source to fail.
+    /// The default service account's token.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,
@@ -96,14 +114,7 @@ impl Server {
                 .get(self.token_url.clone())
                 .header(FLAVOR.0, FLAVOR.1)
         })
-        .await
-        .map_err(|e| {
-            if self.ambient && e.is_connect_failure() {
-                Error::NoSource(Box::new(e))
-            } else {
-                e
-            }
-        })?;
+        .await?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
@@ -167,51 +178,31 @@ mod tests {
         }
     }
 
-    /// A default address that never connects is no credential source, but a
-    /// named one that does not connect is a source that failed. Breaks if a
-    /// broken source silently becomes anonymous, or an absent one stays an
-    /// error.
-    #[tokio::test(start_paused = true)]
-    async fn only_an_unreachable_default_address_is_no_source() {
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
+    /// A host is on Google Cloud when `GCE_METADATA_HOST` is set or its DMI
+    /// product name is Google's, and off it otherwise, whatever else the
+    /// name says. Breaks if a rule is dropped, a near name matches, or the
+    /// name is read from the real file system.
+    #[test]
+    fn residency_follows_googles_rule() {
+        let on = |vars: &[(&str, &str)], name: Option<&[u8]>| {
+            let files: Vec<(&str, Vec<u8>)> = name
+                .map(|name| (PRODUCT_NAME_FILE, name.to_vec()))
+                .into_iter()
+                .collect();
+            is_on_google_cloud(&crate::google::tests::host(Platform::Unix, vars, &files))
         };
-        let mut server = Server::new(&host_env(&closed.to_string()), Scopes::Registry).unwrap();
-        let clients = Clients::new().unwrap();
-        async fn fetch(server: &Server, clients: &Clients) -> Error {
-            server
-                .access_token(clients, Clock::Fixed(now()))
-                .await
-                .unwrap_err()
-        }
-
-        let named = fetch(&server, &clients).await;
-        assert!(matches!(named, Error::Transport { .. }), "{named}");
-
-        server.ambient = true;
-        let default = fetch(&server, &clients).await;
-        assert!(default.is_no_source(), "{default}");
-    }
-
-    /// A server that answers with an error is a source that failed, even at
-    /// the default address. Breaks if any answer counts as no source.
-    #[tokio::test]
-    async fn an_answering_server_is_a_source() {
-        let answering = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&answering)
-            .await;
-        let mut server = Server::new(&server_env(&answering), Scopes::Registry).unwrap();
-        server.ambient = true;
-
-        let error = server
-            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, Error::Status { .. }), "{error:?}");
+        assert!(on(&[(HOST_VARIABLE, "10.0.0.1")], None));
+        assert!(on(&[], Some(b"Google Compute Engine\n")));
+        assert!(on(&[], Some(b"Google")));
+        assert!(!on(&[], None));
+        assert!(!on(&[], Some(b"Dell Inc.")));
+        assert!(!on(&[], Some(b"Google Compute Engine Plus")));
+        assert!(!on(&[], Some(b"")));
+        assert!(is_on_google_cloud(&crate::google::tests::host(
+            Platform::Windows,
+            &[],
+            &[]
+        )));
     }
 
     /// Upstream `token_provider_full` and `headers_success_with_quota_project`:

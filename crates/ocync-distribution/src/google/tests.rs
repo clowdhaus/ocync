@@ -52,7 +52,7 @@ impl Fixture {
     }
 }
 
-async fn load(host: &Host) -> Result<Credentials, Error> {
+async fn load(host: &Host) -> Result<Located, Error> {
     Credentials::load(
         host,
         &Clients::new().unwrap(),
@@ -124,27 +124,34 @@ fn reads_a_path_that_is_not_utf8() {
 /// `load_adc_no_file_at_well_known_path_fallback_to_mds` and
 /// `create_access_token_credentials_fallback_to_mds`: the file the variable
 /// names comes first and must exist, then the well-known file, then the
-/// metadata server. Breaks if the order changes, a missing named file
-/// falls back, or no file is an error.
+/// metadata server of a host that is on Google Cloud, and none otherwise.
+/// Breaks if the order changes, a missing named file falls back, a
+/// host off Google Cloud is given a metadata server, or one on it none.
 #[tokio::test]
 async fn finds_the_credentials_in_order() {
     let well_known = "/home/u/.config/gcloud/application_default_credentials.json";
     let user = b"{\"type\":\"authorized_user\"}".to_vec();
     let named = [(CREDENTIALS_VARIABLE, "/keys/sa.json"), ("HOME", "/home/u")];
-    type Check = fn(&Result<Credentials, Error>) -> bool;
+    type Check = fn(&Result<Located, Error>) -> bool;
     type Case<'a> = (
         &'a str,
         &'a [(&'a str, &'a str)],
         Vec<(&'a str, Vec<u8>)>,
         Check,
     );
-    let service_account: Check = |r| matches!(r, Ok(Credentials(Kind::ServiceAccount(_))));
-    let metadata: Check = |r| matches!(r, Ok(Credentials(Kind::Metadata(_))));
+    let service_account: Check = |r| matches!(r, Ok(Located::Found(c)) if matches!(**c, Credentials(Kind::ServiceAccount(_))));
+    let metadata: Check =
+        |r| matches!(r, Ok(Located::Found(c)) if matches!(**c, Credentials(Kind::Metadata(_))));
+    let absent: Check = |r| matches!(r, Ok(Located::Absent));
     let missing: Check = |r| match r {
         Err(e @ Error::MissingFile(_)) => e.to_string().contains(CREDENTIALS_VARIABLE),
         _ => false,
     };
-    let cases: [Case<'_>; 5] = [
+    let on_google = (
+        metadata::PRODUCT_NAME_FILE,
+        b"Google Compute Engine\n".to_vec(),
+    );
+    let cases: [Case<'_>; 8] = [
         (
             "the named file before the well-known one",
             &named,
@@ -166,12 +173,33 @@ async fn finds_the_credentials_in_order() {
             vec![(well_known, service_account_bytes())],
             service_account,
         ),
-        ("no home", &[], vec![], metadata),
+        ("no home, off Google Cloud", &[], vec![], absent),
         (
-            "no well-known file",
+            "no well-known file, off Google Cloud",
             &[("HOME", "/home/u")],
             vec![],
+            absent,
+        ),
+        (
+            "no well-known file, on Google Cloud",
+            &[("HOME", "/home/u")],
+            vec![(metadata::PRODUCT_NAME_FILE, on_google.1.clone())],
             metadata,
+        ),
+        (
+            "no file, a named metadata server",
+            &[("GCE_METADATA_HOST", "10.0.0.1")],
+            vec![],
+            metadata,
+        ),
+        (
+            "a file before the Google Cloud check",
+            &[("HOME", "/home/u")],
+            vec![
+                (well_known, service_account_bytes()),
+                (on_google.0, on_google.1),
+            ],
+            service_account,
         ),
     ];
     for (case, vars, files, expected) in cases {

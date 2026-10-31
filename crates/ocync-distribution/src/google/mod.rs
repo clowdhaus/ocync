@@ -3,7 +3,9 @@
 //!
 //! The credentials come from the file `GOOGLE_APPLICATION_CREDENTIALS`
 //! names, else from gcloud's well-known file, else from the metadata server
-//! of the GCE or GKE host. A file holds a service account key, an authorized
+//! of the GCE or GKE host. With no file, no `GCE_METADATA_HOST` and a host
+//! that is not on Google Cloud there is no source at all, which loading
+//! reports as [`Located::Absent`] without contacting any address. A file holds a service account key, an authorized
 //! user's refresh token, an external account (Workload Identity Federation)
 //! or a service account impersonated with any of those.
 
@@ -389,12 +391,6 @@ pub(crate) enum Error {
     /// An answer was longer than any token response.
     #[error("{call}, answer over {MAX_SMALL_ANSWER} bytes")]
     BodyTooLarge { call: Call },
-    /// There is no credential source at all: no file is named, gcloud has
-    /// none, and no metadata server answers at its default address. This is
-    /// the only failure that is not an error to a caller that can read
-    /// anonymously. A source that exists but fails is never this.
-    #[error("no Google credentials were found, and no metadata server answered")]
-    NoSource(#[source] Box<Error>),
 }
 
 impl Error {
@@ -421,17 +417,6 @@ impl Error {
             }
             _ => false,
         }
-    }
-
-    /// Whether there is no credential source at all, as opposed to one that
-    /// failed.
-    pub(crate) fn is_no_source(&self) -> bool {
-        matches!(self, Self::NoSource(_))
-    }
-
-    /// Whether this is a request that never connected.
-    fn is_connect_failure(&self) -> bool {
-        matches!(self, Self::Transport { source, .. } if source.is_connect())
     }
 
     /// Whether Google refused the identity, the call may pass if sent
@@ -620,6 +605,16 @@ impl SourceAuth {
 #[derive(Debug)]
 pub(crate) struct Credentials(Kind);
 
+/// What looking for Application Default Credentials found.
+#[derive(Debug)]
+pub(crate) enum Located {
+    /// A source exists. Failing to use it is an error.
+    Found(Box<Credentials>),
+    /// No source exists: no file, no `GCE_METADATA_HOST`, and a host that is
+    /// not on Google Cloud. Nothing was contacted to find out.
+    Absent,
+}
+
 /// The kinds of [`Credentials`].
 #[derive(Debug)]
 enum Kind {
@@ -632,27 +627,39 @@ enum Kind {
 
 impl Credentials {
     /// The Application Default Credentials of `host`, asking for the
-    /// registry scope. An external account with an AWS subject token
-    /// takes its AWS credentials from `aws_credentials`.
+    /// registry scope, decided once from its files and environment. An
+    /// external account with an AWS subject token takes its AWS credentials
+    /// from `aws_credentials`.
     pub(crate) async fn load(
         host: &Host,
         clients: &Clients,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Self, Error> {
+    ) -> Result<Located, Error> {
         let setup = Setup {
             host,
             clients,
             aws_credentials,
         };
         match find_file(host)? {
-            None => metadata::Server::new(&host.env, Scopes::Registry)
-                .map(|server| Self(Kind::Metadata(server))),
+            None if metadata::is_on_google_cloud(host) => {
+                Self::metadata(host).map(|c| Located::Found(Box::new(c)))
+            }
+            None => Ok(Located::Absent),
             Some(contents) => {
                 let json: Value = crate::json::parse(&contents).map_err(Error::Parse)?;
                 let kind = CredentialType::of(&json)?;
-                Self::from_json(kind, json, Scopes::Registry, &setup).await
+                Self::from_json(kind, json, Scopes::Registry, &setup)
+                    .await
+                    .map(|c| Located::Found(Box::new(c)))
             }
         }
+    }
+
+    /// The metadata server of `host`, for a caller that wants it whether or
+    /// not [`Self::load`] found a reason to think one is there.
+    pub(crate) fn metadata(host: &Host) -> Result<Self, Error> {
+        metadata::Server::new(&host.env, Scopes::Registry)
+            .map(|server| Self(Kind::Metadata(server)))
     }
 
     /// The credentials of type `kind` that `json` describes.
