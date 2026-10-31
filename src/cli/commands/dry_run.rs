@@ -71,7 +71,7 @@ pub(crate) fn write_to<W: Write>(
 }
 
 fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io::Result<()> {
-    let target_names: Vec<&str> = m.targets.iter().map(|t| &*t.name).collect();
+    let target_names: Vec<&str> = m.targets.iter().map(|t| &**t.name()).collect();
     writeln!(
         w,
         "dry-run: {} -> {} [{}]",

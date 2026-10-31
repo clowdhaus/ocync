@@ -1319,7 +1319,7 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
         .await;
 
     let target_name = "target";
-    let target_auth = mock_authority(&target_server);
+    let target_auth = mock_target_id("target", &target_server);
     let cache = cache_with(
         &target_auth,
         &repo("tgt-a"),
@@ -1746,9 +1746,13 @@ async fn prior_run_cycle_breaks_via_deadline() {
     }
 
     let layer = &img_a.layer_descs[0].digest;
-    let cache = cache_with(&mock_authority(&target_server), &repo("repo-b"), &[layer]);
+    let cache = cache_with(
+        &mock_target_id("target", &target_server),
+        &repo("repo-b"),
+        &[layer],
+    );
     cache.borrow_mut().set_blob_completed(
-        &mock_authority(&target_server),
+        &mock_target_id("target", &target_server),
         layer.clone(),
         repo("repo-a"),
     );
@@ -1787,11 +1791,19 @@ async fn resolver_retries_mount_after_source_marked_stale() {
 
     // tgt-a is committed and valid; stale-src was rejected earlier and must be excluded.
     let layer = &img.layer_descs[0].digest;
-    let cache = cache_with(&mock_authority(&target_server), &repo("tgt-a"), &[layer]);
+    let cache = cache_with(
+        &mock_target_id("target", &target_server),
+        &repo("tgt-a"),
+        &[layer],
+    );
     {
         let mut c = cache.borrow_mut();
-        c.mark_repo_committed(&mock_authority(&target_server), &repo("tgt-a"));
-        c.mark_blob_repo_stale(&mock_authority(&target_server), layer, &repo("stale-src"));
+        c.mark_repo_committed(&mock_target_id("target", &target_server), &repo("tgt-a"));
+        c.mark_blob_repo_stale(
+            &mock_target_id("target", &target_server),
+            layer,
+            &repo("stale-src"),
+        );
     }
 
     let mapping = mapping_from_servers(

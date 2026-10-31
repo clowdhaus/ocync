@@ -5,6 +5,7 @@
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
+use ocync_sync::engine::{RegistryAlias, TargetId};
 
 /// A sha256 digest from a short suffix, zero-padded to 64 hex chars.
 pub fn make_digest(suffix: &str) -> Digest {
@@ -35,7 +36,7 @@ pub fn repo(name: &str) -> RepositoryName {
     RepositoryName::new(name).unwrap()
 }
 
-/// A registry authority, the key the cache records blobs under.
-pub fn authority(name: &str) -> RegistryAuthority {
-    RegistryAuthority::new(name)
+/// A cache key whose alias and address are both `name`.
+pub fn target_id(name: &str) -> TargetId {
+    TargetId::new(RegistryAlias::new(name), RegistryAuthority::new(name))
 }

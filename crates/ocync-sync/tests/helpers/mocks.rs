@@ -472,8 +472,7 @@ pub fn batch_target(
     client: Arc<ocync_distribution::RegistryClient>,
     checker: impl BatchBlobChecker + 'static,
 ) -> TargetEntry {
-    TargetEntry {
-        batch_checker: Some(Rc::new(checker)),
-        ..target_entry(name, client)
-    }
+    let mut entry = target_entry(name, client);
+    entry.batch_checker = Some(Rc::new(checker));
+    entry
 }

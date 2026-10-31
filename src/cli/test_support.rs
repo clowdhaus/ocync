@@ -46,7 +46,6 @@ pub(crate) fn mapping_with_tags_and_report(
 ) -> ocync_sync::engine::ResolvedMapping {
     use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
     use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TargetEntry};
-    use std::collections::HashSet;
     use std::rc::Rc;
 
     let client = test_client("http://127.0.0.1");
@@ -56,13 +55,7 @@ pub(crate) fn mapping_with_tags_and_report(
         source_client: client.clone(),
         source_repo: RepositoryName::new("repo").unwrap(),
         target_repo: RepositoryName::new("repo").unwrap(),
-        targets: vec![TargetEntry {
-            name: RegistryAlias::new("target"),
-            authority: RegistryAuthority::new("target.test:443"),
-            client,
-            batch_checker: None,
-            existing_tags: HashSet::new(),
-        }],
+        targets: vec![TargetEntry::new(RegistryAlias::new("target"), client, None).unwrap()],
         tags,
         platforms: None,
         head_first: false,

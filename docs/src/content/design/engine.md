@@ -248,7 +248,7 @@ Tested on c6in.large, Jupyter corpus (5 images, 1 tag each), cold sync to ECR us
 
 ## Transfer state cache
 
-The transfer state cache eliminates redundant API discovery calls by recording knowledge from every operation. It is the single source of truth for blob existence across all target registries, progressively populated as transfers proceed.
+The transfer state cache eliminates redundant API discovery calls by recording knowledge from every operation. It is the single source of truth for blob existence across all target registries, progressively populated as transfers proceed. It is keyed by config entry and registry address together, so a changed `url` under the same entry starts cold for that entry, while two entries for one host keep separate state.
 
 ### Two-tier design
 

@@ -732,7 +732,7 @@ pub(crate) async fn run(
             let from = m.source_repo.as_str().to_string();
             MappingDescriptor {
                 target_repo: m.target_repo.as_str().to_string(),
-                target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+                target_names: m.targets.iter().map(|t| t.name().to_string()).collect(),
                 // From the dropped list, since `m.targets` is already filtered;
                 // otherwise the bracket vanishes when a registry is missing.
                 dropped_names: dropped_targets
@@ -1060,7 +1060,16 @@ pub(crate) async fn build_clients(
         }
         // Token minting is a round trip; track it so a wedged provider is named.
         let _item = tracker.track(name);
-        let entry = match build_registry_client(Registry::Configured(reg), credentials).await {
+        let built = build_registry_client(Registry::Configured(reg), credentials)
+            .await
+            .and_then(|client| {
+                // Every use of the client keys the cache by its address.
+                client
+                    .registry_authority()
+                    .map_err(|e| CliError::Input(format!("registry '{name}': {e}")))?;
+                Ok(client)
+            });
+        let entry = match built {
             Ok(client) => Ok(Arc::new(client)),
             Err(err) => {
                 tracing::error!(
@@ -1417,16 +1426,14 @@ fn build_targets(
     let mut codes = Vec::new();
     for name in target_names {
         let entry = client_for(clients, &name, from, RegistryRole::Target).and_then(|client| {
-            let authority = client.registry_authority().map_err(|e| {
-                CliError::Input(format!("target '{name}' of mapping '{from}': {e}"))
-            })?;
-            Ok(TargetEntry {
-                batch_checker: batch_checkers.get(&name).cloned(),
-                name: RegistryAlias::new(&name),
-                authority,
+            // `build_clients` already rejected a client without an address, once
+            // per registry; this only guards a client map built elsewhere.
+            TargetEntry::new(
+                RegistryAlias::new(&name),
                 client,
-                existing_tags: HashSet::new(),
-            })
+                batch_checkers.get(&name).cloned(),
+            )
+            .map_err(|e| CliError::Input(format!("target '{name}' of mapping '{from}': {e}")))
         });
         match entry {
             Ok(entry) => targets.push(entry),
@@ -1651,7 +1658,7 @@ async fn resolve_mapping_inner(
                         // Mappings resolve concurrently, so neighbouring log
                         // lines do not identify the mapping.
                         from = %mapping.from,
-                        registry = %entry.name,
+                        registry = %entry.name(),
                         error = %e,
                         "failed to list target tags; immutable skip disabled for this target"
                     );
@@ -3107,7 +3114,7 @@ mappings:
             "one dead target must not unresolve the whole mapping"
         );
         assert_eq!(resolved.len(), 1);
-        let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &*t.name).collect();
+        let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &**t.name()).collect();
         assert_eq!(targets, vec!["good"], "the healthy target must survive");
 
         // The unreached target must stay visible.

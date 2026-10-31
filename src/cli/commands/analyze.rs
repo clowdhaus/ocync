@@ -433,7 +433,7 @@ fn record_blob(
     for target in targets {
         entry
             .target_repos
-            .entry(target.name.to_string())
+            .entry(target.name().to_string())
             .or_default()
             .insert(target_repo.clone());
     }

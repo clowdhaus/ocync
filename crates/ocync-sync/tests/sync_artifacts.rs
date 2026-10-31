@@ -541,7 +541,11 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
     sig.mount_target(&target_server, "repo").await;
 
     let sig_blobs = [&sig.config_desc.digest, &sig.layer_desc.digest];
-    let cache = cache_with(&mock_authority(&target_server), &repo("repo"), &sig_blobs);
+    let cache = cache_with(
+        &mock_target_id("target", &target_server),
+        &repo("repo"),
+        &sig_blobs,
+    );
     let mapping = artifact_mapping(&source_server, &target_server, ResolvedArtifacts::default());
     let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
 

@@ -1,7 +1,6 @@
 //! The `copy` subcommand: copies a single image between registries.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -73,22 +72,19 @@ pub(crate) async fn run(
     // rate-limit budget. False without `--config`: there is no override flag.
     let head_first = source.config().map(|r| r.head_first).unwrap_or(false);
 
-    let target_authority = target_client
-        .registry_authority()
-        .map_err(|e| CliError::Input(format!("destination '{}': {e}", args.destination)))?;
-
     let mapping = ResolvedMapping {
         source_authority,
         source_client,
         source_repo: args.source.repository().clone(),
         target_repo: args.destination.repository().clone(),
-        targets: vec![TargetEntry {
-            name: RegistryAlias::new(dst_hostname),
-            authority: target_authority,
-            client: target_client,
-            batch_checker,
-            existing_tags: HashSet::new(),
-        }],
+        targets: vec![
+            TargetEntry::new(
+                RegistryAlias::new(dst_hostname),
+                target_client,
+                batch_checker,
+            )
+            .map_err(|e| CliError::Input(format!("destination '{}': {e}", args.destination)))?,
+        ],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
         platforms: None,
         head_first,
