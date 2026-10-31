@@ -185,7 +185,7 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 | Registry | Windows | Rationale |
 |---|---|---|
 | ECR private | 9 (one per action) | Critical: `InitiateLayerUpload` (100 TPS) and `UploadLayerPart` (500 TPS) have a 5x rate disparity, so a 429 on session initiation must not throttle chunk uploads |
-| ECR Public | 5 (read paths share, write paths split) | Same per-action enforcement as private but caps are 10x lower; `UploadLayerPart` at 260 TPS still warrants its own window |
+| ECR Public | 5 (read paths share, write paths split) | Same per-action enforcement as private; `InitiateLayerUpload` and `CompleteLayerUpload` are 10x lower (10 TPS), `PutImage` is the same (10 TPS), and `UploadLayerPart` at 260 TPS warrants its own window |
 | Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
 | GAR / GCR | 1 (all shared) | Shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
 | GHCR | 1 (all shared) | GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate windows would let combined traffic exceed the cap |
@@ -407,7 +407,7 @@ Optimizations can amplify each other's failure modes. This matrix captures non-o
 | CronJob overlap (`concurrencyPolicy: Allow`) | Two runs read/write cache file simultaneously, second write overwrites first's updates | Document `Forbid` as required. Detect concurrent access via advisory file lock; log warning and skip persistence if locked |
 | Disk full during staging | Partial temp file, subsequent reads corrupt | Atomic rename pattern (`.tmp.{random}` -> `{digest}`). On ENOSPC: disable disk staging for remainder of run (circuit breaker), continue with fresh source pulls per target |
 | HEAD/GET digest mismatch (Docker Hub) | Discovery HEAD: graceful degradation to always-pull (extra HEAD per cycle, no correctness bug). `head_first`: false skip means target has stale content | Discovery HEAD: unconditional with fallback, no operator action needed. `head_first`: opt-in only, observable via `discovery_head_first_skips` in `SyncStats` |
-| GAR shared quota + high pipeline concurrency | Increased request rate exhausts shared quota faster than sequential processing | Detect GAR targets (`*-docker.pkg.dev`), cap concurrency at 5 for all operation types via single shared AIMD window |
+| GAR shared quota + high pipeline concurrency | Increased request rate exhausts shared quota faster than sequential processing | Each GAR or GCR host has one AIMD window for every operation, paced at 240 requests per second |
 | Shared work fails (child manifest, blob copy, artifact), needed by N tags | One exhausted retry budget fails all N tags, including tags of different indexes that share a child | Intended: the same request between the same repos gets the same answer, so retrying per tag would only add requests against the failing endpoint. Each tag reports the failure and the retries it made itself. A blob with a mount source is mounted instead. The record is per run, so the next run retries |
 
 ## Alternatives considered

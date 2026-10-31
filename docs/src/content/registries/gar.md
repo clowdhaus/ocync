@@ -1,12 +1,12 @@
 ---
 title: Google Artifact Registry
-description: Using ocync with GAR and legacy GCR via Application Default Credentials.
+description: Using ocync with Artifact Registry, including gcr.io, via Application Default Credentials.
 order: 3
 ---
 
 ## Auth
 
-ocync auto-detects GAR (`*-docker.pkg.dev`) and legacy GCR hostnames (`gcr.io`, `us.gcr.io`, `eu.gcr.io`, `asia.gcr.io`) and uses Google Application Default Credentials (ADC):
+ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io`, such as `us.gcr.io`, which Artifact Registry [serves](https://docs.cloud.google.com/artifact-registry/docs/transition/gcr-repositories)) and uses Google Application Default Credentials (ADC):
 
 - `GOOGLE_APPLICATION_CREDENTIALS` pointing at a credentials file: a service account key, an authorized user, a Workload Identity Federation (`external_account`) configuration or an impersonated service account
 - `gcloud auth application-default login` (developer machines)
@@ -21,9 +21,9 @@ Notable behaviors:
 
 - The OAuth2 access token is sent as the password half of HTTP Basic credentials (username `oauth2accesstoken`) to drive a standard OCI `/v2/token` Bearer exchange. This matches what `gcloud auth configure-docker` writes into the docker config.
 - Streaming uploads: ocync uploads each blob as a POST followed by one streaming PUT (`Transfer-Encoding: chunked`), so memory does not grow with blob size. On 2026-10-28 that path peaked at 21.6 MB while pushing 382,663,875 bytes across 8 blobs. Buffering each blob for a single PUT, the path ocync used before, peaked at 452.8 MB on a different set of 8 blobs totalling 224,330,551 bytes, so the two are not a like-for-like comparison: the buffered peak follows the largest blobs held at once. A second PATCH in one upload session answers 405, and a monolithic POST answers 502, so ocync uses neither.
-- Cross-repo blob mounts between two images in the same Artifact Registry repository are fulfilled: on 2026-10-28 a sync into `<repo>/main/static` mounted all 4 blobs an earlier sync had pushed to `<repo>/branch/static` in the same repository, transferring 0 bytes. Mounts between different repositories have not been tested. ocync attempts the mount POST anyway (cheap, ~100 ms) and falls through to upload on 202.
-- GAR enforces a single per-project quota across all operation types; ocync uses one AIMD window per project rather than per-action.
-- The access token is kept for its real lifetime, from the token endpoint's `expires_in` or impersonation's `expireTime`, and fetched again 30 seconds before it expires.
+- Cross-repo blob mounts between two images in the same Artifact Registry repository are fulfilled: on 2026-10-28 a sync into `<repo>/main/static` mounted all 4 blobs an earlier sync had pushed to `<repo>/branch/static` in the same repository, transferring 0 bytes. Mounts between repositories are fulfilled too: on 2026-10-30 one run syncing a two-platform index into two Artifact Registry repositories uploaded its 4 blobs once and mounted all 4 into the second. A mount answered 202 falls through to upload.
+- GAR enforces one quota per project and region across all operation types. ocync paces each registry host in one window at 240 requests per second, so hosts sharing a project and region, such as `gcr.io` and `us-docker.pkg.dev`, are paced separately against one quota.
+- The access token is kept for its real lifetime, from the token endpoint's `expires_in` or impersonation's `expireTime`, and fetched again 30 seconds before it expires. It lasted 3,600 seconds on 2026-10-30, and the registry token exchanged for it 43,200.
 
 ## CLI example
 
