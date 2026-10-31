@@ -226,16 +226,24 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // fetch takes and stamps the run's record.
     let timestamp = RunTimestamp::now();
 
-    // Made after the push, so a refused or failed push creates nothing. Dropped
-    // on every way out of this function, which deletes the repositories.
+    // Made after the push, so a refused or failed push creates nothing, and
+    // only once no live run can be refused: the sweep would delete a live
+    // run's repositories. Dropped on every way out of this function, which
+    // deletes the repositories.
     let mut provisioned = match args.target {
         Target::Ecr => None,
-        Target::ArtifactRegistry => Some(Provisioned::create(
-            Gcloud::installed(),
-            Outputs::read()?,
-            &timestamp,
-            args.tool_selection.rounds,
-        )?),
+        Target::ArtifactRegistry => Some({
+            may_provision(
+                RunLock::parse(&ssh_run(&config, &run_lock_probe())?)?,
+                ExistingRun::from_force(args.force),
+            )?;
+            Provisioned::create(
+                Gcloud::installed(),
+                Outputs::read()?,
+                &timestamp,
+                args.tool_selection.rounds,
+            )?
+        }),
     };
 
     let result = run_on_instance(
@@ -285,12 +293,7 @@ fn run_on_instance(
 
     let exit_code = match ssh_stream(config, &script)? {
         RemoteOutcome::Refused => {
-            return Err(
-                "a benchmark is still running on the instance; pass --force to kill it, \
-                 or --fetch to copy the newest results there (a live run's partial results \
-                 once its benchmark has started)"
-                    .into(),
-            );
+            return Err(LIVE_RUN_REFUSAL.into());
         }
         RemoteOutcome::FailedBeforeStart(code) => {
             return Err(format!(
@@ -644,6 +647,53 @@ fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// Why a run is refused while another benchmark holds the instance.
+const LIVE_RUN_REFUSAL: &str = "a benchmark is still running on the instance; pass --force to kill it, \
+     or --fetch to copy the newest results there (a live run's partial results \
+     once its benchmark has started)";
+
+/// The run lock, relative to the repository on the instance.
+const RUN_LOCK: &str = "bench/.bench-run.lock";
+
+/// Whether a benchmark holds the instance's run lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLock {
+    /// No run holds it, or the instance has no repository yet.
+    Free,
+    /// A run holds it.
+    Held,
+}
+
+impl RunLock {
+    /// The answer [`run_lock_probe`] printed.
+    fn parse(output: &str) -> Result<Self, String> {
+        match output.trim() {
+            "free" => Ok(Self::Free),
+            "held" => Ok(Self::Held),
+            other => Err(format!("run lock probe printed {other:?}")),
+        }
+    }
+}
+
+/// Asks the instance whether its run lock is held, without taking it for
+/// longer than the question.
+fn run_lock_probe() -> String {
+    format!(
+        "cd ~/ocync 2>/dev/null || {{ echo free; exit 0; }}; \
+         if flock -n {RUN_LOCK} true; then echo free; else echo held; fi"
+    )
+}
+
+/// Refuses to touch Artifact Registry while a live run would be refused: the
+/// leftover sweep would delete that run's repositories. `--force` kills the
+/// run, so its repositories go with it.
+fn may_provision(lock: RunLock, existing: ExistingRun) -> Result<(), String> {
+    match (lock, existing) {
+        (RunLock::Held, ExistingRun::Refuse) => Err(LIVE_RUN_REFUSAL.into()),
+        _ => Ok(()),
+    }
+}
+
 /// What to do with a benchmark still running on the instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExistingRun {
@@ -811,7 +861,7 @@ if [ ! -d ~/ocync ]; then
 fi
 
 cd ~/ocync
-LOCK_FILE=bench/.bench-run.lock
+LOCK_FILE={RUN_LOCK}
 PGID_FILE=bench/.bench-run.pgid
 LOG_FILE=bench/.bench-run.log
 EXIT_FILE=bench/.bench-run.exit
@@ -1781,6 +1831,25 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
     // The generated script targets the Linux bench instance: it needs
     // util-linux `setsid` and `flock`.
     #[cfg(target_os = "linux")]
+    /// A held lock without `--force` refuses before any repository is swept
+    /// or made; an unreadable probe is an error, never taken as free.
+    #[test]
+    fn a_live_run_keeps_its_repositories() {
+        assert_eq!(
+            may_provision(RunLock::Held, ExistingRun::Refuse),
+            Err(LIVE_RUN_REFUSAL.to_string())
+        );
+        assert_eq!(may_provision(RunLock::Held, ExistingRun::Kill), Ok(()));
+        assert_eq!(may_provision(RunLock::Free, ExistingRun::Refuse), Ok(()));
+        assert_eq!(RunLock::parse("held\n"), Ok(RunLock::Held));
+        assert_eq!(RunLock::parse("free\n"), Ok(RunLock::Free));
+        assert_eq!(
+            RunLock::parse(""),
+            Err("run lock probe printed \"\"".to_string())
+        );
+        assert!(run_lock_probe().contains("flock -n bench/.bench-run.lock true"));
+    }
+
     #[test]
     fn existing_run_guard_refuses_kills_or_proceeds() {
         use std::os::unix::process::ExitStatusExt;
