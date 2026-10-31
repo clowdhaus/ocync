@@ -11,14 +11,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde::Deserialize;
 
-use super::gar::ENV_CREDENTIALS;
-use super::gcloud::{Gcloud, Outputs, Provisioned};
+use super::gar::{ArtifactRegistryTarget, ENV_CREDENTIALS};
+use super::gcloud::{Gcloud, Outputs, Provisioned, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
-use super::target::ensure_artifact_registry_applies;
+use super::target::{ENV_REGISTRY, Kind, ensure_artifact_registry_applies};
 use super::{Provider, RunTimestamp, Scenario, ToolSelection, finish_pass, value_name};
 
 /// Common SSH options for all remote connections.
@@ -46,21 +46,6 @@ fn ssh_args(config: &BenchConfig) -> Vec<&str> {
     args
 }
 
-/// The registry the instance syncs into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum Target {
-    /// Amazon ECR, in the account the instance runs in.
-    Ecr,
-    /// Google Artifact Registry, in the project `bench/terraform/gcp` names.
-    ArtifactRegistry,
-}
-
-impl std::fmt::Display for Target {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&value_name(self))
-    }
-}
-
 /// Where on the instance the Google federation file is copied to, relative to
 /// the bench user's home.
 const REMOTE_CREDENTIALS: &str = ".bench-gar-credentials.json";
@@ -76,8 +61,8 @@ pub(crate) struct BenchRemoteArgs {
     /// Registry the instance syncs into. Artifact Registry needs the Google
     /// stack applied (`bench/terraform/gcp`) and `gcloud` signed in here: this
     /// command makes a repository for each round and deletes them when it ends.
-    #[arg(long, value_enum, default_value_t = Target::Ecr)]
-    pub(crate) target: Target,
+    #[arg(long, value_enum, default_value = "ecr")]
+    pub(crate) target: Kind,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -193,15 +178,24 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     // Decided before the push, so a provider with no setup is refused before
     // anything leaves this machine.
-    ensure_placement(args.provider, args.target)?;
+    ensure_placement(args.provider)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
-    if args.target == Target::ArtifactRegistry {
+    if args.target == Kind::ArtifactRegistry {
         ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
+
+    // Held, with the Terraform outputs read, until this function returns,
+    // and so also after the push: a missing apply is refused before anything
+    // leaves this machine, and a second Artifact Registry run on this machine
+    // cannot sweep the repositories made below.
+    let (_local_run, outputs) = match args.target {
+        Kind::Ecr => (None, None),
+        Kind::ArtifactRegistry => (Some(lock_local_run()?), Some(Outputs::read()?)),
+    };
 
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
@@ -226,24 +220,25 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // fetch takes and stamps the run's record.
     let timestamp = RunTimestamp::now();
 
-    // Made after the push, so a refused or failed push creates nothing, and
-    // only once no live run can be refused: the sweep would delete a live
-    // run's repositories. Dropped on every way out of this function, which
-    // deletes the repositories.
-    let mut provisioned = match args.target {
-        Target::Ecr => None,
-        Target::ArtifactRegistry => Some({
+    // Made after the push, so a refused or failed push creates nothing. The
+    // local lock above covers another run on this machine; the probe covers
+    // one whose local process died but whose benchmark is still going on the
+    // instance, which the sweep would otherwise empty. Dropped on every way out
+    // of this function, which deletes the repositories.
+    let mut provisioned = match outputs {
+        None => None,
+        Some(outputs) => {
             may_provision(
                 RunLock::parse(&ssh_run(&config, &run_lock_probe())?)?,
                 ExistingRun::from_force(args.force),
             )?;
-            Provisioned::create(
+            Some(Provisioned::create(
                 Gcloud::installed(),
-                Outputs::read()?,
+                outputs,
                 &timestamp,
                 args.tool_selection.rounds,
-            )?
-        }),
+            )?)
+        }
     };
 
     let result = run_on_instance(
@@ -282,7 +277,7 @@ fn run_on_instance(
         git_ref,
         git_sha,
         &bench_args,
-        &registry_env(provisioned),
+        &registry_env(provisioned.map(|p| &p.target)),
         ExistingRun::from_force(args.force),
     );
 
@@ -367,6 +362,8 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
         value_name(&ArchiveMode::Defer),
         "--run-timestamp".to_string(),
         timestamp.to_string(),
+        "--target".to_string(),
+        value_name(&args.target),
         "--tools".to_string(),
         join_tools(&args.tool_selection.tools),
         "--rounds".to_string(),
@@ -394,31 +391,31 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     bench_args
 }
 
-/// Fails unless the instance in `provider`'s cloud can sync into `target`.
-/// Decided before the push, so a pair with no setup is refused before anything
-/// leaves this machine.
-fn ensure_placement(provider: Provider, target: Target) -> Result<(), String> {
-    match (provider, target) {
-        (Provider::Aws, Target::Ecr | Target::ArtifactRegistry) => Ok(()),
-        _ => Err(format!(
-            "provider '{provider}' with target '{target}' not yet supported. \
-             Add registry env setup for this pair."
-        )),
+/// Fails unless `provider` has registry env setup.
+fn ensure_placement(provider: Provider) -> Result<(), String> {
+    if provider != Provider::Aws {
+        return Err(format!(
+            "provider '{provider}' not yet supported. Add registry env setup for this provider."
+        ));
     }
+    Ok(())
 }
 
 /// The shell that points the benchmark at its target registry on the instance:
 /// ECR in the instance's own account, or the repositories this machine made.
-fn registry_env(provisioned: Option<&Provisioned>) -> String {
-    match provisioned {
-        None => "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com".to_owned(),
+fn registry_env(target: Option<&ArtifactRegistryTarget>) -> String {
+    match target {
+        None => format!(
+            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport {ENV_REGISTRY}=${{ACCOUNT}}.dkr.ecr.${{REGION}}.amazonaws.com"
+        ),
         // Every value was parsed as an id or a host, so none holds shell syntax.
-        Some(provisioned) => provisioned
-            .target
+        Some(target) => target
             .env()
             .iter()
             .map(|(name, value)| format!("export {name}={value}"))
-            .chain([format!("export {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\"")])
+            .chain([format!(
+                "export {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\""
+            )])
             .collect::<Vec<_>>()
             .join("\n"),
     }
@@ -676,11 +673,18 @@ impl RunLock {
 }
 
 /// Asks the instance whether its run lock is held, without taking it for
-/// longer than the question.
+/// longer than the question. Only [`FLOCK_HELD_EXIT`] means held, as in
+/// [`existing_run_guard`]; any other `flock` failure is an error, never taken
+/// for a free lock. No repository yet means no run.
 fn run_lock_probe() -> String {
     format!(
-        "cd ~/ocync 2>/dev/null || {{ echo free; exit 0; }}; \
-         if flock -n {RUN_LOCK} true; then echo free; else echo held; fi"
+        r#"cd ~/ocync 2>/dev/null || {{ echo free; exit 0; }}
+rc=0; flock -n -E {FLOCK_HELD_EXIT} {RUN_LOCK} true || rc=$?
+case "$rc" in
+  0) echo free ;;
+  {FLOCK_HELD_EXIT}) echo held ;;
+  *) echo "flock failed (exit $rc); is util-linux installed?" >&2; exit 1 ;;
+esac"#
     )
 }
 
@@ -1264,78 +1268,60 @@ mod tests {
     }
 
     #[test]
-    fn only_an_aws_instance_is_placed_and_every_other_pair_is_refused_by_name() {
-        assert!(registry_env(None).contains("BENCH_TARGET_REGISTRY"));
-        for (provider, target, expected) in [
-            (Provider::Aws, Target::Ecr, None),
-            (Provider::Aws, Target::ArtifactRegistry, None),
+    fn a_provider_without_registry_setup_is_refused_by_name() {
+        assert!(registry_env(None).contains(ENV_REGISTRY));
+        assert_eq!(ensure_placement(Provider::Aws), Ok(()));
+        for (provider, expected) in [
             (
                 Provider::Gcp,
-                Target::Ecr,
-                Some(
-                    "provider 'gcp' with target 'ecr' not yet supported. Add registry env setup for this pair.",
-                ),
-            ),
-            (
-                Provider::Gcp,
-                Target::ArtifactRegistry,
-                Some(
-                    "provider 'gcp' with target 'artifact-registry' not yet supported. Add registry env setup for this pair.",
-                ),
+                "provider 'gcp' not yet supported. Add registry env setup for this provider.",
             ),
             (
                 Provider::Azure,
-                Target::Ecr,
-                Some(
-                    "provider 'azure' with target 'ecr' not yet supported. Add registry env setup for this pair.",
-                ),
-            ),
-            (
-                Provider::Azure,
-                Target::ArtifactRegistry,
-                Some(
-                    "provider 'azure' with target 'artifact-registry' not yet supported. Add registry env setup for this pair.",
-                ),
+                "provider 'azure' not yet supported. Add registry env setup for this provider.",
             ),
         ] {
-            assert_eq!(
-                ensure_placement(provider, target),
-                expected.map_or(Ok(()), |e| Err(e.to_string())),
-                "{provider} {target}"
-            );
+            assert_eq!(ensure_placement(provider), Err(expected.to_string()));
         }
     }
 
     #[test]
     fn the_instance_is_told_its_repositories_and_where_the_credentials_are() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("gcloud");
-        std::fs::write(&program, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-        let outputs = Outputs::parse(
-            r#"{"repository":{"value":"europe-west9-docker.pkg.dev/example-project/ocync-bench"},
-                "service_account":{"value":"bench@example-project.iam.gserviceaccount.com"},
-                "credentials_file":{"value":"/work/credentials.json"}}"#,
-        )
-        .unwrap();
-        let provisioned = Provisioned::create(
-            Gcloud::at(program),
-            outputs,
-            &"2026-10-30-120000".parse().unwrap(),
-            "3".parse().unwrap(),
-        )
-        .unwrap();
+        let target = ArtifactRegistryTarget {
+            location: "europe-west9".parse().unwrap(),
+            project: "example-project".parse().unwrap(),
+            repositories: ["run-r1", "run-r2", "run-r3"]
+                .map(|id| id.parse().unwrap())
+                .to_vec(),
+        };
         assert_eq!(
-            registry_env(Some(&provisioned)),
+            registry_env(Some(&target)),
             "export BENCH_TARGET_REGISTRY=europe-west9-docker.pkg.dev\n\
              export BENCH_GAR_PROJECT=example-project\n\
-             export BENCH_GAR_REPOSITORIES=ocync-bench-run-2026-10-30-120000-r1,\
-             ocync-bench-run-2026-10-30-120000-r2,ocync-bench-run-2026-10-30-120000-r3\n\
+             export BENCH_GAR_REPOSITORIES=run-r1,run-r2,run-r3\n\
              export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.bench-gar-credentials.json\""
+        );
+    }
+
+    #[test]
+    fn the_target_reaches_the_benchmark_on_the_instance() {
+        // Catches: `bench-remote` choosing Artifact Registry and the instance
+        // defaulting to ECR, or the reverse.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            let bench_args = bench_args(&args, &timestamp);
+            let argv: Vec<&str> = bench_args.iter().map(String::as_str).collect();
+            crate::bench::parse_bench(&argv).unwrap().target
+        };
+        assert_eq!(passed(&[]), Kind::Ecr);
+        assert_eq!(
+            passed(&["--target", "artifact-registry"]),
+            Kind::ArtifactRegistry
         );
     }
 
@@ -1356,7 +1342,7 @@ mod tests {
                 "ocync".to_string(),
                 "all".to_string(),
             ],
-            "export BENCH_TARGET_REGISTRY=registry.example.com",
+            &format!("export {ENV_REGISTRY}=registry.example.com"),
             existing,
         )
     }
@@ -1687,7 +1673,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
                 .unwrap_or(0)
         };
         let report = sample_report();
-        let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
 
         let with_record = tempfile::tempdir().unwrap();
         Deferred::new("ecr", Some(record), PageBlocks::of(&report))
@@ -1828,9 +1814,6 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         command.output().unwrap()
     }
 
-    // The generated script targets the Linux bench instance: it needs
-    // util-linux `setsid` and `flock`.
-    #[cfg(target_os = "linux")]
     /// A held lock without `--force` refuses before any repository is swept
     /// or made; an unreadable probe is an error, never taken as free.
     #[test]
@@ -1847,9 +1830,48 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
             RunLock::parse(""),
             Err("run lock probe printed \"\"".to_string())
         );
-        assert!(run_lock_probe().contains("flock -n bench/.bench-run.lock true"));
     }
 
+    // The probe is shell for the Linux bench instance: it needs util-linux
+    // `flock`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_probe_says_held_only_for_a_held_lock() {
+        // Catches: any `flock` failure, such as a missing binary, read as a
+        // live run (or a free lock), and a held lock read as free.
+        let home = tempfile::tempdir().unwrap();
+        let probe = |path: Option<&str>| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(run_lock_probe())
+                .env("HOME", home.path());
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            let out = command.output().unwrap();
+            (out.status.success(), String::from_utf8(out.stdout).unwrap())
+        };
+
+        assert_eq!(probe(None), (true, "free\n".into()), "no repository yet");
+
+        let bench = home.path().join("ocync/bench");
+        std::fs::create_dir_all(&bench).unwrap();
+        assert_eq!(probe(None), (true, "free\n".into()), "lock not taken");
+
+        let lock = std::fs::File::create(bench.join(".bench-run.lock")).unwrap();
+        lock.lock().unwrap();
+        assert_eq!(probe(None), (true, "held\n".into()), "lock held");
+        assert_eq!(
+            probe(Some("/nonexistent")),
+            (false, String::new()),
+            "flock missing"
+        );
+    }
+
+    // The generated script targets the Linux bench instance: it needs
+    // util-linux `setsid` and `flock`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn existing_run_guard_refuses_kills_or_proceeds() {
         use std::os::unix::process::ExitStatusExt;

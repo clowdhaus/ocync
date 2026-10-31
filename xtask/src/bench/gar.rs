@@ -9,8 +9,10 @@ use std::str::FromStr;
 use ocync_distribution::auth::gcp::{GcpAuth, Residency, SharedGoogleToken};
 use ocync_distribution::{AwsCredentialProviders, RegistryClient, RepositoryName};
 
+use crate::bench::Rounds;
 use crate::bench::lock::Entry;
-use crate::bench::target::RepoListing;
+use crate::bench::registry::http_client;
+use crate::bench::target::{ENV_REGISTRY, RepoListing};
 
 /// Environment variable holding the project the repositories are in.
 pub(crate) const ENV_PROJECT: &str = "BENCH_GAR_PROJECT";
@@ -19,8 +21,6 @@ pub(crate) const ENV_PROJECT: &str = "BENCH_GAR_PROJECT";
 pub(crate) const ENV_REPOSITORIES: &str = "BENCH_GAR_REPOSITORIES";
 /// Environment variable naming the Google federation file ocync signs in with.
 pub(crate) const ENV_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
-/// Environment variable holding the registry host, for every target.
-pub(crate) const ENV_REGISTRY: &str = "BENCH_TARGET_REGISTRY";
 
 /// What follows the location in an Artifact Registry host.
 const HOST_SUFFIX: &str = "-docker.pkg.dev";
@@ -81,13 +81,6 @@ id!(
     1..=63
 );
 
-impl RepositoryId {
-    /// The id as text.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl Location {
     /// The registry host serving this location.
     pub(crate) fn host(&self) -> String {
@@ -114,11 +107,6 @@ pub(crate) struct ArtifactRegistryTarget {
 }
 
 impl ArtifactRegistryTarget {
-    /// The registry host.
-    pub(crate) fn host(&self) -> String {
-        self.location.host()
-    }
-
     /// The target prefix of `round` (from 1): the round's own repository, then
     /// the corpus's `prefix` level, so repository names match ECR's below it.
     pub(crate) fn target_prefix(&self, round: usize, prefix: &str) -> String {
@@ -133,7 +121,7 @@ impl ArtifactRegistryTarget {
     pub(crate) fn env(&self) -> [(&'static str, String); 3] {
         let ids: Vec<String> = self.repositories.iter().map(ToString::to_string).collect();
         [
-            (ENV_REGISTRY, self.host()),
+            (ENV_REGISTRY, self.location.host()),
             (ENV_PROJECT, self.project.to_string()),
             (ENV_REPOSITORIES, ids.join(",")),
         ]
@@ -143,7 +131,7 @@ impl ArtifactRegistryTarget {
     /// `rounds`.
     pub(crate) fn parse(
         env: &dyn Fn(&str) -> Option<String>,
-        rounds: usize,
+        rounds: Rounds,
     ) -> Result<Self, String> {
         let location = Location::from_host(&require(env, ENV_REGISTRY)?)?;
         let project = require(env, ENV_PROJECT)?.parse()?;
@@ -152,10 +140,11 @@ impl ArtifactRegistryTarget {
             .map(str::parse)
             .collect::<Result<Vec<RepositoryId>, _>>()
             .map_err(|e| format!("{ENV_REPOSITORIES}: {e}"))?;
-        if repositories.len() < rounds {
+        if repositories.len() < rounds.get() {
             return Err(format!(
-                "{ENV_REPOSITORIES} names {} repositories but {rounds} rounds need one each",
-                repositories.len()
+                "{ENV_REPOSITORIES} names {} repositories but {} rounds need one each",
+                repositories.len(),
+                rounds.get()
             ));
         }
         Ok(Self {
@@ -180,7 +169,7 @@ pub(crate) async fn client(host: &str) -> Result<RegistryClient, String> {
         .map_err(|e| format!("registry host {host}: {e}"))?;
     let auth = GcpAuth::new(
         &url,
-        reqwest::Client::new(),
+        http_client()?,
         &AwsCredentialProviders::default(),
         &SharedGoogleToken::with_residency(Residency::process()),
     )
@@ -225,23 +214,31 @@ pub(crate) async fn list_repo(
     Ok(listing)
 }
 
+/// A lookup over `pairs`, standing in for the process environment.
+#[cfg(test)]
+pub(super) fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    |name| {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    }
+}
+
+/// `n` rounds, as the command line spells them.
+#[cfg(test)]
+pub(super) fn rounds(n: &str) -> Rounds {
+    n.parse().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        |name| {
-            pairs
-                .iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).to_owned())
-        }
-    }
-
     const FULL: [(&str, &str); 3] = [
         (ENV_REGISTRY, "europe-west9-docker.pkg.dev"),
         (ENV_PROJECT, "example-project"),
-        (ENV_REPOSITORIES, "run-r1,run-r2"),
+        (ENV_REPOSITORIES, "run-r1,run-r2,run-r3"),
     ];
 
     #[test]
@@ -274,18 +271,14 @@ mod tests {
 
     #[test]
     fn the_target_is_read_from_the_environment_it_describes() {
-        let target = ArtifactRegistryTarget::parse(&env_of(&FULL), 2).unwrap();
-        assert_eq!(target.host(), "europe-west9-docker.pkg.dev");
-        assert_eq!(
-            target.target_prefix(2, "bench"),
-            "example-project/run-r2/bench"
-        );
+        let target = ArtifactRegistryTarget::parse(&env_of(&FULL), rounds("3")).unwrap();
+        assert_eq!(target.location.host(), "europe-west9-docker.pkg.dev");
         // Catches: the names the local side writes drifting from the ones
         // the instance reads.
         let written = target.env();
         let pairs: Vec<(&str, &str)> = written.iter().map(|(k, v)| (*k, v.as_str())).collect();
         assert_eq!(
-            ArtifactRegistryTarget::parse(&env_of(&pairs), 2).unwrap(),
+            ArtifactRegistryTarget::parse(&env_of(&pairs), rounds("3")).unwrap(),
             target
         );
     }
@@ -295,23 +288,33 @@ mod tests {
         let without = |name: &str| -> Vec<(&str, &str)> {
             FULL.iter().filter(|(k, _)| *k != name).copied().collect()
         };
-        for (name, pairs, rounds, error) in [
+        for (name, pairs, asked, error) in [
             (
                 "no host",
                 without(ENV_REGISTRY),
-                2,
+                "3",
                 "BENCH_TARGET_REGISTRY is not set",
             ),
             (
                 "no project",
                 without(ENV_PROJECT),
-                2,
+                "3",
+                "BENCH_GAR_PROJECT is not set",
+            ),
+            (
+                "empty project",
+                vec![
+                    (ENV_REGISTRY, "europe-west9-docker.pkg.dev"),
+                    (ENV_PROJECT, ""),
+                    (ENV_REPOSITORIES, "run-r1,run-r2,run-r3"),
+                ],
+                "3",
                 "BENCH_GAR_PROJECT is not set",
             ),
             (
                 "no repositories",
                 without(ENV_REPOSITORIES),
-                2,
+                "3",
                 "BENCH_GAR_REPOSITORIES is not set",
             ),
             (
@@ -321,17 +324,17 @@ mod tests {
                     (ENV_PROJECT, "example-project"),
                     (ENV_REPOSITORIES, "run-r1,Run_2"),
                 ],
-                2,
+                "3",
                 "BENCH_GAR_REPOSITORIES: \"Run_2\" is not a repository id",
             ),
             (
                 "fewer repositories than rounds",
                 FULL.to_vec(),
-                3,
-                "BENCH_GAR_REPOSITORIES names 2 repositories but 3 rounds need one each",
+                "5",
+                "BENCH_GAR_REPOSITORIES names 3 repositories but 5 rounds need one each",
             ),
         ] {
-            let err = ArtifactRegistryTarget::parse(&env_of(&pairs), rounds).unwrap_err();
+            let err = ArtifactRegistryTarget::parse(&env_of(&pairs), rounds(asked)).unwrap_err();
             assert!(err.starts_with(error), "{name}: {err}");
         }
     }

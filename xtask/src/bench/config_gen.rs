@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 
 use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
+use crate::bench::target::Kind;
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
 ///
@@ -74,7 +75,7 @@ fn registry_key(hostname: &str) -> String {
 /// Generate an ocync YAML config from a corpus.
 ///
 /// Produces a `registries:` section with unique source registries (anonymous auth)
-/// and the target registry (the corpus's `target_auth`), followed by a `mappings:` section.
+/// and the target registry (signed in to as `target` says), followed by a `mappings:` section.
 /// Each mapping uses `source:` and `targets:` to reference registries by name,
 /// and `tags: glob:` with a list of exact tag globs.
 ///
@@ -82,6 +83,7 @@ fn registry_key(hostname: &str) -> String {
 /// without one the config has no `global:` block and ocync keeps its default.
 pub(crate) fn ocync_config(
     corpus: &Corpus,
+    target: Kind,
     max_concurrent_transfers: Option<NonZeroUsize>,
 ) -> String {
     let mut out = String::new();
@@ -117,10 +119,7 @@ pub(crate) fn ocync_config(
     }
     out.push_str(&format!("  {target_key}:\n"));
     out.push_str(&format!("    url: {}\n", corpus.settings.target_registry));
-    out.push_str(&format!(
-        "    auth_type: {}\n",
-        corpus.settings.target_auth.auth_type()
-    ));
+    out.push_str(&format!("    auth_type: {}\n", target.auth_type()));
 
     out.push('\n');
     out.push_str("mappings:\n");
@@ -298,18 +297,18 @@ images:
         // written when none was asked for.
         let corpus = test_corpus();
         assert_eq!(
-            ocync_config(&corpus, NonZeroUsize::new(20)),
+            ocync_config(&corpus, Kind::Ecr, NonZeroUsize::new(20)),
             format!(
                 "global:\n  max_concurrent_transfers: 20\n\n{}",
-                ocync_config(&corpus, None)
+                ocync_config(&corpus, Kind::Ecr, None)
             )
         );
-        assert!(!ocync_config(&corpus, None).contains("global:"));
+        assert!(!ocync_config(&corpus, Kind::Ecr, None).contains("global:"));
     }
 
     #[test]
     fn generated_configs_match_exactly() {
-        use crate::bench::corpus::{DockerHubAuth, TargetAuth};
+        use crate::bench::corpus::DockerHubAuth;
 
         let plain = test_corpus();
         let mut with_auth = test_corpus();
@@ -321,12 +320,11 @@ images:
         let mut gar = test_corpus();
         gar.settings.target_registry = "europe-west9-docker.pkg.dev".to_string();
         gar.settings.target_prefix = "example-project/run-r1/bench".to_string();
-        gar.settings.target_auth = TargetAuth::Gar;
 
         for (name, config, expected) in [
             (
                 "ocync_config_artifact_registry",
-                ocync_config(&gar, None),
+                ocync_config(&gar, Kind::ArtifactRegistry, None),
                 "\
 registries:
   cgr-dev:
@@ -357,7 +355,7 @@ mappings:
             ),
             (
                 "ocync_config_exact_output",
-                ocync_config(&plain, None),
+                ocync_config(&plain, Kind::Ecr, None),
                 "\
 registries:
   cgr-dev:
@@ -463,7 +461,7 @@ sync:
             ),
             (
                 "ocync_config_with_dockerhub_auth",
-                ocync_config(&with_auth, None),
+                ocync_config(&with_auth, Kind::Ecr, None),
                 "\
 registries:
   cgr-dev:

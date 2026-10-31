@@ -33,7 +33,7 @@ use regression::Baseline;
 use remote::CommitSha;
 use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, rounds_of};
 use runner::Tool;
-use target::{BenchTarget, Destination, Store};
+use target::{Destination, Store, Target};
 
 /// How many rounds the sync and partial scenarios run, each round running
 /// every tool once in a fresh order.
@@ -194,6 +194,12 @@ pub(crate) struct BenchArgs {
 
     #[command(flatten)]
     pub(crate) paths: corpus::CorpusPaths,
+
+    /// Registry the run syncs into. Artifact Registry reads its project,
+    /// repositories and credentials from the environment, as `bench-remote`
+    /// sets them.
+    #[arg(long, value_enum, default_value = "ecr")]
+    pub(crate) target: target::Kind,
 
     /// Path to the prepare-scenario corpus YAML.
     ///
@@ -493,7 +499,8 @@ fn git_ref() -> String {
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
-    let bench_target = BenchTarget::from_env(
+    let bench_target = Target::from_env(
+        args.target,
         &|name| std::env::var(name).ok(),
         args.scenario,
         &args.tool_selection.run_tools(),
@@ -527,7 +534,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     corpus.dockerhub_auth = docker_hub_auth();
-    corpus.settings.target_auth = bench_target.auth();
 
     // The lock is read only when a scenario syncs from it: prepare reads its own
     // wildcard corpus and transfers nothing, so it needs no lock.
@@ -603,7 +609,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         let config = config_dir.path().join("baseline-check.yaml");
         std::fs::write(
             &config,
-            config_gen::ocync_config(&corpus, args.tool_selection.max_concurrent_transfers),
+            config_gen::ocync_config(
+                &corpus,
+                args.target,
+                args.tool_selection.max_concurrent_transfers,
+            ),
         )
         .map_err(|e| format!("write config {}: {e}", config.display()))?;
         runner::check_baseline(commit, &config)?;
@@ -837,25 +847,20 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 /// registry is in. The page compares ECR runs, so a run into another registry
 /// writes no block to it.
 fn deferred_output(
-    target: &BenchTarget,
+    target: &Target,
     target_registry: &str,
     report: &BenchReport,
     git_ref: String,
     corpus_locked_at: Option<lock::LockedAt>,
 ) -> report::Deferred {
-    let record = report::RunRecord::of(
-        report,
-        git_ref,
-        report.instance.provider(),
-        corpus_locked_at,
-    );
+    let record = report::RunRecord::of(report, git_ref, corpus_locked_at);
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
     // missing field. Appending it anyway puts a laptop's numbers next to the
     // rig's under the same key, where nothing downstream can tell them apart.
     // The summary is still written; only the shared history is protected.
-    let record = if record.machine.instance_type == "unknown" {
+    let record = if record.machine.provider.is_none() {
         eprintln!(
             "bench: run record NOT appended (instance metadata unknown, so this \
              run is not comparable to the archived ones); summary only"
@@ -865,8 +870,8 @@ fn deferred_output(
         Some(record)
     };
     let page = match target {
-        BenchTarget::Ecr => report::PageBlocks::of(report),
-        BenchTarget::ArtifactRegistry(_) => report::PageBlocks::default(),
+        Target::Ecr => report::PageBlocks::of(report),
+        Target::ArtifactRegistry(_) => report::PageBlocks::default(),
     };
     report::Deferred::new(
         RegistryKind::of(target_registry).archive_stem(),
@@ -1204,9 +1209,11 @@ async fn run_single_tool(
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     let config_content = match tool {
-        Tool::Ocync | Tool::OcyncBaseline => {
-            config_gen::ocync_config(corpus, args.tool_selection.max_concurrent_transfers)
-        }
+        Tool::Ocync | Tool::OcyncBaseline => config_gen::ocync_config(
+            corpus,
+            args.target,
+            args.tool_selection.max_concurrent_transfers,
+        ),
         Tool::Dregsy => config_gen::dregsy_config(corpus),
         Tool::Regsync => config_gen::regsync_config(corpus),
     };
@@ -1378,9 +1385,6 @@ async fn run_sync(
         let label = args.tool_selection.label(tool);
         prepare_clean_slate();
 
-        // Delete repos first to guarantee a truly empty target, then recreate.
-        // create_repos alone skips existing repos which may contain partial
-        // data from aborted runs.
         target.reset(corpus).await?;
 
         // Single config_dir for cold + warm. The cache file lives
@@ -1431,9 +1435,7 @@ async fn run_sync(
         }
         .await;
 
-        // Always clean up ECR repos, even if the tool run failed. A repo that
-        // cannot be deleted fails the pass, so its content cannot satisfy the
-        // next tool's digest check.
+        // Always clean up, even if the tool run failed.
         let cleanup = target.release(corpus).await;
         finish_pass(run_result, cleanup)?;
 
@@ -1499,7 +1501,7 @@ async fn run_partial(
         }
         .await;
 
-        // Always clean up ECR repos, even if the tool run failed.
+        // Always clean up, even if the tool run failed.
         let cleanup = target.release(base_corpus).await;
         finish_pass(run_result, cleanup)?;
 
@@ -1560,7 +1562,7 @@ async fn run_scale(
             }
             .await;
 
-            // Always clean up ECR repos, even if the tool run failed.
+            // Always clean up, even if the tool run failed.
             let cleanup = target.release(&subset).await;
             finish_pass(run_result, cleanup)?;
 
@@ -2196,13 +2198,13 @@ mod tests {
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::report::tests::sample_report;
 
-        let google = BenchTarget::ArtifactRegistry(ArtifactRegistryTarget {
+        let google = Target::ArtifactRegistry(ArtifactRegistryTarget {
             location: "europe-west9".parse().unwrap(),
             project: "example-project".parse().unwrap(),
             repositories: vec!["run-r1".parse().unwrap(), "run-r2".parse().unwrap()],
         });
         let report = sample_report();
-        let output = |target: &BenchTarget, host: &str| {
+        let output = |target: &Target, host: &str| {
             let deferred = deferred_output(target, host, &report, "abc1234".into(), None);
             let text = serde_json::to_string(&deferred).unwrap();
             (
@@ -2229,11 +2231,7 @@ mod tests {
             assert!(!text.contains(name), "{name} in {text}");
         }
 
-        let (ecr, _) = output(
-            &BenchTarget::Ecr,
-            "111111111111.dkr.ecr.us-east-1.amazonaws.com",
-        );
-        assert_eq!(ecr["record"]["machine"]["provider"], "aws");
+        let (ecr, _) = output(&Target::Ecr, "111111111111.dkr.ecr.us-east-1.amazonaws.com");
         assert_eq!(ecr["archive_key"], "ecr");
         assert!(ecr["page"]["cold"].is_string(), "{ecr}");
     }
