@@ -205,6 +205,12 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) output: Option<String>,
 
+    /// Where the run record and the performance-page blocks go: `write` puts
+    /// them in the tracked archive and page, `defer` leaves both in the output
+    /// directory for whoever fetches the run (`bench-remote` does).
+    #[arg(long, value_enum, default_value = "write")]
+    pub(crate) archive: report::ArchiveMode,
+
     /// Regression mode: compare against stored baseline, exit non-zero on regression.
     #[arg(long)]
     pub(crate) regression: bool,
@@ -591,7 +597,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let timestamp = utc_timestamp();
     let output_dir = match &args.output {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(format!("bench/results/{timestamp}")),
+        None => Path::new(report::ARCHIVE_DIR).join(&timestamp),
     };
 
     let instance = report::InstanceInfo::collect();
@@ -761,16 +767,42 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // missing field. Appending it anyway puts a laptop's numbers next to the
     // rig's under the same key, where nothing downstream can tell them apart.
     // The summary is still written; only the shared history is protected.
-    let results_dir = Path::new("bench/results");
-    if record.machine.instance_type == "unknown" {
+    let record = if record.machine.instance_type == "unknown" {
         eprintln!(
             "bench: run record NOT appended (instance metadata unknown, so this \
              run is not comparable to the archived ones); summary only"
         );
+        None
     } else {
-        report::append_record(results_dir, reg_key, record)
-            .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
-        eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+        Some(record)
+    };
+    match args.archive {
+        report::ArchiveMode::Write => {
+            let page = Path::new(report::PERFORMANCE_PAGE);
+            // Best-effort; a missing page is not fatal.
+            if page.exists() {
+                if let Err(e) = report::PageBlocks::of(&report).apply(page) {
+                    eprintln!("WARNING: failed to update {}: {e}", page.display());
+                }
+            }
+            if let Some(record) = record {
+                report::append_record(Path::new(report::ARCHIVE_DIR), reg_key, record)
+                    .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
+                eprintln!(
+                    "bench: run record appended to {}/{reg_key}.json",
+                    report::ARCHIVE_DIR
+                );
+            }
+        }
+        report::ArchiveMode::Defer => {
+            report::Deferred::new(reg_key, record, &report)
+                .write(&output_dir)
+                .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
+            eprintln!(
+                "bench: run record and page blocks left in {} for the fetch to apply",
+                output_dir.display()
+            );
+        }
     }
 
     if let Some(reason) = stopped {

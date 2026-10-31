@@ -14,8 +14,9 @@ use std::process::{Command, Stdio};
 use clap::Args;
 use serde::Deserialize;
 
+use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
-use super::{Provider, Scenario, ToolSelection, value_name};
+use super::{Provider, Scenario, ToolSelection, utc_timestamp, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -105,7 +106,7 @@ pub(crate) struct BenchRemoteArgs {
     pub(crate) no_proxy: bool,
 
     /// Local directory to save fetched results.
-    #[arg(long, default_value = "bench/results")]
+    #[arg(long, default_value = ARCHIVE_DIR)]
     pub(crate) output: String,
 }
 
@@ -145,7 +146,10 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     let config = read_config(args.provider)?;
 
     if args.fetch {
-        return fetch_results(&config, &args.output, None);
+        let Some(remote_dir) = newest_results_dir(&config)? else {
+            return Err("no results directory found on instance".into());
+        };
+        return fetch_results(&config, &args.output, &remote_dir);
     }
 
     // Decided before the push, so a provider with no setup is refused before
@@ -175,8 +179,97 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
-    // The benchmark's arguments, unquoted: `remote_script` quotes each one.
+    // This run's results directory, named here so the fetch takes exactly it:
+    // a run that wrote none leaves nothing at this path, and no earlier run's
+    // directory can stand in for it.
+    let results_dir = format!("{ARCHIVE_DIR}/{}", utc_timestamp());
+
+    let bench_args = bench_args(&args, &results_dir);
+
+    let script = remote_script(
+        &git_ref,
+        &git_sha,
+        &bench_args,
+        registry_env,
+        ExistingRun::from_force(args.force),
+    );
+
+    eprintln!(
+        "bench-remote: connecting to {}@{}...",
+        config.user, config.host
+    );
+
+    let exit_code = match ssh_stream(&config, &script)? {
+        RemoteOutcome::Refused => {
+            return Err(
+                "a benchmark is still running on the instance; pass --force to kill it, \
+                 or --fetch to copy the newest results there (a live run's partial results \
+                 once its benchmark has started)"
+                    .into(),
+            );
+        }
+        RemoteOutcome::FailedBeforeStart(code) => {
+            return Err(format!(
+                "remote script exited with code {code} before the benchmark started; \
+                 not fetching results"
+            )
+            .into());
+        }
+        RemoteOutcome::Ran(code) => code,
+    };
+
+    if exit_code != 0 {
+        eprintln!("bench-remote: fetching partial results...");
+    } else {
+        eprintln!("bench-remote: fetching results...");
+    }
+
+    let results = fetch_run_results(&config, &args.output, &results_dir);
+    run_result(exit_code, results)
+}
+
+/// What the fetch of a run's results directory found.
+#[derive(Debug, PartialEq, Eq)]
+enum Fetch {
+    /// The directory was on the instance and is copied.
+    Copied,
+    /// There was no such directory: the run wrote no results.
+    NoResults,
+}
+
+/// The result of a run whose script exited with `exit_code` and whose fetch
+/// ended as `fetched`. A nonzero exit is an error whatever the fetch did, so a
+/// refused or failed run is never a success to the caller; a failed fetch is
+/// named alongside it. A script that exited 0 without writing results did not
+/// do its job either.
+fn run_result(
+    exit_code: i32,
+    fetched: Result<Fetch, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (exit_code, fetched) {
+        (0, Ok(Fetch::Copied)) => Ok(()),
+        (0, Ok(Fetch::NoResults)) => {
+            Err("remote script exited with code 0 but wrote no results".into())
+        }
+        (0, Err(e)) => Err(e),
+        (code, Ok(_)) => Err(format!("remote script exited with code {code}").into()),
+        (code, Err(e)) => Err(format!(
+            "remote script exited with code {code}; fetching results failed: {e}"
+        )
+        .into()),
+    }
+}
+
+/// The arguments `cargo xtask bench` runs with on the instance, unquoted:
+/// `remote_script` quotes each one. The run writes into `results_dir` and, so
+/// that the instance writes no tracked file, defers its record and page blocks
+/// there until the fetch applies them locally.
+fn bench_args(args: &BenchRemoteArgs, results_dir: &str) -> Vec<String> {
     let mut bench_args = vec![
+        "--archive".to_string(),
+        value_name(&ArchiveMode::Defer),
+        "--output".to_string(),
+        results_dir.to_string(),
         "--tools".to_string(),
         join_tools(&args.tool_selection.tools),
         "--rounds".to_string(),
@@ -198,77 +291,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         bench_args.push("--no-proxy".to_string());
     }
     bench_args.push(value_name(&args.scenario));
-
-    let script = remote_script(
-        &git_ref,
-        &git_sha,
-        &bench_args,
-        registry_env,
-        ExistingRun::from_force(args.force),
-    );
-
-    eprintln!(
-        "bench-remote: connecting to {}@{}...",
-        config.user, config.host
-    );
-
-    let StreamEnd {
-        outcome,
-        results_before,
-    } = ssh_stream(&config, &script)?;
-    let exit_code = match outcome {
-        RemoteOutcome::Refused => {
-            return Err(
-                "a benchmark is still running on the instance; pass --force to kill it, \
-                 or --fetch to copy the newest results there (a live run's partial results \
-                 once its benchmark has started)"
-                    .into(),
-            );
-        }
-        RemoteOutcome::FailedBeforeStart(code) => {
-            return Err(format!(
-                "remote script exited with code {code} before the benchmark started; \
-                 not fetching results"
-            )
-            .into());
-        }
-        RemoteOutcome::Ran(code) => code,
-    };
-
-    if exit_code != 0 {
-        eprintln!("bench-remote: remote script exited with code {exit_code}");
-        eprintln!("bench-remote: fetching partial results...");
-    } else {
-        eprintln!("bench-remote: fetching results...");
-    }
-
-    // The script prints the marker before the started line, so a run that
-    // started always has one; without it no directory can be told to be this
-    // run's, and none is fetched.
-    let results_before = results_before.ok_or(
-        "remote script started the benchmark without reporting the newest results directory; \
-         not fetching results",
-    )?;
-    let fetched = fetch_results(&config, &args.output, Some(&results_before));
-    run_result(exit_code, fetched)
-}
-
-/// The result of a run whose script exited with `exit_code` and whose fetch
-/// ended as `fetched`. A nonzero exit is an error whatever the fetch did, so a
-/// refused or failed run is never a success to the caller; a failed fetch is
-/// named alongside it.
-fn run_result(
-    exit_code: i32,
-    fetched: Result<(), Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match (exit_code, fetched) {
-        (0, fetched) => fetched,
-        (code, Ok(())) => Err(format!("remote script exited with code {code}").into()),
-        (code, Err(e)) => Err(format!(
-            "remote script exited with code {code}; fetching results failed: {e}"
-        )
-        .into()),
-    }
+    bench_args
 }
 
 /// The shell that points the benchmark at `provider`'s registry on the
@@ -331,15 +354,6 @@ impl RemoteOutcome {
     }
 }
 
-/// What [`ssh_stream`] saw of the remote script.
-struct StreamEnd {
-    /// How the script ended.
-    outcome: RemoteOutcome,
-    /// The newest results directory on the instance before the run, empty when
-    /// there was none; `None` when the script never reported it.
-    results_before: Option<String>,
-}
-
 /// Command that receives the script on stdin. `setsid -w` makes the script
 /// lead its own process group, so `$$` is a group id `--force` can kill, and
 /// waits so the script's exit status is the command's. The benchmark runner is
@@ -348,7 +362,10 @@ struct StreamEnd {
 const REMOTE_COMMAND: &str = "setsid -w bash -s";
 
 /// Pipe a script to the remote instance via SSH and stream stdout.
-fn ssh_stream(config: &BenchConfig, script: &str) -> Result<StreamEnd, Box<dyn std::error::Error>> {
+fn ssh_stream(
+    config: &BenchConfig,
+    script: &str,
+) -> Result<RemoteOutcome, Box<dyn std::error::Error>> {
     let mut child = Command::new("ssh")
         .args(ssh_args(config))
         .args(["-o", "ServerAliveInterval=30"])
@@ -367,67 +384,60 @@ fn ssh_stream(config: &BenchConfig, script: &str) -> Result<StreamEnd, Box<dyn s
     }
 
     let mut sentinel = None;
-    let mut results_before = None;
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let line = line?;
             sentinel = sentinel.or(Sentinel::from_line(&line));
-            if let Some(name) = line.strip_prefix(RESULTS_BEFORE_PREFIX) {
-                results_before.get_or_insert_with(|| name.trim().to_string());
-            }
             eprintln!("{line}");
         }
     }
 
     let status = child.wait()?;
-    Ok(StreamEnd {
-        outcome: RemoteOutcome::new(sentinel, status.code()),
-        results_before,
-    })
+    Ok(RemoteOutcome::new(sentinel, status.code()))
 }
 
-/// The newest results directory `after` a run, if the run created it: not
-/// when there is none, and not when it is the one that was newest `before` (an
-/// earlier run's). Empty means no directory.
-fn created_results_dir<'a>(before: &str, after: &'a str) -> Option<&'a str> {
-    (!after.is_empty() && after != before).then_some(after)
-}
-
-/// Fetch results from the instance via SCP.
-///
-/// With `newest_before` (the newest results directory name before a run, empty
-/// when there was none), only a directory the run created is fetched, so a run
-/// that wrote nothing copies no directory, archive or performance page. With
-/// `None`, the newest directory is fetched as it stands (`--fetch`).
-fn fetch_results(
-    config: &BenchConfig,
-    local_output: &str,
-    newest_before: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// The newest results directory on the instance, as a path there, if any.
+fn newest_results_dir(config: &BenchConfig) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let ls_output = ssh_run(
         config,
         "ls -td ~/ocync/bench/results/2* 2>/dev/null | head -1",
     )?;
-    let remote_dir = ls_output.trim();
+    Ok(Some(ls_output.trim().to_string()).filter(|dir| !dir.is_empty()))
+}
+
+/// Fetches the run's results directory, relative to the repository on the
+/// instance, if the run wrote it.
+fn fetch_run_results(
+    config: &BenchConfig,
+    local_output: &str,
+    results_dir: &str,
+) -> Result<Fetch, Box<dyn std::error::Error>> {
+    let remote_dir = format!("~/ocync/{results_dir}");
+    let found = ssh_run(
+        config,
+        &format!("if [ -d {remote_dir} ]; then echo present; fi"),
+    )?;
+    if found.trim() != "present" {
+        eprintln!("bench-remote: the run wrote no results; copying nothing");
+        return Ok(Fetch::NoResults);
+    }
+    fetch_results(config, local_output, &remote_dir)?;
+    Ok(Fetch::Copied)
+}
+
+/// Copies the results directory `remote_dir` from the instance into
+/// `local_output`, then writes the run record and the performance-page blocks
+/// it carries into the local archive and page, as a local run does.
+fn fetch_results(
+    config: &BenchConfig,
+    local_output: &str,
+    remote_dir: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let remote_basename = Path::new(remote_dir)
         .file_name()
         .unwrap_or_default()
         .to_string_lossy();
-
-    match newest_before {
-        None if remote_dir.is_empty() => {
-            return Err("no results directory found on instance".into());
-        }
-        None => {}
-        Some(before) => {
-            if created_results_dir(before, &remote_basename).is_none() {
-                eprintln!("bench-remote: the run wrote no results; copying nothing");
-                return Ok(());
-            }
-        }
-    }
-
     let local_dir = Path::new(local_output).join(remote_basename.as_ref());
 
     // Ensure the parent exists but NOT local_dir itself. OpenSSH >= 9.0
@@ -454,48 +464,11 @@ fn fetch_results(
         return Err("scp failed".into());
     }
 
-    let json_files = ssh_run(
-        config,
-        "ls ~/ocync/bench/results/*.json 2>/dev/null | grep -v baseline",
-    )?;
-
-    for json_file in json_files.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let json_basename = Path::new(json_file)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let local_json = Path::new(local_output).join(json_basename.as_ref());
-        eprintln!(
-            "bench-remote: copying {json_file} to {}",
-            local_json.display()
-        );
-        let status = Command::new("scp")
-            .args(ssh_args(config))
-            .arg(format!("{}@{}:{}", config.user, config.host, json_file))
-            .arg(local_json.to_str().unwrap_or("."))
-            .status()?;
-        if !status.success() {
-            eprintln!("bench-remote: warning: failed to copy {json_file}");
-        }
-    }
-
-    // Pull the auto-updated performance page back to the local working tree.
-    // The bench harness updates docs/src/content/performance.md between the
-    // BENCH:START/END and BENCH-WARM:START/END markers on the remote instance.
-    // Without this fetch, the update stays on the instance and is never committed.
-    let perf_page = "docs/src/content/performance.md";
-    let remote_perf = format!("~/ocync/{perf_page}");
-    let local_perf = Path::new(perf_page);
-    if local_perf.exists() {
-        eprintln!("bench-remote: updating {perf_page}");
-        let status = Command::new("scp")
-            .args(ssh_args(config))
-            .arg(format!("{}@{}:{}", config.user, config.host, remote_perf))
-            .arg(local_perf)
-            .status()?;
-        if !status.success() {
-            eprintln!("bench-remote: warning: failed to fetch updated {perf_page}");
-        }
+    // The instance writes no tracked file. What a local run would have put in
+    // the archive and the page is in the directory just copied, and goes in
+    // here; applying it again is harmless.
+    if let Some(deferred) = Deferred::read(&local_dir)? {
+        deferred.apply(Path::new(ARCHIVE_DIR), Path::new(PERFORMANCE_PAGE))?;
     }
 
     let summary = ssh_run(
@@ -556,15 +529,6 @@ const RUN_IN_PROGRESS_LINE: &str = "bench-remote: a benchmark is already running
 /// Line the remote script prints right after it launches the benchmark runner.
 /// Results fetched after it are this run's, whole or partial.
 const BENCH_STARTED_LINE: &str = "bench-remote: benchmark started, streaming log...";
-
-/// Prefix of the line, printed before [`BENCH_STARTED_LINE`], that carries the
-/// name of the newest results directory on the instance before the run (empty
-/// when there is none).
-const RESULTS_BEFORE_PREFIX: &str = "bench-remote: newest results before this run: ";
-
-/// The tracked files a run writes, relative to the repository root: the run
-/// archives and the performance page.
-const RUN_WRITTEN_PATHS: &str = "bench/results/ docs/src/content/performance.md";
 
 /// Seconds `--force` waits for a killed run to release the run lock.
 const KILL_WAIT_SECS: u32 = 30;
@@ -725,11 +689,6 @@ RUNNER_FILE=bench/.bench-run.sh
 # built. The SHA is resolved locally before pushing and is immutable.
 echo '[1/4] Checking out {git_sha} ({escaped_git_ref})...'
 git fetch origin 9>&-
-# Restore the tracked files a run writes (its archive and the performance
-# page), or the next checkout refuses once main changes either. Safe because
-# bench-remote copies a run's results to the operator's tree by fetch; the
-# instance copy is never the only one.
-git checkout -- {RUN_WRITTEN_PATHS} 9>&-
 git checkout '{git_sha}' --detach 9>&-
 # Remove untracked files left by previous builds or deleted from the repo.
 {GIT_CLEAN}
@@ -768,10 +727,6 @@ mkdir -p "$TMPDIR"
 # session.
 > "$LOG_FILE"
 rm -f "$EXIT_FILE"
-# The newest results directory before this run, so a run that writes none
-# (the benchmark refused at its start) is not mistaken for an earlier run's.
-RESULTS_BEFORE=$(cd bench/results 2>/dev/null && ls -td 2* 2>/dev/null | head -1 || true)
-echo "{RESULTS_BEFORE_PREFIX}$RESULTS_BEFORE"
 cat > "$RUNNER_FILE" <<'RUNNER_EOF'
 {BENCH_RUNNER}
 RUNNER_EOF
@@ -1189,42 +1144,13 @@ mod tests {
     }
 
     #[test]
-    fn the_run_written_files_are_restored_under_the_lock_before_the_checkout() {
-        for existing in [ExistingRun::Refuse, ExistingRun::Kill] {
-            let script = script_for(existing);
-            let at = |needle: &str| {
-                script
-                    .find(needle)
-                    .unwrap_or_else(|| panic!("{needle:?} missing from the script"))
-            };
-            let restore = at("git checkout -- bench/results/ docs/src/content/performance.md");
-            assert!(
-                at("flock -n") < restore,
-                "{existing:?}: restore before lock"
-            );
-            assert!(
-                restore < at("git checkout '"),
-                "{existing:?}: restore after checkout"
-            );
-            assert!(
-                script[restore..].lines().next().unwrap().ends_with(" 9>&-"),
-                "{existing:?}: restore keeps the run lock open"
-            );
-        }
-    }
-
-    #[test]
     fn git_runs_with_the_run_lock_closed() {
         let script = script_for(ExistingRun::Refuse);
         let git_lines: Vec<&str> = script
             .lines()
             .filter(|line| line.starts_with("git "))
             .collect();
-        assert_eq!(
-            git_lines.len(),
-            4,
-            "fetch, restore, checkout, clean: {git_lines:?}"
-        );
+        assert_eq!(git_lines.len(), 3, "fetch, checkout, clean: {git_lines:?}");
 
         // Each line runs against a stand-in `git` that reports whether fd 9
         // was open when it was called.
@@ -1243,7 +1169,7 @@ mod tests {
         assert!(status.success());
         assert_eq!(
             std::fs::read_to_string(&seen).unwrap(),
-            "closed\nclosed\nclosed\nclosed\n"
+            "closed\nclosed\nclosed\n"
         );
     }
 
@@ -1299,163 +1225,56 @@ mod tests {
     }
 
     #[test]
-    fn the_script_reports_the_newest_results_before_the_runner_starts() {
-        let script = script_for(ExistingRun::Refuse);
-        let marker = script.find(RESULTS_BEFORE_PREFIX).unwrap();
+    fn the_exit_code_and_the_fetch_decide_the_result() {
+        let err = |exit, fetched| run_result(exit, fetched).unwrap_err().to_string();
 
-        assert_eq!(script.matches(RESULTS_BEFORE_PREFIX).count(), 1);
-        assert!(marker > script.find("git checkout '").unwrap());
-        assert!(marker < script.find(r#"bash "$RUNNER_FILE""#).unwrap());
-        assert!(marker < script.find(BENCH_STARTED_LINE).unwrap());
-        // A directory-less results tree must not fail the script under `set -e`.
-        let line = script
-            .lines()
-            .find(|l| l.starts_with("RESULTS_BEFORE="))
-            .unwrap();
-        assert!(line.ends_with("|| true)"), "{line}");
-    }
-
-    #[test]
-    fn a_nonzero_remote_exit_is_an_error_after_the_fetch() {
-        assert!(run_result(0, Ok(())).is_ok());
+        assert!(run_result(0, Ok(Fetch::Copied)).is_ok());
         assert_eq!(
-            run_result(0, Err("scp failed".into()))
-                .unwrap_err()
-                .to_string(),
-            "scp failed"
+            err(0, Ok(Fetch::NoResults)),
+            "remote script exited with code 0 but wrote no results"
         );
+        assert_eq!(err(0, Err("scp failed".into())), "scp failed");
+        // A failed script is an error whatever the fetch found.
+        for fetched in [Ok(Fetch::Copied), Ok(Fetch::NoResults)] {
+            assert_eq!(err(3, fetched), "remote script exited with code 3");
+        }
         assert_eq!(
-            run_result(3, Ok(())).unwrap_err().to_string(),
-            "remote script exited with code 3"
-        );
-        assert_eq!(
-            run_result(1, Err("scp failed".into()))
-                .unwrap_err()
-                .to_string(),
+            err(1, Err("scp failed".into())),
             "remote script exited with code 1; fetching results failed: scp failed"
         );
     }
 
     #[test]
-    fn only_a_results_directory_the_run_created_is_fetched() {
-        let rows = [
-            // (newest before, newest after, fetched)
-            ("2026-10-01", "2026-10-02", Some("2026-10-02")),
-            ("", "2026-10-02", Some("2026-10-02")),
-            // The refused run: nothing new, the earlier run's directory stays.
-            ("2026-10-01", "2026-10-01", None),
-            ("2026-10-01", "", None),
-            ("", "", None),
-        ];
-        for (before, after, want) in rows {
-            assert_eq!(
-                created_results_dir(before, after),
-                want,
-                "{before:?} {after:?}"
-            );
-        }
-    }
+    fn the_benchmark_defers_its_record_into_the_directory_bench_remote_names() {
+        use clap::Parser;
+        let args = Cli::try_parse_from(["xtask", "--provider", "aws", "--limit", "3"])
+            .unwrap()
+            .args;
+        let bench_args = bench_args(&args, "bench/results/2026-10-30-120000");
+        let argv: Vec<&str> = bench_args.iter().map(String::as_str).collect();
 
-    /// Runs `fetch_results` in a child of this test binary so `ssh` and `scp`
-    /// stubs can lead its `PATH` without touching this process's environment.
-    /// The child is [`fetch_with_stubs`].
-    fn scp_log_of_fetch(newest_after: &str, newest_before: Option<&str>) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        for (name, body) in [
-            (
-                "ssh",
-                r#"case "$*" in
-  *'ls -td'*) [ -n "$STUB_AFTER" ] && echo "/home/u/ocync/bench/results/$STUB_AFTER" ;;
-  *'.json'*) echo /home/u/ocync/bench/results/ecr.json ;;
-esac
-exit 0"#,
-            ),
-            ("scp", r#"echo "$@" >> "$STUB_LOG""#),
-        ] {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
-        }
-        // The performance page exists locally, so a copy of it is attempted
-        // whenever the fetch gets that far.
-        let page = dir.path().join("docs/src/content/performance.md");
-        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
-        std::fs::write(&page, "").unwrap();
-
-        let log = dir.path().join("scp.log");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
+        // The args are what `bench` itself parses, so a rename of either
+        // option breaks this rather than a run on the instance.
+        let parsed = crate::bench::parse_bench(&argv).unwrap();
+        assert_eq!(parsed.archive, ArchiveMode::Defer);
+        assert_eq!(
+            parsed.output.as_deref(),
+            Some("bench/results/2026-10-30-120000")
         );
-        let mut child = Command::new(std::env::current_exe().unwrap());
-        child
-            .args([
-                "--exact",
-                // Test names omit the crate, which `module_path!` leads with.
-                &format!(
-                    "{}::fetch_with_stubs",
-                    module_path!().split_once("::").unwrap().1
-                ),
-                "--nocapture",
-            ])
-            .current_dir(dir.path())
-            .env("PATH", path)
-            .env("STUB_CHILD", "1")
-            .env("STUB_AFTER", newest_after)
-            .env("STUB_LOG", &log);
-        if let Some(before) = newest_before {
-            child.env("STUB_BEFORE", before);
-        }
-        let out = child.output().unwrap();
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-            "the child ran no test: {}",
-            String::from_utf8_lossy(&out.stdout)
+        assert_eq!(parsed.limit, Some(3));
+        assert_eq!(
+            crate::bench::parse_bench(&["sync"]).unwrap().archive,
+            ArchiveMode::Write,
+            "a local run keeps writing the tracked files"
         );
-        assert!(
-            out.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        std::fs::read_to_string(&log).unwrap_or_default()
-    }
-
-    /// The child of [`scp_log_of_fetch`]; a no-op in a normal test run.
-    #[test]
-    fn fetch_with_stubs() {
-        if std::env::var_os("STUB_CHILD").is_none() {
-            return;
-        }
-        let config = BenchConfig {
-            host: "h".into(),
-            user: "u".into(),
-            ssh_key_path: "/k".into(),
-        };
-        let before = std::env::var("STUB_BEFORE").ok();
-        fetch_results(&config, "out", before.as_deref()).unwrap();
     }
 
     #[test]
-    fn a_run_that_wrote_no_results_copies_no_directory_archive_or_page() {
-        // The refused run: the newest directory is the earlier run's.
-        let log = scp_log_of_fetch("2026-10-01", Some("2026-10-01"));
-        assert_eq!(log, "", "nothing may be copied: {log}");
-
-        // A run that created a directory copies it, the archive and the page,
-        // so the empty log above is not a stub that never copies.
-        let log = scp_log_of_fetch("2026-10-02", Some("2026-10-01"));
-        assert!(log.contains("/results/2026-10-02"), "{log}");
-        assert!(log.contains("ecr.json"), "{log}");
-        assert!(log.contains("performance.md"), "{log}");
-
-        // `--fetch` takes the newest as it stands.
-        let log = scp_log_of_fetch("2026-10-01", None);
-        assert!(log.contains("/results/2026-10-01"), "{log}");
+    fn the_script_never_edits_tracked_files_or_reads_a_results_marker() {
+        let script = script_for(ExistingRun::Refuse);
+        assert!(!script.contains("git checkout --"), "no restore step");
+        assert!(!script.contains("performance.md"));
+        assert!(!script.contains("ls -td"), "no listing to agree with");
     }
 
     #[test]

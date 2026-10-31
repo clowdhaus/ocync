@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::lock::LockedAt;
@@ -12,6 +13,17 @@ use crate::bench::remote::CommitSha;
 use crate::bench::runner::Tool;
 use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
+
+/// The docs performance page, relative to the repository root.
+pub(crate) const PERFORMANCE_PAGE: &str = "docs/src/content/performance.md";
+
+/// The directory of the per-registry run archives, relative to the repository
+/// root.
+pub(crate) const ARCHIVE_DIR: &str = "bench/results";
+
+/// The file in a run's output directory that carries what a deferred run did
+/// not write into the tracked files.
+const DEFERRED_FILE: &str = "deferred.json";
 
 /// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
 fn is_zero(v: &u64) -> bool {
@@ -1038,14 +1050,9 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
 /// Writes the benchmark summary to `output_dir`.
 ///
 /// Creates `summary.md` -- the human-readable comparison table with
-/// per-scenario metrics and winners bolded. Also updates the docs
-/// performance page (`docs/src/content/performance.md`) between
-/// scenario-specific marker pairs:
-/// - `<!-- BENCH:START -->` / `<!-- BENCH:END -->` for cold sync
-/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for warm sync
-///
-/// The compact per-registry JSON archive is written separately by
-/// `append_record()`.
+/// per-scenario metrics and winners bolded. The performance page and the
+/// compact per-registry JSON archive are written separately, see
+/// [`ArchiveMode`].
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
@@ -1053,14 +1060,6 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     let md = summary_markdown(report);
     let md_path = output_dir.join("summary.md");
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
-
-    // Update docs performance page (best-effort; missing file is not fatal).
-    let perf_page = Path::new("docs/src/content/performance.md");
-    if perf_page.exists() {
-        if let Err(e) = update_performance_page(perf_page, report) {
-            eprintln!("WARNING: failed to update {}: {e}", perf_page.display());
-        }
-    }
 
     Ok(())
 }
@@ -1179,65 +1178,154 @@ fn replace_between_markers(
     Ok(Some(updated))
 }
 
-/// Updates the docs performance page with benchmark results.
+/// The performance-page blocks of a run: the text that replaces the content
+/// between each scenario's marker pair.
 ///
-/// Replaces content between marker pairs for each scenario present:
 /// - `<!-- BENCH:START -->` / `<!-- BENCH:END -->` for the cold scenario
-/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for the warm scenario
-fn update_performance_page(path: &Path, report: &BenchReport) -> Result<(), String> {
-    let mut content =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for the warm one
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PageBlocks {
+    /// The cold-sync block; `None` when the run has no cold scenario.
+    cold: Option<String>,
+    /// The warm-sync block; `None` when the run has no warm scenario.
+    warm: Option<String>,
+}
 
-    let mut updated = false;
-
-    let cold = rounds_of(&report.scenarios, ScenarioKind::Cold);
-    if !cold.is_empty() {
-        let snippet = scenario_markdown(report, &cold, "Cold sync");
-        match replace_between_markers(&content, BENCH_COLD_START, BENCH_COLD_END, &snippet)? {
-            Some(new_content) => {
-                content = new_content;
-                updated = true;
-            }
-            None => {
-                eprintln!(
-                    "WARNING: {BENCH_COLD_START} marker not found in {}; skipping cold update",
-                    path.display()
-                );
-            }
+impl PageBlocks {
+    /// The blocks `report` produces.
+    pub(crate) fn of(report: &BenchReport) -> Self {
+        let block = |kind, description| {
+            let rounds = rounds_of(&report.scenarios, kind);
+            (!rounds.is_empty()).then(|| scenario_markdown(report, &rounds, description))
+        };
+        Self {
+            cold: block(ScenarioKind::Cold, "Cold sync"),
+            warm: block(ScenarioKind::Warm, "Warm sync (no changes)"),
         }
     }
 
-    let warm = rounds_of(&report.scenarios, ScenarioKind::Warm);
-    if !warm.is_empty() {
-        let snippet = scenario_markdown(report, &warm, "Warm sync (no changes)");
-        match replace_between_markers(&content, BENCH_WARM_START, BENCH_WARM_END, &snippet)? {
-            Some(new_content) => {
-                content = new_content;
-                updated = true;
+    /// Writes the blocks into the page at `path`, replacing what is between
+    /// each marker pair, so applying the same blocks twice leaves the page as
+    /// applying them once. A pair missing from the page is skipped with a
+    /// warning; a page with no block to write is left untouched.
+    pub(crate) fn apply(&self, path: &Path) -> Result<(), String> {
+        let mut content =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+
+        let mut updated = false;
+        for (block, start, end, name) in [
+            (&self.cold, BENCH_COLD_START, BENCH_COLD_END, "cold"),
+            (&self.warm, BENCH_WARM_START, BENCH_WARM_END, "warm"),
+        ] {
+            let Some(snippet) = block else { continue };
+            match replace_between_markers(&content, start, end, snippet)? {
+                Some(new_content) => {
+                    content = new_content;
+                    updated = true;
+                }
+                None => {
+                    eprintln!(
+                        "WARNING: {start} marker not found in {}; skipping {name} update",
+                        path.display()
+                    );
+                }
             }
-            None => {
-                eprintln!(
-                    "WARNING: {BENCH_WARM_START} marker not found in {}; skipping warm update",
-                    path.display()
-                );
-            }
+        }
+
+        if updated {
+            std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Where a run's record and performance-page blocks go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ArchiveMode {
+    /// Append the record to the tracked archive and update the tracked page.
+    Write,
+    /// Touch neither: write both into the run's output directory
+    /// ([`Deferred`]) for whoever fetches the run to apply.
+    Defer,
+}
+
+/// What a deferred run leaves in its output directory in place of writing the
+/// tracked archive and page.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Deferred {
+    /// The archive the record belongs to: `{archive_key}.json`.
+    archive_key: String,
+    /// The run's record; `None` for a run that is not comparable to the
+    /// archived ones, which the archive never takes.
+    record: Option<RunRecord>,
+    /// The page blocks.
+    page: PageBlocks,
+}
+
+impl Deferred {
+    /// The deferred output of `report`, its `record` going to the archive
+    /// `archive_key`.
+    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, report: &BenchReport) -> Self {
+        Self {
+            archive_key: archive_key.to_string(),
+            record,
+            page: PageBlocks::of(report),
         }
     }
 
-    if updated {
-        std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+    /// Writes this into `output_dir`.
+    pub(crate) fn write(&self, output_dir: &Path) -> Result<(), String> {
+        let path = output_dir.join(DEFERRED_FILE);
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("serialize {}: {e}", path.display()))?;
+        std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
     }
 
-    Ok(())
+    /// What a run left in `output_dir`; `None` for a directory with none (a
+    /// run that was not deferred).
+    #[expect(clippy::disallowed_methods, reason = "reads a file the bench wrote")]
+    pub(crate) fn read(output_dir: &Path) -> Result<Option<Self>, String> {
+        let path = output_dir.join(DEFERRED_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&contents)
+            .map(Some)
+            .map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    /// Appends the record to the archive in `archive_dir` and writes the
+    /// blocks into `page`, as a local run does. Safe to repeat, see
+    /// [`append_record`]. A `page` that does not exist is left alone.
+    pub(crate) fn apply(self, archive_dir: &Path, page: &Path) -> Result<(), String> {
+        if let Some(record) = self.record {
+            append_record(archive_dir, &self.archive_key, record)?;
+            eprintln!(
+                "bench: run record is in {}",
+                archive_dir
+                    .join(format!("{}.json", self.archive_key))
+                    .display()
+            );
+        }
+        if page.exists() {
+            self.page.apply(page)?;
+            eprintln!("bench: updated {}", page.display());
+        }
+        Ok(())
+    }
 }
 
 /// Appends a compact run record to the per-registry JSON archive.
 ///
 /// The file at `results_dir/{registry_key}.json` is a JSON array of
 /// `RunRecord` values. If the file does not exist, it is created with
-/// `[record]`. If it exists, the record is appended. If the file
-/// contains invalid JSON, an error is returned (never silently
-/// overwrite corrupt data).
+/// `[record]`. If it exists, the record is appended, unless the file already
+/// has a record with its timestamp: a run is recorded once, however many
+/// times its record is applied. If the file contains invalid JSON, an error is
+/// returned (never silently overwrite corrupt data).
 #[expect(
     clippy::disallowed_methods,
     reason = "reads a record file the bench wrote"
@@ -1260,6 +1348,9 @@ pub(crate) fn append_record(
         Vec::new()
     };
 
+    if records.iter().any(|r| r.timestamp == record.timestamp) {
+        return Ok(());
+    }
     records.push(record);
 
     let json = serde_json::to_string_pretty(&records)
@@ -1614,6 +1705,81 @@ mod tests {
         assert!(append_record(dir.path(), "ecr", record).is_err());
     }
 
+    fn sample_record() -> RunRecord {
+        RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        )
+    }
+
+    #[test]
+    fn append_record_skips_a_timestamp_already_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        append_record(dir.path(), "ecr", sample_record()).unwrap();
+        append_record(dir.path(), "ecr", sample_record()).unwrap();
+
+        let path = dir.path().join("ecr.json");
+        let records: Vec<RunRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+
+        // A different run is still appended.
+        let mut later = sample_record();
+        later.timestamp = "2026-04-16-100000".into();
+        append_record(dir.path(), "ecr", later).unwrap();
+        let records: Vec<RunRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn a_deferred_run_is_applied_once_however_often_it_is_fetched() {
+        let run = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let page = local.path().join("performance.md");
+        let marked = "<!-- BENCH:START -->\nold\n<!-- BENCH:END -->\n";
+        std::fs::write(&page, marked).unwrap();
+
+        // A directory with no deferred output has nothing to apply.
+        assert!(Deferred::read(run.path()).unwrap().is_none());
+
+        let report = sample_report();
+        Deferred::new("ecr", Some(sample_record()), &report)
+            .write(run.path())
+            .unwrap();
+
+        for _ in 0..2 {
+            Deferred::read(run.path())
+                .unwrap()
+                .unwrap()
+                .apply(local.path(), &page)
+                .unwrap();
+        }
+
+        let archive = local.path().join("ecr.json");
+        let records: Vec<RunRecord> =
+            serde_json::from_str(&std::fs::read_to_string(archive).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        let content = std::fs::read_to_string(&page).unwrap();
+        assert!(content.contains("Measured 2026-04-15"), "{content}");
+        assert!(!content.contains("\nold\n"), "{content}");
+        assert_eq!(content.matches("Measured").count(), 1);
+    }
+
+    #[test]
+    fn a_deferred_run_not_comparable_to_the_archive_appends_no_record() {
+        let local = tempfile::tempdir().unwrap();
+        let page = local.path().join("performance.md");
+        Deferred::new("ecr", None, &sample_report())
+            .apply(local.path(), &page)
+            .unwrap();
+        assert!(!local.path().join("ecr.json").exists());
+        // A page that does not exist is not created.
+        assert!(!page.exists());
+    }
+
     #[test]
     fn summary_markdown_single_tool_no_bold() {
         let report = BenchReport {
@@ -1707,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn update_performance_page_replaces_markers() {
+    fn page_blocks_replaces_markers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
         std::fs::write(
@@ -1717,7 +1883,7 @@ mod tests {
         .unwrap();
 
         let report = sample_report();
-        update_performance_page(&path, &report).unwrap();
+        PageBlocks::of(&report).apply(&path).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("<!-- BENCH:START -->"));
@@ -1728,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn update_performance_page_missing_markers_is_ok() {
+    fn page_blocks_missing_markers_is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
         let original = "# Performance\n\nNo markers here.\n";
@@ -1736,7 +1902,7 @@ mod tests {
 
         let report = sample_report();
         // Missing markers warn instead of failing: both are optional.
-        update_performance_page(&path, &report).unwrap();
+        PageBlocks::of(&report).apply(&path).unwrap();
         // File should be unchanged.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
@@ -1951,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn update_performance_page_reversed_markers_returns_error() {
+    fn page_blocks_reversed_markers_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
         std::fs::write(
@@ -1961,12 +2127,12 @@ mod tests {
         .unwrap();
 
         let report = sample_report();
-        let err = update_performance_page(&path, &report).unwrap_err();
+        let err = PageBlocks::of(&report).apply(&path).unwrap_err();
         assert!(err.contains("must appear before"), "err: {err}");
     }
 
     #[test]
-    fn update_performance_page_both_cold_and_warm() {
+    fn page_blocks_both_cold_and_warm() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
         std::fs::write(
@@ -2013,7 +2179,7 @@ mod tests {
                 ),
             ],
         };
-        update_performance_page(&path, &report).unwrap();
+        PageBlocks::of(&report).apply(&path).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("old cold"));
@@ -2024,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn update_performance_page_warm_only() {
+    fn page_blocks_warm_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("performance.md");
         std::fs::write(
@@ -2058,7 +2224,7 @@ mod tests {
                 }],
             )],
         };
-        update_performance_page(&path, &report).unwrap();
+        PageBlocks::of(&report).apply(&path).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         // Cold section should be untouched.
@@ -2159,7 +2325,7 @@ mod tests {
     #[test]
     fn scenario_markdown_includes_referrer_footnote_when_present() {
         // Parity with summary.md: the docs performance.md snippet (via
-        // update_performance_page -> scenario_markdown) must also surface
+        // PageBlocks -> scenario_markdown) must also surface
         // referrers when ocync is in the run.
         let report = BenchReport {
             baseline: None,
