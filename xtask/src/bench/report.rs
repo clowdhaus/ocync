@@ -928,7 +928,8 @@ struct Cell {
     /// How many runs the spread is over.
     runs: usize,
     /// The median, followed by the lowest and highest in brackets when there
-    /// is more than one run. For an `a/b` row the range is of `a`.
+    /// is more than one run. For an `a/b` row the brackets hold both ranges,
+    /// `(a_low..a_high / b_low..b_high)`.
     text: String,
 }
 
@@ -936,13 +937,16 @@ struct Cell {
 fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
     let spread = spread_of(runs.iter().filter_map(|r| (row.rank)(r)))?;
     let shown = |value: f64| (row.format)(value.round() as u64);
+    let range = |s: &stats::Spread| format!("{}..{}", shown(s.min), shown(s.max));
     let mut text = shown(spread.median);
+    let mut ranges = range(&spread);
     if let Some(of) = row.of {
         let denominator = spread_of(runs.iter().filter_map(|r| of(r)))?;
         text = format!("{text}/{}", shown(denominator.median));
+        ranges = format!("{ranges} / {}", range(&denominator));
     }
     if runs.len() > 1 {
-        text = format!("{text} ({}..{})", shown(spread.min), shown(spread.max));
+        text = format!("{text} ({ranges})");
     }
     Some(Cell {
         spread,
@@ -1864,6 +1868,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn appending_leaves_an_old_records_floats_as_written() {
+        // Catches: a float that does not round-trip through `f64` parsing
+        // being rewritten (`2.5753332589999998` as `2.575333259`).
+        let dir = tempfile::tempdir().unwrap();
+        let old = serde_json::to_string_pretty(&[sample_record()])
+            .unwrap()
+            .replacen(
+                "\"wall_clock_secs\": 47.0",
+                "\"wall_clock_secs\": 2.5753332589999998",
+                1,
+            );
+        assert!(old.contains("2.5753332589999998"), "{old}");
+        std::fs::write(dir.path().join("ecr.json"), &old).unwrap();
+
+        let mut later = sample_record();
+        later.timestamp = "2026-04-16-100000".into();
+        append_record(dir.path(), "ecr", later).unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("ecr.json")).unwrap();
+        assert!(after.contains("2.5753332589999998"), "{after}");
+    }
+
+    #[test]
     fn a_deferred_run_is_applied_once_however_often_it_is_fetched() {
         let run = tempfile::tempdir().unwrap();
         let local = tempfile::tempdir().unwrap();
@@ -2666,6 +2693,44 @@ pub(crate) mod tests {
         assert!(
             md.contains("Referrers calls -- ocync: 0, ocync@0123456: 105,"),
             "{md}"
+        );
+    }
+
+    #[test]
+    fn a_paired_cell_shows_the_range_of_both_values() {
+        // Catches: the second value's spread dropped, as when a round with 69
+        // CDN misses and another with 320 mount attempts read `1072/0 (..)`.
+        let mut report = five_rounds(3);
+        let paired = [
+            (1003, 69, 320, 300),
+            (1072, 0, 355, 300),
+            (1072, 0, 356, 300),
+        ];
+        for (scenario, (hits, misses, attempts, successes)) in
+            report.scenarios.iter_mut().zip(paired)
+        {
+            let metrics = scenario.runs[0].proxy_metrics.as_mut().unwrap();
+            metrics.cdn_hits = hits;
+            metrics.cdn_misses = misses;
+            metrics.mount_attempts = attempts;
+            metrics.mount_successes = successes;
+        }
+        let md = summary_markdown(&report);
+
+        assert!(
+            md.contains("| CDN hits/misses | **1072/0 (1003..1072 / 0..69)** |"),
+            "{md}"
+        );
+        // Only the second value varies in the successes/attempts row.
+        assert!(
+            md.contains("| Mounts (success/attempt) | **300/355 (300..300 / 320..356)** |"),
+            "{md}"
+        );
+        // A single run keeps the plain cell.
+        let single = summary_markdown(&sample_report_with_metrics());
+        assert!(
+            single.contains("| Mounts (success/attempt) | **362/379** |"),
+            "{single}"
         );
     }
 
