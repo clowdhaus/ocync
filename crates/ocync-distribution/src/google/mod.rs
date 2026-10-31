@@ -3,11 +3,13 @@
 //!
 //! The credentials come from the file `GOOGLE_APPLICATION_CREDENTIALS`
 //! names, else from gcloud's well-known file, else from the metadata server
-//! of the GCE or GKE host. Loading finds only a file; the metadata server is
-//! [`Credentials::metadata`], which a caller that reads anonymously without
-//! one first asks [`is_on_google_cloud`] whether to use. A file holds a service account key, an authorized
-//! user's refresh token, an external account (Workload Identity Federation)
-//! or a service account impersonated with any of those.
+//! of the GCE or GKE host. Loading finds only a file. The metadata server is
+//! [`Credentials::metadata`](crate::google::Credentials::metadata); a caller
+//! that can fall back to anonymous asks
+//! [`is_on_google_cloud`](crate::google::is_on_google_cloud) first. A file
+//! holds a service account key, an authorized user's refresh token, an
+//! external account (Workload Identity Federation) or a service account
+//! impersonated with any of those.
 
 mod aws_source;
 mod external_account;
