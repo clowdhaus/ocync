@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync finishes a cold sync to ECR about 3 times faster than regsync and 4 times faster than dregsy, with fewer requests, about 10 GB fewer bytes than regsync, and cross-repo blob mounting.
+description: How ocync finishes a cold sync to ECR about 2.9 times faster than regsync, with 27% fewer requests, about 10 GB fewer bytes, and cross-repo blob mounting.
 order: 6
 ---
 
@@ -8,39 +8,40 @@ order: 6
 
 <!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
 <!-- BENCH:START -->
-Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 55 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-10-31 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 54 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement. 4 of 5 rounds (stopped), the tool order shuffled in each. A cell is the median over the rounds, with the lowest and highest in brackets.
 
-| Metric | ocync | dregsy | regsync |
+| Metric | ocync | ocync@7634416 | regsync |
 |---|---:|---:|---:|
-| Wall clock | **4m 10s** | 18m 5s | 12m 29s |
-| Peak RSS | 54.2 MB | 344.2 MB | **27.6 MB** |
-| Requests | **6995** | 11541 | 9588 |
-| Response bytes | 55.0 GB | **54.9 GB** | 65.1 GB |
-| Source blob GETs | 1428 | **1399** | 1692 |
-| Source blob bytes | 55.0 GB | **54.9 GB** | 65.1 GB |
-| Mounts (success/attempt) | **356/356** | 341/341 | 0/0 |
-| Duplicate blob GETs | **0** | 48 | **0** |
-| CDN hits/misses | 898/174 | 546/504 | **1006/2** |
-| Rate-limit 429s | **0** | **0** | **0** |
+| Wall clock | 4m 9s (4m 8s..4m 12s) | **3m 31s (3m 27s..3m 35s)** | 12m (11m 51s..12m 9s) |
+| Peak RSS | 55.8 MB (52.6 MB..59.7 MB) | 64.5 MB (63.2 MB..66.3 MB) | **28.2 MB (27.9 MB..28.5 MB)** |
+| Requests | **6999 (6994..7036)** | 7596 (7582..7602) | 9566 (9565..9567) |
+| Response bytes | 55.0 GB (55.0 GB..55.0 GB) | **55.0 GB (55.0 GB..55.0 GB)** | 65.1 GB (65.1 GB..65.1 GB) |
+| Source blob GETs | **1428 (1428..1428)** | 1443 (1443..1443) | 1692 (1692..1692) |
+| Source blob bytes | **55.0 GB (55.0 GB..55.0 GB)** | 55.0 GB (55.0 GB..55.0 GB) | 65.1 GB (65.1 GB..65.1 GB) |
+| Mounts (success/attempt) | 352/356 (315..354) | **489/489 (483..502)** | 0/0 (0..0) |
+| Duplicate blob GETs | 0 (0..0) | 0 (0..0) | 0 (0..0) |
+| CDN hits/misses | 1072/0 (1003..1072) | **1082/0 (1078..1082)** | 1008/0 (1008..1008) |
+| Rate-limit 429s | 0 (0..0) | 0 (0..0) | 0 (0..0) |
+
+Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is the lowest to the highest of 4 rounds and holds the true median ratio with 87.50% confidence. No verdict is given below 5 rounds.
+
+| Tool | Metric | Median ratio | Range |
+|---|---|---:|---:|
+| ocync@7634416 | Wall clock | 0.85 | 0.83..0.87 |
+| ocync@7634416 | Requests | 1.09 | 1.08..1.09 |
+| ocync@7634416 | Response bytes | 1.00 | 1.00..1.00 |
+| regsync | Wall clock | 2.88 | 2.87..2.90 |
+| regsync | Requests | 1.37 | 1.36..1.37 |
+| regsync | Response bytes | 1.18 | 1.18..1.18 |
 
 > **Artifact sync (OCI 1.1 referrers).** ocync issues `GET /v2/<repo>/referrers/...` to discover attestations (SBOM, SLSA) and transfers any referenced artifacts. Comparable tools do not implement this. The Source blob GETs and Source blob bytes columns above include this artifact content for ocync.
 >
-> Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
+> Referrers calls -- ocync: 52, ocync@7634416: 54, regsync: 0.
 <!-- BENCH:END -->
 
-The 30 October 2026 run (ocync 0.8.2) was one run per tool, in the order ocync, dregsy, regsync. It was made before the corpus lock and the per-tool content check existed, so whether the three tools copied identical content was not checked. Its CDN misses were uneven: 174 for ocync, 504 for dregsy and 2 for regsync. Separately, the pre-warm read only each image's first tag, and 11 images in the corpus sync more than one version. The [benchmark design](/design/benchmark) describes the fixes, and repeated rounds that replace single runs.
+The fifth round stopped when a source tag was republished mid-round. `ocync@7634416` is ocync as of April 2026. It finishes about 15% sooner because it syncs 50 images at once; today's default is 10. April makes 9% more requests and uploads 58.9 GB per round against 55.0 GB at 10. Raising the cap shortens the sync but loses cross-repo mounts ([#230](https://github.com/clowdhaus/ocync/issues/230)).
 
-Two comparison runs exist from code with the fix that ended ocync's 429s. The 26 April run measured that change's branch about an hour before it merged, on a commit no longer in the repository's history; the 30 October run measured `main`. Their corpora differ (51 and 55 tags, and most tags then tracked `latest`, so the content differed too), so they are two data points, not a series.
-
-| | 26 April | 30 October |
-|---|---:|---:|
-| ocync speed vs regsync, cold | 3.39x | 2.99x |
-| ocync speed vs dregsy, cold | 3.99x | 4.33x |
-| Requests: ocync / dregsy / regsync | 7373 / 11301 / 9532 | 6995 / 11541 / 9588 |
-| Response bytes: ocync / dregsy / regsync | 55.4 / 55.3 / 65.3 GB | 55.0 / 54.9 / 65.1 GB |
-| 429s, any tool | 0 | 0 |
-
-ocync moved about 10 GB less than regsync and slightly more than dregsy. Only ECR has been measured as a target.
+dregsy is left out: the content check found it rewrote 2 of the 54 images. Earlier dregsy figures predate that check. Only ECR has been measured as a target.
 
 ## How tools compare
 
@@ -77,20 +78,31 @@ ocync moved about 10 GB less than regsync and slightly more than dregsy. Only EC
 ### Warm sync efficiency
 
 <!-- BENCH-WARM:START -->
-Measured 2026-10-30 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 55 tags. Warm sync (no changes) to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement.
+Measured 2026-10-31 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 40 images, 54 tags. Warm sync (no changes) to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement. 4 of 5 rounds (stopped), the tool order shuffled in each. A cell is the median over the rounds, with the lowest and highest in brackets.
 
-| Metric | ocync | dregsy | regsync |
+| Metric | ocync | ocync@7634416 | regsync |
 |---|---:|---:|---:|
-| Wall clock | **2s** | 1m 46s | 11s |
-| Peak RSS | **17.3 MB** | 36.8 MB | 20.7 MB |
-| Requests | **156** | 3486 | 179 |
-| Response bytes | 143.1 KB | 2.0 MB | **128.3 KB** |
-| Source blob GETs | **0** | 279 | **0** |
-| Source blob bytes | 133.7 KB | 2.0 MB | **128.3 KB** |
-| Mounts (success/attempt) | **0/0** | **0/0** | **0/0** |
-| Duplicate blob GETs | **0** | 48 | **0** |
-| CDN hits/misses | 0/0 | **225/0** | 0/0 |
-| Rate-limit 429s | **0** | **0** | **0** |
+| Wall clock | 2s (2s..2s) | **2s (2s..2s)** | 12s (11s..12s) |
+| Peak RSS | **16.9 MB (16.8 MB..17.1 MB)** | 18.5 MB (18.3 MB..18.7 MB) | 20.9 MB (20.6 MB..21.1 MB) |
+| Requests | 154 (154..154) | 154 (154..154) | 177 (177..177) |
+| Response bytes | 143.1 KB (143.1 KB..143.1 KB) | 143.1 KB (143.1 KB..143.1 KB) | **128.3 KB (128.3 KB..128.3 KB)** |
+| Source blob GETs | 0 (0..0) | 0 (0..0) | 0 (0..0) |
+| Source blob bytes | 133.7 KB (133.7 KB..133.7 KB) | 133.7 KB (133.7 KB..133.7 KB) | **128.3 KB (128.3 KB..128.3 KB)** |
+| Mounts (success/attempt) | 0/0 (0..0) | 0/0 (0..0) | 0/0 (0..0) |
+| Duplicate blob GETs | 0 (0..0) | 0 (0..0) | 0 (0..0) |
+| CDN hits/misses | 0/0 (0..0) | 0/0 (0..0) | 0/0 (0..0) |
+| Rate-limit 429s | 0 (0..0) | 0 (0..0) | 0 (0..0) |
+
+Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is the lowest to the highest of 4 rounds and holds the true median ratio with 87.50% confidence. No verdict is given below 5 rounds.
+
+| Tool | Metric | Median ratio | Range |
+|---|---|---:|---:|
+| ocync@7634416 | Wall clock | 0.99 | 0.99..1.00 |
+| ocync@7634416 | Requests | 1.00 | 1.00..1.00 |
+| ocync@7634416 | Response bytes | 1.00 | 1.00..1.00 |
+| regsync | Wall clock | 4.97 | 4.71..5.27 |
+| regsync | Requests | 1.15 | 1.15..1.15 |
+| regsync | Response bytes | 0.90 | 0.90..0.90 |
 <!-- BENCH-WARM:END -->
 
 `ocync` skips tag enumeration when exact tags are configured (no wildcard, semver, or latest filters), using the configured tag names directly instead of paginating through the registry's full tag list. Combined with the transfer state cache and source manifest HEAD checks, this reduces a no-op warm sync to ~150 requests regardless of how many tags exist at the source.
