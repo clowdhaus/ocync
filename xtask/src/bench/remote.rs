@@ -60,6 +60,8 @@ pub(crate) struct BenchRemoteArgs {
             "force",
             "git_ref",
             "tools",
+            "baseline_ref",
+            "rounds",
             "scenario",
             "limit",
             "skip_registries",
@@ -149,6 +151,10 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // Decided before the push, so a provider with no setup is refused before
     // anything leaves this machine.
     let registry_env = registry_env(args.provider)?;
+    args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    if let Some(commit) = &args.tool_selection.baseline_ref {
+        ensure_on_origin(Path::new("."), commit)?;
+    }
 
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
@@ -173,7 +179,12 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     let mut bench_args = vec![
         "--tools".to_string(),
         join_tools(&args.tool_selection.tools),
+        "--rounds".to_string(),
+        args.tool_selection.rounds.to_string(),
     ];
+    if let Some(commit) = &args.tool_selection.baseline_ref {
+        bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
+    }
     if let Some(limit) = args.limit {
         bench_args.extend(["--limit".to_string(), limit.to_string()]);
     }
@@ -566,11 +577,10 @@ echo "[bench-remote] exit code: $BENCH_EXIT"
 exit "$BENCH_EXIT""#;
 
 /// Removes untracked files left by previous builds, keeping the build cache,
-/// results and the run's own files. The run-file pattern is quoted so the
+/// results, the baseline checkouts and the run's own files. The run-file pattern is quoted so the
 /// shell cannot expand it against the files present. Runs with fd 9 closed
 /// like every git command in the script, see [`remote_script`].
-const GIT_CLEAN: &str =
-    "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/ 9>&-";
+const GIT_CLEAN: &str = "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/ -e bench/.baseline/ 9>&-";
 
 /// Shell that starts the benchmark runner in the background in the script's
 /// own process group, passing `bench_args` as one quoted word each so no
@@ -704,17 +714,13 @@ exit $EXIT
     )
 }
 
-/// Runs `git rev-parse` with `args` in `repo` and returns its trimmed output,
-/// or an error carrying git's own message.
-fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .arg("rev-parse")
-        .args(args)
-        .output()?;
+/// Runs `git` with `args` in `repo` and returns its trimmed output, or an error
+/// carrying git's own message.
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git").current_dir(repo).args(args).output()?;
     if !output.status.success() {
         return Err(format!(
-            "git rev-parse {} failed: {}",
+            "git {} failed: {}",
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         )
@@ -723,12 +729,51 @@ fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::erro
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
+/// Runs `git rev-parse` with `args` in `repo`.
+fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    git(repo, &[&["rev-parse"], args].concat())
+}
+
+/// Fails unless a remote branch holds `commit`, as of a fetch now. The
+/// instance fetches from origin, so a commit only this machine has cannot be
+/// built there.
+fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::error::Error>> {
+    // Pruning drops the tracking ref of a branch deleted on origin, and the
+    // pattern leaves out the branches of any other remote.
+    git(repo, &["fetch", "--prune", "origin"])?;
+    let sha = commit.to_string();
+    if git(
+        repo,
+        &["branch", "-r", "--contains", &sha, "--list", "origin/*"],
+    )?
+    .is_empty()
+    {
+        return Err(format!(
+            "the baseline commit {sha} is not on origin, where the instance fetches from; \
+             push it first"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// A full commit object name: 40 lowercase hex digits, safe to place in a
 /// shell command unescaped.
-#[derive(Debug)]
-struct CommitSha(String);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommitSha(String);
 
 impl CommitSha {
+    /// A fixed id for tests that name a commit but never look one up.
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self("0123456789abcdef0123456789abcdef01234567".to_owned())
+    }
+
+    /// The leading 7 digits, for a label a reader can type.
+    pub(crate) fn short(&self) -> &str {
+        &self.0[..7]
+    }
+
     /// Accepts only 40 lowercase hex digits.
     fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
         if s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -746,7 +791,10 @@ impl std::fmt::Display for CommitSha {
 }
 
 /// Resolves `git_ref` to the commit it names in the repository at `repo`.
-fn resolve_commit(repo: &Path, git_ref: &str) -> Result<CommitSha, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_commit(
+    repo: &Path,
+    git_ref: &str,
+) -> Result<CommitSha, Box<dyn std::error::Error>> {
     CommitSha::parse(&git_rev_parse(
         repo,
         &["--verify", &format!("{git_ref}^{{commit}}")],
@@ -756,6 +804,28 @@ fn resolve_commit(repo: &Path, git_ref: &str) -> Result<CommitSha, Box<dyn std::
 /// Get the current local git branch name.
 fn current_branch() -> Result<String, Box<dyn std::error::Error>> {
     git_rev_parse(Path::new("."), &["--abbrev-ref", "HEAD"])
+}
+
+/// Runs `git` in `repo` for a test, asserting it succeeds. Anything of the
+/// developer's own config is kept out of the run.
+#[cfg(test)]
+pub(crate) fn git_in(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(repo)
+        // A developer's gpgsign, hooks or templates must not reach the test.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "user.name=bench",
+            "-c",
+            "user.email=bench@example.com",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 #[cfg(test)]
@@ -809,41 +879,83 @@ mod tests {
         }
     }
 
-    fn git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .current_dir(repo)
-            // A developer's gpgsign, hooks or templates must not reach the test.
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args([
-                "-c",
-                "user.name=bench",
-                "-c",
-                "user.email=bench@example.com",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git {args:?}: {output:?}");
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
     #[test]
     fn resolve_commit_follows_the_ref_not_head() {
         let repo = tempfile::tempdir().unwrap();
-        git(repo.path(), &["init", "-q", "-b", "main"]);
-        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
-        git(repo.path(), &["branch", "other"]);
-        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
-        let other = git(repo.path(), &["rev-parse", "other"]);
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(repo.path(), &["branch", "other"]);
+        git_in(repo.path(), &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let other = git_in(repo.path(), &["rev-parse", "other"]);
 
         let resolved = resolve_commit(repo.path(), "other").unwrap();
 
         assert_eq!(resolved.to_string(), other);
         assert_ne!(
             resolved.to_string(),
-            git(repo.path(), &["rev-parse", "HEAD"])
+            git_in(repo.path(), &["rev-parse", "HEAD"])
         );
+    }
+
+    #[test]
+    fn a_baseline_commit_must_be_on_origin_before_the_instance_is_asked_for_it() {
+        let origin = tempfile::tempdir().unwrap();
+        git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let work = tempfile::tempdir().unwrap();
+        git_in(work.path(), &["init", "-q", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            work.path(),
+            &["commit", "-q", "--allow-empty", "-m", "pushed"],
+        );
+        git_in(work.path(), &["push", "-q", "origin", "main"]);
+        let pushed = resolve_commit(work.path(), "HEAD").unwrap();
+        git_in(
+            work.path(),
+            &["commit", "-q", "--allow-empty", "-m", "local only"],
+        );
+        let local = resolve_commit(work.path(), "HEAD").unwrap();
+
+        // Catches: a baseline only this machine has, which the instance could
+        // not fetch, failing after the push and the build.
+        assert!(ensure_on_origin(work.path(), &pushed).is_ok());
+        let pushed_ref = &pushed.to_string();
+        let refused = |commit: &CommitSha| {
+            ensure_on_origin(work.path(), commit)
+                .unwrap_err()
+                .to_string()
+        };
+        let not_on_origin = |commit: &CommitSha| {
+            format!(
+                "the baseline commit {commit} is not on origin, where the instance fetches \
+                 from; push it first"
+            )
+        };
+        assert_eq!(refused(&local), not_on_origin(&local));
+
+        // Catches: a commit only another remote has, and one on a branch since
+        // deleted on origin, both of which the instance cannot fetch.
+        let fork = tempfile::tempdir().unwrap();
+        git_in(fork.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "fork", fork.path().to_str().unwrap()],
+        );
+        git_in(work.path(), &["push", "-q", "fork", "main"]);
+        assert_eq!(refused(&local), not_on_origin(&local));
+
+        git_in(work.path(), &["push", "-q", "origin", "main:gone"]);
+        assert!(ensure_on_origin(work.path(), &local).is_ok());
+        // Deleted at origin itself, so only a pruning fetch drops the tracking ref.
+        git_in(origin.path(), &["branch", "-q", "-D", "gone"]);
+        git_in(
+            origin.path(),
+            &["update-ref", "refs/heads/main", pushed_ref],
+        );
+        assert_eq!(refused(&local), not_on_origin(&local));
     }
 
     #[test]
@@ -868,10 +980,14 @@ mod tests {
     #[test]
     fn fetch_conflicts_with_every_run_option() {
         use clap::Parser;
+        let head =
+            crate::bench::command_stdout(Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
         for extra in [
             &["--force"][..],
             &["--git-ref", "main"][..],
             &["--tools", "ocync"][..],
+            &["--rounds", "3"][..],
+            &["--baseline-ref", &head][..],
             &["--scenario", "sync"][..],
             &["--limit", "3"][..],
             &["--skip-registries", "docker.io"][..],
@@ -1094,7 +1210,7 @@ mod tests {
     #[test]
     fn git_clean_keeps_the_run_files_and_removes_strays() {
         let repo = tempfile::tempdir().unwrap();
-        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
         let bench = repo.path().join("bench");
         std::fs::create_dir(&bench).unwrap();
         let run_files = ["lock", "log", "pgid", "sh", "exit"].map(|ext| {
@@ -1102,6 +1218,9 @@ mod tests {
             std::fs::write(&file, "").unwrap();
             file
         });
+        let baseline_build = bench.join(".baseline/0123456/target/release/ocync");
+        std::fs::create_dir_all(baseline_build.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_build, "").unwrap();
         let stray = bench.join("stray");
         std::fs::write(&stray, "").unwrap();
 
@@ -1117,6 +1236,7 @@ mod tests {
         for file in &run_files {
             assert!(file.exists(), "{} was cleaned", file.display());
         }
+        assert!(baseline_build.exists(), "the baseline build was cleaned");
         assert!(!stray.exists(), "the stray file survived");
     }
 

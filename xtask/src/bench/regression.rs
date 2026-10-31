@@ -30,6 +30,16 @@ pub(crate) struct Baseline {
     /// was recorded, which therefore compare against no run.
     #[serde(default)]
     pub(crate) corpus: CorpusInfo,
+    /// Rounds the figures are the median of. A median over other rounds has
+    /// another spread, so two are not compared. One in baselines saved before
+    /// rounds, which were a single run.
+    #[serde(default = "one_round")]
+    pub(crate) rounds: u32,
+}
+
+/// The rounds of a baseline saved before rounds were recorded.
+fn one_round() -> u32 {
+    1
 }
 
 /// Result of comparing a current run against a stored baseline.
@@ -48,7 +58,8 @@ pub(crate) struct RegressionResult {
 ///
 /// Refuses when the two were recorded under different corpus locks, the
 /// baseline under none, or over a different number of images or tags: they
-/// synced different content, so a delta is not a regression. `baseline_path` names the file to replace.
+/// synced different content, so a delta is not a regression. Refuses a
+/// different number of rounds too. `baseline_path` names the file to replace.
 ///
 /// Returns percentage deltas computed as `(current - baseline) / baseline * 100`.
 /// Zero baselines return a delta of `0.0` to avoid division by zero.
@@ -74,6 +85,16 @@ pub(crate) fn compare(
             show(&current.corpus_locked_at),
             current.corpus.images,
             current.corpus.tags,
+            baseline_path.display()
+        ));
+    }
+    if current.rounds != baseline.rounds {
+        return Err(format!(
+            "{} was recorded over {} rounds, this run over {}; record a new baseline by \
+             deleting {} and rerunning",
+            baseline_path.display(),
+            baseline.rounds,
+            current.rounds,
             baseline_path.display()
         ));
     }
@@ -189,6 +210,7 @@ mod tests {
                 images: 40,
                 tags: 55,
             },
+            rounds: 5,
         }
     }
 
@@ -310,6 +332,7 @@ mod tests {
                 images: 40,
                 tags: 55,
             },
+            rounds: 5,
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         save_baseline(tmpfile.path(), &baseline).unwrap();
@@ -379,6 +402,41 @@ mod tests {
                 assert!(e.contains("deleting results/b.json"), "{e}");
             }
         }
+    }
+
+    #[test]
+    fn a_baseline_over_other_rounds_is_not_compared_and_an_old_one_is_one_round() {
+        // Catches: a median of 5 rounds compared with one run, and a baseline
+        // saved before rounds failing to load.
+        let stored = Baseline {
+            rounds: 3,
+            ..baseline(1.0, 1, 1)
+        };
+        let err = compare(
+            &baseline(1.0, 1, 1),
+            &stored,
+            20,
+            Path::new("results/b.json"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err,
+            "results/b.json was recorded over 3 rounds, this run over 5; record a new \
+             baseline by deleting results/b.json and rerunning"
+        );
+        assert!(
+            compare(
+                &baseline(1.0, 1, 1),
+                &baseline(1.0, 1, 1),
+                20,
+                Path::new("b")
+            )
+            .is_ok()
+        );
+
+        let old = r#"{"wall_clock_secs": 1.0, "requests": 1, "total_bytes": 1}"#;
+        assert_eq!(serde_json::from_str::<Baseline>(old).unwrap().rounds, 1);
     }
 
     #[test]
