@@ -11,7 +11,7 @@ Sync OCI container images across registries - efficiently.
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.94.0.html)
 [![ECR Public](https://img.shields.io/badge/ECR_Public-clowdhaus%2Focync-ff9900.svg?logo=amazonecs)](https://gallery.ecr.aws/clowdhaus/ocync)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. In a cold sync of a 55 GB corpus to ECR, over 4 rounds, it finished about 2.9 times faster than regsync, made 27% fewer requests and moved about 10 GB (15%) less, and no tool drew a 429. See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. In 4 rounds of a cold sync of a 55 GB corpus to ECR, it finished 2.87 to 2.90 times faster than regsync, made about 27% fewer requests and moved about 10 GB (15%) less, and no tool drew a 429. See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
 
 ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job. Multi-architecture indexes, manifests, blobs, and OCI 1.1 referrers (signatures, SBOMs, attestations) all flow through bit-for-bit.
 

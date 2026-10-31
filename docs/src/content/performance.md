@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: How ocync finishes a cold sync to ECR about 2.9 times faster than regsync, with 27% fewer requests, about 10 GB fewer bytes, and cross-repo blob mounting.
+description: How ocync finishes a cold sync to ECR 2.87 to 2.90 times faster than regsync in 4 rounds, with about 27% fewer requests and about 10 GB fewer bytes, and cross-repo blob mounting.
 order: 6
 ---
 
@@ -39,9 +39,11 @@ Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is 
 > Referrers calls -- ocync: 52, ocync@7634416: 54, regsync: 0.
 <!-- BENCH:END -->
 
-The fifth round stopped when a source tag was republished mid-round. `ocync@7634416` is ocync as of April 2026. It finishes about 15% sooner because it syncs 50 images at once; today's default is 10. April makes 9% more requests and uploads 58.9 GB per round against 55.0 GB at 10. Raising the cap shortens the sync but loses cross-repo mounts ([#230](https://github.com/clowdhaus/ocync/issues/230)).
+`ocync` is `main` at 67c1676; `ocync@7634416` is ocync as of April 2026. The fifth round stopped when a source tag was republished mid-round. CDN misses the medians above do not show: ocync 69 in round 1, when it also made 320 mount attempts against 355 to 356 in the other rounds, and the April build 4 in round 3.
 
-dregsy is left out: the content check found it rewrote 2 of the 54 images. Earlier dregsy figures predate that check. Only ECR has been measured as a target.
+The two ocync builds differ in six months of code. One difference is the cap on images synced at once: 50 in April, 10 today. On today's code, raising it from 10 to 50 shortened a cold sync by 11% but uploaded more, because fewer blobs were mounted ([#230](https://github.com/clowdhaus/ocync/issues/230)).
+
+dregsy is left out because its run did not pass the content check, which requires every image to arrive at the digest the corpus lock names. Earlier dregsy figures predate that check. Only ECR has been measured as a target.
 
 ## How tools compare
 
@@ -59,7 +61,7 @@ dregsy is left out: the content check found it rewrote 2 of the 54 images. Earli
 
 | Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
 |------|:---:|:---:|-----|
-| `ocync` | 1 initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429, plus bounded jittered retry (4 attempts) of throttled prepare-phase reads |
+| `ocync` | 10 images at once; per registry, 1 request initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429, plus bounded jittered retry (4 attempts) of throttled prepare-phase reads |
 | containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
 | regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
 | crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |
