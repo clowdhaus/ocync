@@ -1,12 +1,12 @@
 ---
 title: Google Artifact Registry
-description: Using ocync with GAR and legacy GCR via Application Default Credentials.
+description: Using ocync with Artifact Registry, including gcr.io, via Application Default Credentials.
 order: 3
 ---
 
 ## Auth
 
-ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io`, such as `us.gcr.io` or `mirror.gcr.io`) and uses Google Application Default Credentials (ADC):
+ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io`, such as `us.gcr.io` or `mirror.gcr.io`; Artifact Registry has [served `gcr.io`](https://docs.cloud.google.com/artifact-registry/docs/transition/gcr-repositories) since Container Registry shut down) and uses Google Application Default Credentials (ADC):
 
 - `GOOGLE_APPLICATION_CREDENTIALS` pointing at a credentials file: a service account key, an authorized user, a Workload Identity Federation (`external_account`) configuration or an impersonated service account
 - `gcloud auth application-default login` (developer machines)
