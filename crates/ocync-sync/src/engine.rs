@@ -2144,7 +2144,7 @@ async fn transfer_image_blobs(
     };
 
     let blob_sem = Semaphore::new(BLOB_CONCURRENCY);
-    let cancel = Cell::new(false);
+    let cancel = Cancel::default();
     let mut blob_futures = FuturesUnordered::new();
 
     for blob in &blobs {
@@ -2163,7 +2163,7 @@ async fn transfer_image_blobs(
                 BlobClaim::Failed(err) => return BlobResult::Failed(crate::Error::Shared(err)),
                 BlobClaim::Claimed => {}
             }
-            let mount_source = resolve_mount_source(ctx, &digest).await;
+            let mount_source = resolve_mount_source(ctx, &digest, cancel).await;
             let staging_claim = resolve_staging(ctx.staging, &digest).await;
 
             // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
@@ -2193,7 +2193,7 @@ async fn transfer_image_blobs(
             }
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
-                cancel.set(true);
+                cancel.set();
                 outcome.error = Some(err);
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
@@ -2202,6 +2202,37 @@ async fn transfer_image_blobs(
     }
 
     outcome
+}
+
+/// Per-image cancel signal: set when one blob fails so the image's other
+/// blobs stop waiting, including those parked on a claim or mount-source wait.
+#[derive(Default)]
+struct Cancel {
+    flag: Cell<bool>,
+    notify: tokio::sync::Notify,
+}
+
+impl Cancel {
+    fn set(&self) {
+        self.flag.set(true);
+        self.notify.notify_waiters();
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.get()
+    }
+
+    /// Returns once [`set`](Self::set) has run. Interest is registered before
+    /// the flag is read, so a `set` between the two is not lost.
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_set() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// Result of the pre-semaphore blob claim phase.
@@ -2241,7 +2272,7 @@ fn is_local_io(err: &crate::Error) -> bool {
 async fn wait_for_blob_claim(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-    cancel: &Cell<bool>,
+    cancel: &Cancel,
 ) -> BlobClaim {
     let skip = {
         let c = ctx.cache.borrow();
@@ -2254,7 +2285,7 @@ async fn wait_for_blob_claim(
     // A copy that already failed between the same repos fails this one too,
     // unless a mount can avoid the copy.
     loop {
-        if cancel.get() {
+        if cancel.is_set() {
             return BlobClaim::Cancelled;
         }
         if let Some(err) = BlobIoContext::from_ctx(ctx).recorded_failure(digest) {
@@ -2280,7 +2311,10 @@ async fn wait_for_blob_claim(
                     target = %ctx.target_id.alias(),
                     "waiting for in-flight upload of this blob to finish",
                 );
-                notify.notified().await;
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    () = cancel.cancelled() => return BlobClaim::Cancelled,
+                }
                 // A batch check may have populated our repo's state during the wait.
                 let skip = {
                     let c = ctx.cache.borrow();
@@ -2325,6 +2359,7 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
+    cancel: &Cancel,
 ) -> Option<RepositoryName> {
     let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
     loop {
@@ -2355,6 +2390,8 @@ async fn resolve_mount_source(
                 );
                 return None;
             }
+            // The caller reaches `run_under_semaphore`, which sees the flag.
+            () = cancel.cancelled() => return None,
         }
     }
 }
@@ -2384,11 +2421,11 @@ async fn run_under_semaphore(
     digest: &Digest,
     size: u64,
     batch_checked: &HashSet<Digest>,
-    cancel: &Cell<bool>,
+    cancel: &Cancel,
     mount_source: Option<RepositoryName>,
     staging: StagingClaim<'_>,
 ) -> BlobResult {
-    if cancel.get() {
+    if cancel.is_set() {
         io.sink.fail(
             digest.clone(),
             io.target_repo.to_owned(),

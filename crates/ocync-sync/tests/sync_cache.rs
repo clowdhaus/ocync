@@ -152,7 +152,7 @@ async fn sync_warm_cache_mounts_from_a_cached_repo() {
             vec![TagPair::same("v1")],
         );
 
-        // Waiting for repo-a's commit would hold each blob for the 60-second
+        // Waiting for repo-a's commit would hold each blob for the 180-second
         // deadline and then push it.
         let report = tokio::time::timeout(
             Duration::from_secs(10),
