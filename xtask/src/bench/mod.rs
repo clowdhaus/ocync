@@ -3,6 +3,8 @@
 pub(crate) mod config_gen;
 pub(crate) mod corpus;
 pub(crate) mod ecr;
+pub(crate) mod gar;
+pub(crate) mod gcloud;
 pub(crate) mod lock;
 pub(crate) mod proxy;
 pub(crate) mod registry;
@@ -11,6 +13,7 @@ pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
 pub(crate) mod stats;
+pub(crate) mod target;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -30,6 +33,7 @@ use regression::Baseline;
 use remote::CommitSha;
 use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, rounds_of};
 use runner::Tool;
+use target::{BenchTarget, Destination, Store};
 
 /// How many rounds the sync and partial scenarios run, each round running
 /// every tool once in a fresh order.
@@ -466,16 +470,6 @@ impl RegistryKind {
             Self::Other => "other",
         }
     }
-
-    /// The cloud that hosts this registry, if it is one of the three.
-    fn provider(self) -> Option<Provider> {
-        match self {
-            Self::Ecr => Some(Provider::Aws),
-            Self::Gcr => Some(Provider::Gcp),
-            Self::Acr => Some(Provider::Azure),
-            Self::Other => None,
-        }
-    }
 }
 
 /// Returns the short git commit hash of HEAD.
@@ -499,6 +493,12 @@ fn git_ref() -> String {
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    let bench_target = BenchTarget::from_env(
+        &|name| std::env::var(name).ok(),
+        args.scenario,
+        &args.tool_selection.run_tools(),
+        args.tool_selection.rounds,
+    )?;
 
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
@@ -527,6 +527,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
 
     corpus.dockerhub_auth = docker_hub_auth();
+    corpus.settings.target_auth = bench_target.auth();
 
     // The lock is read only when a scenario syncs from it: prepare reads its own
     // wildcard corpus and transfers nothing, so it needs no lock.
@@ -582,8 +583,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         corpus.total_tags(),
     );
 
-    let ecr_client = ecr::client().await;
-    ecr::validate_credentials(&ecr_client).await?;
+    let store = Store::open(&bench_target).await?;
 
     // Build ocync first, so its version probe reads the binary the run will
     // actually execute rather than whatever is on PATH from instance setup.
@@ -717,16 +717,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     }
                 }
 
-                let target = ecr::Target {
-                    client: &ecr_client,
+                let target = Destination {
+                    store: &store,
                     lock,
                 };
                 let outcome: Result<Finished, Box<dyn std::error::Error>> = async {
                     Ok(match transfer {
                         Transfer::Sync { round } => {
                             let logs = round_dir(&output_dir, *round);
+                            let round_corpus = bench_target.round_corpus(&corpus, *round);
                             let (cold, warm) =
-                                run_sync(&args, &corpus, &target, order, &logs).await?;
+                                run_sync(&args, &round_corpus, &target, order, &logs).await?;
                             vec![(ScenarioKind::Cold, cold), (ScenarioKind::Warm, warm)]
                         }
                         Transfer::Partial {
@@ -790,32 +791,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
     eprintln!("bench: summary written to {}", output_dir.display());
 
-    let target_registry = &corpus.settings.target_registry;
-    let registry = RegistryKind::of(target_registry);
-    let reg_key = registry.archive_stem();
-    let git_ref = git_ref();
-    let record = report::RunRecord::of(
+    let deferred = deferred_output(
+        &bench_target,
+        &corpus.settings.target_registry,
         &report,
-        git_ref,
-        registry.provider(),
+        git_ref(),
         corpus_locked_at.clone(),
     );
-    // The archive is tracked in git and read as a history of comparable runs.
-    // A run whose machine could not be identified is not comparable to one on
-    // a known instance, and the harness already says so with a WARNING per
-    // missing field. Appending it anyway puts a laptop's numbers next to the
-    // rig's under the same key, where nothing downstream can tell them apart.
-    // The summary is still written; only the shared history is protected.
-    let record = if record.machine.instance_type == "unknown" {
-        eprintln!(
-            "bench: run record NOT appended (instance metadata unknown, so this \
-             run is not comparable to the archived ones); summary only"
-        );
-        None
-    } else {
-        Some(record)
-    };
-    let deferred = report::Deferred::new(reg_key, record, &report);
     match args.archive {
         // The step a fetch of a deferred run takes too.
         report::ArchiveMode::Write => deferred
@@ -847,6 +829,50 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// What a finished run leaves for the archive and the performance page.
+///
+/// The machine's cloud is where the benchmark ran, whichever cloud the target
+/// registry is in. The page compares ECR runs, so a run into another registry
+/// writes no block to it.
+fn deferred_output(
+    target: &BenchTarget,
+    target_registry: &str,
+    report: &BenchReport,
+    git_ref: String,
+    corpus_locked_at: Option<lock::LockedAt>,
+) -> report::Deferred {
+    let record = report::RunRecord::of(
+        report,
+        git_ref,
+        report.instance.provider(),
+        corpus_locked_at,
+    );
+    // The archive is tracked in git and read as a history of comparable runs.
+    // A run whose machine could not be identified is not comparable to one on
+    // a known instance, and the harness already says so with a WARNING per
+    // missing field. Appending it anyway puts a laptop's numbers next to the
+    // rig's under the same key, where nothing downstream can tell them apart.
+    // The summary is still written; only the shared history is protected.
+    let record = if record.machine.instance_type == "unknown" {
+        eprintln!(
+            "bench: run record NOT appended (instance metadata unknown, so this \
+             run is not comparable to the archived ones); summary only"
+        );
+        None
+    } else {
+        Some(record)
+    };
+    let page = match target {
+        BenchTarget::Ecr => report::PageBlocks::of(report),
+        BenchTarget::ArtifactRegistry(_) => report::PageBlocks::default(),
+    };
+    report::Deferred::new(
+        RegistryKind::of(target_registry).archive_stem(),
+        record,
+        page,
+    )
 }
 
 /// The scenarios a pass finished, with each one's runs.
@@ -1340,7 +1366,7 @@ fn check_source_errors(
 async fn run_sync(
     args: &BenchArgs,
     corpus: &Corpus,
-    target: &ecr::Target<'_>,
+    target: &Destination<'_>,
     tools: &[Tool],
     output_dir: &Path,
 ) -> Result<(Vec<ToolRun>, Vec<ToolRun>), Box<dyn std::error::Error>> {
@@ -1355,8 +1381,7 @@ async fn run_sync(
         // Delete repos first to guarantee a truly empty target, then recreate.
         // create_repos alone skips existing repos which may contain partial
         // data from aborted runs.
-        ecr::delete_repos(target.client, corpus).await?;
-        ecr::create_repos(target.client, corpus).await?;
+        target.reset(corpus).await?;
 
         // Single config_dir for cold + warm. The cache file lives
         // under this directory, so reusing it means the warm run
@@ -1381,7 +1406,7 @@ async fn run_sync(
             ));
             cold_runs.push(cold);
 
-            ecr::verify_sync(target, corpus, &label, ScenarioKind::Cold).await?;
+            target::verify_sync(target, corpus, &label, ScenarioKind::Cold).await?;
 
             progress(&format!("  warm: {label}"));
             let warm = run_single_tool(
@@ -1400,7 +1425,7 @@ async fn run_sync(
             ));
             warm_runs.push(warm);
 
-            ecr::verify_sync(target, corpus, &label, ScenarioKind::Warm).await?;
+            target::verify_sync(target, corpus, &label, ScenarioKind::Warm).await?;
 
             Ok(())
         }
@@ -1409,7 +1434,7 @@ async fn run_sync(
         // Always clean up ECR repos, even if the tool run failed. A repo that
         // cannot be deleted fails the pass, so its content cannot satisfy the
         // next tool's digest check.
-        let cleanup = ecr::delete_repos(target.client, corpus).await;
+        let cleanup = target.release(corpus).await;
         finish_pass(run_result, cleanup)?;
 
         cooldown().await;
@@ -1424,7 +1449,7 @@ async fn run_partial(
     args: &BenchArgs,
     base_corpus: &Corpus,
     partial_corpus: &Corpus,
-    target: &ecr::Target<'_>,
+    target: &Destination<'_>,
     tools: &[Tool],
     output_dir: &Path,
 ) -> Result<Vec<ToolRun>, Box<dyn std::error::Error>> {
@@ -1434,8 +1459,7 @@ async fn run_partial(
     for &tool in tools {
         let label = args.tool_selection.label(tool);
         prepare_clean_slate();
-        ecr::delete_repos(target.client, base_corpus).await?;
-        ecr::create_repos(target.client, base_corpus).await?;
+        target.reset(base_corpus).await?;
         progress(&format!("  partial: {label} (priming)"));
 
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
@@ -1470,13 +1494,13 @@ async fn run_partial(
             ));
             runs.push(run);
 
-            ecr::verify_sync(target, partial_corpus, &label, ScenarioKind::Partial).await?;
+            target::verify_sync(target, partial_corpus, &label, ScenarioKind::Partial).await?;
             Ok(())
         }
         .await;
 
         // Always clean up ECR repos, even if the tool run failed.
-        let cleanup = ecr::delete_repos(target.client, base_corpus).await;
+        let cleanup = target.release(base_corpus).await;
         finish_pass(run_result, cleanup)?;
 
         cooldown().await;
@@ -1490,7 +1514,7 @@ async fn run_partial(
 async fn run_scale(
     args: &BenchArgs,
     corpus: &Corpus,
-    target: &ecr::Target<'_>,
+    target: &Destination<'_>,
     tools: &[Tool],
     output_dir: &Path,
 ) -> Result<Finished, Box<dyn std::error::Error>> {
@@ -1513,8 +1537,7 @@ async fn run_scale(
         for &tool in tools {
             let label = args.tool_selection.label(tool);
             prepare_clean_slate();
-            ecr::delete_repos(target.client, &subset).await?;
-            ecr::create_repos(target.client, &subset).await?;
+            target.reset(&subset).await?;
             progress(&format!("  scale: {label} @ {size} images"));
 
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
@@ -1532,13 +1555,13 @@ async fn run_scale(
                 runs.push(run);
 
                 let kind = ScenarioKind::Scale { images: size };
-                ecr::verify_sync(target, &subset, &label, kind).await?;
+                target::verify_sync(target, &subset, &label, kind).await?;
                 Ok(())
             }
             .await;
 
             // Always clean up ECR repos, even if the tool run failed.
-            let cleanup = ecr::delete_repos(target.client, &subset).await;
+            let cleanup = target.release(&subset).await;
             finish_pass(run_result, cleanup)?;
 
             cooldown().await;
@@ -2141,49 +2164,30 @@ mod tests {
     }
 
     #[test]
-    fn registry_kind_names_archive_and_provider() {
-        for (host, stem, provider) in [
-            (
-                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
-                "ecr",
-                Some(Provider::Aws),
-            ),
-            (
-                "111111111111.dkr.ecr.eu-west-1.amazonaws.com",
-                "ecr",
-                Some(Provider::Aws),
-            ),
-            ("gcr.io", "gcr", Some(Provider::Gcp)),
-            ("us-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
-            ("europe-west1-docker.pkg.dev", "gcr", Some(Provider::Gcp)),
-            ("myregistry.azurecr.io", "acr", Some(Provider::Azure)),
+    fn registry_kind_names_the_archive() {
+        for (host, stem) in [
+            ("123456789012.dkr.ecr.us-east-1.amazonaws.com", "ecr"),
+            ("111111111111.dkr.ecr.eu-west-1.amazonaws.com", "ecr"),
+            ("gcr.io", "gcr"),
+            ("us-docker.pkg.dev", "gcr"),
+            ("europe-west1-docker.pkg.dev", "gcr"),
+            ("myregistry.azurecr.io", "acr"),
             (
                 "123456789012.dkr.ecr-fips.us-gov-west-1.amazonaws.com",
                 "ecr",
-                Some(Provider::Aws),
             ),
-            (
-                "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
-                "ecr",
-                Some(Provider::Aws),
-            ),
-            (
-                "123456789012.DKR.ECR.US-EAST-1.AMAZONAWS.COM",
-                "ecr",
-                Some(Provider::Aws),
-            ),
-            ("myreg.azurecr.us", "acr", Some(Provider::Azure)),
-            ("myreg.azurecr.cn", "acr", Some(Provider::Azure)),
-            ("MyReg.AzureCR.io", "acr", Some(Provider::Azure)),
-            ("ecr.example.com", "other", None),
-            ("public.ecr.aws", "other", None),
-            ("ghcr.io", "other", None),
-            ("docker.io", "other", None),
-            ("quay.io", "other", None),
+            ("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn", "ecr"),
+            ("123456789012.DKR.ECR.US-EAST-1.AMAZONAWS.COM", "ecr"),
+            ("myreg.azurecr.us", "acr"),
+            ("myreg.azurecr.cn", "acr"),
+            ("MyReg.AzureCR.io", "acr"),
+            ("ecr.example.com", "other"),
+            ("public.ecr.aws", "other"),
+            ("ghcr.io", "other"),
+            ("docker.io", "other"),
+            ("quay.io", "other"),
         ] {
-            let kind = RegistryKind::of(host);
-            assert_eq!(kind.archive_stem(), stem, "{host}");
-            assert_eq!(kind.provider(), provider, "{host}");
+            assert_eq!(RegistryKind::of(host).archive_stem(), stem, "{host}");
         }
     }
 

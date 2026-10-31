@@ -11,12 +11,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Deserialize;
 
+use super::gar::ENV_CREDENTIALS;
+use super::gcloud::{Gcloud, Outputs, Provisioned};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
-use super::{Provider, RunTimestamp, Scenario, ToolSelection, value_name};
+use super::target::ensure_artifact_registry_applies;
+use super::{Provider, RunTimestamp, Scenario, ToolSelection, finish_pass, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -43,6 +46,25 @@ fn ssh_args(config: &BenchConfig) -> Vec<&str> {
     args
 }
 
+/// The registry the instance syncs into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Target {
+    /// Amazon ECR, in the account the instance runs in.
+    Ecr,
+    /// Google Artifact Registry, in the project `bench/terraform/gcp` names.
+    ArtifactRegistry,
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&value_name(self))
+    }
+}
+
+/// Where on the instance the Google federation file is copied to, relative to
+/// the bench user's home.
+const REMOTE_CREDENTIALS: &str = ".bench-gar-credentials.json";
+
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
@@ -50,6 +72,12 @@ pub(crate) struct BenchRemoteArgs {
     /// `bench/terraform/<provider>/bench.json`.
     #[arg(long)]
     pub(crate) provider: Provider,
+
+    /// Registry the instance syncs into. Artifact Registry needs the Google
+    /// stack applied (`bench/terraform/gcp`) and `gcloud` signed in here: this
+    /// command makes a repository for each round and deletes them when it ends.
+    #[arg(long, value_enum, default_value_t = Target::Ecr)]
+    pub(crate) target: Target,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -60,6 +88,7 @@ pub(crate) struct BenchRemoteArgs {
         conflicts_with_all = [
             "force",
             "git_ref",
+            "target",
             "tools",
             "baseline_ref",
             "rounds",
@@ -164,9 +193,12 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     // Decided before the push, so a provider with no setup is refused before
     // anything leaves this machine.
-    let registry_env = registry_env(args.provider)?;
+    ensure_placement(args.provider, args.target)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    if args.target == Target::ArtifactRegistry {
+        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
+    }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
@@ -191,19 +223,58 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // This run's start time, chosen here: it names the results directory the
-    // fetch takes and stamps the run's record. A run that wrote no results
-    // leaves nothing at that path, and no earlier run's directory can stand in
-    // for it.
+    // fetch takes and stamps the run's record.
     let timestamp = RunTimestamp::now();
-    let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
 
-    let bench_args = bench_args(&args, &timestamp);
+    // Made after the push, so a refused or failed push creates nothing. Dropped
+    // on every way out of this function, which deletes the repositories.
+    let mut provisioned = match args.target {
+        Target::Ecr => None,
+        Target::ArtifactRegistry => Some(Provisioned::create(
+            Gcloud::installed(),
+            Outputs::read()?,
+            &timestamp,
+            args.tool_selection.rounds,
+        )?),
+    };
 
-    let script = remote_script(
+    let result = run_on_instance(
+        &args,
+        &config,
         &git_ref,
         &git_sha,
+        &timestamp,
+        provisioned.as_ref(),
+    );
+    let cleanup = provisioned.as_mut().map_or(Ok(()), Provisioned::delete);
+    finish_pass(result, cleanup)
+}
+
+/// Runs the benchmark on the instance and fetches its results.
+fn run_on_instance(
+    args: &BenchRemoteArgs,
+    config: &BenchConfig,
+    git_ref: &str,
+    git_sha: &CommitSha,
+    timestamp: &RunTimestamp,
+    provisioned: Option<&Provisioned>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The directory the fetch takes, named by this run's start time. A run
+    // that wrote no results leaves nothing at that path, and no earlier run's
+    // directory can stand in for it.
+    let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
+
+    if let Some(provisioned) = provisioned {
+        copy_credentials(config, &provisioned.credentials_file)?;
+    }
+
+    let bench_args = bench_args(args, timestamp);
+
+    let script = remote_script(
+        git_ref,
+        git_sha,
         &bench_args,
-        registry_env,
+        &registry_env(provisioned),
         ExistingRun::from_force(args.force),
     );
 
@@ -212,7 +283,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         config.user, config.host
     );
 
-    let exit_code = match ssh_stream(&config, &script)? {
+    let exit_code = match ssh_stream(config, &script)? {
         RemoteOutcome::Refused => {
             return Err(
                 "a benchmark is still running on the instance; pass --force to kill it, \
@@ -237,7 +308,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench-remote: fetching results...");
     }
 
-    let results = fetch_run_results(&config, &args.output, &results_dir);
+    let results = fetch_run_results(config, &args.output, &results_dir);
     run_result(exit_code, results)
 }
 
@@ -320,17 +391,55 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     bench_args
 }
 
-/// The shell that points the benchmark at `provider`'s registry on the
-/// instance, or the reason there is none yet.
-fn registry_env(provider: Provider) -> Result<&'static str, String> {
-    match provider {
-        Provider::Aws => Ok(
-            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com",
-        ),
-        Provider::Gcp | Provider::Azure => Err(format!(
-            "provider '{provider}' not yet supported. Add registry env setup for this provider."
+/// Fails unless the instance in `provider`'s cloud can sync into `target`.
+/// Decided before the push, so a pair with no setup is refused before anything
+/// leaves this machine.
+fn ensure_placement(provider: Provider, target: Target) -> Result<(), String> {
+    match (provider, target) {
+        (Provider::Aws, Target::Ecr | Target::ArtifactRegistry) => Ok(()),
+        _ => Err(format!(
+            "provider '{provider}' with target '{target}' not yet supported. \
+             Add registry env setup for this pair."
         )),
     }
+}
+
+/// The shell that points the benchmark at its target registry on the instance:
+/// ECR in the instance's own account, or the repositories this machine made.
+fn registry_env(provisioned: Option<&Provisioned>) -> String {
+    match provisioned {
+        None => "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com".to_owned(),
+        // Every value was parsed as an id or a host, so none holds shell syntax.
+        Some(provisioned) => provisioned
+            .target
+            .env()
+            .iter()
+            .map(|(name, value)| format!("export {name}={value}"))
+            .chain([format!("export {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\"")])
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Copies the Google federation file to the instance, readable by its user
+/// alone: it is created closed before any content is in it.
+fn copy_credentials(config: &BenchConfig, local: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    ssh_run(
+        config,
+        &format!("umask 077 && touch {REMOTE_CREDENTIALS} && chmod 600 {REMOTE_CREDENTIALS}"),
+    )?;
+    let status = Command::new("scp")
+        .args(ssh_args(config))
+        .arg(local)
+        .arg(format!(
+            "{}@{}:{REMOTE_CREDENTIALS}",
+            config.user, config.host
+        ))
+        .status()?;
+    if !status.success() {
+        return Err("scp of the Google credentials file failed".into());
+    }
+    Ok(())
 }
 
 /// A line the remote script prints that says how far it got.
@@ -1056,6 +1165,7 @@ mod tests {
         for extra in [
             &["--force"][..],
             &["--git-ref", "main"][..],
+            &["--target", "ecr"][..],
             &["--tools", "ocync"][..],
             &["--rounds", "3"][..],
             &["--max-concurrent-transfers", "20"][..],
@@ -1104,24 +1214,79 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_without_registry_setup_is_refused_by_name() {
-        assert!(
-            registry_env(Provider::Aws)
-                .unwrap()
-                .contains("BENCH_TARGET_REGISTRY")
-        );
-        for (provider, expected) in [
+    fn only_an_aws_instance_is_placed_and_every_other_pair_is_refused_by_name() {
+        assert!(registry_env(None).contains("BENCH_TARGET_REGISTRY"));
+        for (provider, target, expected) in [
+            (Provider::Aws, Target::Ecr, None),
+            (Provider::Aws, Target::ArtifactRegistry, None),
             (
                 Provider::Gcp,
-                "provider 'gcp' not yet supported. Add registry env setup for this provider.",
+                Target::Ecr,
+                Some(
+                    "provider 'gcp' with target 'ecr' not yet supported. Add registry env setup for this pair.",
+                ),
+            ),
+            (
+                Provider::Gcp,
+                Target::ArtifactRegistry,
+                Some(
+                    "provider 'gcp' with target 'artifact-registry' not yet supported. Add registry env setup for this pair.",
+                ),
             ),
             (
                 Provider::Azure,
-                "provider 'azure' not yet supported. Add registry env setup for this provider.",
+                Target::Ecr,
+                Some(
+                    "provider 'azure' with target 'ecr' not yet supported. Add registry env setup for this pair.",
+                ),
+            ),
+            (
+                Provider::Azure,
+                Target::ArtifactRegistry,
+                Some(
+                    "provider 'azure' with target 'artifact-registry' not yet supported. Add registry env setup for this pair.",
+                ),
             ),
         ] {
-            assert_eq!(registry_env(provider), Err(expected.to_string()));
+            assert_eq!(
+                ensure_placement(provider, target),
+                expected.map_or(Ok(()), |e| Err(e.to_string())),
+                "{provider} {target}"
+            );
         }
+    }
+
+    #[test]
+    fn the_instance_is_told_its_repositories_and_where_the_credentials_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("gcloud");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let outputs = Outputs::parse(
+            r#"{"repository":{"value":"europe-west9-docker.pkg.dev/example-project/ocync-bench"},
+                "service_account":{"value":"bench@example-project.iam.gserviceaccount.com"},
+                "credentials_file":{"value":"/work/credentials.json"}}"#,
+        )
+        .unwrap();
+        let provisioned = Provisioned::create(
+            Gcloud::at(program),
+            outputs,
+            &"2026-10-30-120000".parse().unwrap(),
+            "3".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry_env(Some(&provisioned)),
+            "export BENCH_TARGET_REGISTRY=europe-west9-docker.pkg.dev\n\
+             export BENCH_GAR_PROJECT=example-project\n\
+             export BENCH_GAR_REPOSITORIES=ocync-bench-run-2026-10-30-120000-r1,\
+             ocync-bench-run-2026-10-30-120000-r2,ocync-bench-run-2026-10-30-120000-r3\n\
+             export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.bench-gar-credentials.json\""
+        );
     }
 
     #[test]
@@ -1463,7 +1628,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
 
     #[test]
     fn the_fetch_copies_a_present_run_once_and_an_absent_one_not_at_all() {
-        use crate::bench::report::{Deferred, RunRecord, tests::sample_report};
+        use crate::bench::report::{Deferred, PageBlocks, RunRecord, tests::sample_report};
         let work = tempfile::tempdir().unwrap();
         let archive = work.path().join("bench/results/ecr.json");
         let records = || -> usize {
@@ -1475,7 +1640,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
 
         let with_record = tempfile::tempdir().unwrap();
-        Deferred::new("ecr", Some(record), &report)
+        Deferred::new("ecr", Some(record), PageBlocks::of(&report))
             .write(with_record.path())
             .unwrap();
         let without_record = tempfile::tempdir().unwrap();

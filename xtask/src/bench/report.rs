@@ -108,7 +108,7 @@ pub(crate) struct RoundCount {
 }
 
 impl RunRecord {
-    /// The record of a finished live run, `report` as measured on a registry of
+    /// The record of a finished live run, `report` as measured on a machine of
     /// `provider`, synced against the lock written at `corpus_locked_at`.
     pub(crate) fn of(
         report: &BenchReport,
@@ -205,8 +205,8 @@ impl Prewarm {
 /// Machine metadata for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MachineInfo {
-    /// Cloud of the target registry, absent when the registry belongs to none
-    /// of the three clouds.
+    /// Cloud the benchmark ran in, whichever cloud the target registry is in;
+    /// absent when the machine could not be identified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider: Option<Provider>,
     /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
@@ -411,6 +411,12 @@ pub(crate) struct InstanceInfo {
 }
 
 impl InstanceInfo {
+    /// The cloud the benchmark ran in: AWS when EC2's metadata service
+    /// answered. Only EC2 is read, so no other cloud is named.
+    pub(crate) fn provider(&self) -> Option<Provider> {
+        (self.instance_type != "unknown").then_some(Provider::Aws)
+    }
+
     /// Collect instance metadata from EC2 IMDS + `DescribeInstanceTypes`.
     ///
     /// IMDS provides the instance type and region. The AWS CLI
@@ -1343,13 +1349,13 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
-    /// The deferred output of `report`, its `record` going to the archive
-    /// `archive_key`.
-    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, report: &BenchReport) -> Self {
+    /// The deferred output of a run: its `record` going to the archive
+    /// `archive_key`, and the `page` blocks.
+    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, page: PageBlocks) -> Self {
         Self {
             archive_key: archive_key.to_string(),
             record,
-            page: PageBlocks::of(report),
+            page,
         }
     }
 
@@ -1952,7 +1958,7 @@ pub(crate) mod tests {
         assert!(Deferred::read(run.path()).unwrap().is_none());
 
         let report = sample_report();
-        Deferred::new("ecr", Some(sample_record()), &report)
+        Deferred::new("ecr", Some(sample_record()), PageBlocks::of(&report))
             .write(run.path())
             .unwrap();
 
@@ -1982,9 +1988,13 @@ pub(crate) mod tests {
         let broken = "<!-- BENCH:END -->\n<!-- BENCH:START -->\n";
         std::fs::write(&page, broken).unwrap();
 
-        Deferred::new("ecr", Some(sample_record()), &sample_report())
-            .apply(local.path(), &page)
-            .unwrap();
+        Deferred::new(
+            "ecr",
+            Some(sample_record()),
+            PageBlocks::of(&sample_report()),
+        )
+        .apply(local.path(), &page)
+        .unwrap();
 
         assert_eq!(std::fs::read_to_string(&page).unwrap(), broken);
         assert!(local.path().join("ecr.json").exists(), "the record is kept");
@@ -1994,7 +2004,7 @@ pub(crate) mod tests {
     fn a_deferred_run_not_comparable_to_the_archive_appends_no_record() {
         let local = tempfile::tempdir().unwrap();
         let page = local.path().join("performance.md");
-        Deferred::new("ecr", None, &sample_report())
+        Deferred::new("ecr", None, PageBlocks::of(&sample_report()))
             .apply(local.path(), &page)
             .unwrap();
         assert!(!local.path().join("ecr.json").exists());

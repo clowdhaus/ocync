@@ -67,13 +67,36 @@ pub(crate) struct Corpus {
     pub(crate) dockerhub_auth: Option<DockerHubAuth>,
 }
 
+/// How ocync signs in to the target registry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TargetAuth {
+    /// Amazon ECR.
+    #[default]
+    Ecr,
+    /// Google Artifact Registry.
+    Gar,
+}
+
+impl TargetAuth {
+    /// The `auth_type` ocync's config names it by.
+    pub(crate) fn auth_type(self) -> &'static str {
+        match self {
+            Self::Ecr => "ecr",
+            Self::Gar => "gar",
+        }
+    }
+}
+
 /// Corpus-level settings (target registry, prefix).
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CorpusSettings {
-    /// ECR target registry hostname.
+    /// Target registry hostname.
     pub(crate) target_registry: String,
     /// Prefix for all target repos.
     pub(crate) target_prefix: String,
+    /// How ocync signs in to the target (set at runtime, not from YAML).
+    #[serde(skip)]
+    pub(crate) target_auth: TargetAuth,
 }
 
 /// A single image entry in the corpus.

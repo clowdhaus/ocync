@@ -74,7 +74,7 @@ fn registry_key(hostname: &str) -> String {
 /// Generate an ocync YAML config from a corpus.
 ///
 /// Produces a `registries:` section with unique source registries (anonymous auth)
-/// and the target ECR registry (ecr auth), followed by a `mappings:` section.
+/// and the target registry (the corpus's `target_auth`), followed by a `mappings:` section.
 /// Each mapping uses `source:` and `targets:` to reference registries by name,
 /// and `tags: glob:` with a list of exact tag globs.
 ///
@@ -98,7 +98,7 @@ pub(crate) fn ocync_config(
     source_registries.sort_unstable();
     source_registries.dedup();
 
-    let ecr_key = registry_key(&corpus.settings.target_registry);
+    let target_key = registry_key(&corpus.settings.target_registry);
 
     out.push_str("registries:\n");
     for reg in &source_registries {
@@ -115,9 +115,12 @@ pub(crate) fn ocync_config(
             }
         }
     }
-    out.push_str(&format!("  {ecr_key}:\n"));
+    out.push_str(&format!("  {target_key}:\n"));
     out.push_str(&format!("    url: {}\n", corpus.settings.target_registry));
-    out.push_str("    auth_type: ecr\n");
+    out.push_str(&format!(
+        "    auth_type: {}\n",
+        corpus.settings.target_auth.auth_type()
+    ));
 
     out.push('\n');
     out.push_str("mappings:\n");
@@ -128,7 +131,7 @@ pub(crate) fn ocync_config(
         out.push_str(&format!("  - from: \"{path}\"\n"));
         out.push_str(&format!("    to: \"{target_repo}\"\n"));
         out.push_str(&format!("    source: {src_key}\n"));
-        out.push_str(&format!("    targets: [{ecr_key}]\n"));
+        out.push_str(&format!("    targets: [{target_key}]\n"));
         out.push_str("    tags:\n");
         out.push_str("      glob:\n");
         for tag in &img.tags {
@@ -306,7 +309,7 @@ images:
 
     #[test]
     fn generated_configs_match_exactly() {
-        use crate::bench::corpus::DockerHubAuth;
+        use crate::bench::corpus::{DockerHubAuth, TargetAuth};
 
         let plain = test_corpus();
         let mut with_auth = test_corpus();
@@ -315,7 +318,43 @@ images:
             token: "dkr_pat_abc123".to_string(),
         });
 
+        let mut gar = test_corpus();
+        gar.settings.target_registry = "europe-west9-docker.pkg.dev".to_string();
+        gar.settings.target_prefix = "example-project/run-r1/bench".to_string();
+        gar.settings.target_auth = TargetAuth::Gar;
+
         for (name, config, expected) in [
+            (
+                "ocync_config_artifact_registry",
+                ocync_config(&gar, None),
+                "\
+registries:
+  cgr-dev:
+    url: cgr.dev
+  docker-io:
+    url: docker.io
+  europe-west9-docker-pkg-dev:
+    url: europe-west9-docker.pkg.dev
+    auth_type: gar
+
+mappings:
+  - from: \"chainguard/static\"
+    to: \"example-project/run-r1/bench/chainguard-static\"
+    source: cgr-dev
+    targets: [europe-west9-docker-pkg-dev]
+    tags:
+      glob:
+        - \"latest\"
+  - from: \"library/alpine\"
+    to: \"example-project/run-r1/bench/library-alpine\"
+    source: docker-io
+    targets: [europe-west9-docker-pkg-dev]
+    tags:
+      glob:
+        - \"3.20\"
+        - \"latest\"
+",
+            ),
             (
                 "ocync_config_exact_output",
                 ocync_config(&plain, None),
