@@ -36,6 +36,14 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
             let safe_url = redact_url(&reg.url);
             match build_registry_client(Registry::Configured(reg), &credentials).await {
                 Ok(client) => match client.ping().await {
+                    // `ping` accepts 401, so a registry read without credentials
+                    // answers it too: say so rather than imply they work.
+                    Ok(()) if client.auth_name() == Some("anonymous") => {
+                        let _ = writeln!(
+                            out,
+                            "  OK    {name} ({safe_url}) -- anonymous, no credentials checked"
+                        );
+                    }
                     Ok(()) => {
                         let _ = writeln!(out, "  OK    {name} ({safe_url})");
                     }
@@ -150,5 +158,46 @@ mod tests {
         assert!(Worst::Unreadable > Worst::Denied);
         assert!(Worst::Denied > Worst::Failed);
         assert!(Worst::Failed > Worst::Clean);
+    }
+
+    /// A registry read anonymously says so, and one with credentials does
+    /// not: `ping` accepts 401, so a bare OK would imply credentials were
+    /// checked. Breaks if an anonymous registry prints a plain OK, or one
+    /// with credentials is called anonymous.
+    #[tokio::test]
+    async fn an_anonymous_registry_is_not_reported_as_a_plain_ok() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "registries:\n  open:\n    url: {uri}\n    auth_type: anonymous\n  \
+                 signed:\n    url: {uri}\n    auth_type: static_token\n    token: t\nmappings: []\n",
+                uri = server.uri()
+            ),
+        )
+        .expect("write config");
+
+        let mut out = Vec::new();
+        let code = run_check_to(&[config], &mut out).await.expect("runs");
+        let out = String::from_utf8(out).expect("utf8");
+
+        assert_eq!(code, ExitCode::Success, "{out}");
+        let line = |name: &str| {
+            out.lines()
+                .find(|line| line.contains(&format!("  {name} ")))
+                .unwrap_or_else(|| panic!("no line for {name}: {out}"))
+        };
+        assert!(line("open").contains("anonymous"), "{out}");
+        assert!(!line("signed").contains("anonymous"), "{out}");
     }
 }

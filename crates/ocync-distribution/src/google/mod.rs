@@ -3,14 +3,11 @@
 //!
 //! The credentials come from the file `GOOGLE_APPLICATION_CREDENTIALS`
 //! names, else from gcloud's well-known file, else from the metadata server
-//! of the GCE or GKE host. With no file, no `GCE_METADATA_HOST` and a host
-//! that is not on Google Cloud there is no source at all, which loading
-//! reports as [`Located::Absent`]. Whether a host is on Google Cloud is
-//! judged by its DMI product name, then by one short probe of the metadata
-//! IP, which is the only address contacted to find out. A file holds a
-//! service account key, an authorized user's refresh token, an external
-//! account (Workload Identity Federation) or a service account
-//! impersonated with any of those.
+//! of the GCE or GKE host. Loading finds only a file; the metadata server is
+//! [`Credentials::metadata`], which a caller that reads anonymously without
+//! one first asks [`is_on_google_cloud`] whether to use. A file holds a service account key, an authorized
+//! user's refresh token, an external account (Workload Identity Federation)
+//! or a service account impersonated with any of those.
 
 mod aws_source;
 mod external_account;
@@ -604,19 +601,11 @@ impl SourceAuth {
     }
 }
 
+pub(crate) use self::metadata::is_on_google_cloud;
+
 /// Credentials that obtain access tokens.
 #[derive(Debug)]
 pub(crate) struct Credentials(Kind);
-
-/// What looking for Application Default Credentials found.
-#[derive(Debug)]
-pub(crate) enum Located {
-    /// A source exists. Failing to use it is an error.
-    Found(Box<Credentials>),
-    /// No source exists: no file, no `GCE_METADATA_HOST`, and a host that is
-    /// not on Google Cloud.
-    Absent,
-}
 
 /// The kinds of [`Credentials`].
 #[derive(Debug)]
@@ -629,39 +618,32 @@ enum Kind {
 }
 
 impl Credentials {
-    /// The Application Default Credentials of `host`, asking for the
-    /// registry scope, decided once from its files, its environment, its
-    /// DMI product name and, when those find nothing, one probe of the
-    /// metadata IP. An
-    /// external account with an AWS subject token takes its AWS credentials
-    /// from `aws_credentials`.
+    /// The credentials the file of `host` holds, asking for the registry
+    /// scope, or `None` when it has no file: the one `GOOGLE_APPLICATION_CREDENTIALS`
+    /// names, which must exist, else gcloud's well-known file if it does.
+    /// An external account with an AWS subject token takes its AWS
+    /// credentials from `aws_credentials`.
     pub(crate) async fn load(
         host: &Host,
         clients: &Clients,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Located, Error> {
+    ) -> Result<Option<Self>, Error> {
         let setup = Setup {
             host,
             clients,
             aws_credentials,
         };
-        match find_file(host)? {
-            None if metadata::is_on_google_cloud(host).await => {
-                Self::metadata(host).map(|c| Located::Found(Box::new(c)))
-            }
-            None => Ok(Located::Absent),
-            Some(contents) => {
-                let json: Value = crate::json::parse(&contents).map_err(Error::Parse)?;
-                let kind = CredentialType::of(&json)?;
-                Self::from_json(kind, json, Scopes::Registry, &setup)
-                    .await
-                    .map(|c| Located::Found(Box::new(c)))
-            }
-        }
+        let Some(contents) = find_file(host)? else {
+            return Ok(None);
+        };
+        let json: Value = crate::json::parse(&contents).map_err(Error::Parse)?;
+        let kind = CredentialType::of(&json)?;
+        Self::from_json(kind, json, Scopes::Registry, &setup)
+            .await
+            .map(Some)
     }
 
-    /// The metadata server of `host`, for a caller that wants it whether or
-    /// not [`Self::load`] found a reason to think one is there.
+    /// The metadata server of `host`, at `GCE_METADATA_HOST` when it is set.
     pub(crate) fn metadata(host: &Host) -> Result<Self, Error> {
         metadata::Server::new(&host.env, Scopes::Registry)
             .map(|server| Self(Kind::Metadata(server)))
@@ -763,8 +745,7 @@ struct Setup<'a> {
     aws_credentials: &'a AwsCredentialProviders,
 }
 
-/// The contents of the credentials file, or `None` to use the metadata
-/// server: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
+/// The contents of the credentials file, or `None` when there is none: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
 /// exist, else gcloud's well-known file if it does.
 fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
     if let Some(path) = host.env.get_os(CREDENTIALS_VARIABLE) {

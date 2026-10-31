@@ -24,7 +24,9 @@ pub(crate) use self::credentials::imds;
 use self::credentials::{Chain, Credentials};
 pub(crate) use self::host::Host;
 pub(crate) use self::host::{Clock, Env, Fs, Platform, Timeouts, credential_endpoint_client};
-use self::host::{Network, Transport};
+pub(crate) use self::host::{Network, Transport};
+#[cfg(test)]
+pub(crate) use self::replay::{Replay, record};
 
 use std::cell::RefCell;
 use std::collections::HashMap;

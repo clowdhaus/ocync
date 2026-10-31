@@ -49,9 +49,9 @@ impl EnvGuard {
 
     /// `DOCKER_CONFIG` as [`Self::set_docker_config`], and a Google metadata
     /// server at a closed port. A host naming one is on Google Cloud, so a
-    /// Google provider is built without reading the machine's DMI name or
-    /// probing the metadata IP: the distribution crate's test-only probe
-    /// address is not in effect in this crate, and nothing is contacted.
+    /// registry detected as Google's gets the Google provider without the
+    /// machine's DMI name being read or the metadata IP probed: nothing is
+    /// contacted.
     fn set_docker_config_and_offline_google(value: &std::path::Path) -> Self {
         Self::set(&[
             ("DOCKER_CONFIG", value.as_os_str()),

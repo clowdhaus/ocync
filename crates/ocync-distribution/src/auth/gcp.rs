@@ -14,7 +14,6 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::OnceCell;
@@ -24,8 +23,8 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::{CredentialFailure, Error, error_chain};
-use crate::google::{self, AccessToken, Expiry, Located};
+use crate::error::{Error, error_chain};
+use crate::google::{self, AccessToken, Expiry};
 
 /// The HTTP Basic username GAR and GCR take with an `OAuth2` access token as
 /// the password.
@@ -39,40 +38,23 @@ trait GcpTokenSource: Send + Sync + fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>>;
 }
 
-/// How a registry came to use Google authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Selection {
-    /// The user named it with `auth_type`. With no Google credentials the
-    /// metadata server is asked and its failure is an error.
-    Configured,
-    /// The registry's hostname chose it. With no Google credentials at all
-    /// the registry is read anonymously, as a public one.
-    Detected,
-}
-
-/// What a run found when it looked for Google credentials.
-enum Loaded {
-    Found(Arc<CachedGoogleToken>),
-    /// There is no source: see [`google::Located::Absent`].
-    Absent,
-}
-
 /// The Google credentials one run's GAR and GCR providers share, so the
 /// Application Default Credentials are loaded, and their token fetched,
 /// once per run rather than once per registry host, and hosts that ask at
 /// once share the one load. A failed load is kept too: a load already sends
 /// a transient failure again, so another host would only repeat the same
-/// doomed requests. So is finding none, so the answer cannot change mid-run.
-/// Create one per run: the next run, such as the next watch cycle, reads the
-/// credentials again.
+/// doomed requests. Create one per run: the next run, such as the next
+/// watch cycle, reads the credentials again.
 #[derive(Default)]
 pub struct SharedGoogleToken {
-    loaded: OnceCell<Result<Loaded, Arc<google::Error>>>,
-    /// The metadata server's token, for the registries the user named when
-    /// there are no credentials: kept once per run, as a found source's is.
+    /// The token of the credentials file, or `None` when there is no file.
+    file: OnceCell<Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>>>,
+    /// Whether the machine is on Google Cloud, asked only for a registry
+    /// chosen by its hostname.
+    on_google_cloud: OnceCell<bool>,
+    /// The metadata server's token, for a registry that goes there when
+    /// there is no file.
     metadata: OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>,
-    /// Whether the anonymous read has been announced, once per run.
-    announced: AtomicBool,
 }
 
 impl fmt::Debug for SharedGoogleToken {
@@ -82,46 +64,70 @@ impl fmt::Debug for SharedGoogleToken {
 }
 
 impl SharedGoogleToken {
-    /// The cached token of `host`'s credentials, loaded on first use, or
-    /// `None` when `selection` reads anonymously and there are none.
-    async fn cached_token(
+    /// The cached token of `host`'s credentials file, loaded on first use.
+    async fn file(
         &self,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-        selection: Selection,
     ) -> Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>> {
-        let loaded = self
-            .loaded
+        self.file
             .get_or_init(|| async {
-                match AdcTokenSource::load(host, aws_credentials).await? {
-                    Some(source) => Ok(Loaded::Found(Arc::new(CachedGoogleToken::new(source)))),
-                    None => Ok(Loaded::Absent),
-                }
-                .map_err(Arc::new)
+                Ok(AdcTokenSource::load(host, aws_credentials)
+                    .await?
+                    .map(|source| Arc::new(CachedGoogleToken::new(source))))
             })
-            .await;
-        match (loaded, selection) {
-            (Err(e), _) => Err(Arc::clone(e)),
-            (Ok(Loaded::Found(token)), _) => Ok(Some(Arc::clone(token))),
-            (Ok(Loaded::Absent), Selection::Detected) => {
-                if !self.announced.swap(true, Ordering::Relaxed) {
-                    tracing::info!(
-                        "no Google credentials found, reading Google registries anonymously"
-                    );
-                }
-                Ok(None)
-            }
-            (Ok(Loaded::Absent), Selection::Configured) => self
-                .metadata
-                .get_or_init(|| async {
-                    AdcTokenSource::metadata(host)
-                        .map(|source| Arc::new(CachedGoogleToken::new(source)))
-                        .map_err(Arc::new)
-                })
-                .await
-                .clone()
-                .map(Some),
+            .await
+            .clone()
+    }
+
+    /// The cached token of the metadata server of `host`.
+    async fn metadata(
+        &self,
+        host: &crate::aws::Host,
+    ) -> Result<Arc<CachedGoogleToken>, Arc<google::Error>> {
+        self.metadata
+            .get_or_init(|| async {
+                Ok(Arc::new(CachedGoogleToken::new(AdcTokenSource::metadata(
+                    host,
+                )?)))
+            })
+            .await
+            .clone()
+    }
+
+    /// The cached token of `host`'s credentials for a registry the user
+    /// named: the file, else the metadata server, whether or not one is
+    /// there. The machine is not asked whether it is on Google Cloud.
+    async fn configured(
+        &self,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Arc<CachedGoogleToken>, Arc<google::Error>> {
+        match self.file(host, aws_credentials).await? {
+            Some(token) => Ok(token),
+            None => self.metadata(host).await,
         }
+    }
+
+    /// The cached token of `host`'s credentials for a registry chosen by
+    /// its hostname: the file, else the metadata server if the machine is on
+    /// Google Cloud, else `None`.
+    async fn detected(
+        &self,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>> {
+        if let Some(token) = self.file(host, aws_credentials).await? {
+            return Ok(Some(token));
+        }
+        if !*self
+            .on_google_cloud
+            .get_or_init(|| google::is_on_google_cloud(host))
+            .await
+        {
+            return Ok(None);
+        }
+        self.metadata(host).await.map(Some)
     }
 }
 
@@ -215,6 +221,11 @@ fn credentials_failed(registry: &str, stage: Stage, error: &google::Error) -> Er
     )
 }
 
+/// The error for `registry` when Google's credentials failed to load.
+fn setup_failed(registry: &url::Url, error: &google::Error) -> Error {
+    credentials_failed(registry.host_str().unwrap_or_default(), Stage::Setup, error)
+}
+
 /// Default [`GcpTokenSource`]: the run's Application Default Credentials.
 #[derive(Debug)]
 struct AdcTokenSource {
@@ -223,53 +234,26 @@ struct AdcTokenSource {
 }
 
 impl AdcTokenSource {
-    /// The Application Default Credentials of `host`, or `None` when there
-    /// are none.
+    /// The credentials file of `host`, or `None` when it has none.
     async fn load(
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
     ) -> Result<Option<Self>, google::Error> {
         let clients = google::Clients::new()?;
-        Ok(
-            match google::Credentials::load(host, &clients, aws_credentials).await? {
-                Located::Found(credentials) => Some(Self {
-                    credentials: *credentials,
-                    clients,
-                }),
-                Located::Absent => None,
-            },
-        )
+        Ok(google::Credentials::load(host, &clients, aws_credentials)
+            .await?
+            .map(|credentials| Self {
+                credentials,
+                clients,
+            }))
     }
 
-    /// The metadata server of `host`, asked whether or not anything
-    /// suggests it is there.
+    /// The metadata server of `host`.
     fn metadata(host: &crate::aws::Host) -> Result<Self, google::Error> {
         Ok(Self {
             credentials: google::Credentials::metadata(host)?,
             clients: google::Clients::new()?,
         })
-    }
-}
-
-/// Who a registry token exchange is made as.
-#[derive(Clone, PartialEq, Eq)]
-enum Identity {
-    /// A Google account, by its access token.
-    Google(google::Secret),
-    /// No one: the registry is read as a public one.
-    Anonymous,
-}
-
-impl Identity {
-    /// The credentials the token request carries, or none.
-    fn credentials(&self) -> Option<Credentials> {
-        match self {
-            Self::Google(token) => Some(Credentials::Basic {
-                username: GCP_USERNAME.to_owned(),
-                password: token.expose().to_owned(),
-            }),
-            Self::Anonymous => None,
-        }
     }
 }
 
@@ -294,11 +278,10 @@ pub struct GcpAuth {
     /// For error context.
     hostname: String,
     http: reqwest::Client,
-    /// Shared by the run's GAR and GCR providers, or `None` to read
-    /// anonymously.
-    cached_token: Option<Arc<CachedGoogleToken>>,
+    /// Shared by the run's GAR and GCR providers.
+    cached_token: Arc<CachedGoogleToken>,
     tokens: TokenCache,
-    recovery: Recovery<Identity>,
+    recovery: Recovery<google::Secret>,
 }
 
 impl fmt::Debug for GcpAuth {
@@ -311,10 +294,7 @@ impl fmt::Debug for GcpAuth {
 
 impl GcpAuth {
     /// Create a GCP auth provider using Application Default Credentials.
-    /// `registry` is the base URL the registry's client uses. With
-    /// [`Selection::Detected`] and no Google credentials at all, off Google
-    /// Cloud, it reads the registry anonymously: a source that exists but
-    /// fails is still an error.
+    /// `registry` is the base URL the registry's client uses.
     ///
     /// The run's credentials are read and parsed on the first call, which
     /// for an external account with an AWS source may also ask the EC2
@@ -325,7 +305,6 @@ impl GcpAuth {
         http: reqwest::Client,
         aws_credentials: &AwsCredentialProviders,
         shared_token: &SharedGoogleToken,
-        selection: Selection,
     ) -> Result<Self, Error> {
         Self::on_host(
             registry,
@@ -333,7 +312,29 @@ impl GcpAuth {
             &crate::aws::Host::current(),
             aws_credentials,
             shared_token,
-            selection,
+        )
+        .await
+    }
+
+    /// [`Self::new`] for a registry chosen by its hostname rather than
+    /// named by the user, which returns `None` when the run has no Google
+    /// credentials: no file, and a machine that is not on Google Cloud. The
+    /// caller then reads the registry as it reads any other, with docker
+    /// config or anonymously. A machine is asked whether it is on Google
+    /// Cloud only here, once per run, and only when there is no file; a
+    /// source that exists but fails is still an error.
+    pub async fn detected(
+        registry: &url::Url,
+        http: reqwest::Client,
+        aws_credentials: &AwsCredentialProviders,
+        shared_token: &SharedGoogleToken,
+    ) -> Result<Option<Self>, Error> {
+        Self::detected_on_host(
+            registry,
+            http,
+            &crate::aws::Host::current(),
+            aws_credentials,
+            shared_token,
         )
         .await
     }
@@ -345,21 +346,33 @@ impl GcpAuth {
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
         shared_token: &SharedGoogleToken,
-        selection: Selection,
     ) -> Result<Self, Error> {
         let cached_token = shared_token
-            .cached_token(host, aws_credentials, selection)
+            .configured(host, aws_credentials)
             .await
-            .map_err(|e| {
-                credentials_failed(registry.host_str().unwrap_or_default(), Stage::Setup, &e)
-            })?;
+            .map_err(|e| setup_failed(registry, &e))?;
         Ok(Self::with_token(registry, http, cached_token))
+    }
+
+    /// [`Self::detected`] with the credentials of `host`.
+    async fn detected_on_host(
+        registry: &url::Url,
+        http: reqwest::Client,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+        shared_token: &SharedGoogleToken,
+    ) -> Result<Option<Self>, Error> {
+        let cached_token = shared_token
+            .detected(host, aws_credentials)
+            .await
+            .map_err(|e| setup_failed(registry, &e))?;
+        Ok(cached_token.map(|token| Self::with_token(registry, http, token)))
     }
 
     fn with_token(
         registry: &url::Url,
         http: reqwest::Client,
-        cached_token: Option<Arc<CachedGoogleToken>>,
+        cached_token: Arc<CachedGoogleToken>,
     ) -> Self {
         Self {
             base_url: registry_origin(registry),
@@ -381,47 +394,34 @@ impl GcpAuth {
         Self::with_token(
             &base_url.into().parse().expect("a registry URL"),
             http,
-            Some(Arc::new(CachedGoogleToken::new(api))),
+            Arc::new(CachedGoogleToken::new(api)),
         )
     }
 
-    /// The registry token for `scopes`, exchanged as `identity`. An
-    /// anonymous exchange the registry refuses names the cause: Google
-    /// credentials would have been needed.
-    async fn exchange(&self, scopes: &[Scope], identity: &Identity) -> Result<Token, Error> {
-        let exchanged = self
-            .tokens
+    /// The registry token for `scopes`, exchanged with `google_token`.
+    async fn exchange(
+        &self,
+        scopes: &[Scope],
+        google_token: &google::Secret,
+    ) -> Result<Token, Error> {
+        let credentials = Credentials::Basic {
+            username: GCP_USERNAME.to_owned(),
+            password: google_token.expose().to_owned(),
+        };
+        self.tokens
             .challenge()
-            .exchange(
-                &self.http,
-                &self.base_url,
-                scopes,
-                identity.credentials().as_ref(),
-            )
-            .await;
-        match (identity, exchanged) {
-            (Identity::Anonymous, Err(e)) if e.is_auth_error() => Err(Error::cloud_credentials(
-                &self.hostname,
-                CredentialFailure::Refused,
-                format_args!(
-                    "no Google credentials were found, so the registry was read anonymously and \
-                     refused it ({e}); this image needs Google credentials"
-                ),
-            )),
-            (_, exchanged) => exchanged,
-        }
+            .exchange(&self.http, &self.base_url, scopes, Some(&credentials))
+            .await
     }
 
-    /// The identity to exchange as now.
-    async fn identity(&self) -> Result<Identity, Error> {
-        let Some(cached_token) = &self.cached_token else {
-            return Ok(Identity::Anonymous);
-        };
-        let token = cached_token
+    /// The current Google token.
+    async fn google_token(&self) -> Result<google::Secret, Error> {
+        let token = self
+            .cached_token
             .get()
             .await
             .map_err(|e| credentials_failed(&self.hostname, Stage::TokenRequest, &e))?;
-        Ok(Identity::Google(token.token))
+        Ok(token.token)
     }
 }
 
@@ -444,16 +444,10 @@ impl AuthProvider for GcpAuth {
                     let exchanged = self
                         .recovery
                         .exchange(
-                            || self.identity(),
-                            |identity| async move { self.exchange(scopes, &identity).await },
+                            || self.google_token(),
+                            |google_token| async move { self.exchange(scopes, &google_token).await },
                             judge_token_endpoint,
-                            |refused| {
-                                if let (Identity::Google(refused), Some(cached_token)) =
-                                    (refused, &self.cached_token)
-                                {
-                                    cached_token.refuse(refused);
-                                }
-                            },
+                            |refused| self.cached_token.refuse(refused),
                         )
                         .await;
                     let token = exchanged.inspect_err(|e| {
@@ -483,7 +477,7 @@ mod tests {
 
     use tokio::sync::Mutex;
     use wiremock::MockServer;
-    use wiremock::matchers::{header, header_exists, method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
@@ -638,10 +632,7 @@ mod tests {
 
     /// The password of the credentials `auth` holds now.
     async fn password(auth: &GcpAuth) -> String {
-        match auth.identity().await.unwrap() {
-            Identity::Google(token) => token.expose().to_owned(),
-            Identity::Anonymous => panic!("anonymous, not a Google account"),
-        }
+        auth.google_token().await.unwrap().expose().to_owned()
     }
 
     #[tokio::test]
@@ -775,7 +766,7 @@ mod tests {
             .await;
         let source = MockGcpTokenSource::with_tokens(vec![("ya29.fresh", None)]);
         let auth = GcpAuth::with_api(server.uri(), crate::test_http_client(), source);
-        auth.cached_token.as_ref().unwrap().token.set(
+        auth.cached_token.token.set(
             AccessToken {
                 token: "ya29.revoked".to_owned().into(),
                 expiry: Expiry::Never,
@@ -938,7 +929,6 @@ mod tests {
                 &host,
                 &aws_credentials,
                 &shared,
-                Selection::Configured,
             )
             .await
             .unwrap_err();
@@ -970,7 +960,6 @@ mod tests {
                     host,
                     aws_credentials,
                     shared,
-                    Selection::Configured,
                 )
                 .await
             }
@@ -1046,7 +1035,6 @@ mod tests {
             host,
             &AwsCredentialProviders::default(),
             shared,
-            Selection::Configured,
         )
         .await
         .unwrap()
@@ -1106,92 +1094,79 @@ mod tests {
         auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
     }
 
-    /// A request with no `Authorization` header, as an anonymous read sends.
-    fn without_credentials(request: &wiremock::Request) -> bool {
-        !request.headers.contains_key("authorization")
+    /// A host with no Google file whose metadata IP answers the probe once
+    /// with `headers`.
+    fn probed_host(
+        vars: &[(&str, &str)],
+        headers: serde_json::Value,
+    ) -> (crate::aws::Host, Arc<crate::aws::Replay>) {
+        let replay = Arc::new(crate::aws::Replay::of([crate::aws::record(
+            0,
+            &http::Method::GET,
+            "http://169.254.169.254/",
+            serde_json::json!({}),
+            http::StatusCode::OK,
+            headers,
+            b"",
+        )]));
+        let mut host = google::tests::host(crate::aws::Platform::Unix, vars, &[]);
+        host.network = crate::aws::Network::Replay(Arc::clone(&replay));
+        (host, replay)
     }
 
-    /// A provider that reads `server` anonymously.
-    fn anonymous(server: &MockServer) -> GcpAuth {
-        GcpAuth::with_token(
-            &server.uri().parse().unwrap(),
+    /// A provider for a registry chosen by its hostname.
+    async fn detected(
+        registry: &str,
+        host: &crate::aws::Host,
+        shared: &SharedGoogleToken,
+    ) -> Result<Option<GcpAuth>, Error> {
+        GcpAuth::detected_on_host(
+            &registry.parse().unwrap(),
             crate::test_http_client(),
-            None,
-        )
-    }
-
-    /// A host-detected registry on a machine with no Google credentials
-    /// anywhere and not on Google Cloud reads anonymously: the token request
-    /// carries no credentials and no Google token is ever asked for.
-    /// Breaks if a missing source is an error, the exchange sends
-    /// credentials, or a source is built that could be contacted.
-    #[tokio::test]
-    async fn a_detected_registry_with_no_source_reads_anonymously() {
-        let server = MockServer::start().await;
-        testing::challenge(&server, "us-docker.pkg.dev")
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .and(without_credentials)
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"token": "public", "expires_in": 300})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let host = google::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        let auth = GcpAuth::on_host(
-            &server.uri().parse().unwrap(),
-            crate::test_http_client(),
-            &host,
+            host,
             &AwsCredentialProviders::default(),
-            &SharedGoogleToken::default(),
-            Selection::Detected,
+            shared,
         )
         .await
-        .unwrap();
-
-        let token = auth.get_token(&[Scope::pull("repo")]).await.unwrap();
-
-        assert_eq!(token.value(), "public");
-        assert!(auth.cached_token.is_none());
     }
 
-    /// A registry the user named with `auth_type` still has a Google token
-    /// source when there are no credentials, so missing ones stay an error
-    /// and never become an anonymous read. Breaks if a named registry reads
-    /// anonymously.
+    /// A registry chosen by its hostname, on a machine with no Google file
+    /// that is not on Google Cloud, gets no Google provider, so the caller
+    /// reads it as any other. The machine is asked once for the run however
+    /// many registries (a second probe fails the replay). Breaks if a
+    /// missing source is an error, a Google provider is built, or each
+    /// registry probes.
     #[tokio::test]
-    async fn a_configured_registry_keeps_its_google_token_source() {
-        let host = google::tests::host(crate::aws::Platform::Unix, &[], &[]);
-        for (selection, has_source) in [(Selection::Configured, true), (Selection::Detected, false)]
-        {
-            let auth = GcpAuth::on_host(
-                &"https://us-docker.pkg.dev".parse().unwrap(),
-                crate::test_http_client(),
-                &host,
-                &AwsCredentialProviders::default(),
-                &SharedGoogleToken::default(),
-                selection,
-            )
-            .await
-            .unwrap();
-            assert_eq!(auth.cached_token.is_some(), has_source, "{selection:?}");
+    async fn a_detected_registry_with_no_source_gets_no_provider() {
+        let (host, replay) = probed_host(&[], serde_json::json!({"Server": ["EC2ws"]}));
+        let shared = SharedGoogleToken::default();
+
+        for registry in ["https://us-docker.pkg.dev", "https://gcr.io"] {
+            assert!(detected(registry, &host, &shared).await.unwrap().is_none());
         }
+        replay.assert_done();
     }
 
-    /// On Google Cloud a metadata server that fails is an error, never an
-    /// anonymous read: the registry is not asked for anything. Breaks if a
-    /// machine with credentials it cannot fetch reads anonymously.
+    /// A registry chosen by its hostname uses the Google file when there is
+    /// one, without asking whether the machine is on Google Cloud (the
+    /// replay answers nothing, so a probe fails the test). Breaks if a file
+    /// is passed over for the probe.
+    #[tokio::test]
+    async fn a_detected_registry_uses_the_google_file() {
+        let host = user_host_with_file();
+        let shared = SharedGoogleToken::default();
+        assert!(
+            detected("https://gcr.io", &host, &shared)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// On Google Cloud a metadata server that fails is an error, never a
+    /// fall through to anonymous: the registry is not asked for anything.
+    /// Breaks if a machine with credentials it cannot fetch reads
+    /// anonymously.
     #[tokio::test]
     async fn on_google_cloud_a_failing_metadata_server_is_an_error() {
         let metadata = MockServer::start().await;
@@ -1214,16 +1189,10 @@ mod tests {
             )],
             &[],
         );
-        let auth = GcpAuth::on_host(
-            &registry.uri().parse().unwrap(),
-            crate::test_http_client(),
-            &host,
-            &AwsCredentialProviders::default(),
-            &SharedGoogleToken::default(),
-            Selection::Detected,
-        )
-        .await
-        .unwrap();
+        let auth = detected(&registry.uri(), &host, &SharedGoogleToken::default())
+            .await
+            .unwrap()
+            .expect("a Google provider on Google Cloud");
 
         let error = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
 
@@ -1233,17 +1202,15 @@ mod tests {
                 .contains("GCP access token request failed"),
             "{error}"
         );
-        assert!(
-            !error.to_string().contains("no Google credentials"),
-            "{error}"
-        );
     }
 
-    /// Registries the user named share one metadata server token when there
-    /// are no credentials, as they share a found source's: one token request
-    /// however many registries. Breaks if each registry loads its own.
+    /// A registry the user named asks the metadata server without asking
+    /// whether the machine is on Google Cloud, and registries that do share
+    /// its one token request. The host's replay answers nothing, so a probe
+    /// fails the test. Breaks if a named registry probes or each loads its
+    /// own metadata token.
     #[tokio::test]
-    async fn configured_registries_with_no_source_share_one_metadata_token() {
+    async fn configured_registries_with_no_file_share_one_metadata_token() {
         let metadata = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1257,9 +1224,6 @@ mod tests {
             .mount(&registry)
             .await;
         testing::token("registry").mount(&registry).await;
-        // The run found no source, which a host cannot say while it also
-        // names the mock as its metadata server, so the outcome is set and
-        // the named host only points the metadata token source at the mock.
         let host = google::tests::host(
             crate::aws::Platform::Unix,
             &[(
@@ -1269,112 +1233,49 @@ mod tests {
             &[],
         );
         let shared = SharedGoogleToken::default();
-        shared.loaded.set(Ok(Loaded::Absent)).ok().unwrap();
-        let mut auths = Vec::new();
-        for scope in ["a", "b", "c"] {
+
+        for repo in ["a", "b", "c"] {
             let auth = GcpAuth::on_host(
                 &registry.uri().parse().unwrap(),
                 crate::test_http_client(),
                 &host,
                 &AwsCredentialProviders::default(),
                 &shared,
-                Selection::Configured,
             )
             .await
             .unwrap();
-            auth.get_token(&[Scope::pull(scope)]).await.unwrap();
-            auths.push(auth);
+            auth.get_token(&[Scope::pull(repo)]).await.unwrap();
         }
     }
 
-    /// An anonymous read the token endpoint refuses fails naming the missing
-    /// credentials, as an authentication failure. Breaks if the error is the
-    /// bare status or is not an authentication failure.
+    /// A named registry on a machine with no Google file and no named
+    /// metadata server is still given the metadata server and not asked
+    /// whether it exists: the empty replay fails the test on any request.
+    /// Breaks if a named registry falls through or probes.
     #[tokio::test]
-    async fn an_anonymous_read_refused_names_the_cause() {
-        let server = MockServer::start().await;
-        testing::challenge(&server, "us-docker.pkg.dev")
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(403))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let error = anonymous(&server)
-            .get_token(&[Scope::pull("repo")])
-            .await
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("no Google credentials were found"),
-            "{error}"
-        );
-        assert!(error.to_string().contains("403"), "{error}");
-        assert!(error.is_auth_error(), "{error}");
+    async fn a_configured_registry_with_no_source_is_not_probed() {
+        let host = google::tests::host(crate::aws::Platform::Unix, &[], &[]);
+        GcpAuth::on_host(
+            &"https://us-docker.pkg.dev".parse().unwrap(),
+            crate::test_http_client(),
+            &host,
+            &AwsCredentialProviders::default(),
+            &SharedGoogleToken::default(),
+        )
+        .await
+        .unwrap();
     }
 
-    /// A failure of an anonymous read that is not a refusal keeps its own
-    /// error. Breaks if a throttle is reported as missing credentials.
-    #[tokio::test]
-    async fn an_anonymous_read_throttled_does_not_name_missing_credentials() {
-        let server = MockServer::start().await;
-        testing::challenge(&server, "us-docker.pkg.dev")
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(429))
-            .mount(&server)
-            .await;
-
-        let error = anonymous(&server)
-            .get_token(&[Scope::pull("repo")])
-            .await
-            .unwrap_err();
-
-        assert!(
-            !error.to_string().contains("no Google credentials"),
-            "{error}"
-        );
-        assert!(!error.is_auth_error(), "{error}");
-    }
-
-    /// A registry that refuses the anonymous token (401 on a request) has it
-    /// dropped and exchanged again, as an anonymous read of any registry is,
-    /// and the new token is used. Breaks if the refused token is kept or the
-    /// refusal poisons the host.
-    #[tokio::test]
-    async fn an_anonymous_token_refused_with_401_is_exchanged_again() {
-        let server = MockServer::start().await;
-        testing::challenge(&server, "us-docker.pkg.dev")
-            .expect(2)
-            .mount(&server)
-            .await;
-        for token in ["anon-first", "anon-second"] {
-            Mock::given(method("GET"))
-                .and(path("/token"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"token": token, "expires_in": 300})),
-                )
-                .up_to_n_times(1)
-                .expect(1)
-                .mount(&server)
-                .await;
-        }
-        let auth = anonymous(&server);
-        let scopes = [Scope::pull("repo")];
-
-        let refused = auth.get_token(&scopes).await.unwrap();
-        auth.refuse(refused).await;
-        let again = auth.get_token(&scopes).await.unwrap();
-
-        assert_eq!(again.value(), "anon-second");
+    /// A host whose `GOOGLE_APPLICATION_CREDENTIALS` file is an authorized
+    /// user's.
+    fn user_host_with_file() -> crate::aws::Host {
+        adc_host(&serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "client",
+            "client_secret": "secret",
+            "refresh_token": "refresh",
+            "token_uri": "http://127.0.0.1:9/token",
+        }))
     }
 
     #[tokio::test]
