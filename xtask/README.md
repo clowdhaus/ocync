@@ -24,7 +24,7 @@ Primary entry point -- orchestrates benchmarks on a remote cloud instance via SS
 cargo xtask bench-remote --provider aws --scenario sync
 ```
 
-Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks with live streamed output, then SCPs results back.
+Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks with live streamed output, then SCPs results back. The run's record and performance-page blocks come back in `deferred.json` inside the results directory; `bench-remote` appends the record to the local `bench/results/<registry>.json` (once per run, however often it is fetched) and updates the local performance page. A command that exits nonzero, or exits 0 with no results, fails.
 
 A run already in progress on the instance, including one still checking out or building, is refused: the command prints that and fails, leaving the run alone. `--force` kills the run and everything it started, then begins fresh. `--fetch` copies the newest results on the instance, which are a live run's partial results only once its benchmark has started (while it checks out or builds, they are the previous run's). It cannot be combined with any option that shapes a run.
 
@@ -41,7 +41,7 @@ A run already in progress on the instance, including one still checking out or b
 | `--no-proxy` | flag | | Run without bench-proxy on the instance |
 | `--fetch` | flag | | Copy the newest results on the instance without running (a live run's partial results once its benchmark has started); conflicts with every run option |
 | `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |
-| `--git-ref` | string | current branch | Git ref to checkout on the instance |
+| `--git-ref` | string | current branch | Git ref to checkout on the instance; a ref older than `bench --archive` cannot run |
 | `--output` | path | `bench/results` | Local directory to save fetched results |
 
 ### `cargo xtask bench-lock`
@@ -81,6 +81,8 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | `--proxy-ca` | path | `/etc/bench-proxy/ca.pem` | Bench-proxy CA certificate |
 | `--proxy-ca-key` | path | `/etc/bench-proxy/ca-key.pem` | Bench-proxy CA private key |
 | `--output` | path | `bench/results/<timestamp>` | Output directory for results |
+| `--run-timestamp` | `YYYY-MM-DD-HHMMSS` | now | The run's start time: names the default output directory and is the run record's timestamp. `bench-remote` sets it so it knows which directory to fetch |
+| `--archive` | `write`, `defer` | `write` | `write` appends the run record to `bench/results/<registry>.json` and updates the performance page. `defer` touches neither and leaves both in `deferred.json` in the output directory, for the fetch to apply; `bench-remote` runs with it, so the instance writes no tracked file |
 | `--regression` | flag | | Compare against baseline, exit non-zero on regression |
 | `--threshold-pct` | u32 | `20` | Regression threshold percentage |
 

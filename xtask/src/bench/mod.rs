@@ -201,9 +201,21 @@ pub(crate) struct BenchArgs {
     #[arg(long, default_value = "/etc/bench-proxy/ca-key.pem")]
     pub(crate) proxy_ca_key: PathBuf,
 
-    /// Output directory for results (default: bench-results/{timestamp}).
+    /// Output directory for results (default: bench/results/{timestamp}).
     #[arg(long)]
     pub(crate) output: Option<String>,
+
+    /// The run's start time, `YYYY-MM-DD-HHMMSS`: names the default output
+    /// directory and is the run record's timestamp (default: now).
+    /// `bench-remote` sets it so it knows the directory to fetch.
+    #[arg(long)]
+    pub(crate) run_timestamp: Option<RunTimestamp>,
+
+    /// Where the run record and the performance-page blocks go: `write` puts
+    /// them in the tracked archive and page, `defer` leaves both in the output
+    /// directory for whoever fetches the run (`bench-remote` does).
+    #[arg(long, value_enum, default_value = "write")]
+    pub(crate) archive: report::ArchiveMode,
 
     /// Regression mode: compare against stored baseline, exit non-zero on regression.
     #[arg(long)]
@@ -588,10 +600,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         relay_versions.insert(binary, version);
     }
 
-    let timestamp = utc_timestamp();
+    // One value names the results directory and stamps the record.
+    let timestamp = args.run_timestamp.clone().unwrap_or_else(RunTimestamp::now);
     let output_dir = match &args.output {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(format!("bench/results/{timestamp}")),
+        None => timestamp.results_dir(),
     };
 
     let instance = report::InstanceInfo::collect();
@@ -633,7 +646,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         }
     }
     let mut report = BenchReport {
-        timestamp,
+        timestamp: timestamp.to_string(),
         instance,
         corpus_size: corpus.images.len(),
         total_tags: corpus.total_tags(),
@@ -761,16 +774,33 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // missing field. Appending it anyway puts a laptop's numbers next to the
     // rig's under the same key, where nothing downstream can tell them apart.
     // The summary is still written; only the shared history is protected.
-    let results_dir = Path::new("bench/results");
-    if record.machine.instance_type == "unknown" {
+    let record = if record.machine.instance_type == "unknown" {
         eprintln!(
             "bench: run record NOT appended (instance metadata unknown, so this \
              run is not comparable to the archived ones); summary only"
         );
+        None
     } else {
-        report::append_record(results_dir, reg_key, record)
-            .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
-        eprintln!("bench: run record appended to bench/results/{reg_key}.json");
+        Some(record)
+    };
+    let deferred = report::Deferred::new(reg_key, record, &report);
+    match args.archive {
+        // The step a fetch of a deferred run takes too.
+        report::ArchiveMode::Write => deferred
+            .apply(
+                Path::new(report::ARCHIVE_DIR),
+                Path::new(report::PERFORMANCE_PAGE),
+            )
+            .map_err(|e| with_stop_reason(e, stopped.as_deref()))?,
+        report::ArchiveMode::Defer => {
+            deferred
+                .write(&output_dir)
+                .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
+            eprintln!(
+                "bench: run record and page blocks left in {} for the fetch to apply",
+                output_dir.display()
+            );
+        }
     }
 
     if let Some(reason) = stopped {
@@ -1819,6 +1849,53 @@ fn clean_staging_tmpdir() {
     }
 }
 
+/// When a run started: a UTC timestamp, `YYYY-MM-DD-HHMMSS`. It names the
+/// run's results directory and is the timestamp of its record, so the one value
+/// feeds both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunTimestamp(String);
+
+impl RunTimestamp {
+    /// The current time.
+    pub(crate) fn now() -> Self {
+        Self(utc_timestamp())
+    }
+
+    /// Accept the format's shape: 17 characters, digits with dashes after the
+    /// year, month and day.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        let shaped = raw.len() == 17
+            && raw.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 | 10 => b == b'-',
+                _ => b.is_ascii_digit(),
+            });
+        if shaped {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(format!("{raw:?} is not a timestamp like 2026-10-30-214340"))
+        }
+    }
+
+    /// The directory a run with this timestamp writes its results into.
+    pub(crate) fn results_dir(&self) -> PathBuf {
+        Path::new(report::ARCHIVE_DIR).join(&self.0)
+    }
+}
+
+impl std::str::FromStr for RunTimestamp {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, String> {
+        Self::parse(raw)
+    }
+}
+
+impl std::fmt::Display for RunTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Returns a UTC timestamp string in `YYYY-MM-DD-HHMMSS` format.
 fn utc_timestamp() -> String {
     let secs = std::time::SystemTime::now()
@@ -1826,7 +1903,8 @@ fn utc_timestamp() -> String {
         .unwrap_or_default()
         .as_secs();
 
-    // Manual UTC formatting -- avoids a chrono/time dependency for one call site.
+    // Manual UTC formatting -- avoids a chrono/time dependency for the run
+    // timestamp alone.
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
@@ -1895,6 +1973,22 @@ mod tests {
         ] {
             assert_eq!(days_to_civil(days), expected, "day {days}");
         }
+    }
+
+    #[test]
+    fn a_run_timestamp_names_the_results_directory_and_refuses_other_shapes() {
+        let ts: RunTimestamp = "2026-10-30-214340".parse().unwrap();
+        assert_eq!(ts.to_string(), "2026-10-30-214340");
+        assert_eq!(
+            ts.results_dir(),
+            Path::new("bench/results/2026-10-30-214340")
+        );
+        for bad in ["", "../etc", "2026-10-30-21434", "2026/10/30-214340"] {
+            assert!(bad.parse::<RunTimestamp>().is_err(), "{bad:?}");
+        }
+        let args = parse_bench(&["--run-timestamp", "2026-10-30-214340", "sync"]).unwrap();
+        assert_eq!(args.run_timestamp, Some(ts));
+        assert!(parse_bench(&["--run-timestamp", "../x", "sync"]).is_err());
     }
 
     #[test]
