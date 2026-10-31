@@ -68,12 +68,12 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 ## The corpus lock
 
-`bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to its manifest digest, so runs on different dates sync the same content. It is tracked in git, sits beside the corpus it locks, and is written only by `cargo xtask bench-lock`. A prepare-only run reads no lock.
+`bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to its manifest digest and the blob digests it holds, so runs on different dates sync the same content. It is tracked in git, sits beside the corpus it locks, and is written only by `cargo xtask bench-lock`. A prepare-only run reads no lock.
 
 - **`cargo xtask bench-lock`** resolves every ref in the corpus and the partial overrides and writes the lock. A ref that cannot be resolved fails the command and is named. Over unchanged sources it leaves the file, and its `locked_at`, untouched. It needs the network and Docker Hub credentials (anonymous works for a small corpus), and writes nothing to a cloud.
 - **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
 - **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and its sources have since moved, the error says so.
-- **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, or under none; delete `bench/results/baseline.json` to record a new one.
+- **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, under none, or over another corpus size; delete `bench/results/baseline.json` to record a new one.
 - A floating tag stays in the corpus only where the source publishes no immutable tag for the same content.
 
 ## Benchmark fairness invariants
@@ -82,8 +82,10 @@ The harness enforces these automatically -- do not bypass them.
 
 **Before the build, and again before every later scenario except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
 
+**Before any tool runs (once per run):**
+0. **CDN pre-warm** -- GET every blob the lock lists for the run's refs, 8 at a time per registry, within 8 minutes, then wait 6 minutes if any blob missed the CDN. A registry not fully warmed is warned about and recorded in the run record's `prewarm` field. Without this, the first tool meets a cold CDN and the last a warm one.
+
 **Before any tool runs (once per scenario):**
-0. **CDN pre-warm** -- GET every unique blob (following 302 redirects to CloudFront, consuming full body) with OCI token exchange; the lock check has just requested every source manifest, which warms the manifest edge caches. Wait 6 minutes for CloudFront propagation. Without this, the first tool hits cold CDN while the last tool gets near-100% hits -- a massive unfair advantage from execution order.
 1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
 
 **Before every tool run (including the first):**
@@ -187,7 +189,7 @@ jq '[.response_bytes] | add' <tool>-<pass>-proxy.jsonl
 
 Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
 
-Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, and all 9 per-tool metrics per scenario.
+Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, the pre-warm outcome, and all 9 per-tool metrics per scenario.
 
 ## Competitor config gotchas
 

@@ -85,7 +85,7 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-- **CDN pre-warm**, once per run before the first tool (skippable with `--skip-prewarm`): every blob of every tag the run syncs is fetched once, with a fixed number of requests at a time per registry, and a failed request retried. The blobs are the ones the corpus lock records for each tag, so the pre-warm reads no manifest. A registry with a blob that failed, or that was not finished by the 8-minute deadline, is named in a warning, and in the run's summary and record with how many of its blobs were not warmed, and a skipped pre-warm is recorded the same way.
+- **CDN pre-warm**, once per run before the first tool (`--skip-prewarm` skips it): every blob the corpus lock records for the run's tags is fetched once, a fixed number at a time per registry, within 8 minutes. A skipped pre-warm, or a registry not fully warmed, is named in the run's summary and record.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.
