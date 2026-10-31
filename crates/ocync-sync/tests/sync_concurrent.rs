@@ -1498,6 +1498,8 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
 #[tokio::test(flavor = "current_thread")]
 async fn sync_blob_failure_ends_a_blobs_mount_source_wait() {
     const COMMIT_DELAY: Duration = Duration::from_secs(4);
+    // Long enough for B's shared layer to reach the commit wait first.
+    const FAILURE_DELAY: Duration = Duration::from_millis(500);
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
@@ -1515,7 +1517,7 @@ async fn sync_blob_failure_ends_a_blobs_mount_source_wait() {
             "/v2/src-b/blobs/{}",
             parts_b.layer_descs[1].digest
         )))
-        .respond_with(ResponseTemplate::new(404))
+        .respond_with(ResponseTemplate::new(404).set_delay(FAILURE_DELAY))
         .with_priority(1)
         .mount(&source_server)
         .await;
