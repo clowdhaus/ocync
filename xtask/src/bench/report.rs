@@ -123,8 +123,8 @@ pub(crate) enum Prewarm {
     Skipped,
     /// Ran.
     Done {
-        /// Registries with a blob that failed or was not started before the
-        /// deadline; empty when every blob was warmed.
+        /// Registries with a blob that failed or was not finished by the
+        /// deadline, started or not; empty when every blob was warmed.
         unwarmed: Vec<String>,
     },
 }

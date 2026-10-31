@@ -12,7 +12,7 @@ use ocync_distribution::sha256::Sha256;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::bench::corpus::{self, CorpusPaths, ImageEntry};
+use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
 use crate::bench::registry::{self, Access, Repository};
 
 /// The digest of `bytes`.
@@ -336,14 +336,16 @@ fn check_unmoved(
 /// Probes with HEAD, which costs no body, and falls back to a GET only for a
 /// registry that sends no digest header.
 pub(crate) async fn ensure_unmoved(
-    access: &Access<'_>,
+    client: &reqwest::Client,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
+    auth: Option<&DockerHubAuth>,
 ) -> Result<(), RecheckError> {
     eprintln!(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
+    let access = Access::new(client, auth);
     let (resolved, failed) = access.resolve(refs, Access::fetch_digest).await;
     check_unmoved(lock, &resolved, &failed)
 }

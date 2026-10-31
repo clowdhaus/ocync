@@ -20,7 +20,7 @@ const DOCKER_HUB_API_HOST: &str = "registry-1.docker.io";
 const DOCKER_HUB_NAMES: [&str; 3] = ["docker.io", DOCKER_HUB_API_HOST, "index.docker.io"];
 
 /// The registry a repository lives on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Host<'a> {
     /// Docker Hub, named `docker.io`, `index.docker.io` or its API host in a
     /// corpus source, and served from its API host.
@@ -29,9 +29,9 @@ pub(crate) enum Host<'a> {
     Other(&'a str),
 }
 
-impl Host<'_> {
+impl<'a> Host<'a> {
     /// The hostname requests go to.
-    pub(crate) fn api_host(&self) -> &str {
+    pub(crate) fn api_host(&self) -> &'a str {
         match self {
             Self::DockerHub => DOCKER_HUB_API_HOST,
             Self::Other(host) => host,
@@ -40,7 +40,7 @@ impl Host<'_> {
 }
 
 /// A repository on a registry, as a corpus source names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Repository<'a> {
     /// The registry holding the repository.
     pub(crate) host: Host<'a>,
@@ -131,11 +131,11 @@ async fn send_retrying(
 
 /// A repository as a map key: the API host and the path, owned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct RepoKey {
+struct RepoKey {
     /// Hostname requests go to.
-    pub(crate) host: String,
+    host: String,
     /// Path within the registry.
-    pub(crate) path: String,
+    path: String,
 }
 
 impl From<&Repository<'_>> for RepoKey {
@@ -147,27 +147,17 @@ impl From<&Repository<'_>> for RepoKey {
     }
 }
 
-impl RepoKey {
-    /// The repository this key names.
-    pub(crate) fn repository(&self) -> Repository<'_> {
-        Repository {
-            host: host_of(&self.host),
-            path: &self.path,
-        }
-    }
-}
-
-/// Longest a connection may go without sending a byte before the request that
-/// waits on it fails.
+/// Longest the client waits for a response, and then for each further chunk of
+/// its body.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The client [`Access`] sends through. Its total timeout bounds a manifest or
-/// token request; a request that may legitimately run longer, as a blob
-/// download does, sets its own, and [`READ_TIMEOUT`] still ends it if the
-/// connection stalls.
+/// The client [`Access`] sends through. It has no total timeout, so a large
+/// blob is not cut mid-download; [`READ_TIMEOUT`] ends a request that stalls
+/// before its headers or between chunks. A body that trickles without ever
+/// stalling that long is not capped, which only a caller that bounds its own
+/// time, as the pre-warm does, can handle.
 pub(crate) fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
         .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))
@@ -175,15 +165,18 @@ pub(crate) fn http_client() -> Result<reqwest::Client, String> {
 
 /// The client, credentials and bearer tokens requests go through. Tokens are
 /// kept by repository, so a repository with several tags is authorized once.
-/// Shared by reference, because blob tasks run together; no borrow is held
-/// across an exchange.
+/// Built for one check or one pre-warm and dropped with it: a token is only
+/// renewed when the registry answers 401, and one held for hours may be
+/// answered with another status. Shared by reference, because blob tasks run
+/// together; no borrow is held across an exchange.
 pub(crate) struct Access<'a> {
     /// Client for every request and token exchange.
     client: &'a reqwest::Client,
     /// Docker Hub credentials for the token exchange, if any.
     auth: Option<&'a DockerHubAuth>,
-    /// Latest successful exchange for each repository.
-    tokens: RefCell<HashMap<RepoKey, String>>,
+    /// Latest exchange for each repository; a failure is kept so it is
+    /// reported for every tag and not retried at once.
+    tokens: RefCell<HashMap<RepoKey, Result<String, String>>>,
 }
 
 impl<'a> Access<'a> {
@@ -197,12 +190,19 @@ impl<'a> Access<'a> {
     }
 
     /// The token for `repo`, exchanged for the first time it is asked, or when
-    /// the one held is `rejected`, which the registry refused.
+    /// the one held is `rejected`, which the registry refused. A token another
+    /// request already replaced is returned as it is.
     async fn token(&self, repo: &Repository<'_>, rejected: Option<&str>) -> Result<String, String> {
-        cached_token(&self.tokens, RepoKey::from(repo), rejected, async || {
-            oci_token(self.client, repo, self.auth).await
-        })
-        .await
+        let key = RepoKey::from(repo);
+        let held = self.tokens.borrow().get(&key).cloned();
+        if let Some(held) =
+            held.filter(|held| rejected.is_none() || held.as_deref().ok() != rejected)
+        {
+            return held;
+        }
+        let exchanged = oci_token(self.client, repo, self.auth).await;
+        self.tokens.borrow_mut().insert(key, exchanged.clone());
+        exchanged
     }
 
     /// Send the request `build` makes on the shared client, with the bearer
@@ -221,25 +221,6 @@ impl<'a> Access<'a> {
         )
         .await
     }
-}
-
-/// The token held for `key`, or the one `exchange` yields, which is kept. A
-/// held token that is `rejected` is exchanged for; one another request already
-/// replaced is returned as it is. A failed exchange is returned and not kept,
-/// so the next call tries again instead of serving the error for the run.
-async fn cached_token(
-    held: &RefCell<HashMap<RepoKey, String>>,
-    key: RepoKey,
-    rejected: Option<&str>,
-    exchange: impl AsyncFnOnce() -> Result<String, String>,
-) -> Result<String, String> {
-    let current = held.borrow().get(&key).cloned();
-    if let Some(current) = current.filter(|t| rejected.is_none() || Some(t.as_str()) != rejected) {
-        return Ok(current);
-    }
-    let token = exchange().await?;
-    held.borrow_mut().insert(key, token.clone());
-    Ok(token)
 }
 
 /// Send with the current token. A 401 means the token expired, so exchange for
@@ -347,35 +328,6 @@ mod tests {
     use futures_util::FutureExt;
 
     use super::*;
-
-    #[test]
-    fn a_failed_token_exchange_is_not_kept() {
-        // Catches: one transient failure answering for the run.
-        use futures_util::FutureExt;
-        let held = RefCell::default();
-        let key = || RepoKey {
-            host: "r.example".into(),
-            path: "a/b".into(),
-        };
-        let exchanges = Cell::new(0);
-        let ask = |rejected: Option<&str>, answer: Result<&str, &str>| {
-            cached_token(&held, key(), rejected, async || {
-                exchanges.set(exchanges.get() + 1);
-                answer.map(str::to_owned).map_err(str::to_owned)
-            })
-            .now_or_never()
-            .expect("nothing here waits")
-        };
-        assert_eq!(ask(None, Err("timeout")), Err("timeout".to_owned()));
-        assert_eq!(ask(None, Ok("t1")), Ok("t1".to_owned()));
-        // Held now: no exchange.
-        assert_eq!(ask(None, Err("unused")), Ok("t1".to_owned()));
-        assert_eq!(exchanges.get(), 2);
-        // Rejected: exchanged for again; another request's replacement is not.
-        assert_eq!(ask(Some("t1"), Ok("t2")), Ok("t2".to_owned()));
-        assert_eq!(ask(Some("t1"), Err("unused")), Ok("t2".to_owned()));
-        assert_eq!(exchanges.get(), 3);
-    }
 
     #[test]
     fn split_source_maps_docker_hub_to_its_api_host() {

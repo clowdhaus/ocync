@@ -383,9 +383,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
     let http = registry::http_client()?;
-    // One for the whole run, so the pre-warm reuses the tokens the lock check
-    // already exchanged.
-    let access = registry::Access::new(&http, corpus.dockerhub_auth.as_ref());
+    let auth = corpus.dockerhub_auth.as_ref();
     let refs: BTreeSet<_> = transfers
         .iter()
         .flat_map(|transfer| scenario_refs(transfer, &corpus))
@@ -393,7 +391,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a moved source costs
         // seconds rather than a wasted run.
-        lock::ensure_unmoved(&access, lock, &refs)
+        lock::ensure_unmoved(&http, lock, &refs, auth)
             .await
             .map_err(|e| match e {
                 lock::RecheckError::Lookup(text) => format!(
@@ -468,7 +466,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
         (!transfers.is_empty()).then_some(Prewarm::Skipped)
     } else if let Some(lock) = &lock {
-        Some(cdn_prewarm(&access, lock, &refs).await)
+        Some(cdn_prewarm(&http, auth, lock, &refs).await)
     } else {
         eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
         None
@@ -495,7 +493,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         for (position, transfer) in transfers.iter().enumerate() {
             let refs = scenario_refs(transfer, &corpus);
             if position > 0 {
-                let check = lock::ensure_unmoved(&access, lock, &refs).await;
+                let check = lock::ensure_unmoved(&http, lock, &refs, auth).await;
                 match lock::between_scenarios(check) {
                     lock::Next::Proceed { warning } => {
                         if let Some(warning) = warning {
@@ -562,7 +560,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .await;
             if let Err(error) = outcome {
                 // A source that moved mid-scenario is not the tool's fault.
-                let recheck = lock::ensure_unmoved(&access, lock, &refs).await;
+                let recheck = lock::ensure_unmoved(&http, lock, &refs, auth).await;
                 stopped = Some(lock::explain(error.to_string(), recheck));
                 break;
             }
@@ -1346,10 +1344,10 @@ impl PrewarmStats {
 /// The (repository, digest) of every blob the pre-warm fetches: all those the
 /// lock records for the refs the run syncs, deduplicated, so every tag is
 /// covered.
-fn blobs_to_warm(
-    lock: &lock::Lock,
-    refs: &BTreeSet<lock::ImageRef>,
-) -> HashSet<(registry::RepoKey, Digest)> {
+fn blobs_to_warm<'a>(
+    lock: &'a lock::Lock,
+    refs: &'a BTreeSet<lock::ImageRef>,
+) -> HashSet<(registry::Repository<'a>, &'a Digest)> {
     let mut blobs = HashSet::new();
     for image in refs {
         let repo = registry::split_source(&image.source)
@@ -1358,8 +1356,7 @@ fn blobs_to_warm(
             .images
             .get(image)
             .expect("ensure_unmoved refuses a ref the lock lacks");
-        let repo = registry::RepoKey::from(&repo);
-        blobs.extend(entry.blobs.iter().map(|b| (repo.clone(), b.clone())));
+        blobs.extend(entry.blobs.iter().map(|blob| (repo, blob)));
     }
     blobs
 }
@@ -1384,6 +1381,38 @@ const PREWARM_PER_REGISTRY: usize = 8;
 /// Attempts at one blob whose body fails mid-read.
 const PREWARM_MAX_ATTEMPTS: u32 = 2;
 
+/// Warm every blob, at most [`PREWARM_PER_REGISTRY`] at a time per registry,
+/// each by `deadline`, and count the outcomes by registry. `send` requests one
+/// blob, `what` naming it in notices.
+async fn warm_blobs<'a>(
+    blobs: &HashSet<(registry::Repository<'a>, &'a Digest)>,
+    deadline: Instant,
+    send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
+) -> BTreeMap<&'a str, PrewarmStats> {
+    let hosts: BTreeSet<&str> = blobs.iter().map(|(repo, _)| repo.host.api_host()).collect();
+    let permits: HashMap<&str, tokio::sync::Semaphore> = hosts
+        .into_iter()
+        .map(|host| (host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY)))
+        .collect();
+    let outcomes = futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
+        let (permits, send) = (&permits, &send);
+        async move {
+            let host = repo.host.api_host();
+            let _permit = permits[host].acquire().await.unwrap();
+            let what = format!("blob pre-warm {repo}@{digest}");
+            let outcome =
+                warm_blob(deadline, &what, async || send(repo, digest, &what).await).await;
+            (host, outcome)
+        }
+    }))
+    .await;
+    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
+    for (host, outcome) in outcomes {
+        stats.entry(host).or_default().record(outcome);
+    }
+    stats
+}
+
 /// Pull every unique source blob once to warm CDN edge caches.
 ///
 /// Runs before any tool so all tools see identically warm CDN. Uses
@@ -1394,22 +1423,21 @@ const PREWARM_MAX_ATTEMPTS: u32 = 2;
 ///
 /// The outcome says which registries were not warmed, for the run record.
 async fn cdn_prewarm(
-    access: &registry::Access<'_>,
+    client: &reqwest::Client,
+    auth: Option<&corpus::DockerHubAuth>,
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
 ) -> Prewarm {
     // Every blob is held to this time, so the downloads end by it. The CDN
     // wait below follows.
     let deadline = Instant::now() + PREWARM_DEADLINE;
+    let access = registry::Access::new(client, auth);
     let blobs = blobs_to_warm(lock, refs);
 
     // Blob URLs are served via 302 redirects to CloudFront -- completely
     // different cache keys from manifests. Without this pass the first
     // tool to run pays a CDN miss penalty on every blob.
-    //
-    // Each registry has its own concurrency limit, so a slow registry does
-    // not hold back fast ones.
-    let hosts: BTreeSet<&str> = blobs.iter().map(|(key, _)| key.host.as_str()).collect();
+    let hosts: BTreeSet<&str> = blobs.iter().map(|(repo, _)| repo.host.api_host()).collect();
     eprintln!(
         "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} concurrent per registry, \
          {} at most across {} registries)...",
@@ -1417,40 +1445,15 @@ async fn cdn_prewarm(
         PREWARM_PER_REGISTRY * hosts.len(),
         hosts.len()
     );
-    let permits: HashMap<&str, tokio::sync::Semaphore> = hosts
-        .iter()
-        .map(|host| (*host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY)))
-        .collect();
-
-    let outcomes = futures_util::future::join_all(blobs.iter().map(|(key, digest)| {
-        let permits = &permits;
-        async move {
-            let host = key.host.as_str();
-            let _permit = permits[host].acquire().await.unwrap();
-            let url = format!("https://{host}/v2/{}/blobs/{digest}", key.path);
-            let what = format!("blob pre-warm {host}/{}@{digest}", key.path);
-            let outcome = warm_blob(deadline, &what, async || {
-                access
-                    .send(&key.repository(), &what, |client| {
-                        // The time left, so the client's total timeout does
-                        // not cut a large layer; its read timeout still ends
-                        // a stalled download.
-                        client
-                            .get(&url)
-                            .timeout(deadline.saturating_duration_since(Instant::now()))
-                    })
-                    .await
-            })
-            .await;
-            (host, outcome)
-        }
-    }))
+    let stats = warm_blobs(&blobs, deadline, async |repo, digest, what| {
+        let url = format!(
+            "https://{}/v2/{}/blobs/{digest}",
+            repo.host.api_host(),
+            repo.path
+        );
+        access.send(repo, what, |client| client.get(&url)).await
+    })
     .await;
-
-    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
-    for (host, outcome) in outcomes {
-        stats.entry(host).or_default().record(outcome);
-    }
     for (registry, s) in &stats {
         eprintln!(
             "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline",
@@ -1860,12 +1863,7 @@ images:
             .collect();
         let mut got: Vec<(String, String)> = blobs_to_warm(&lock, &refs)
             .into_iter()
-            .map(|(repo, digest)| {
-                (
-                    format!("{}/{}", repo.host, repo.path),
-                    digest.hex()[..1].to_owned(),
-                )
-            })
+            .map(|(repo, digest)| (repo.to_string(), digest.hex()[..1].to_owned()))
             .collect();
         got.sort();
         let want = [
@@ -2177,15 +2175,57 @@ images:
             .block_on(future)
     }
 
+    /// Run `future` to completion, failing rather than hanging if it takes
+    /// over five seconds.
+    fn block_on_within_five_seconds<T>(future: impl Future<Output = T>) -> T {
+        block_on(async { tokio::time::timeout(Duration::from_secs(5), future).await })
+            .expect("the future hung instead of ending at the deadline")
+    }
+
     #[test]
     fn a_blob_not_finished_by_the_deadline_is_dropped_whatever_it_is_waiting_on() {
         // Catches: a send that retries or waits past the deadline holding the
         // pre-warm with it.
         let deadline = Instant::now() + Duration::from_millis(50);
-        let outcome = block_on(warm_blob(deadline, "blob", async || {
+        let outcome = block_on_within_five_seconds(warm_blob(deadline, "blob", async || {
             std::future::pending::<Result<reqwest::Response, String>>().await
         }));
         assert_eq!(outcome, BlobOutcome::PastDeadline);
+    }
+
+    #[test]
+    fn a_registry_that_never_answers_does_not_hold_back_another() {
+        // Catches: one concurrency limit shared by all registries, so a
+        // registry whose requests hang keeps another's blobs waiting for a slot.
+        use registry::{Host, Repository};
+        let digest = lock::fixtures::digest('1');
+        // Many blobs of each, so that under one shared limit some of the
+        // good registry's are sure to queue behind hung ones.
+        let hung_paths: Vec<String> = (0..4 * PREWARM_PER_REGISTRY)
+            .map(|i| format!("a{i}"))
+            .collect();
+        let fine_paths: Vec<String> = (0..4).map(|i| format!("b{i}")).collect();
+        let blobs: HashSet<_> = hung_paths
+            .iter()
+            .map(|path| (Host::Other("hung.example"), path))
+            .chain(
+                fine_paths
+                    .iter()
+                    .map(|path| (Host::Other("fine.example"), path)),
+            )
+            .map(|(host, path)| (Repository { host, path }, &digest))
+            .collect();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let stats = block_on_within_five_seconds(warm_blobs(
+            &blobs,
+            deadline,
+            async |repo, _, _| match repo.host {
+                Host::Other("hung.example") => std::future::pending().await,
+                _ => served("Hit from cloudfront"),
+            },
+        ));
+        assert_eq!(stats["fine.example"].hits, fine_paths.len() as u64);
+        assert_eq!(stats["hung.example"].past_deadline, hung_paths.len() as u64);
     }
 
     #[test]
