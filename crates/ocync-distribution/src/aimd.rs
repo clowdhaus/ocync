@@ -134,14 +134,20 @@ impl TokenBucket {
                     s.tokens -= 1.0;
                     return;
                 }
-                let need = 1.0 - s.tokens;
-                Duration::from_secs_f64(need / self.rate_per_sec)
+                refill_wait(1.0 - s.tokens, self.rate_per_sec)
             };
             // The lock is released before sleeping, or every consumer
             // would serialize on it.
             tokio::time::sleep(sleep_for).await;
         }
     }
+}
+
+/// How long until `need` tokens refill at `rate_per_sec`, at least tokio's
+/// 1 ms timer resolution: a shortfall of a few ulps would otherwise round to
+/// a zero sleep, and under paused test time the clock then never advances.
+fn refill_wait(need: f64, rate_per_sec: f64) -> Duration {
+    Duration::from_secs_f64(need / rate_per_sec).max(Duration::from_millis(1))
 }
 
 /// An OCI registry API action, used to map operations to independent AIMD windows.
@@ -648,6 +654,14 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A shortfall too small for a nanosecond still sleeps long enough for
+    /// tokio's clock to move; a zero sleep spins forever under paused time.
+    #[test]
+    fn refill_wait_never_rounds_to_zero() {
+        assert_eq!(refill_wait(1e-12, 1.0), Duration::from_millis(1));
+        assert_eq!(refill_wait(1.0, 4.0), Duration::from_millis(250));
+    }
 
     // ---------------------------------------------------------------------------
     // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
