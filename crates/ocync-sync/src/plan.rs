@@ -1,12 +1,74 @@
 //! Per-(repo) blob state and upload-claim coordination for mount support.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::RepositoryName;
+use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+
+/// A registry identifier used as the in-run copy and failure key.
+///
+/// The config-defined name (e.g. `us-ecr`) or the bare hostname for ad-hoc
+/// commands. Must be unique per mapping. Within one run an alias has one
+/// address; the transfer state cache, which outlives a config edit, keys by
+/// [`TargetId`] instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegistryAlias(String);
+
+impl RegistryAlias {
+    /// Create a new registry alias.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::ops::Deref for RegistryAlias {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RegistryAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Key of a target in the transfer state cache: the config entry and the
+/// address it served when the state was recorded.
+///
+/// The address makes a changed `url` under a kept alias a new key, so the cache
+/// never credits the new registry with the old one's blobs. The alias keeps two
+/// entries for one host apart, as their clients (and so credentials and
+/// outcomes) are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TargetId {
+    /// Config entry name.
+    alias: RegistryAlias,
+    /// Address the entry's client talks to.
+    authority: RegistryAuthority,
+}
+
+impl TargetId {
+    /// Key for the entry `alias` served at `authority`.
+    pub fn new(alias: RegistryAlias, authority: RegistryAuthority) -> Self {
+        Self { alias, authority }
+    }
+
+    /// The config entry name.
+    pub fn alias(&self) -> &RegistryAlias {
+        &self.alias
+    }
+
+    /// The registry address.
+    pub fn authority(&self) -> &RegistryAuthority {
+        &self.authority
+    }
+}
 
 /// State of a blob at a single (target, repo) pair.
 ///
@@ -81,13 +143,13 @@ type BlobIndex = HashMap<Digest, BlobInfo>;
 /// Process-global blob coordination map keyed by target registry, then digest.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct BlobDedupMap {
-    inner: HashMap<String, BlobIndex>,
+    inner: HashMap<TargetId, BlobIndex>,
 }
 
 impl BlobDedupMap {
-    fn entry_mut(&mut self, target: &str, digest: &Digest) -> &mut BlobInfo {
+    fn entry_mut(&mut self, target: &TargetId, digest: &Digest) -> &mut BlobInfo {
         self.inner
-            .entry(target.to_owned())
+            .entry(target.clone())
             .or_default()
             .entry(digest.clone())
             .or_default()
@@ -96,7 +158,7 @@ impl BlobDedupMap {
     /// The recorded state of a blob at one (target, repo), if any.
     pub(crate) fn repo_state(
         &self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) -> Option<&RepoBlobState> {
@@ -107,7 +169,7 @@ impl BlobDedupMap {
     /// the given (target, repo).
     pub(crate) fn blob_present_at(
         &self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) -> bool {
@@ -118,7 +180,7 @@ impl BlobDedupMap {
     /// Set a repo's state to `Verified`, leaving other repos and the claim alone.
     pub(crate) fn set_blob_verified(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) {
@@ -129,7 +191,7 @@ impl BlobDedupMap {
     /// Set a repo's state to `Completed`.
     pub(crate) fn set_blob_completed(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) {
@@ -140,7 +202,7 @@ impl BlobDedupMap {
     /// Set a repo's state to `Failed` (this repo's own upload failed).
     pub(crate) fn set_blob_failed(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
         error: String,
@@ -156,7 +218,7 @@ impl BlobDedupMap {
     /// `unresolved_watches_for`.
     pub(crate) fn mark_blob_repo_stale(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) {
@@ -175,7 +237,7 @@ impl BlobDedupMap {
     /// the upload.
     pub(crate) fn claim_blob_upload(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> ClaimAction {
@@ -203,7 +265,7 @@ impl BlobDedupMap {
 
     /// Release the upload claim and wake waiters. Called by the holder on a
     /// terminal outcome.
-    pub(crate) fn release_blob_claim(&mut self, target: &str, digest: &Digest) {
+    pub(crate) fn release_blob_claim(&mut self, target: &TargetId, digest: &Digest) {
         if let Some(index) = self.inner.get_mut(target) {
             if let Some(info) = index.get_mut(digest) {
                 info.claim = None;
@@ -217,7 +279,7 @@ impl BlobDedupMap {
     /// `(repo, state)` pairs for a blob at a target; empty if untracked.
     pub(crate) fn repos_iter<'a>(
         &'a self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
     ) -> impl Iterator<Item = (&'a RepositoryName, &'a RepoBlobState)> + 'a {
         self.inner
@@ -232,7 +294,7 @@ impl BlobDedupMap {
     /// check can lag an upload made seconds before it.
     pub(crate) fn forget_remembered(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) -> bool {
@@ -250,7 +312,7 @@ impl BlobDedupMap {
     /// there proves. A live upload claim, presence this run recorded, and a
     /// `Failed` mark are left alone: the mark also excludes a mount source
     /// the registry refused, which a commit does not make mountable.
-    pub(crate) fn confirm(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+    pub(crate) fn confirm(&mut self, target: &TargetId, digest: &Digest, repo: &RepositoryName) {
         if let None | Some(RepoBlobState::Remembered) = self.repo_state(target, digest, repo) {
             self.set_blob_verified(target, digest, repo);
         }
@@ -332,7 +394,7 @@ impl BlobDedupMap {
 
     /// Drop entries for targets not in `live_targets`, returning the number of
     /// blob entries removed.
-    pub(crate) fn retain_targets(&mut self, live_targets: &HashSet<String>) -> usize {
+    pub(crate) fn retain_targets(&mut self, live_targets: &HashSet<TargetId>) -> usize {
         let mut removed = 0usize;
         self.inner.retain(|target, index| {
             if live_targets.contains(target) {
@@ -351,7 +413,9 @@ impl BlobDedupMap {
 #[cfg(test)]
 pub(crate) mod test_support {
     use ocync_distribution::Digest;
-    use ocync_distribution::spec::RepositoryName;
+    use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
+
+    use crate::engine::{RegistryAlias, TargetId};
 
     /// The digest of empty content.
     pub(crate) fn test_digest() -> Digest {
@@ -367,6 +431,16 @@ pub(crate) mod test_support {
             .unwrap()
     }
 
+    /// A cache key from an alias and an address.
+    pub(crate) fn target(alias: &str, authority: &str) -> TargetId {
+        TargetId::new(RegistryAlias::new(alias), RegistryAuthority::new(authority))
+    }
+
+    /// A cache key whose alias and address are both `name`.
+    pub(crate) fn target_id(name: &str) -> TargetId {
+        target(name, name)
+    }
+
     /// A valid repository name.
     pub(crate) fn repo(name: &str) -> RepositoryName {
         RepositoryName::new(name).unwrap()
@@ -375,8 +449,50 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{other_digest, repo, test_digest};
+    use super::test_support::{other_digest, repo, target, target_id, test_digest};
     use super::*;
+
+    /// State belongs to the (alias, address) pair: the same alias at another
+    /// address and another alias at the same address are both strangers. A
+    /// blob recorded for one is not present, claimed or offered as a mount
+    /// source for the other, for the same repo.
+    #[test]
+    fn blob_state_is_per_alias_and_address() {
+        let d = test_digest();
+        let recorded = target("t", "a.io:443");
+        let strangers = [
+            ("same alias, new address", target("t", "b.io:443")),
+            ("other alias, same address", target("u", "a.io:443")),
+        ];
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed(&recorded, &d, &repo("x"));
+        assert!(map.blob_present_at(&recorded, &d, &repo("x")));
+
+        for (name, stranger) in &strangers {
+            assert!(!map.blob_present_at(stranger, &d, &repo("x")), "{name}");
+            assert_eq!(map.repos_iter(stranger, &d).count(), 0, "{name}");
+        }
+        assert!(matches!(
+            map.claim_blob_upload(&recorded, &d, &repo("x")),
+            ClaimAction::Claimed
+        ));
+        for (name, stranger) in &strangers {
+            assert!(
+                matches!(
+                    map.claim_blob_upload(stranger, &d, &repo("x")),
+                    ClaimAction::Claimed
+                ),
+                "{name}: a claim for the recorded target does not make it wait"
+            );
+        }
+
+        let live = HashSet::from([recorded.clone()]);
+        map.retain_targets(&live);
+        assert!(map.repo_state(&recorded, &d, &repo("x")).is_some());
+        for (name, stranger) in &strangers {
+            assert!(map.repo_state(stranger, &d, &repo("x")).is_none(), "{name}");
+        }
+    }
 
     /// A new run marks present states `Remembered`, which a missing batch
     /// answer drops. State this run recorded, at the same repo or
@@ -385,62 +501,62 @@ mod tests {
     fn forgets_only_remembered_state() {
         let d = test_digest();
         let mut map = BlobDedupMap::default();
-        map.set_blob_completed("reg.io", &d, &repo("x"));
-        map.set_blob_verified("reg.io", &d, &repo("y"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("x"));
+        map.set_blob_verified(&target_id("reg.io"), &d, &repo("y"));
         map.remember_present();
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Remembered)
         );
-        assert!(map.blob_present_at("reg.io", &d, &repo("x")));
+        assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("x")));
         assert_eq!(
             map.filter_persistable()
-                .repo_state("reg.io", &d, &repo("x")),
+                .repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Verified)
         );
 
-        map.forget_remembered("reg.io", &d, &repo("x"));
-        assert!(!map.blob_present_at("reg.io", &d, &repo("x")));
+        map.forget_remembered(&target_id("reg.io"), &d, &repo("x"));
+        assert!(!map.blob_present_at(&target_id("reg.io"), &d, &repo("x")));
         assert!(
-            map.blob_present_at("reg.io", &d, &repo("y")),
+            map.blob_present_at(&target_id("reg.io"), &d, &repo("y")),
             "another repo is untouched"
         );
 
-        map.set_blob_completed("reg.io", &d, &repo("x"));
-        map.forget_remembered("reg.io", &d, &repo("x"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("x"));
+        map.forget_remembered(&target_id("reg.io"), &d, &repo("x"));
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Completed),
             "state this run recorded is kept"
         );
 
         map.remember_present();
-        map.confirm("reg.io", &d, &repo("x"));
+        map.confirm(&target_id("reg.io"), &d, &repo("x"));
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Verified)
         );
-        map.forget_remembered("reg.io", &d, &repo("y"));
-        map.confirm("reg.io", &d, &repo("y"));
+        map.forget_remembered(&target_id("reg.io"), &d, &repo("y"));
+        map.confirm(&target_id("reg.io"), &d, &repo("y"));
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("y")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("y")),
             Some(&RepoBlobState::Verified),
             "a commit records a blob a refusal dropped"
         );
         assert!(matches!(
-            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            map.claim_blob_upload(&target_id("reg.io"), &d, &repo("z")),
             ClaimAction::Claimed
         ));
-        map.confirm("reg.io", &d, &repo("z"));
+        map.confirm(&target_id("reg.io"), &d, &repo("z"));
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("z")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("z")),
             Some(&RepoBlobState::Uploading),
             "a commit never overwrites a live upload claim"
         );
-        map.set_blob_failed("reg.io", &d, &repo("w"), "mount refused".into());
-        map.confirm("reg.io", &d, &repo("w"));
+        map.set_blob_failed(&target_id("reg.io"), &d, &repo("w"), "mount refused".into());
+        map.confirm(&target_id("reg.io"), &d, &repo("w"));
         assert!(
-            map.repo_state("reg.io", &d, &repo("w"))
+            map.repo_state(&target_id("reg.io"), &d, &repo("w"))
                 .is_some_and(|state| matches!(state, RepoBlobState::Failed(_))),
             "a commit keeps a refused mount source excluded"
         );
@@ -457,30 +573,38 @@ mod tests {
                 .parse()
                 .unwrap();
         let mut map = BlobDedupMap::default();
-        map.set_blob_completed("reg.io", &d, &repo("x"));
-        map.set_blob_failed("reg.io", &d, &repo("y"), "mount refused".into());
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("x"));
+        map.set_blob_failed(&target_id("reg.io"), &d, &repo("y"), "mount refused".into());
         assert!(matches!(
-            map.claim_blob_upload("reg.io", &d, &repo("z")),
+            map.claim_blob_upload(&target_id("reg.io"), &d, &repo("z")),
             ClaimAction::Claimed
         ));
-        map.set_blob_failed("reg.io", &other, &repo("x"), "upload failed".into());
+        map.set_blob_failed(
+            &target_id("reg.io"),
+            &other,
+            &repo("x"),
+            "upload failed".into(),
+        );
 
         map.remember_present();
 
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Remembered)
         );
-        assert_eq!(map.repo_state("reg.io", &d, &repo("y")), None);
-        assert_eq!(map.repo_state("reg.io", &d, &repo("z")), None);
+        assert_eq!(map.repo_state(&target_id("reg.io"), &d, &repo("y")), None);
+        assert_eq!(map.repo_state(&target_id("reg.io"), &d, &repo("z")), None);
         assert!(
             matches!(
-                map.claim_blob_upload("reg.io", &d, &repo("y")),
+                map.claim_blob_upload(&target_id("reg.io"), &d, &repo("y")),
                 ClaimAction::Claimed
             ),
             "the last run's claim is released"
         );
-        assert_eq!(map.repo_state("reg.io", &other, &repo("x")), None);
+        assert_eq!(
+            map.repo_state(&target_id("reg.io"), &other, &repo("x")),
+            None
+        );
     }
 
     /// Writing Y's state must not disturb X's `Uploading` state or release X's
@@ -491,12 +615,19 @@ mod tests {
         let cases: [(&str, WriteY, RepoBlobState); 2] = [
             (
                 "a batch check verifies Y",
-                |m| m.set_blob_verified("reg.io", &test_digest(), &repo("y")),
+                |m| m.set_blob_verified(&target_id("reg.io"), &test_digest(), &repo("y")),
                 RepoBlobState::Verified,
             ),
             (
                 "Y's own upload fails",
-                |m| m.set_blob_failed("reg.io", &test_digest(), &repo("y"), "io error".into()),
+                |m| {
+                    m.set_blob_failed(
+                        &target_id("reg.io"),
+                        &test_digest(),
+                        &repo("y"),
+                        "io error".into(),
+                    )
+                },
                 RepoBlobState::Failed("io error".into()),
             ),
         ];
@@ -505,7 +636,7 @@ mod tests {
             let d = test_digest();
             assert!(
                 matches!(
-                    map.claim_blob_upload("reg.io", &d, &repo("x")),
+                    map.claim_blob_upload(&target_id("reg.io"), &d, &repo("x")),
                     ClaimAction::Claimed
                 ),
                 "{name}: first claim should succeed"
@@ -514,16 +645,16 @@ mod tests {
             write_y(&mut map);
 
             assert_eq!(
-                map.repo_state("reg.io", &d, &repo("x")),
+                map.repo_state(&target_id("reg.io"), &d, &repo("x")),
                 Some(&RepoBlobState::Uploading),
                 "{name}: X is unchanged"
             );
             assert_eq!(
-                map.repo_state("reg.io", &d, &repo("y")),
+                map.repo_state(&target_id("reg.io"), &d, &repo("y")),
                 Some(&want_y),
                 "{name}: Y holds the written state"
             );
-            match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+            match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("z")) {
                 ClaimAction::Wait { holder, notify: _ } => {
                     assert_eq!(holder, repo("x"), "{name}");
                 }
@@ -541,11 +672,11 @@ mod tests {
                 let mut map = BlobDedupMap::default();
                 let d = test_digest();
 
-                match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+                match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("x")) {
                     ClaimAction::Claimed => {}
                     _ => panic!(),
                 }
-                let notify = match map.claim_blob_upload("reg.io", &d, &repo("y")) {
+                let notify = match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("y")) {
                     ClaimAction::Wait { holder, notify } => {
                         assert_eq!(holder, repo("x"));
                         notify
@@ -558,11 +689,11 @@ mod tests {
                 });
                 tokio::task::yield_now().await;
 
-                map.release_blob_claim("reg.io", &d);
+                map.release_blob_claim(&target_id("reg.io"), &d);
 
                 waiter.await.expect("waiter should complete");
 
-                match map.claim_blob_upload("reg.io", &d, &repo("y")) {
+                match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("y")) {
                     ClaimAction::Claimed => {}
                     _ => panic!("Y should claim after X releases"),
                 }
@@ -577,18 +708,18 @@ mod tests {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
 
-        match map.claim_blob_upload("reg.io", &d, &repo("y")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("y")) {
             ClaimAction::Claimed => {}
             _ => panic!(),
         }
-        map.set_blob_completed("reg.io", &d, &repo("y"));
-        map.release_blob_claim("reg.io", &d);
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("y"));
+        map.release_blob_claim(&target_id("reg.io"), &d);
 
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("y")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("y")),
             Some(&RepoBlobState::Completed),
         );
-        match map.claim_blob_upload("reg.io", &d, &repo("z")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("z")) {
             ClaimAction::Claimed => {}
             ClaimAction::Wait { .. } => panic!("a released claim is free again"),
         }
@@ -601,14 +732,14 @@ mod tests {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
 
-        map.set_blob_completed("reg.io", &d, &repo("x"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("x"));
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("x")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
             Some(&RepoBlobState::Completed),
         );
 
-        map.mark_blob_repo_stale("reg.io", &d, &repo("x"));
-        match map.repo_state("reg.io", &d, &repo("x")) {
+        map.mark_blob_repo_stale(&target_id("reg.io"), &d, &repo("x"));
+        match map.repo_state(&target_id("reg.io"), &d, &repo("x")) {
             Some(RepoBlobState::Failed(_)) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -621,17 +752,17 @@ mod tests {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
 
-        match map.claim_blob_upload("reg.io", &d, &repo("y")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("y")) {
             ClaimAction::Claimed => {}
             _ => panic!(),
         }
-        map.set_blob_verified("reg.io", &d, &repo("y"));
+        map.set_blob_verified(&target_id("reg.io"), &d, &repo("y"));
 
         assert_eq!(
-            map.repo_state("reg.io", &d, &repo("y")),
+            map.repo_state(&target_id("reg.io"), &d, &repo("y")),
             Some(&RepoBlobState::Verified),
         );
-        let entry = map.entry_mut("reg.io", &d);
+        let entry = map.entry_mut(&target_id("reg.io"), &d);
         assert_eq!(entry.claim, Some(repo("y")));
     }
 
@@ -642,32 +773,45 @@ mod tests {
         let d = test_digest();
         let d2 = other_digest();
 
-        map.set_blob_verified("reg.io", &d, &repo("a"));
-        map.set_blob_completed("reg.io", &d, &repo("b"));
-        match map.claim_blob_upload("reg.io", &d, &repo("c")) {
+        map.set_blob_verified(&target_id("reg.io"), &d, &repo("a"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("b"));
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("c")) {
             ClaimAction::Claimed => {} // c is Uploading
             _ => panic!(),
         }
-        map.set_blob_failed("reg.io", &d, &repo("e"), "oops".into());
+        map.set_blob_failed(&target_id("reg.io"), &d, &repo("e"), "oops".into());
         // d2 holds only a Failed state, so its whole entry is stripped.
-        map.set_blob_failed("reg.io", &d2, &repo("z"), "oops".into());
+        map.set_blob_failed(&target_id("reg.io"), &d2, &repo("z"), "oops".into());
         // A target left with no entries is dropped, not kept empty.
-        map.set_blob_failed("other.io", &d, &repo("a"), "oops".into());
+        map.set_blob_failed(&target_id("other.io"), &d, &repo("a"), "oops".into());
 
         let persisted = map.filter_persistable();
 
         assert_eq!(
-            persisted.repo_state("reg.io", &d, &repo("a")),
+            persisted.repo_state(&target_id("reg.io"), &d, &repo("a")),
             Some(&RepoBlobState::Verified),
         );
         assert_eq!(
-            persisted.repo_state("reg.io", &d, &repo("b")),
+            persisted.repo_state(&target_id("reg.io"), &d, &repo("b")),
             Some(&RepoBlobState::Completed),
         );
-        assert!(persisted.repo_state("reg.io", &d, &repo("c")).is_none());
-        assert!(persisted.repo_state("reg.io", &d, &repo("e")).is_none());
-        assert!(persisted.repos_iter("reg.io", &d2).next().is_none());
-        assert!(!persisted.inner.contains_key("other.io"));
+        assert!(
+            persisted
+                .repo_state(&target_id("reg.io"), &d, &repo("c"))
+                .is_none()
+        );
+        assert!(
+            persisted
+                .repo_state(&target_id("reg.io"), &d, &repo("e"))
+                .is_none()
+        );
+        assert!(
+            persisted
+                .repos_iter(&target_id("reg.io"), &d2)
+                .next()
+                .is_none()
+        );
+        assert!(!persisted.inner.contains_key(&target_id("other.io")));
     }
 
     /// Only `Verified` and `Completed` blobs count as present; an upload in
@@ -676,18 +820,18 @@ mod tests {
     fn blob_present_at_excludes_uploading_and_failed() {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
-        map.set_blob_verified("reg.io", &d, &repo("a"));
-        map.set_blob_completed("reg.io", &d, &repo("b"));
+        map.set_blob_verified(&target_id("reg.io"), &d, &repo("a"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("b"));
         assert!(matches!(
-            map.claim_blob_upload("reg.io", &d, &repo("c")),
+            map.claim_blob_upload(&target_id("reg.io"), &d, &repo("c")),
             ClaimAction::Claimed
         ));
-        map.set_blob_failed("reg.io", &d, &repo("d"), "oops".into());
+        map.set_blob_failed(&target_id("reg.io"), &d, &repo("d"), "oops".into());
 
-        assert!(map.blob_present_at("reg.io", &d, &repo("a")));
-        assert!(map.blob_present_at("reg.io", &d, &repo("b")));
-        assert!(!map.blob_present_at("reg.io", &d, &repo("c")));
-        assert!(!map.blob_present_at("reg.io", &d, &repo("d")));
+        assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("a")));
+        assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("b")));
+        assert!(!map.blob_present_at(&target_id("reg.io"), &d, &repo("c")));
+        assert!(!map.blob_present_at(&target_id("reg.io"), &d, &repo("d")));
     }
 
     /// A second image syncing into the holder's own repo waits for the
@@ -697,17 +841,17 @@ mod tests {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
 
-        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("x")) {
             ClaimAction::Claimed => {}
             _ => panic!(),
         }
-        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("x")) {
             ClaimAction::Wait { holder, notify: _ } => assert_eq!(holder, repo("x")),
             ClaimAction::Claimed => panic!("a second claim in the same repo must wait"),
         }
 
-        map.release_blob_claim("reg.io", &d);
-        match map.claim_blob_upload("reg.io", &d, &repo("x")) {
+        map.release_blob_claim(&target_id("reg.io"), &d);
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("x")) {
             ClaimAction::Claimed => {}
             _ => panic!("a released claim is free again"),
         }
@@ -719,16 +863,16 @@ mod tests {
         let mut map = BlobDedupMap::default();
         let d = test_digest();
 
-        match map.claim_blob_upload("reg.io", &d, &repo("a")) {
+        match map.claim_blob_upload(&target_id("reg.io"), &d, &repo("a")) {
             ClaimAction::Claimed => {}
             _ => panic!(),
         }
-        map.set_blob_completed("reg.io", &d, &repo("a"));
+        map.set_blob_completed(&target_id("reg.io"), &d, &repo("a"));
 
         let persisted = map.filter_persistable();
         let entry = persisted
             .inner
-            .get("reg.io")
+            .get(&target_id("reg.io"))
             .and_then(|m| m.get(&d))
             .expect("entry should persist because A is Completed");
         assert!(entry.claim.is_none(), "claim must be stripped");

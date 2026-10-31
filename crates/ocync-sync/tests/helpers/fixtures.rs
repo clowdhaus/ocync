@@ -12,7 +12,9 @@ use ocync_distribution::spec::{
 };
 use ocync_distribution::{Digest, RegistryClientBuilder};
 use ocync_sync::cache::{SnapshotKey, TransferStateCache};
-use ocync_sync::engine::{RegistryAlias, ResolvedArtifacts, ResolvedMapping, TagPair, TargetEntry};
+use ocync_sync::engine::{
+    RegistryAlias, ResolvedArtifacts, ResolvedMapping, TagPair, TargetEntry, TargetId,
+};
 use ocync_sync::retry::RetryConfig;
 use url::Url;
 use wiremock::MockServer;
@@ -36,6 +38,17 @@ pub fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClien
             .build()
             .unwrap(),
     )
+}
+
+/// The cache key of the entry `alias` on `server`, as the engine derives it.
+pub fn mock_target_id(alias: &str, server: &MockServer) -> TargetId {
+    target_entry(alias, mock_client(server)).id().clone()
+}
+
+/// The cache key of the entry `alias` on `server` as reached through
+/// [`ecr_mock_client`].
+pub fn ecr_mock_target_id(alias: &str, server: &MockServer) -> TargetId {
+    target_entry(alias, ecr_mock_client(server)).id().clone()
 }
 
 /// A client whose base URL has an ECR hostname but whose traffic is resolved
@@ -82,7 +95,7 @@ pub fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 
 /// A cache holding each of `digests` as completed at `repo_name` on `target`.
 pub fn cache_with(
-    target: &str,
+    target: &TargetId,
     repo: &RepositoryName,
     digests: &[&Digest],
 ) -> Rc<RefCell<TransferStateCache>> {
@@ -106,12 +119,7 @@ pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
 
 /// A [`TargetEntry`] without a batch checker.
 pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
-    TargetEntry {
-        name: RegistryAlias::new(name),
-        client,
-        batch_checker: None,
-        existing_tags: HashSet::new(),
-    }
+    TargetEntry::new(RegistryAlias::new(name), client, None)
 }
 
 /// A `ResolvedMapping` with no platform filter or immutable glob and the

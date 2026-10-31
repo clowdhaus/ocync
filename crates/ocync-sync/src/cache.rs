@@ -25,11 +25,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::plan::{BlobDedupMap, ClaimAction, RepoBlobState};
+use crate::plan::{BlobDedupMap, ClaimAction, RepoBlobState, TargetId};
 
-/// Cache file format version. Bump on incompatible layout changes; a mismatched
-/// file is discarded and rebuilt.
-const CACHE_VERSION: u32 = 1;
+/// Cache file format version. Bump when the layout or the meaning of a key
+/// changes; a mismatched file is discarded and rebuilt.
+const CACHE_VERSION: u32 = 2;
 
 /// Header written at the start of every cache file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,13 +115,13 @@ pub struct TransferStateCache {
     /// across runs in one process: a repo committed earlier still holds its
     /// manifest, and a stale entry self-heals through `mark_blob_repo_stale`
     /// when a mount from it fails.
-    committed_repos: HashMap<String, HashSet<RepositoryName>>,
+    committed_repos: HashMap<TargetId, HashSet<RepositoryName>>,
     /// Runtime-only: per-(target, repo) channel that turns `true` when the
     /// repo's manifest commits or fails (resolved either way). Followers
     /// subscribe through `unresolved_watches_for` and consume it with
     /// `wait_for(|&v| v)`, never `changed()`, which misses a value sent before
     /// they subscribed. Fresh each run.
-    repo_resolved_watches: HashMap<String, HashMap<RepositoryName, watch::Sender<bool>>>,
+    repo_resolved_watches: HashMap<TargetId, HashMap<RepositoryName, watch::Sender<bool>>>,
 }
 
 impl TransferStateCache {
@@ -137,14 +137,19 @@ impl TransferStateCache {
 
     /// Whether the blob is present (`Verified`, `Completed` or `Remembered`) at
     /// the given (target, repo).
-    pub fn blob_present_at(&self, target: &str, digest: &Digest, repo: &RepositoryName) -> bool {
+    pub fn blob_present_at(
+        &self,
+        target: &TargetId,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) -> bool {
         self.dedup.blob_present_at(target, digest, repo)
     }
 
     /// Atomic check-and-claim on the upload-coordination slot.
     pub fn claim_blob_upload(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> ClaimAction {
@@ -152,30 +157,35 @@ impl TransferStateCache {
     }
 
     /// Release the upload claim, waking waiters.
-    pub fn release_blob_claim(&mut self, target: &str, digest: &Digest) {
+    pub fn release_blob_claim(&mut self, target: &TargetId, digest: &Digest) {
         self.dedup.release_blob_claim(target, digest);
     }
 
     /// Mark `repo` as a stale mount source (a mount from it was rejected),
     /// excluding it from future `mount_sources` results.
-    pub fn mark_blob_repo_stale(&mut self, target: &str, digest: &Digest, repo: &RepositoryName) {
+    pub fn mark_blob_repo_stale(
+        &mut self,
+        target: &TargetId,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) {
         self.dedup.mark_blob_repo_stale(target, digest, repo);
     }
 
     /// Set a repo's state to `Verified`.
-    pub fn set_blob_verified(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
+    pub fn set_blob_verified(&mut self, target: &TargetId, digest: Digest, repo: RepositoryName) {
         self.dedup.set_blob_verified(target, &digest, &repo);
     }
 
     /// Set a repo's state to `Completed`.
-    pub fn set_blob_completed(&mut self, target: &str, digest: Digest, repo: RepositoryName) {
+    pub fn set_blob_completed(&mut self, target: &TargetId, digest: Digest, repo: RepositoryName) {
         self.dedup.set_blob_completed(target, &digest, &repo);
     }
 
     /// Set a repo's state to `Failed` (this repo's own upload failed).
     pub fn set_blob_failed(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: Digest,
         repo: RepositoryName,
         error: String,
@@ -194,7 +204,7 @@ impl TransferStateCache {
     /// within each group is `BTreeMap` order.
     pub fn mount_sources<'a>(
         &'a self,
-        target: &'a str,
+        target: &'a TargetId,
         digest: &'a Digest,
         current_repo: &'a RepositoryName,
     ) -> impl Iterator<Item = &'a RepositoryName> + 'a {
@@ -219,7 +229,7 @@ impl TransferStateCache {
     /// [`Self::mount_sources`] offers it at once.
     pub fn unresolved_watches_for(
         &mut self,
-        target: &str,
+        target: &TargetId,
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> Vec<watch::Receiver<bool>> {
@@ -232,7 +242,7 @@ impl TransferStateCache {
 
         let watches = self
             .repo_resolved_watches
-            .entry(target.to_owned())
+            .entry(target.clone())
             .or_default();
         candidates
             .into_iter()
@@ -247,24 +257,24 @@ impl TransferStateCache {
     }
 
     /// Record that a repo's manifest is committed, waking its watchers.
-    pub fn mark_repo_committed(&mut self, target: &str, repo: &RepositoryName) {
+    pub fn mark_repo_committed(&mut self, target: &TargetId, repo: &RepositoryName) {
         self.committed_repos
-            .entry(target.to_owned())
+            .entry(target.clone())
             .or_default()
             .insert(repo.clone());
         self.resolve_repo_watch(target, repo);
     }
 
     /// Mark a repo's manifest commit as failed, unblocking followers.
-    pub fn notify_repo_failed(&mut self, target: &str, repo: &RepositoryName) {
+    pub fn notify_repo_failed(&mut self, target: &TargetId, repo: &RepositoryName) {
         self.resolve_repo_watch(target, repo);
     }
 
     /// Fire the repo's watch, creating it if no follower has subscribed yet.
-    fn resolve_repo_watch(&mut self, target: &str, repo: &RepositoryName) {
+    fn resolve_repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) {
         let tx = self
             .repo_resolved_watches
-            .entry(target.to_owned())
+            .entry(target.clone())
             .or_default()
             .entry(repo.clone())
             .or_insert_with(|| watch::channel(false).0);
@@ -286,7 +296,7 @@ impl TransferStateCache {
     /// earlier run, returning the digests dropped.
     pub(crate) fn forget_remembered_blobs<'a>(
         &mut self,
-        target: &str,
+        target: &TargetId,
         repo: &RepositoryName,
         digests: impl IntoIterator<Item = &'a Digest>,
     ) -> Vec<&'a Digest> {
@@ -300,7 +310,7 @@ impl TransferStateCache {
     /// references them was committed there.
     pub(crate) fn confirm_blobs<'a>(
         &mut self,
-        target: &str,
+        target: &TargetId,
         repo: &RepositoryName,
         digests: impl IntoIterator<Item = &'a Digest>,
     ) {
@@ -325,10 +335,14 @@ impl TransferStateCache {
         self.snapshots.retain(|k, _| live_keys.contains(k));
     }
 
-    /// Remove dedup entries for targets not in `live_targets`. Call after each
-    /// sync cycle so targets dropped from config do not grow the cache without
-    /// bound.
-    pub fn prune_dedup(&mut self, live_targets: &HashSet<String>) {
+    /// Remove blob state, committed repos and commit watches for targets not in
+    /// `live_targets`. Call after each sync cycle so targets dropped from
+    /// config do not grow the cache without bound.
+    pub fn prune_dedup(&mut self, live_targets: &HashSet<TargetId>) {
+        self.committed_repos
+            .retain(|target, _| live_targets.contains(target));
+        self.repo_resolved_watches
+            .retain(|target, _| live_targets.contains(target));
         let removed = self.dedup.retain_targets(live_targets);
         if removed > 0 {
             tracing::debug!(removed, "pruned stale dedup entries for removed targets");
@@ -414,7 +428,7 @@ impl TransferStateCache {
                 path = %path.display(),
                 version = header.version,
                 expected = CACHE_VERSION,
-                "unsupported cache version, discarding"
+                "cache written by another ocync version; starting cold"
             );
             return Err(LoadError::BadVersion);
         }
@@ -511,7 +525,7 @@ fn build_cache_bytes(
 mod tests {
     use super::*;
 
-    use crate::plan::test_support::{other_digest, repo, test_digest};
+    use crate::plan::test_support::{other_digest, repo, target_id, test_digest};
 
     type Setup = fn(&mut TransferStateCache);
 
@@ -525,15 +539,15 @@ mod tests {
         let cases: [(&str, Setup, &str, &[&str]); 8] = [
             (
                 "a repo recorded this run must commit before it is offered",
-                |c| c.set_blob_completed("reg.io", test_digest(), repo("repo/a")),
+                |c| c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a")),
                 "repo/b",
                 &[],
             ),
             (
                 "a committed repo is offered",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
-                    c.mark_repo_committed("reg.io", &repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
                 },
                 "repo/b",
                 &["repo/a"],
@@ -541,11 +555,11 @@ mod tests {
             (
                 "a failed mount source is excluded",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/b"));
-                    c.mark_repo_committed("reg.io", &repo("repo/a"));
-                    c.mark_repo_committed("reg.io", &repo("repo/b"));
-                    c.mark_blob_repo_stale("reg.io", &test_digest(), &repo("repo/b"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/b"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/b"));
+                    c.mark_blob_repo_stale(&target_id("reg.io"), &test_digest(), &repo("repo/b"));
                 },
                 "repo/c",
                 &["repo/a"],
@@ -553,8 +567,8 @@ mod tests {
             (
                 "the requesting repo is never its own source",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
-                    c.mark_repo_committed("reg.io", &repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
                 },
                 "repo/a",
                 &[],
@@ -562,7 +576,7 @@ mod tests {
             (
                 "an earlier run's repo is offered without a commit",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
                     c.start_run();
                 },
                 "repo/b",
@@ -571,10 +585,10 @@ mod tests {
             (
                 "this run's commits come before an earlier run's repos",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
                     c.start_run();
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/b"));
-                    c.mark_repo_committed("reg.io", &repo("repo/b"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/b"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/b"));
                 },
                 "repo/c",
                 &["repo/b", "repo/a"],
@@ -582,8 +596,8 @@ mod tests {
             (
                 "a remembered committed repo is offered once",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
-                    c.mark_repo_committed("reg.io", &repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+                    c.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
                     c.start_run();
                 },
                 "repo/b",
@@ -592,9 +606,9 @@ mod tests {
             (
                 "a refused earlier-run mount source is not offered again",
                 |c| {
-                    c.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
                     c.start_run();
-                    c.mark_blob_repo_stale("reg.io", &test_digest(), &repo("repo/a"));
+                    c.mark_blob_repo_stale(&target_id("reg.io"), &test_digest(), &repo("repo/a"));
                 },
                 "repo/b",
                 &[],
@@ -604,7 +618,7 @@ mod tests {
             let mut cache = TransferStateCache::new();
             setup(&mut cache);
             let got: Vec<_> = cache
-                .mount_sources("reg.io", &test_digest(), &repo(requester))
+                .mount_sources(&target_id("reg.io"), &test_digest(), &repo(requester))
                 .cloned()
                 .collect();
             let want: Vec<_> = want.iter().map(|r| repo(r)).collect();
@@ -618,50 +632,72 @@ mod tests {
         let cases: [(&str, Setup, &str); 2] = [
             (
                 "a repo whose watch already fired",
-                |c| c.mark_repo_committed("reg.io", &repo("repo/a")),
+                |c| c.mark_repo_committed(&target_id("reg.io"), &repo("repo/a")),
                 "repo/b",
             ),
             (
                 "a repo whose blob state is failed",
-                |c| c.mark_blob_repo_stale("reg.io", &test_digest(), &repo("repo/b")),
+                |c| c.mark_blob_repo_stale(&target_id("reg.io"), &test_digest(), &repo("repo/b")),
                 "repo/a",
             ),
         ];
         for (name, setup, left) in cases {
             let mut cache = TransferStateCache::new();
-            cache.set_blob_completed("reg.io", test_digest(), repo("repo/a"));
-            cache.set_blob_completed("reg.io", test_digest(), repo("repo/b"));
+            cache.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+            cache.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/b"));
             setup(&mut cache);
 
-            let receivers = cache.unresolved_watches_for("reg.io", &test_digest(), &repo("repo/c"));
+            let receivers =
+                cache.unresolved_watches_for(&target_id("reg.io"), &test_digest(), &repo("repo/c"));
             assert_eq!(receivers.len(), 1, "{name}");
-            cache.mark_repo_committed("reg.io", &repo(left));
+            cache.mark_repo_committed(&target_id("reg.io"), &repo(left));
             assert!(*receivers[0].borrow(), "{name}: the watch left is {left}'s");
         }
     }
 
+    /// Pruning drops every per-target map for a target no longer in the
+    /// config, not only its blob state, and leaves the live target alone.
+    #[test]
+    fn prune_dedup_drops_committed_repos_and_watches_of_removed_targets() {
+        let (live, gone) = (target_id("live.io"), target_id("gone.io"));
+        let mut cache = TransferStateCache::new();
+        for t in [&live, &gone] {
+            cache.set_blob_completed(t, test_digest(), repo("repo/a"));
+            cache.mark_repo_committed(t, &repo("repo/a"));
+        }
+
+        cache.prune_dedup(&HashSet::from([live.clone()]));
+
+        assert!(cache.blob_present_at(&live, &test_digest(), &repo("repo/a")));
+        assert!(cache.committed_repos.contains_key(&live));
+        assert!(cache.repo_resolved_watches.contains_key(&live));
+        assert!(!cache.blob_present_at(&gone, &test_digest(), &repo("repo/a")));
+        assert!(!cache.committed_repos.contains_key(&gone));
+        assert!(!cache.repo_resolved_watches.contains_key(&gone));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn commit_or_failure_resolves_a_repo_watch() {
-        type Signal = fn(&mut TransferStateCache, &str, &RepositoryName);
+        type Signal = fn(&mut TransferStateCache, &TargetId, &RepositoryName);
         let signals: [(&str, Signal); 2] = [
             ("committed", TransferStateCache::mark_repo_committed),
             ("failed", TransferStateCache::notify_repo_failed),
         ];
         for (name, signal) in signals {
             let mut cache = TransferStateCache::new();
-            cache.set_blob_verified("reg.io", test_digest(), repo("repo/a"));
+            cache.set_blob_verified(&target_id("reg.io"), test_digest(), repo("repo/a"));
             let mut waiting =
-                cache.unresolved_watches_for("reg.io", &test_digest(), &repo("repo/b"));
+                cache.unresolved_watches_for(&target_id("reg.io"), &test_digest(), &repo("repo/b"));
             assert_eq!(waiting.len(), 1, "{name}: repo/a is unresolved");
 
-            signal(&mut cache, "reg.io", &repo("repo/a"));
+            signal(&mut cache, &target_id("reg.io"), &repo("repo/a"));
             assert!(
                 waiting.pop().unwrap().wait_for(|&v| v).await.is_ok(),
                 "{name}: a subscriber from before the signal is woken"
             );
             assert!(
                 cache
-                    .unresolved_watches_for("reg.io", &test_digest(), &repo("repo/b"))
+                    .unresolved_watches_for(&target_id("reg.io"), &test_digest(), &repo("repo/b"))
                     .is_empty(),
                 "{name}: a subscriber after the signal finds nothing to wait on"
             );
@@ -671,7 +707,7 @@ mod tests {
     #[test]
     fn build_cache_bytes_roundtrip() {
         let mut dedup = BlobDedupMap::default();
-        dedup.set_blob_completed("reg.io", &test_digest(), &repo("repo/a"));
+        dedup.set_blob_completed(&target_id("reg.io"), &test_digest(), &repo("repo/a"));
         let snapshots = SourceSnapshotMap::default();
         let bytes = build_cache_bytes(&dedup, &snapshots).unwrap();
         let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);

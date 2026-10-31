@@ -301,11 +301,7 @@ async fn docker_io_is_rewritten_to_registry_1_for_endpoint() {
     let _g = EnvGuard::set_docker_config(dir.path());
     let cfg = config("docker.io", None);
     let client = build(&cfg).await.expect("build client");
-    let authority = client
-        .registry_authority()
-        .expect("client has a host")
-        .as_str()
-        .to_owned();
+    let authority = client.registry_authority().as_str().to_owned();
     assert_eq!(
         authority, "registry-1.docker.io:443",
         "expected docker.io to rewrite to registry-1.docker.io, got '{authority}'"

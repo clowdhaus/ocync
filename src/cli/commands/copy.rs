@@ -1,7 +1,6 @@
 //! The `copy` subcommand: copies a single image between registries.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -49,9 +48,7 @@ pub(crate) async fn run(
     let source_client = Arc::new(build_registry_client(source, &credentials).await?);
     let target_client = Arc::new(build_registry_client(destination, &credentials).await?);
 
-    let source_authority = source_client
-        .registry_authority()
-        .map_err(|e| CliError::Input(format!("source '{}': {e}", args.source)))?;
+    let source_authority = source_client.registry_authority().clone();
 
     // ECR batch checker for the destination: ECR's per-blob HEAD returns
     // false-positive 200s under concurrency; only `BatchCheckLayerAvailability`
@@ -78,12 +75,11 @@ pub(crate) async fn run(
         source_client,
         source_repo: args.source.repository().clone(),
         target_repo: args.destination.repository().clone(),
-        targets: vec![TargetEntry {
-            name: RegistryAlias::new(dst_hostname),
-            client: target_client,
+        targets: vec![TargetEntry::new(
+            RegistryAlias::new(dst_hostname),
+            target_client,
             batch_checker,
-            existing_tags: HashSet::new(),
-        }],
+        )],
         tags: vec![TagPair::retag(src_tag.to_owned(), dst_tag.to_owned())],
         platforms: None,
         head_first,

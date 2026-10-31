@@ -1319,14 +1319,15 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
         .await;
 
     let target_name = "target";
+    let target_auth = mock_target_id("target", &target_server);
     let cache = cache_with(
-        target_name,
+        &target_auth,
         &repo("tgt-a"),
         &[&parts_a.layer_descs[0].digest],
     );
     cache
         .borrow_mut()
-        .mark_repo_committed(target_name, &repo("tgt-a"));
+        .mark_repo_committed(&target_auth, &repo("tgt-a"));
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -1745,10 +1746,16 @@ async fn prior_run_cycle_breaks_via_deadline() {
     }
 
     let layer = &img_a.layer_descs[0].digest;
-    let cache = cache_with("target", &repo("repo-b"), &[layer]);
-    cache
-        .borrow_mut()
-        .set_blob_completed("target", layer.clone(), repo("repo-a"));
+    let cache = cache_with(
+        &mock_target_id("target", &target_server),
+        &repo("repo-b"),
+        &[layer],
+    );
+    cache.borrow_mut().set_blob_completed(
+        &mock_target_id("target", &target_server),
+        layer.clone(),
+        repo("repo-a"),
+    );
 
     let report = run_with_short_mount_wait(
         mappings_with_own_clients(&source_server, &target_server, ["repo-a", "repo-b"]),
@@ -1784,11 +1791,19 @@ async fn resolver_retries_mount_after_source_marked_stale() {
 
     // tgt-a is committed and valid; stale-src was rejected earlier and must be excluded.
     let layer = &img.layer_descs[0].digest;
-    let cache = cache_with("target", &repo("tgt-a"), &[layer]);
+    let cache = cache_with(
+        &mock_target_id("target", &target_server),
+        &repo("tgt-a"),
+        &[layer],
+    );
     {
         let mut c = cache.borrow_mut();
-        c.mark_repo_committed("target", &repo("tgt-a"));
-        c.mark_blob_repo_stale("target", layer, &repo("stale-src"));
+        c.mark_repo_committed(&mock_target_id("target", &target_server), &repo("tgt-a"));
+        c.mark_blob_repo_stale(
+            &mock_target_id("target", &target_server),
+            layer,
+            &repo("stale-src"),
+        );
     }
 
     let mapping = mapping_from_servers(

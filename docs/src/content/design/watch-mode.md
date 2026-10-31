@@ -87,7 +87,7 @@ When platform filtering is active but no source platforms match the filter (e.g.
 
 > **Status: Planned.** SIGHUP handling is designed but not yet implemented. The tag digest cache and discovery optimization described in this document are implemented.
 
-On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP since blob existence is independent of config.
+On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP, except for a registry entry whose `url` changed: that entry's blobs are keyed by its address and start cold.
 
 End-of-cycle pruning evicts entries for tags no longer present in the resolved mapping, preventing unbounded cache growth when source tags are deleted or tag filters change.
 
@@ -176,7 +176,7 @@ For CronJob + PVC deployments, the pod mounts a ReadWriteOnce PVC and the cache 
 
 ### Cache format versioning
 
-The tag digest cache extends the existing [transfer state cache](/design/engine#transfer-state-cache) format. The cache version will increment from v1 to v2 when the source snapshot map is added, with the new source snapshot map appended after the existing blob dedup map. Reads accept both v1 and v2: a v1 cache loads with an empty snapshot map, preserving blob dedup data across the version transition. An older binary encountering a v2 cache falls back to empty cache, which is the existing behavior for version mismatches. The same TTL and atomic write (tmp + rename + fsync) apply to both sections.
+The source snapshot map is stored in the [transfer state cache](/design/engine#transfer-state-cache) file beside the blob dedup map, under the same TTL and atomic write (tmp + rename + fsync). A cache written under another format version loads as empty, so the run starts cold.
 
 ### Observability
 

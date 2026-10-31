@@ -14,7 +14,7 @@ use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority};
 use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 
-use digests::{digest_a, digest_b, repo};
+use digests::{digest_a, digest_b, repo, target_id};
 
 fn snap_key_at(authority: &RegistryAuthority, repo_name: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(authority, &repo(repo_name), tag)
@@ -49,7 +49,7 @@ fn long_ttl() -> Duration {
 /// A cache with one completed blob, persisted to `path`.
 fn persist_one_completed_blob(path: &Path) {
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&target_id("reg.io"), digest_a(), repo("repo/a"));
     cache.persist(path).unwrap();
 }
 
@@ -90,8 +90,12 @@ fn round_trip_stable_blobs_survive() {
         let mut cache = TransferStateCache::new();
         for (registry, state, digest, repo_name) in &entries {
             match state {
-                Stable::Verified => cache.set_blob_verified(registry, digest(), repo(repo_name)),
-                Stable::Completed => cache.set_blob_completed(registry, digest(), repo(repo_name)),
+                Stable::Verified => {
+                    cache.set_blob_verified(&target_id(registry), digest(), repo(repo_name))
+                }
+                Stable::Completed => {
+                    cache.set_blob_completed(&target_id(registry), digest(), repo(repo_name))
+                }
             }
         }
         cache.persist(&path).unwrap();
@@ -99,11 +103,11 @@ fn round_trip_stable_blobs_survive() {
         let loaded = TransferStateCache::load(&path, long_ttl());
         for (registry, state, digest, repo_name) in &entries {
             assert!(
-                loaded.blob_present_at(registry, &digest(), &repo(repo_name)),
+                loaded.blob_present_at(&target_id(registry), &digest(), &repo(repo_name)),
                 "{name}: {state:?} blob at {registry} should survive"
             );
             assert!(
-                !loaded.blob_present_at("other.io", &digest(), &repo(repo_name)),
+                !loaded.blob_present_at(&target_id("other.io"), &digest(), &repo(repo_name)),
                 "{name}: blob must not appear at a registry it was not recorded at"
             );
         }
@@ -116,18 +120,18 @@ fn round_trip_mount_source_survives() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/b"));
+    cache.set_blob_completed(&target_id("reg.io"), digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&target_id("reg.io"), digest_a(), repo("repo/b"));
 
     cache.persist(&path).unwrap();
 
     let mut loaded = TransferStateCache::load(&path, long_ttl());
     // Committed repos are runtime-only: a loaded `Verified` entry is offered
     // as a mount source only once its repo is committed.
-    loaded.mark_repo_committed("reg.io", &repo("repo/a"));
+    loaded.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
     assert_eq!(
         loaded
-            .mount_sources("reg.io", &digest_a(), &repo("repo/b"))
+            .mount_sources(&target_id("reg.io"), &digest_a(), &repo("repo/b"))
             .next()
             .cloned(),
         Some(repo("repo/a"))
@@ -150,11 +154,23 @@ fn ttl_expires_old_caches_and_zero_never_does() {
         let loaded = TransferStateCache::load(&path, ttl);
         assert_eq!(loaded.is_empty(), !expect_kept, "{name}");
         assert_eq!(
-            loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+            loaded.blob_present_at(&target_id("reg.io"), &digest_a(), &repo("repo/a")),
             expect_kept,
             "{name}"
         );
     }
+}
+
+/// `bytes` with the header's version replaced and the CRC recomputed, so only
+/// the version can make the load discard it.
+fn with_version(mut bytes: Vec<u8>, version: u8) -> Vec<u8> {
+    // The version is the first byte of the postcard header, at offset 4 (after
+    // the 4-byte header length). The trailing 4 bytes are the CRC.
+    bytes[4] = version;
+    let payload_len = bytes.len() - 4;
+    let crc = crc32fast::hash(&bytes[..payload_len]);
+    bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
+    bytes
 }
 
 /// A file that cannot be read back as a cache is discarded, never an error.
@@ -162,7 +178,7 @@ fn ttl_expires_old_caches_and_zero_never_does() {
 fn unreadable_files_load_as_empty() {
     // Turns a valid cache file's bytes into the file under test; `None` leaves no file.
     type Damage = fn(Vec<u8>) -> Option<Vec<u8>>;
-    let cases: [(&str, Damage); 5] = [
+    let cases: [(&str, Damage); 6] = [
         ("missing file", |_| None),
         ("not a cache", |_| {
             Some(b"this is not valid cache data at all".to_vec())
@@ -173,15 +189,12 @@ fn unreadable_files_load_as_empty() {
             bytes[mid] ^= 0xFF;
             Some(bytes)
         }),
-        ("wrong version with a valid CRC", |mut bytes| {
-            // The version is the first byte of the postcard header, at offset 4
-            // (after the 4-byte header length). The trailing 4 bytes are the CRC.
-            bytes[4] = 99;
-            let payload_len = bytes.len() - 4;
-            let crc = crc32fast::hash(&bytes[..payload_len]);
-            bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
-            Some(bytes)
+        ("wrong version with a valid CRC", |bytes| {
+            Some(with_version(bytes, 99))
         }),
+        // The previous layout keyed blobs by alias alone; its meaning differs
+        // from the current key even though it parses.
+        ("previous version", |bytes| Some(with_version(bytes, 1))),
     ];
     for (name, damage) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -205,14 +218,14 @@ fn transient_blobs_are_not_persisted() {
     let cases: [(&str, Mark); 2] = [
         ("failed", |cache| {
             cache.set_blob_failed(
-                "reg.io",
+                &target_id("reg.io"),
                 digest_a(),
                 repo("repo/a"),
                 "connection refused".into(),
             );
         }),
         ("uploading (in progress)", |cache| {
-            cache.claim_blob_upload("reg.io", &digest_a(), &repo("repo/a"));
+            cache.claim_blob_upload(&target_id("reg.io"), &digest_a(), &repo("repo/a"));
         }),
     ];
     for (name, mark_transient) in cases {
@@ -229,11 +242,11 @@ fn transient_blobs_are_not_persisted() {
             "{name} blob should not be persisted"
         );
 
-        cache.set_blob_completed("reg.io", digest_b(), repo("repo/b"));
+        cache.set_blob_completed(&target_id("reg.io"), digest_b(), repo("repo/b"));
         cache.persist(&path).unwrap();
         let loaded = TransferStateCache::load(&path, long_ttl());
         assert!(
-            loaded.blob_present_at("reg.io", &digest_b(), &repo("repo/b")),
+            loaded.blob_present_at(&target_id("reg.io"), &digest_b(), &repo("repo/b")),
             "{name}: the completed blob should survive persist"
         );
     }
@@ -284,8 +297,8 @@ fn blobs_and_source_snapshots_round_trip_together() {
     ];
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_verified("reg1.io", digest_a(), repo("repo/a"));
-    cache.set_blob_completed("reg2.io", digest_b(), repo("repo/b"));
+    cache.set_blob_verified(&target_id("reg1.io"), digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&target_id("reg2.io"), digest_b(), repo("repo/b"));
     for (key, snap) in &snapshots {
         cache.set_source_snapshot(key.clone(), snap.clone());
     }
@@ -293,8 +306,8 @@ fn blobs_and_source_snapshots_round_trip_together() {
 
     let loaded = TransferStateCache::load(&path, long_ttl());
 
-    assert!(loaded.blob_present_at("reg1.io", &digest_a(), &repo("repo/a")));
-    assert!(loaded.blob_present_at("reg2.io", &digest_b(), &repo("repo/b")));
+    assert!(loaded.blob_present_at(&target_id("reg1.io"), &digest_a(), &repo("repo/a")));
+    assert!(loaded.blob_present_at(&target_id("reg2.io"), &digest_b(), &repo("repo/b")));
     for (key, want) in &snapshots {
         let got = loaded
             .source_snapshot(key)

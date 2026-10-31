@@ -204,8 +204,14 @@ impl RegistryClientBuilder {
     }
 
     /// Build the registry client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UrlConstruction`] when the URL has no host, and an
+    /// HTTP error when the underlying client cannot be built.
     pub fn build(self) -> Result<RegistryClient, Error> {
         crate::install_crypto_provider();
+        let authority = authority_of(&self.url)?;
         let base_builder = || {
             let mut builder = reqwest::Client::builder().user_agent(USER_AGENT_VALUE);
             for (host, addr) in &self.dns_overrides {
@@ -235,6 +241,7 @@ impl RegistryClientBuilder {
         );
         Ok(RegistryClient {
             base_url: self.url,
+            authority,
             http,
             blob_download_http,
             auth: self.auth,
@@ -254,6 +261,8 @@ impl RegistryClientBuilder {
 /// and AIMD concurrency controller. Construct via [`RegistryClientBuilder`].
 pub struct RegistryClient {
     pub(crate) base_url: Url,
+    /// `host:port` of `base_url`, parsed once at construction.
+    authority: RegistryAuthority,
     pub(crate) http: reqwest::Client,
     /// HTTP/1.1 only, for blob downloads. Over HTTP/2 a response body
     /// holds a share of its connection's receive window until it is read,
@@ -348,6 +357,16 @@ impl RegistryClient {
     }
 }
 
+/// The `host:port` of `url`, with the scheme's default port when it names none.
+fn authority_of(url: &Url) -> Result<RegistryAuthority, Error> {
+    let host = url.host_str().ok_or_else(|| Error::UrlConstruction {
+        path: url.to_string(),
+        reason: "URL has no host".into(),
+    })?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    Ok(RegistryAuthority::new(format!("{host}:{port}")))
+}
+
 impl std::fmt::Debug for RegistryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let remaining = self.rate_limit_remaining.load(Ordering::Relaxed);
@@ -393,16 +412,8 @@ impl RegistryClient {
     }
 
     /// The registry authority as `host:port`, for use as a cache key.
-    pub fn registry_authority(&self) -> Result<RegistryAuthority, Error> {
-        let host = self
-            .base_url
-            .host_str()
-            .ok_or_else(|| Error::UrlConstruction {
-                path: self.base_url.to_string(),
-                reason: "URL has no host".into(),
-            })?;
-        let port = self.base_url.port_or_known_default().unwrap_or(443);
-        Ok(RegistryAuthority::new(format!("{host}:{port}")))
+    pub fn registry_authority(&self) -> &RegistryAuthority {
+        &self.authority
     }
 
     /// The last observed rate-limit remaining value, or `None` before any
@@ -695,7 +706,7 @@ mod tests {
     fn registry_authority_https_default_port() {
         let client = RegistryClient::builder(test_base_url()).build().unwrap();
         assert_eq!(
-            client.registry_authority().unwrap().as_str(),
+            client.registry_authority().as_str(),
             "registry-1.docker.io:443"
         );
     }
@@ -704,10 +715,16 @@ mod tests {
     fn registry_authority_explicit_port() {
         let base = Url::parse("http://localhost:5000").unwrap();
         let client = RegistryClient::builder(base).build().unwrap();
-        assert_eq!(
-            client.registry_authority().unwrap().as_str(),
-            "localhost:5000"
-        );
+        assert_eq!(client.registry_authority().as_str(), "localhost:5000");
+    }
+
+    /// A URL with no host has no address to key a cache by, so the client is
+    /// refused at construction rather than failing later.
+    #[test]
+    fn build_rejects_a_url_without_a_host() {
+        let url = Url::parse("mailto:ops@example.com").unwrap();
+        let err = RegistryClient::builder(url).build().unwrap_err();
+        assert!(matches!(err, Error::UrlConstruction { .. }), "{err}");
     }
 
     #[test]
@@ -715,7 +732,7 @@ mod tests {
         let base = Url::parse("http://registry.example.com").unwrap();
         let client = RegistryClient::builder(base).build().unwrap();
         assert_eq!(
-            client.registry_authority().unwrap().as_str(),
+            client.registry_authority().as_str(),
             "registry.example.com:80"
         );
     }

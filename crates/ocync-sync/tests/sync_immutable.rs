@@ -26,10 +26,9 @@ fn immutable_mapping(
 
 /// A target that already holds `existing_tags`.
 fn target_with_tags(name: &str, server: &MockServer, existing_tags: &[&str]) -> TargetEntry {
-    TargetEntry {
-        existing_tags: existing_tags.iter().map(|t| t.to_string()).collect(),
-        ..target_entry(name, mock_client(server))
-    }
+    let mut entry = target_entry(name, mock_client(server));
+    entry.existing_tags = existing_tags.iter().map(|t| t.to_string()).collect();
+    entry
 }
 
 /// A tag that matches the glob and exists at the target is skipped with no

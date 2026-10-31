@@ -732,7 +732,7 @@ pub(crate) async fn run(
             let from = m.source_repo.as_str().to_string();
             MappingDescriptor {
                 target_repo: m.target_repo.as_str().to_string(),
-                target_names: m.targets.iter().map(|t| (*t.name).to_string()).collect(),
+                target_names: m.targets.iter().map(|t| t.name().to_string()).collect(),
                 // From the dropped list, since `m.targets` is already filtered;
                 // otherwise the bracket vanishes when a registry is missing.
                 dropped_names: dropped_targets
@@ -1417,12 +1417,11 @@ fn build_targets(
     let mut codes = Vec::new();
     for name in target_names {
         match client_for(clients, &name, from, RegistryRole::Target) {
-            Ok(client) => targets.push(TargetEntry {
-                batch_checker: batch_checkers.get(&name).cloned(),
-                name: RegistryAlias::new(name),
+            Ok(client) => targets.push(TargetEntry::new(
+                RegistryAlias::new(&name),
                 client,
-                existing_tags: HashSet::new(),
-            }),
+                batch_checkers.get(&name).cloned(),
+            )),
             Err(err) => {
                 dropped.push(DroppedTarget {
                     from: from.to_owned(),
@@ -1602,9 +1601,7 @@ async fn resolve_mapping_inner(
         })
         .transpose()?;
 
-    let source_authority = source_client
-        .registry_authority()
-        .map_err(|e| CliError::Input(format!("mapping '{}': {e}", mapping.from)))?;
+    let source_authority = source_client.registry_authority().clone();
 
     let head_first = config
         .registries
@@ -1624,7 +1621,7 @@ async fn resolve_mapping_inner(
         // its own AIMD window. Clients are cloned out so the listings do not
         // borrow `targets`, which is mutated below.
         let target_clients: Vec<Arc<RegistryClient>> =
-            targets.iter().map(|e| Arc::clone(&e.client)).collect();
+            targets.iter().map(|e| Arc::clone(e.client())).collect();
         let listings: Vec<Result<Vec<String>, ocync_distribution::Error>> =
             futures_util::stream::iter(
                 target_clients
@@ -1644,7 +1641,7 @@ async fn resolve_mapping_inner(
                         // Mappings resolve concurrently, so neighbouring log
                         // lines do not identify the mapping.
                         from = %mapping.from,
-                        registry = %entry.name,
+                        registry = %entry.name(),
                         error = %e,
                         "failed to list target tags; immutable skip disabled for this target"
                     );
@@ -3100,7 +3097,7 @@ mappings:
             "one dead target must not unresolve the whole mapping"
         );
         assert_eq!(resolved.len(), 1);
-        let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &*t.name).collect();
+        let targets: Vec<&str> = resolved[0].targets.iter().map(|t| &**t.name()).collect();
         assert_eq!(targets, vec!["good"], "the healthy target must survive");
 
         // The unreached target must stay visible.
