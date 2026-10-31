@@ -175,8 +175,8 @@ pub enum RegistryAction {
 pub(crate) enum WindowKey {
     /// ECR private: every API action has an independent per-region TPS cap.
     Ecr(RegistryAction),
-    /// ECR Public: same per-action enforcement model with lower write caps,
-    /// and read paths are aggregated.
+    /// ECR Public: per-action enforcement like ECR private with lower caps on
+    /// pulls and on starting and finishing uploads; read paths are aggregated.
     EcrPublic(EcrPublicGroup),
     /// Docker Hub: HEADs unmetered, manifest reads quota'd, others shared.
     DockerHub(DockerHubGroup),

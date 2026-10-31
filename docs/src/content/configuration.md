@@ -118,7 +118,7 @@ registries:
 |---|---|
 | `ecr` | AWS ECR private. HTTP Basic using a `GetAuthorizationToken` token; ambient AWS credentials |
 | `gar` | Google Artifact Registry (`*-docker.pkg.dev`); Application Default Credentials |
-| `gcr` | Legacy Google Container Registry (`*.gcr.io`); same provider as `gar` |
+| `gcr` | `gcr.io` and `*.gcr.io`, served by Artifact Registry; same provider as `gar` |
 | `acr` | Azure Container Registry; AAD credential chain via proprietary OAuth2 exchange |
 | `ghcr` | Alias for `docker_config`. Prefer `static_token` (e.g., `GITHUB_TOKEN`) or `docker_config` directly |
 | `basic` | HTTP Basic. Requires `credentials` with `username` and `password` |
