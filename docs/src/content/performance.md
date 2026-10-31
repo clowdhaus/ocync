@@ -61,7 +61,7 @@ dregsy is left out because its run did not pass the content check, which require
 
 | Tool | Default concurrency | Adaptive backoff | Rate limit strategy |
 |------|:---:|:---:|-----|
-| `ocync` | 10 images at once; per registry, 1 request initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429, plus bounded jittered retry (4 attempts) of throttled prepare-phase reads |
+| `ocync` | 20 images at once; per registry, 1 request initial, 50 cap ([AIMD](/design/overview#adaptive-concurrency-aimd) adaptive) | Yes (per-registry, per-action) | [AIMD](/design/overview#adaptive-concurrency-aimd) congestion control on 429, plus bounded jittered retry (4 attempts) of throttled prepare-phase reads |
 | containerd | 3 layers | No | Lock-based dedup, retries on 429 (no backoff) |
 | regsync | 3 per registry | No | Reads `RateLimit-Remaining` header, pauses proactively |
 | crane | 4 jobs | Retry with backoff (0.1s-0.9s transport, 1s-9s operation) | Retry on 408/5xx, 3 attempts |

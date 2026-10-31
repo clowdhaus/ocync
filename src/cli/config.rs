@@ -124,12 +124,10 @@ pub(crate) struct Config {
 /// Global engine settings that apply across all sync operations.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct GlobalConfig {
-    /// Maximum concurrent image syncs (default: 10).
+    /// Maximum concurrent image syncs (default: 20).
     ///
-    /// Default derived as `blob_upload_concurrency / BLOB_CONCURRENCY = 64
-    /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
-    /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
-    /// across major container registries).
+    /// HTTP/2 upload streams per target are bounded separately, by the
+    /// registry client's blob upload concurrency, whatever this cap.
     #[serde(
         default = "default_max_concurrent_transfers",
         deserialize_with = "transfers_at_least_one"
