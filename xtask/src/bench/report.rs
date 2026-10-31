@@ -1704,17 +1704,17 @@ pub(crate) mod tests {
         report.max_concurrent_transfers = Some(default);
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
 
-        report.max_concurrent_transfers = NonZeroUsize::new(20);
+        report.max_concurrent_transfers = NonZeroUsize::new(30);
         let record = RunRecord::of(&report, "abc1234".into(), None, None);
-        assert_eq!(record.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert_eq!(record.max_concurrent_transfers, NonZeroUsize::new(30));
         assert_eq!(
             record.baseline_max_concurrent_transfers,
-            NonZeroUsize::new(20).map(BaselineCap::Given)
+            NonZeroUsize::new(30).map(BaselineCap::Given)
         );
         let json = serde_json::to_string(&record).unwrap();
-        assert!(json.contains(r#""max_concurrent_transfers":20"#), "{json}");
+        assert!(json.contains(r#""max_concurrent_transfers":30"#), "{json}");
         assert!(
-            json.contains(r#""baseline_max_concurrent_transfers":{"given":20}"#),
+            json.contains(r#""baseline_max_concurrent_transfers":{"given":30}"#),
             "{json}"
         );
         let reread: RunRecord = serde_json::from_str(&json).unwrap();
@@ -1723,7 +1723,7 @@ pub(crate) mod tests {
             record.baseline_max_concurrent_transfers
         );
         assert!(
-            summary_markdown(&report).contains("ocync ran with `max_concurrent_transfers: 20`\n")
+            summary_markdown(&report).contains("ocync ran with `max_concurrent_transfers: 30`\n")
         );
         assert_eq!(PageBlocks::of(&report), PageBlocks::default());
 
