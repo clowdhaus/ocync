@@ -183,7 +183,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
     if args.target == Kind::ArtifactRegistry {
-        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools(), false)?;
+        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;

@@ -50,19 +50,11 @@ pub(crate) enum Target {
 
 /// Fails unless a run of `scenario` with `tools` can sync into Artifact
 /// Registry. Shared by the instance and by `bench-remote`, which refuses
-/// before it creates anything. `regression` is whether the run compares with
-/// the stored baseline, which `bench-remote` never asks for.
+/// before it creates anything.
 pub(crate) fn ensure_artifact_registry_applies(
     scenario: Scenario,
     tools: &[Tool],
-    regression: bool,
 ) -> Result<(), String> {
-    if regression {
-        return Err(
-            "--regression cannot run against Artifact Registry: the one stored baseline is ECR's"
-                .to_owned(),
-        );
-    }
     if !matches!(scenario, Scenario::Sync) {
         return Err(format!(
             "the {} scenario cannot sync into Artifact Registry yet; only sync can",
@@ -89,7 +81,8 @@ pub(crate) fn ensure_artifact_registry_applies(
 impl Target {
     /// Reads the `kind` of target from `env`, which an ECR run does not read.
     /// Refuses a run that Artifact Registry cannot serve before anything is
-    /// built or pulled.
+    /// built or pulled, a `--regression` run among them: the one stored
+    /// baseline is ECR's.
     pub(crate) fn from_env(
         kind: Kind,
         env: &dyn Fn(&str) -> Option<String>,
@@ -101,7 +94,12 @@ impl Target {
         match kind {
             Kind::Ecr => Ok(Self::Ecr),
             Kind::ArtifactRegistry => {
-                ensure_artifact_registry_applies(scenario, tools, regression)?;
+                if regression {
+                    return Err("--regression cannot run against Artifact Registry: \
+                         the one stored baseline is ECR's"
+                        .to_owned());
+                }
+                ensure_artifact_registry_applies(scenario, tools)?;
                 gar::require(env, ENV_CREDENTIALS)?;
                 ArtifactRegistryTarget::parse(env, rounds).map(Self::ArtifactRegistry)
             }
