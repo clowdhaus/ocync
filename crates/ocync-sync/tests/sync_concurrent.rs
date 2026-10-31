@@ -1492,88 +1492,108 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
 }
 
 /// A blob failure ends the image's other blobs' waits. Image B's shared layer
-/// waits on image A's slow manifest commit, and B's own layer fails to pull.
-/// B is reported failed at once instead of after A's commit, and never pushes
-/// the layer it was waiting to mount.
+/// waits on image A, and B's own layer fails to pull. B is reported failed at
+/// once instead of after A's delay, and never pushes the shared layer. The
+/// delay is A's manifest commit (B waits to mount from A's repo) or A's blob
+/// upload (B waits on A's claim of the layer).
 #[tokio::test(flavor = "current_thread")]
-async fn sync_blob_failure_ends_a_blobs_mount_source_wait() {
-    const COMMIT_DELAY: Duration = Duration::from_secs(4);
-    // Long enough for B's shared layer to reach the commit wait first.
-    const FAILURE_DELAY: Duration = Duration::from_millis(500);
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let parts_a = ManifestBuilder::new(b"cancel-wait-config-a")
-        .layer(b"cancel-wait-shared")
-        .build();
-    let parts_b = ManifestBuilder::new(b"cancel-wait-config-b")
-        .layer(b"cancel-wait-shared")
-        .layer(b"cancel-wait-unpullable")
-        .build();
-    parts_a.mount_source(&source_server, "src-a", "v1").await;
-    parts_b.mount_source(&source_server, "src-b", "v1").await;
-    Mock::given(method("GET"))
-        .and(path(format!(
-            "/v2/src-b/blobs/{}",
-            parts_b.layer_descs[1].digest
-        )))
-        .respond_with(ResponseTemplate::new(404).set_delay(FAILURE_DELAY))
-        .with_priority(1)
-        .mount(&source_server)
-        .await;
-
-    for (repo, parts) in [("tgt-a", &parts_a), ("tgt-b", &parts_b)] {
-        mount_manifest_head_not_found(&target_server, repo, "v1").await;
-        parts.mount_target_blob_misses(&target_server, repo).await;
-        mount_blob_push(&target_server, repo).await;
+async fn sync_blob_failure_ends_a_blobs_waits() {
+    #[derive(Debug, Clone, Copy)]
+    enum Slow {
+        Commit,
+        Upload,
     }
-    Mock::given(method("PUT"))
-        .and(path("/v2/tgt-a/manifests/v1"))
-        .respond_with(ResponseTemplate::new(201).set_delay(COMMIT_DELAY))
-        .mount(&target_server)
-        .await;
+    const DELAY: Duration = Duration::from_secs(4);
+    // Long enough for B's shared layer to reach its wait first.
+    const FAILURE_DELAY: Duration = Duration::from_millis(500);
 
-    // Leader election breaks a tie in favor of the later image, so listing B
-    // first makes A the uploader and B the waiter.
-    let mut mappings = slow_commit_mappings(&source_server, &target_server);
-    mappings.reverse();
-    let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_mount_source_wait_deadline(Duration::from_secs(60));
-    let report = engine
-        .run(
-            mappings,
-            empty_cache(),
-            BlobStage::disabled(),
-            &NullProgress,
-            None,
-        )
-        .await;
+    for slow in [Slow::Commit, Slow::Upload] {
+        let source_server = MockServer::start().await;
+        let target_server = MockServer::start().await;
 
-    let image_b = report
-        .images
-        .iter()
-        .find(|i| i.target.contains("tgt-b"))
-        .expect("image B is reported");
-    assert!(
-        matches!(image_b.status, ImageStatus::Failed { .. }),
-        "{:?}",
-        image_b.status
-    );
-    assert!(
-        image_b.duration < COMMIT_DELAY / 2,
-        "B failed after {:?}: its shared layer kept waiting on A's commit",
-        image_b.duration
-    );
-    assert_eq!(
-        count_blob_uploads(
-            &target_server,
-            PathMatch::Contains("/tgt-b/blobs/uploads/"),
-            &parts_b.layer_descs[0].digest,
-        )
-        .await,
-        0,
-        "B never pushes the layer it was waiting on"
-    );
+        let parts_a = ManifestBuilder::new(b"cancel-wait-config-a")
+            .layer(b"cancel-wait-shared")
+            .build();
+        let parts_b = ManifestBuilder::new(b"cancel-wait-config-b")
+            .layer(b"cancel-wait-shared")
+            .layer(b"cancel-wait-unpullable")
+            .build();
+        parts_a.mount_source(&source_server, "src-a", "v1").await;
+        parts_b.mount_source(&source_server, "src-b", "v1").await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/src-b/blobs/{}",
+                parts_b.layer_descs[1].digest
+            )))
+            .respond_with(ResponseTemplate::new(404).set_delay(FAILURE_DELAY))
+            .with_priority(1)
+            .mount(&source_server)
+            .await;
+
+        for (repo, parts) in [("tgt-a", &parts_a), ("tgt-b", &parts_b)] {
+            mount_manifest_head_not_found(&target_server, repo, "v1").await;
+            parts.mount_target_blob_misses(&target_server, repo).await;
+            mount_blob_push(&target_server, repo).await;
+        }
+        let (commit_delay, upload_delay) = match slow {
+            Slow::Commit => (DELAY, Duration::ZERO),
+            Slow::Upload => (Duration::ZERO, DELAY),
+        };
+        Mock::given(method("PUT"))
+            .and(path("/v2/tgt-a/manifests/v1"))
+            .respond_with(ResponseTemplate::new(201).set_delay(commit_delay))
+            .mount(&target_server)
+            .await;
+        // Outranks the instant finalize in `mount_blob_push`.
+        Mock::given(method("PUT"))
+            .and(path("/v2/tgt-a/blobs/uploads/upload-id"))
+            .respond_with(ResponseTemplate::new(201).set_delay(upload_delay))
+            .with_priority(1)
+            .mount(&target_server)
+            .await;
+
+        // Leader election breaks a tie in favor of the later image, so listing
+        // B first makes A the uploader and B the waiter.
+        let mut mappings = slow_commit_mappings(&source_server, &target_server);
+        mappings.reverse();
+        let engine = SyncEngine::new(fast_retry(), concurrency(10))
+            .with_mount_source_wait_deadline(Duration::from_secs(60));
+        let report = engine
+            .run(
+                mappings,
+                empty_cache(),
+                BlobStage::disabled(),
+                &NullProgress,
+                None,
+            )
+            .await;
+
+        let image_b = report
+            .images
+            .iter()
+            .find(|i| i.target.contains("tgt-b"))
+            .expect("image B is reported");
+        assert!(
+            matches!(image_b.status, ImageStatus::Failed { .. }),
+            "{slow:?}: {:?}",
+            image_b.status
+        );
+        assert!(
+            image_b.duration < DELAY / 2,
+            "{slow:?}: B failed after {:?}, its shared layer kept waiting on A",
+            image_b.duration
+        );
+        assert_eq!(
+            count_blob_uploads(
+                &target_server,
+                PathMatch::Contains("/tgt-b/blobs/uploads/"),
+                &parts_b.layer_descs[0].digest,
+            )
+            .await,
+            0,
+            "{slow:?}: B never pushes the layer it was waiting on"
+        );
+    }
 }
 
 /// Two images share a blob and run concurrently; the blob already exists at
