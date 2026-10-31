@@ -575,14 +575,18 @@ pub(crate) fn tool_label(tool: Tool, baseline: Option<&CommitSha>) -> String {
     }
 }
 
+/// The cap the current ocync runs with: the one `given`, else the engine's
+/// default.
+pub(crate) fn effective_transfer_cap(given: Option<NonZeroUsize>) -> NonZeroUsize {
+    given.unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS)
+}
+
 impl BenchReport {
-    /// The cap the current ocync ran with: the one given, else the engine's
-    /// default. `None` when no ocync ran.
+    /// The cap the current ocync ran with. `None` when no ocync ran.
     pub(crate) fn ocync_transfer_cap(&self) -> Option<NonZeroUsize> {
-        self.tool_versions.contains_key(&Tool::Ocync).then(|| {
-            self.max_concurrent_transfers
-                .unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS)
-        })
+        self.tool_versions
+            .contains_key(&Tool::Ocync)
+            .then(|| effective_transfer_cap(self.max_concurrent_transfers))
     }
 
     /// The cap the baseline build ran with. `None` without a baseline build.
@@ -731,9 +735,11 @@ fn summary_markdown(report: &BenchReport) -> String {
         report.corpus_size, report.total_tags
     ));
     if let Some(cap) = report.ocync_transfer_cap() {
-        out.push_str(&format!(
-            "ocync ran with `max_concurrent_transfers: {cap}`\n\n"
-        ));
+        out.push_str(&format!("ocync ran with `max_concurrent_transfers: {cap}`"));
+        if report.baseline_transfer_cap() == Some(BaselineCap::OwnDefault) {
+            out.push_str("; the baseline build ran at its own default, which may differ");
+        }
+        out.push_str("\n\n");
     }
     if let Some(note) = report.prewarm.as_ref().and_then(Prewarm::note) {
         out.push_str(&format!("{note}\n\n"));
@@ -1241,10 +1247,12 @@ pub(crate) struct PageBlocks {
 }
 
 impl PageBlocks {
-    /// The blocks `report` produces. A run that gave a transfer cap produces
-    /// none: the page shows ocync as it runs out of the box.
+    /// The blocks `report` produces. A run whose transfer cap is not ocync's
+    /// default produces none: the page shows ocync as it runs out of the box.
     pub(crate) fn of(report: &BenchReport) -> Self {
-        if report.max_concurrent_transfers.is_some() {
+        if effective_transfer_cap(report.max_concurrent_transfers)
+            != DEFAULT_MAX_CONCURRENT_TRANSFERS
+        {
             return Self::default();
         }
         let block = |kind, description| {
@@ -1688,8 +1696,12 @@ pub(crate) mod tests {
             "{json}"
         );
         assert!(summary_markdown(&report).contains(&format!(
-            "ocync ran with `max_concurrent_transfers: {default}`\n"
-        )),);
+            "ocync ran with `max_concurrent_transfers: {default}`; the baseline build ran at \
+             its own default, which may differ\n"
+        )));
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.max_concurrent_transfers = Some(default);
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
 
         report.max_concurrent_transfers = NonZeroUsize::new(20);

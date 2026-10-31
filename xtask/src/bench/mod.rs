@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
 use ocync_distribution::Digest;
-use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
@@ -537,25 +536,18 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         args.paths.partial_overrides(),
         args.tool_selection.rounds,
     )?;
-    // The comparison happens after the rounds, but a cap that will refuse it is
-    // known now, before an hour of them.
-    if args.regression
-        && args.tool_selection.run_tools().contains(&Tool::Ocync)
-        && transfers
-            .iter()
-            .any(|transfer| matches!(transfer, Transfer::Sync { .. }))
-    {
-        let cap = args
-            .tool_selection
-            .max_concurrent_transfers
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS);
-        regression::ensure_baseline_cap(&baseline_path(), cap)?;
-    }
     let prepare = matches!(args.scenario, Scenario::Prepare | Scenario::All);
     let lock = (!transfers.is_empty())
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
+    ensure_baseline_comparable(
+        &args,
+        &transfers,
+        &corpus,
+        corpus_locked_at.as_ref(),
+        &baseline_path(),
+    )?;
     let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
     let refs: BTreeSet<_> = transfers
@@ -1051,6 +1043,45 @@ fn cold_ocync_median(
         max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
     })
+}
+
+/// Refuses a `--regression` whose stored baseline the run could not be compared
+/// with, before any round runs rather than after the last. The comparison is
+/// made over the cold sync rounds of ocync and needs the proxy's metrics, so a
+/// run without any of them is left alone, as the comparison skips it.
+fn ensure_baseline_comparable(
+    args: &BenchArgs,
+    transfers: &[Transfer],
+    corpus: &Corpus,
+    corpus_locked_at: Option<&lock::LockedAt>,
+    baseline_path: &Path,
+) -> Result<(), String> {
+    let cold_rounds = transfers
+        .iter()
+        .filter(|transfer| matches!(transfer, Transfer::Sync { .. }))
+        .count();
+    if !args.regression
+        || args.no_proxy
+        || cold_rounds == 0
+        || !args.tool_selection.run_tools().contains(&Tool::Ocync)
+    {
+        return Ok(());
+    }
+    let key = Baseline {
+        wall_clock_secs: 0.0,
+        requests: 0,
+        total_bytes: 0,
+        corpus_locked_at: corpus_locked_at.cloned(),
+        corpus: report::CorpusInfo {
+            images: corpus.images.len(),
+            tags: corpus.total_tags(),
+        },
+        max_concurrent_transfers: Some(report::effective_transfer_cap(
+            args.tool_selection.max_concurrent_transfers,
+        )),
+        rounds: u32::try_from(cold_rounds).expect("a run has fewer than 2^32 rounds"),
+    };
+    regression::ensure_baseline_comparable(baseline_path, &key)
 }
 
 /// Where the stored baseline of `--regression` lives.
@@ -2334,49 +2365,115 @@ mod tests {
             command_stdout(std::process::Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
         let refusal = "--max-concurrent-transfers applies to ocync, and this run builds none: \
                        add ocync to --tools or give --baseline-ref";
+        let cap = ["--max-concurrent-transfers", "20"];
         for (argv, refused) in [
-            (&["--tools", "dregsy", "sync"][..], false),
+            (vec!["--tools", "dregsy", "sync"], None),
             (
-                &[
-                    "--tools",
-                    "dregsy",
-                    "--max-concurrent-transfers",
-                    "20",
-                    "sync",
-                ][..],
-                true,
+                [&["--tools", "dregsy"][..], &cap, &["sync"]].concat(),
+                Some(refusal),
             ),
             (
-                &[
-                    "--tools",
-                    "ocync,dregsy",
-                    "--max-concurrent-transfers",
-                    "20",
-                    "sync",
-                ][..],
-                false,
+                [&["--tools", "ocync,dregsy"][..], &cap, &["sync"]].concat(),
+                None,
             ),
             (
-                &[
-                    "--tools",
-                    "dregsy",
-                    "--baseline-ref",
-                    &head,
-                    "--max-concurrent-transfers",
-                    "20",
-                    "sync",
-                ][..],
-                false,
+                [
+                    &["--tools", "dregsy", "--baseline-ref", &head][..],
+                    &cap,
+                    &["sync"],
+                ]
+                .concat(),
+                None,
             ),
         ] {
-            let selection = parse_bench(argv).unwrap().tool_selection;
+            let selection = parse_bench(&argv).unwrap().tool_selection;
             assert_eq!(
                 selection.ensure_cap_applies(),
-                if refused {
-                    Err(refusal.to_owned())
-                } else {
-                    Ok(())
-                },
+                refused.map_or(Ok(()), |text| Err(text.to_owned())),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_regression_run_is_refused_before_its_rounds_only_when_its_comparison_would_be() {
+        // Catches: the refusal coming after the rounds, and a refusal for a run
+        // whose comparison is skipped (proxy off, no ocync, no cold sync).
+        let corpus = two_image_corpus();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        let cold = |rounds: usize| -> Vec<Transfer> {
+            (1..=rounds).map(|round| Transfer::Sync { round }).collect()
+        };
+        let saved = Baseline {
+            wall_clock_secs: 1.0,
+            requests: 1,
+            total_bytes: 1,
+            corpus_locked_at: None,
+            corpus: report::CorpusInfo {
+                images: corpus.images.len(),
+                tags: corpus.total_tags(),
+            },
+            max_concurrent_transfers: NonZeroUsize::new(20),
+            rounds: 3,
+        };
+        regression::save_baseline(&path, &saved).unwrap();
+        let shown = path.display();
+        let other_cap = format!(
+            "{shown} was recorded with a transfer cap of 20, this run with a transfer cap of \
+             30; record a new baseline by deleting {shown} and rerunning"
+        );
+        let other_rounds = format!(
+            "{shown} was recorded over 3 rounds, this run over 4; record a new baseline by \
+             deleting {shown} and rerunning"
+        );
+        for (argv, transfers, refused) in [
+            (
+                vec!["--regression", "--max-concurrent-transfers", "20", "sync"],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "30", "sync"],
+                cold(3),
+                Some(&other_cap),
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "20", "sync"],
+                cold(4),
+                Some(&other_rounds),
+            ),
+            (
+                vec![
+                    "--regression",
+                    "--max-concurrent-transfers",
+                    "30",
+                    "--no-proxy",
+                    "sync",
+                ],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--tools", "dregsy", "sync"],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "30", "sync"],
+                Vec::new(),
+                None,
+            ),
+            (
+                vec!["--max-concurrent-transfers", "30", "sync"],
+                cold(3),
+                None,
+            ),
+        ] {
+            let args = parse_bench(&argv).unwrap();
+            assert_eq!(
+                ensure_baseline_comparable(&args, &transfers, &corpus, None, &path),
+                refused.map_or(Ok(()), |text| Err(text.clone())),
                 "{argv:?}"
             );
         }

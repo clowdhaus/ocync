@@ -62,24 +62,17 @@ pub(crate) struct RegressionResult {
     pub(crate) regressed: bool,
 }
 
-/// Compares `current` against `baseline` using `threshold_pct` as the regression limit.
-///
-/// Refuses when the two were recorded under different corpus locks, the
-/// baseline under none, or over a different number of images or tags: they
-/// synced different content, so a delta is not a regression. Refuses a
-/// different cap on concurrent transfers or number of rounds too. `baseline_path`
-/// names the file to replace.
-///
-/// Returns percentage deltas computed as `(current - baseline) / baseline * 100`.
-/// Zero baselines return a delta of `0.0` to avoid division by zero.
-/// `regressed` is `true` when either `wall_clock_delta_pct` or `requests_delta_pct`
-/// exceeds `threshold_pct`.
-pub(crate) fn compare(
+/// Refuses when `current` and `baseline` were recorded under different corpus
+/// locks, the baseline under none, or over a different number of images or
+/// tags: they synced different content, so a delta is not a regression. Refuses
+/// a different cap on concurrent transfers or number of rounds too.
+/// `baseline_path` names the file to replace. The figures are not read, so a
+/// run can check this before it measures any.
+pub(crate) fn ensure_comparable(
     current: &Baseline,
     baseline: &Baseline,
-    threshold_pct: u32,
     baseline_path: &Path,
-) -> Result<RegressionResult, String> {
+) -> Result<(), String> {
     if current.corpus_locked_at != baseline.corpus_locked_at || current.corpus != baseline.corpus {
         let show =
             |at: &Option<LockedAt>| at.as_ref().map_or("(none)".to_owned(), ToString::to_string);
@@ -99,11 +92,18 @@ pub(crate) fn compare(
             ),
         ));
     }
-    ensure_same_cap(
-        current.max_concurrent_transfers,
-        baseline.max_concurrent_transfers,
-        baseline_path,
-    )?;
+    if current.max_concurrent_transfers != baseline.max_concurrent_transfers {
+        let show = |cap: Option<NonZeroUsize>| {
+            cap.map_or("no cap recorded".to_owned(), |cap| {
+                format!("a transfer cap of {cap}")
+            })
+        };
+        return Err(refusal(
+            baseline_path,
+            &format!("with {}", show(baseline.max_concurrent_transfers)),
+            &format!("with {}", show(current.max_concurrent_transfers)),
+        ));
+    }
     if current.rounds != baseline.rounds {
         return Err(refusal(
             baseline_path,
@@ -111,6 +111,37 @@ pub(crate) fn compare(
             &format!("over {}", current.rounds),
         ));
     }
+    Ok(())
+}
+
+/// Refuses before a run when the baseline saved at `baseline_path`, if there
+/// is one, could not be compared with the run `current` describes, so that no
+/// round runs for a comparison that will be refused.
+pub(crate) fn ensure_baseline_comparable(
+    baseline_path: &Path,
+    current: &Baseline,
+) -> Result<(), String> {
+    if !baseline_path.exists() {
+        return Ok(());
+    }
+    ensure_comparable(current, &load_baseline(baseline_path)?, baseline_path)
+}
+
+/// Compares `current` against `baseline` using `threshold_pct` as the regression limit.
+///
+/// Refuses what [`ensure_comparable`] refuses.
+///
+/// Returns percentage deltas computed as `(current - baseline) / baseline * 100`.
+/// Zero baselines return a delta of `0.0` to avoid division by zero.
+/// `regressed` is `true` when either `wall_clock_delta_pct` or `requests_delta_pct`
+/// exceeds `threshold_pct`.
+pub(crate) fn compare(
+    current: &Baseline,
+    baseline: &Baseline,
+    threshold_pct: u32,
+    baseline_path: &Path,
+) -> Result<RegressionResult, String> {
+    ensure_comparable(current, baseline, baseline_path)?;
     let wall_clock_delta_pct = pct_delta(current.wall_clock_secs, baseline.wall_clock_secs);
     let requests_delta_pct = pct_delta(current.requests as f64, baseline.requests as f64);
     let bytes_delta_pct = pct_delta(current.total_bytes as f64, baseline.total_bytes as f64);
@@ -134,39 +165,6 @@ fn refusal(baseline_path: &Path, recorded: &str, now: &str) -> String {
         "{path} was recorded {recorded}, this run {now}; record a new baseline by deleting \
          {path} and rerunning"
     )
-}
-
-/// Refuses when the caps differ, one absent from a baseline saved before the
-/// cap was recorded included.
-fn ensure_same_cap(
-    current: Option<NonZeroUsize>,
-    baseline: Option<NonZeroUsize>,
-    baseline_path: &Path,
-) -> Result<(), String> {
-    let show = |cap: Option<NonZeroUsize>| {
-        cap.map_or("no transfer cap".to_owned(), |cap| {
-            format!("a transfer cap of {cap}")
-        })
-    };
-    if current == baseline {
-        return Ok(());
-    }
-    Err(refusal(
-        baseline_path,
-        &format!("with {}", show(baseline)),
-        &format!("with {}", show(current)),
-    ))
-}
-
-/// Refuses before a run when the baseline saved at `baseline_path`, if there
-/// is one, was recorded under a cap other than `cap`, so that no round runs
-/// for a comparison that will be refused.
-pub(crate) fn ensure_baseline_cap(baseline_path: &Path, cap: NonZeroUsize) -> Result<(), String> {
-    if !baseline_path.exists() {
-        return Ok(());
-    }
-    let baseline = load_baseline(baseline_path)?;
-    ensure_same_cap(Some(cap), baseline.max_concurrent_transfers, baseline_path)
 }
 
 /// Loads a [`Baseline`] from a JSON file at `path`.
@@ -481,7 +479,7 @@ mod tests {
             (
                 Some(10),
                 None,
-                Some("with no transfer cap, this run with a transfer cap of 10"),
+                Some("with no cap recorded, this run with a transfer cap of 10"),
             ),
             (Some(10), Some(10), None),
         ] {
@@ -504,38 +502,46 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_baseline_under_another_cap_is_refused_before_the_run() {
-        // Catches: the refusal coming only after every round has run, and a
-        // default raised since the baseline was taken passing for the same cap.
+    fn a_saved_baseline_that_would_be_refused_is_refused_before_the_run() {
+        // Catches: the refusal coming only after every round has run, a default
+        // raised since the baseline was taken passing for the same cap, and a
+        // pre-run check that looks at less than the comparison does.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("baseline.json");
-        let cap = |n: usize| NonZeroUsize::new(n).unwrap();
-
-        assert_eq!(ensure_baseline_cap(&path, cap(10)), Ok(()));
-
-        let saved = Baseline {
-            max_concurrent_transfers: NonZeroUsize::new(10),
-            ..baseline(1.0, 1, 1)
+        let key = |cap: usize, images: usize| Baseline {
+            max_concurrent_transfers: NonZeroUsize::new(cap),
+            corpus: CorpusInfo { images, tags: 55 },
+            ..baseline(0.0, 0, 0)
         };
-        save_baseline(&path, &saved).unwrap();
-        assert_eq!(ensure_baseline_cap(&path, cap(10)), Ok(()));
+
+        assert_eq!(ensure_baseline_comparable(&path, &key(10, 40)), Ok(()));
+
+        save_baseline(&path, &key(10, 40)).unwrap();
         let shown = path.display();
+        assert_eq!(ensure_baseline_comparable(&path, &key(10, 40)), Ok(()));
         assert_eq!(
-            ensure_baseline_cap(&path, cap(20)),
+            ensure_baseline_comparable(&path, &key(20, 40)),
             Err(format!(
                 "{shown} was recorded with a transfer cap of 10, this run with a transfer \
                  cap of 20; record a new baseline by deleting {shown} and rerunning"
             ))
         );
-
-        let old = r#"{"wall_clock_secs": 1.0, "requests": 1, "total_bytes": 1}"#;
-        std::fs::write(&path, old).unwrap();
         assert_eq!(
-            ensure_baseline_cap(&path, cap(10)),
+            ensure_baseline_comparable(&path, &key(10, 3)),
             Err(format!(
-                "{shown} was recorded with no transfer cap, this run with a transfer cap of \
-                 10; record a new baseline by deleting {shown} and rerunning"
+                "{shown} was recorded under corpus lock (none) over 40 images and 55 tags, \
+                 this run under (none) over 3 images and 55 tags; record a new baseline by \
+                 deleting {shown} and rerunning"
             ))
+        );
+
+        let old = r#"{"wall_clock_secs": 1.0, "requests": 1, "total_bytes": 1,
+                      "corpus": {"images": 40, "tags": 55}}"#;
+        std::fs::write(&path, old).unwrap();
+        let refused = ensure_baseline_comparable(&path, &key(10, 40)).unwrap_err();
+        assert!(
+            refused.contains("with no cap recorded, this run with a transfer cap of 10"),
+            "{refused}"
         );
     }
 
