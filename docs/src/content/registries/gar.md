@@ -6,7 +6,7 @@ order: 3
 
 ## Auth
 
-ocync auto-detects GAR (`*-docker.pkg.dev`) and legacy GCR hostnames (`gcr.io`, `us.gcr.io`, `eu.gcr.io`, `asia.gcr.io`) and uses Google Application Default Credentials (ADC):
+ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io`, such as `us.gcr.io` or `mirror.gcr.io`) and uses Google Application Default Credentials (ADC):
 
 - `GOOGLE_APPLICATION_CREDENTIALS` pointing at a credentials file: a service account key, an authorized user, a Workload Identity Federation (`external_account`) configuration or an impersonated service account
 - `gcloud auth application-default login` (developer machines)
