@@ -39,11 +39,13 @@ use ocync_distribution::spec::{
     Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, PlatformFilter,
     RegistryAuthority, RepositoryName,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
+use crate::cache::{
+    BlobOwner, BlobOwners, PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache,
+};
 use crate::error::ManifestRefusal;
 pub use crate::plan::{RegistryAlias, TargetId};
 use crate::progress::RunProgress;
@@ -435,6 +437,18 @@ struct TransferTask {
     artifacts_config: Rc<ResolvedArtifacts>,
     /// Retries made discovering this image, counted into its total.
     discovery_retries: u32,
+    /// Set when this task owns a shared blob: turns `true` once its manifest
+    /// commits or its transfer fails, waking the repos waiting on it.
+    owner_done: Option<watch::Sender<bool>>,
+}
+
+impl TransferTask {
+    /// Wake the repos waiting on this task as a blob owner, if it is one.
+    fn signal_owner_done(&self) {
+        if let Some(tx) = &self.owner_done {
+            tx.send_replace(true);
+        }
+    }
 }
 
 /// Discovery outcome for one (mapping, tag) pair.
@@ -468,67 +482,67 @@ enum DiscoveryRoute {
     HeadFirstSkip,
 }
 
-/// Name one owner repo per blob that two or more repos of a target want, and
+/// The smallest task wanting a blob, and whether a task for another repo
+/// wants it too.
+struct Claimant {
+    task: usize,
+    shared: bool,
+}
+
+/// Name one owner task per blob that two or more repos of a target need, and
 /// promote owners first.
 ///
 /// The owner of a (target, digest) is the task with the fewest total blob
 /// bytes among the tasks needing it, ties by discovery position. Every other
-/// repo waits for the owner's commit and mounts (see [`wait_for_blob_owner`]).
-/// A task waits only on an owner with a strictly smaller (bytes, position)
-/// key, so waits are acyclic. Owner tasks move to the front in that key order,
-/// then every other task follows in discovery order, so each awaited owner
-/// takes an image slot before its dependents.
+/// repo waits for the owner task's commit and mounts (see
+/// [`wait_for_blob_owner`]). A task waits only on an owner with a strictly
+/// smaller (bytes, position) key, so waits are acyclic. Owner tasks move to the
+/// front in that key order, then every other task follows in discovery order,
+/// so each awaited owner takes an image slot before its dependents.
 ///
 /// Tasks sharing a [`PulledManifest`] `Rc` are one source image bound to
 /// different targets; ownership is per target.
-fn assign_blob_owners(
-    pending: &mut VecDeque<TransferTask>,
-) -> HashMap<TargetId, HashMap<Digest, RepositoryName>> {
-    let bytes: Vec<u64> = pending
+fn assign_blob_owners(pending: &mut VecDeque<TransferTask>) -> BlobOwners {
+    let blobs: Vec<Vec<&Descriptor>> = pending
         .iter()
-        .map(|t| {
-            blobs_from_manifest(&t.source_data)
-                .iter()
-                .map(|d| d.size)
-                .sum()
-        })
+        .map(|t| blobs_from_manifest(&t.source_data))
         .collect();
     let mut by_size: Vec<usize> = (0..pending.len()).collect();
-    by_size.sort_by_key(|&i| (bytes[i], i));
+    by_size.sort_by_key(|&i| (blobs[i].iter().map(|d| d.size).sum::<u64>(), i));
 
-    // Smallest task first, so the first to name a blob owns it. The flag turns
-    // on when a task bound for another repo wants the same blob.
-    let mut owned: HashMap<(&TargetId, &Digest), (usize, bool)> = HashMap::new();
+    // Smallest task first, so the first to name a blob owns it.
+    let mut claimants: HashMap<(&TargetId, &Digest), Claimant> = HashMap::new();
     for &i in &by_size {
-        let task = &pending[i];
-        for blob in blobs_from_manifest(&task.source_data) {
-            let (owner, shared) = owned
-                .entry((task.target_entry.id(), &blob.digest))
-                .or_insert((i, false));
-            *shared |= pending[*owner].target.repo != task.target.repo;
+        let target = pending[i].target_entry.id();
+        for blob in &blobs[i] {
+            let claimant = claimants.entry((target, &blob.digest)).or_insert(Claimant {
+                task: i,
+                shared: false,
+            });
+            claimant.shared |= pending[claimant.task].target.repo != pending[i].target.repo;
         }
     }
 
-    let mut owners: HashMap<TargetId, HashMap<Digest, RepositoryName>> = HashMap::new();
-    let mut is_owner = vec![false; pending.len()];
-    for ((target, digest), (owner, shared)) in owned {
-        if shared {
-            is_owner[owner] = true;
-            owners
-                .entry(target.clone())
-                .or_default()
-                .insert(digest.clone(), pending[owner].target.repo.clone());
-        }
+    let mut owners = BlobOwners::default();
+    let mut done: Vec<Option<watch::Sender<bool>>> = pending.iter().map(|_| None).collect();
+    for ((target, digest), claimant) in claimants.into_iter().filter(|(_, c)| c.shared) {
+        let tx = done[claimant.task].get_or_insert_with(|| watch::channel(false).0);
+        let owner = BlobOwner {
+            repo: pending[claimant.task].target.repo.clone(),
+            done: tx.subscribe(),
+        };
+        owners.insert(target, digest, owner);
     }
 
-    let order: Vec<usize> = by_size
-        .iter()
-        .copied()
-        .filter(|&i| is_owner[i])
-        .chain((0..is_owner.len()).filter(|&i| !is_owner[i]))
-        .collect();
     let mut tasks: Vec<Option<TransferTask>> = pending.drain(..).map(Some).collect();
-    pending.extend(order.into_iter().filter_map(|i| tasks[i].take()));
+    for i in by_size {
+        if let Some(tx) = done[i].take() {
+            let mut task = tasks[i].take().expect("each task is placed once");
+            task.owner_done = Some(tx);
+            pending.push_back(task);
+        }
+    }
+    pending.extend(tasks.into_iter().flatten());
     owners
 }
 
@@ -596,7 +610,7 @@ impl DiscoveryCounters {
 ///
 /// Blob owners are ordered first by `assign_blob_owners` so they take
 /// semaphore permits before their dependents. Correctness then rests on three
-/// waits: a repo waits on a blob's owner repo to commit
+/// waits: a repo waits on a blob's owner task to commit
 /// (`wait_for_blob_owner`), then on any in-flight upload of the blob
 /// (`ClaimAction::Wait`), and on a source repo's manifest commit before a
 /// cross-repo mount (ECR requires a committed manifest in the source repo for
@@ -692,10 +706,12 @@ impl SyncEngine {
         self
     }
 
-    /// Configure the per-blob mount-source wait deadline (default 60 seconds).
+    /// Configure the per-blob wait deadline (default 60 seconds).
     ///
-    /// A follower waiting on a leader's manifest-commit watch falls back to
-    /// push on expiry instead of hanging.
+    /// It bounds each of two waits separately: a repo waiting for a shared
+    /// blob's owner task to commit, and a repo waiting for a repo holding the
+    /// blob to commit its manifest so the blob can be mounted from it. On
+    /// expiry the blob is pushed instead of the engine hanging.
     pub fn with_mount_source_wait_deadline(mut self, deadline: Duration) -> Self {
         self.mount_source_wait_deadline = deadline;
         self
@@ -1530,6 +1546,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     target: target.clone(),
                     artifacts_config: Rc::clone(artifacts_config),
                     discovery_retries: retries_made(),
+                    owner_done: None,
                 });
             }
         }
@@ -1575,11 +1592,12 @@ async fn execute_item(
 
     if let Some(err) = outcome.error.take() {
         warn!(target_name = %item.target_entry.id().alias(), error = %err, "blob transfer failed");
-        // Unblock followers waiting on this repo's manifest commit; they
+        // Unblock the repos waiting on this repo's manifest commit; they
         // fall through to HEAD+push.
         cache
             .borrow_mut()
             .notify_repo_failed(item.target_entry.id(), &item.target.repo);
+        item.signal_owner_done();
         let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
@@ -1594,6 +1612,7 @@ async fn execute_item(
             cache
                 .borrow_mut()
                 .mark_repo_committed(item.target_entry.id(), &item.target.repo);
+            item.signal_owner_done();
 
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
@@ -1641,10 +1660,11 @@ async fn execute_item(
             }
         }
         Err(err) => {
-            // Unblock followers waiting on this repo's manifest commit.
+            // Unblock the repos waiting on this repo's manifest commit.
             cache
                 .borrow_mut()
                 .notify_repo_failed(item.target_entry.id(), &item.target.repo);
+            item.signal_owner_done();
 
             if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
@@ -1990,8 +2010,8 @@ struct TransferContext<'a> {
     target_id: &'a TargetId,
     target_repo: &'a RepositoryName,
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
-    /// How long one blob may wait for its owner's commit and for a mount
-    /// source, together.
+    /// Per-blob deadline for each of the owner wait and mount-source
+    /// resolution.
     mount_source_wait_deadline: Duration,
 }
 
@@ -2087,9 +2107,7 @@ async fn transfer_image_blobs(
         let batch = &batch_checked;
         blob_futures.push(async move {
             // Pre-semaphore phase: all external waits run here, with no permit held.
-            // One deadline bounds both the owner wait and the mount-source wait.
-            let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
-            wait_for_blob_owner(ctx, &digest, deadline).await;
+            wait_for_blob_owner(ctx, &digest, batch, cancel).await;
             let claim = wait_for_blob_claim(ctx, &digest, cancel).await;
             match claim {
                 BlobClaim::Skipped => return BlobResult::Skipped,
@@ -2097,7 +2115,7 @@ async fn transfer_image_blobs(
                 BlobClaim::Failed(err) => return BlobResult::Failed(crate::Error::Shared(err)),
                 BlobClaim::Claimed => {}
             }
-            let mount_source = resolve_mount_source(ctx, &digest, deadline).await;
+            let mount_source = resolve_mount_source(ctx, &digest).await;
             let staging_claim = resolve_staging(ctx.staging, &digest).await;
 
             // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
@@ -2248,26 +2266,34 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
     }
 }
 
-/// Wait, claim-free, for the owner repo of a shared blob to commit its
+/// Wait, claim-free, for the owner task of a shared blob to commit its
 /// manifest, so the claim that follows finds the owner's copy to mount.
 ///
-/// Returns at once when this repo is the owner or has no owner to wait for, the
-/// blob is already at this repo, or a mount source exists. Also returns when
-/// the owner's watch fires (commit or failure) or `deadline` passes; the caller
-/// then takes the ordinary claim, mount and push path.
+/// Only a blob the target's batch check reported missing at this repo waits:
+/// without a batch checker, or with no answer for the digest, the blob may
+/// already be here, and waiting would put every repo of a re-sync behind its
+/// owner before the HEAD that finds it. Returns at once too when this repo is
+/// the owner, the blob is already at this repo, a mount source exists, or
+/// `cancel` is set. Otherwise it returns when the owner task signals (commit,
+/// failure or drop), or after `mount_source_wait_deadline`; the caller then
+/// takes the ordinary claim, mount and push path.
 ///
 /// Runs OUTSIDE the per-image blob semaphore (see [`BlobSink`]).
 async fn wait_for_blob_owner(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-    deadline: tokio::time::Instant,
+    batch_checked: &HashSet<Digest>,
+    cancel: &Cell<bool>,
 ) {
-    let mut resolved = {
-        let mut c = ctx.cache.borrow_mut();
-        let Some(owner) = c.blob_owner(ctx.target_id, digest).cloned() else {
+    if cancel.get() || !batch_checked.contains(digest) {
+        return;
+    }
+    let mut done = {
+        let c = ctx.cache.borrow();
+        let Some(owner) = c.blob_owner(ctx.target_id, digest) else {
             return;
         };
-        if owner == *ctx.target_repo
+        if owner.repo == *ctx.target_repo
             || c.blob_present_at(ctx.target_id, digest, ctx.target_repo)
             || c.mount_sources(ctx.target_id, digest, ctx.target_repo)
                 .next()
@@ -2275,21 +2301,22 @@ async fn wait_for_blob_owner(
         {
             return;
         }
-        c.subscribe_repo_resolved(ctx.target_id, &owner)
+        owner.done.clone()
     };
-    tokio::select! {
-        _ = resolved.wait_for(|&v| v) => {}
-        _ = tokio::time::sleep_until(deadline) => {
-            debug!(
-                %digest,
-                target = %ctx.target_id.alias(),
-                "blob owner wait deadline reached, continuing without its commit"
-            );
-        }
+    let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
+    if tokio::time::timeout_at(deadline, done.wait_for(|&v| v))
+        .await
+        .is_err()
+    {
+        warn!(
+            %digest,
+            target = %ctx.target_id.alias(),
+            "blob owner wait deadline reached, pushing without its commit"
+        );
     }
 }
 
-/// Cross-repo mount-source resolver, bounded by `deadline`.
+/// Cross-repo mount-source resolver with bounded deadline.
 ///
 /// Loops until (a) a mount source emerges, (b) all candidate repos resolve
 /// without committing, or (c) the deadline expires. Returns the mount source
@@ -2300,10 +2327,10 @@ async fn wait_for_blob_owner(
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
-    deadline: tokio::time::Instant,
 ) -> Option<RepositoryName> {
+    let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
     loop {
-        let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
+        let receivers: Vec<watch::Receiver<bool>> = {
             let mut c = ctx.cache.borrow_mut();
             if let Some(r) = c
                 .mount_sources(ctx.target_id, digest, ctx.target_repo)
@@ -2318,24 +2345,22 @@ async fn resolve_mount_source(
             return None;
         }
 
-        let wait = wait_any_fired(receivers);
-        tokio::pin!(wait);
-        tokio::select! {
-            _ = &mut wait => continue,
-            _ = tokio::time::sleep_until(deadline) => {
-                debug!(
-                    %digest,
-                    target = %ctx.target_id.alias(),
-                    "mount-source wait deadline reached, falling back to push"
-                );
-                return None;
-            }
+        if tokio::time::timeout_at(deadline, wait_any_fired(receivers))
+            .await
+            .is_err()
+        {
+            debug!(
+                %digest,
+                target = %ctx.target_id.alias(),
+                "mount-source wait deadline reached, falling back to push"
+            );
+            return None;
         }
     }
 }
 
 /// Wait until ANY of the given watch receivers fires (transitions to true).
-async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
+async fn wait_any_fired(receivers: Vec<watch::Receiver<bool>>) {
     if receivers.is_empty() {
         return;
     }
@@ -3332,6 +3357,7 @@ mod tests {
             },
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
             discovery_retries: 0,
+            owner_done: None,
         }
     }
 
@@ -3343,20 +3369,18 @@ mod tests {
             .collect()
     }
 
-    /// The owners as `(target alias, blob suffix, owner repo)` triples.
-    fn owner_triples(
-        owners: &HashMap<TargetId, HashMap<Digest, RepositoryName>>,
-    ) -> HashSet<(String, Digest, String)> {
+    type Triple = (String, Digest, String);
+
+    /// The owners as `(target alias, blob, owner repo)` triples.
+    fn owner_triples(owners: &BlobOwners) -> HashSet<Triple> {
         owners
             .iter()
-            .flat_map(|(t, m)| {
-                m.iter()
-                    .map(|(d, r)| (t.alias().to_string(), d.clone(), r.to_string()))
-            })
+            .map(|(t, d, o)| (t.alias().to_string(), d.clone(), o.repo.to_string()))
             .collect()
     }
 
-    fn triples(want: &[(&str, &str, &str)]) -> HashSet<(String, Digest, String)> {
+    /// `(target alias, blob suffix, owner repo)` as [`owner_triples`] reports.
+    fn triples(want: &[(&str, &str, &str)]) -> HashSet<Triple> {
         want.iter()
             .map(|(alias, suffix, repo)| {
                 ((*alias).to_owned(), test_digest(suffix), (*repo).to_owned())
@@ -3368,49 +3392,54 @@ mod tests {
         pending.iter().map(|t| t.target.repo.as_str()).collect()
     }
 
+    /// Images (repo and blob suffixes, the first being the config; a layer
+    /// weighs 1000 bytes, the config 100) and the owners they get.
+    struct OwnerCase {
+        name: &'static str,
+        images: &'static [(&'static str, &'static [&'static str])],
+        want: &'static [(&'static str, &'static str, &'static str)],
+    }
+
     #[test]
     fn blob_owner_is_the_smallest_image_then_the_earliest() {
-        // Blob suffixes: first is the config. Each layer weighs 1000 bytes,
-        // the config 100.
-        #[allow(clippy::type_complexity)]
-        let cases: [(&str, &[(&str, &[&str])], &[(&str, &str, &str)]); 5] = [
-            (
-                "the smallest image owns its shared blobs, not the first or largest",
-                &[
+        let cases = [
+            OwnerCase {
+                name: "the smallest image owns its shared blobs, not the first or largest",
+                images: &[
                     ("big", &["c1", "a", "b", "e1"]),
                     ("small", &["c2", "a", "b"]),
                 ],
-                &[("t", "a", "small"), ("t", "b", "small")],
-            ),
-            (
-                "equal sizes go to discovery order",
-                &[("first", &["c1", "a"]), ("second", &["c2", "a"])],
-                &[("t", "a", "first")],
-            ),
-            (
-                "a blob wanted by one repo has no owner",
-                &[("one", &["c1", "a"]), ("two", &["c2", "b"])],
-                &[],
-            ),
-            (
-                "two tags of one repo are not two repos",
-                &[("same", &["c1", "a"]), ("same", &["c2", "a"])],
-                &[],
-            ),
-            (
-                "a smaller tag of the owner's repo does not hide the sharing",
-                &[
+                want: &[("t", "a", "small"), ("t", "b", "small")],
+            },
+            OwnerCase {
+                name: "equal sizes go to discovery order",
+                images: &[("first", &["c1", "a"]), ("second", &["c2", "a"])],
+                want: &[("t", "a", "first")],
+            },
+            OwnerCase {
+                name: "a blob wanted by one repo has no owner",
+                images: &[("one", &["c1", "a"]), ("two", &["c2", "b"])],
+                want: &[],
+            },
+            OwnerCase {
+                name: "two tags of one repo are not two repos",
+                images: &[("same", &["c1", "a"]), ("same", &["c2", "a"])],
+                want: &[],
+            },
+            OwnerCase {
+                name: "a smaller tag of the owner's repo does not hide the sharing",
+                images: &[
                     ("other", &["c1", "a", "e1"]),
                     ("same", &["c2", "a"]),
                     ("same", &["c3", "a", "e2", "e3"]),
                 ],
-                &[("t", "a", "same")],
-            ),
+                want: &[("t", "a", "same")],
+            },
         ];
-        for (name, images, want) in cases {
-            let mut pending = pending_at_one_target(images);
+        for case in cases {
+            let mut pending = pending_at_one_target(case.images);
             let owners = assign_blob_owners(&mut pending);
-            assert_eq!(owner_triples(&owners), triples(want), "{name}");
+            assert_eq!(owner_triples(&owners), triples(case.want), "{}", case.name);
         }
     }
 
@@ -3432,38 +3461,33 @@ mod tests {
     }
 
     #[test]
-    fn owners_are_promoted_first_ascending_and_before_their_dependents() {
+    fn owners_are_promoted_first_and_ascending_and_hold_a_signal() {
         // big (5100 bytes) shares 51 with mid (2100) and 52 with small (1100);
         // loner shares nothing. mid owns 51, small owns 52.
-        let images: &[(&str, &[&str])] = &[
+        let mut pending = pending_at_one_target(&[
             ("big", &["cb", "51", "52", "b1", "b2"]),
             ("mid", &["cc", "51", "a1"]),
             ("loner", &["cd", "a2"]),
             ("small", &["ce", "52"]),
-        ];
-        let mut pending = pending_at_one_target(images);
+        ]);
 
         let owners = assign_blob_owners(&mut pending);
 
+        assert_eq!(
+            owner_triples(&owners),
+            triples(&[("t", "51", "mid"), ("t", "52", "small")])
+        );
         assert_eq!(
             pending_repos(&pending),
             ["small", "mid", "big", "loner"],
             "owners by ascending size, then the rest in discovery order"
         );
-        for (digest, owner) in owners.values().flatten() {
-            let owner_at = pending
-                .iter()
-                .position(|t| t.target.repo == *owner)
-                .unwrap();
-            for (at, task) in pending.iter().enumerate() {
-                let wants = blobs_from_manifest(&task.source_data)
-                    .iter()
-                    .any(|d| d.digest == *digest);
-                if wants && task.target.repo != *owner {
-                    assert!(owner_at < at, "{owner} must precede {}", task.target.repo);
-                }
-            }
-        }
+        let signals: Vec<bool> = pending.iter().map(|t| t.owner_done.is_some()).collect();
+        assert_eq!(
+            signals,
+            [true, true, false, false],
+            "only owner tasks carry the signal"
+        );
     }
 
     #[test]
@@ -3473,120 +3497,195 @@ mod tests {
 
         let owners = assign_blob_owners(&mut pending);
 
-        assert!(owners.is_empty());
+        assert!(owners.iter().next().is_none());
         assert_eq!(pending_repos(&pending), ["b", "a"]);
     }
 
-    /// How long `wait_for_blob_owner` takes, on a paused clock, for a repo `mine`, whose blob `51` is
-    /// owned by repo `owner`, after `setup` shaped the cache; `commit_at`
-    /// commits `owner`'s manifest at that offset.
-    async fn owner_wait(
+    /// What happens to the owner of blob `51`, at 2 seconds unless noted.
+    #[derive(Clone, Copy)]
+    enum OwnerEvent {
+        /// Nothing: the wait runs to its deadline.
+        Nothing,
+        /// The owner task signals before the wait starts.
+        DoneBefore,
+        /// The owner task commits or fails.
+        TaskDone,
+        /// The owner task is dropped without signalling.
+        TaskDropped,
+        /// Another task for the owner's repo commits.
+        RepoCommitted,
+    }
+
+    /// A repo `mine` wanting blob `51`, owned by repo `owner` unless `owner`
+    /// says otherwise, and how long its wait for the owner takes.
+    struct OwnerWaitCase {
+        name: &'static str,
+        owner: &'static str,
+        /// Shapes the cache before the wait.
         setup: fn(&mut TransferStateCache, &TargetId),
-        commit_at: Option<Duration>,
-    ) -> Duration {
+        /// The batch check reported the blob missing at `mine`.
+        batch_missing: bool,
+        cancelled: bool,
+        event: OwnerEvent,
+        want: Duration,
+    }
+
+    impl OwnerWaitCase {
         const DEADLINE: Duration = Duration::from_secs(5);
-        let client = test_client();
-        let target = TargetEntry::new(RegistryAlias::new("t"), Arc::clone(&client), None);
-        let cache = Rc::new(RefCell::new(TransferStateCache::new()));
-        cache.borrow_mut().set_blob_owners(HashMap::from([(
-            target.id().clone(),
-            HashMap::from([(test_digest("51"), RepositoryName::new("owner").unwrap())]),
-        )]));
-        setup(&mut cache.borrow_mut(), target.id());
-        let (shared, staging, retry) = (
-            PerRun::default(),
-            Rc::new(BlobStage::disabled()),
-            RetryConfig::default(),
-        );
-        let mine = RepositoryName::new("mine").unwrap();
-        let source = RepositoryName::new("source").unwrap();
-        let ctx = TransferContext {
-            cache: &cache,
-            shared: &shared,
-            staging: &staging,
-            retry: &retry,
-            source_client: &client,
-            source_repo: &source,
-            target_client: &client,
-            target_id: target.id(),
-            target_repo: &mine,
-            batch_checker: None,
-            mount_source_wait_deadline: DEADLINE,
+
+        /// A blob to wait for the owner on: nothing else shapes the cache.
+        const WAITS: Self = Self {
+            name: "",
+            owner: "owner",
+            setup: |_, _| {},
+            batch_missing: true,
+            cancelled: false,
+            event: OwnerEvent::TaskDone,
+            want: Duration::from_secs(2),
         };
-        let start = tokio::time::Instant::now();
-        let deadline = start + DEADLINE;
-        let commit = async {
-            if let Some(at) = commit_at {
-                tokio::time::sleep(at).await;
-                let owner = RepositoryName::new("owner").unwrap();
-                cache.borrow_mut().mark_repo_committed(target.id(), &owner);
+
+        /// How long `wait_for_blob_owner` takes on a paused clock.
+        async fn elapsed(&self) -> Duration {
+            let client = test_client();
+            let target = TargetEntry::new(RegistryAlias::new("t"), Arc::clone(&client), None);
+            let digest = test_digest("51");
+            let (tx, done) = watch::channel(false);
+            let mut tx = Some(tx);
+            let mut owners = BlobOwners::default();
+            owners.insert(
+                target.id(),
+                &digest,
+                BlobOwner {
+                    repo: RepositoryName::new(self.owner).unwrap(),
+                    done,
+                },
+            );
+            let cache = Rc::new(RefCell::new(TransferStateCache::new()));
+            cache.borrow_mut().set_blob_owners(owners);
+            (self.setup)(&mut cache.borrow_mut(), target.id());
+            let (shared, staging, retry) = (
+                PerRun::default(),
+                Rc::new(BlobStage::disabled()),
+                RetryConfig::default(),
+            );
+            let mine = RepositoryName::new("mine").unwrap();
+            let source = RepositoryName::new("source").unwrap();
+            let ctx = TransferContext {
+                cache: &cache,
+                shared: &shared,
+                staging: &staging,
+                retry: &retry,
+                source_client: &client,
+                source_repo: &source,
+                target_client: &client,
+                target_id: target.id(),
+                target_repo: &mine,
+                batch_checker: None,
+                mount_source_wait_deadline: Self::DEADLINE,
+            };
+            let batch_checked: HashSet<Digest> = if self.batch_missing {
+                HashSet::from([digest.clone()])
+            } else {
+                HashSet::new()
+            };
+            let cancel = Cell::new(self.cancelled);
+            let start = tokio::time::Instant::now();
+            let at_two_seconds = Duration::from_secs(2);
+            if matches!(self.event, OwnerEvent::DoneBefore) {
+                tx.as_ref().unwrap().send_replace(true);
             }
-        };
-        let wait = async {
-            wait_for_blob_owner(&ctx, &test_digest("51"), deadline).await;
-            start.elapsed()
-        };
-        tokio::join!(wait, commit).0
+            let event = async {
+                tokio::time::sleep(at_two_seconds).await;
+                match self.event {
+                    OwnerEvent::TaskDone => {
+                        tx.as_ref().unwrap().send_replace(true);
+                    }
+                    OwnerEvent::TaskDropped => tx = None,
+                    OwnerEvent::RepoCommitted => {
+                        let owner = RepositoryName::new(self.owner).unwrap();
+                        cache.borrow_mut().mark_repo_committed(target.id(), &owner);
+                    }
+                    OwnerEvent::Nothing | OwnerEvent::DoneBefore => {}
+                }
+            };
+            let wait = async {
+                wait_for_blob_owner(&ctx, &digest, &batch_checked, &cancel).await;
+                start.elapsed()
+            };
+            tokio::join!(wait, event).0
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_blob_waits_for_its_owner_only_when_it_has_nothing_better() {
-        let none = Duration::ZERO;
-        let owner_commit = Some(Duration::from_secs(2));
-        // (name, setup, owner commits at, want elapsed)
-        #[allow(clippy::type_complexity)]
-        let cases: [(&str, fn(&mut TransferStateCache, &TargetId), _, Duration); 6] = [
-            (
-                "waits for the owner's commit",
-                |_, _| {},
-                owner_commit,
-                Duration::from_secs(2),
-            ),
-            (
-                "gives up at the deadline when the owner never resolves",
-                |_, _| {},
-                None,
-                Duration::from_secs(5),
-            ),
-            (
-                "does not wait once the owner already committed",
-                |c, t| c.mark_repo_committed(t, &RepositoryName::new("owner").unwrap()),
-                owner_commit,
-                none,
-            ),
-            (
-                "does not wait when the blob is already here",
-                |c, t| {
-                    c.set_blob_verified(t, test_digest("51"), RepositoryName::new("mine").unwrap())
+    async fn a_blob_waits_for_its_owner_task_only_when_the_batch_check_found_it_missing() {
+        let never = Duration::ZERO;
+        let cases = [
+            OwnerWaitCase {
+                name: "waits for the owner task's commit or failure",
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "a dropped owner task ends the wait",
+                event: OwnerEvent::TaskDropped,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "another tag of the owner's repo committing does not end the wait",
+                event: OwnerEvent::RepoCommitted,
+                want: OwnerWaitCase::DEADLINE,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "gives up at the deadline when the owner never signals",
+                event: OwnerEvent::Nothing,
+                want: OwnerWaitCase::DEADLINE,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait once the owner task is done",
+                event: OwnerEvent::DoneBefore,
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait without a batch answer that the blob is missing",
+                batch_missing: false,
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait once cancelled",
+                cancelled: true,
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait when the blob is already here",
+                setup: |c, t| {
+                    c.set_blob_verified(t, test_digest("51"), RepositoryName::new("mine").unwrap());
                 },
-                owner_commit,
-                none,
-            ),
-            (
-                "does not wait when a mount source exists",
-                |c, t| {
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait when a mount source exists",
+                setup: |c, t| {
                     let other = RepositoryName::new("other").unwrap();
                     c.set_blob_completed(t, test_digest("51"), other.clone());
                     c.mark_repo_committed(t, &other);
                 },
-                owner_commit,
-                none,
-            ),
-            (
-                "does not wait when it is the owner",
-                |c, t| {
-                    let mine = RepositoryName::new("mine").unwrap();
-                    c.set_blob_owners(HashMap::from([(
-                        t.clone(),
-                        HashMap::from([(test_digest("51"), mine)]),
-                    )]));
-                },
-                owner_commit,
-                none,
-            ),
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
+            OwnerWaitCase {
+                name: "does not wait when it is the owner",
+                owner: "mine",
+                want: never,
+                ..OwnerWaitCase::WAITS
+            },
         ];
-        for (name, setup, commit_at, want) in cases {
-            assert_eq!(owner_wait(setup, commit_at).await, want, "{name}");
+        for case in cases {
+            assert_eq!(case.elapsed().await, case.want, "{}", case.name);
         }
     }
 

@@ -29,13 +29,32 @@ pub fn source_manifest_mock(
     bytes: &[u8],
     content_type: MediaType,
 ) -> Mock {
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/{repo}/manifests/{reference}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(bytes.to_vec())
-                .insert_header("content-type", content_type.as_str()),
-        )
+    source_manifest_get(repo, reference).respond_with(manifest_response(bytes, content_type))
+}
+
+fn source_manifest_get(repo: &str, reference: &str) -> MockBuilder {
+    Mock::given(method("GET")).and(path(format!("/v2/{repo}/manifests/{reference}")))
+}
+
+fn manifest_response(bytes: &[u8], content_type: MediaType) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_bytes(bytes.to_vec())
+        .insert_header("content-type", content_type.as_str())
+}
+
+/// Mount a source manifest GET that answers only after `delay`, so the image
+/// finishes discovery later than its siblings.
+pub async fn mount_source_manifest_delayed(
+    server: &MockServer,
+    repo: &str,
+    tag: &str,
+    bytes: &[u8],
+    delay: Duration,
+) {
+    source_manifest_get(repo, tag)
+        .respond_with(manifest_response(bytes, MediaType::OciManifest).set_delay(delay))
+        .mount(server)
+        .await;
 }
 
 /// Mount a source manifest GET served as an OCI image manifest.
@@ -407,6 +426,39 @@ impl BatchBlobChecker for MockChecker {
                 .cloned()
                 .collect();
             Ok(BlobExistence::new(&checked, existing))
+        })
+    }
+}
+
+/// A batch checker for a target with several repos: it reports every blob
+/// missing, and answers for `slow_repo` only after `delay`, so that repo's
+/// blobs reach their claim later than the others'.
+pub struct SlowChecker {
+    slow_repo: RepositoryName,
+    delay: Duration,
+}
+
+impl SlowChecker {
+    /// A checker that delays its answers for `slow_repo` by `delay`.
+    pub fn new(slow_repo: &str, delay: Duration) -> Self {
+        Self {
+            slow_repo: repo(slow_repo),
+            delay,
+        }
+    }
+}
+
+impl BatchBlobChecker for SlowChecker {
+    fn check_blob_existence<'a>(
+        &'a self,
+        repo: &'a RepositoryName,
+        digests: &'a [Digest],
+    ) -> Pin<Box<dyn Future<Output = Result<BlobExistence, ocync_distribution::Error>> + 'a>> {
+        Box::pin(async move {
+            if *repo == self.slow_repo {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(BlobExistence::new(digests, &HashSet::new()))
         })
     }
 }

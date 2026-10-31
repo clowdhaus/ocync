@@ -12,7 +12,7 @@ Pipelined sync engine that coordinates image transfers between OCI registries wi
 
 - Pipelined architecture: discovery and execution overlap (no idle time)
 - Global blob deduplication across all images in a sync run
-- Leader-follower election for cross-repo blob mounting
+- One owner per shared blob (the smallest image needing it), so other repos mount it instead of uploading it again
 - Content-addressable disk staging for multi-target blob reuse
 - Persistent transfer state cache (survives across runs)
 - Tag filtering: glob patterns, semver ranges, exclude patterns, sort, latest-N

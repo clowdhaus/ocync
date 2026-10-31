@@ -101,6 +101,44 @@ pub struct SourceSnapshot {
 /// Map of [`SnapshotKey`] to [`SourceSnapshot`].
 type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 
+/// The task that uploads a blob wanted by several repos of one target.
+#[derive(Debug, Clone)]
+pub(crate) struct BlobOwner {
+    /// The repo the owner task syncs into, where the others mount from.
+    pub(crate) repo: RepositoryName,
+    /// Turns `true` when the owner task has committed its manifest or failed,
+    /// and ends if the task is dropped. Fired by that task alone, so it does
+    /// not wake on another tag of the same repo.
+    pub(crate) done: watch::Receiver<bool>,
+}
+
+/// The [`BlobOwner`] of each shared blob, per target.
+#[derive(Debug, Default)]
+pub(crate) struct BlobOwners(HashMap<TargetId, HashMap<Digest, BlobOwner>>);
+
+impl BlobOwners {
+    /// Record `owner` as the owner of `digest` at `target`.
+    pub(crate) fn insert(&mut self, target: &TargetId, digest: &Digest, owner: BlobOwner) {
+        self.0
+            .entry(target.clone())
+            .or_default()
+            .insert(digest.clone(), owner);
+    }
+
+    /// The owner of `digest` at `target`, if it has one.
+    pub(crate) fn owner(&self, target: &TargetId, digest: &Digest) -> Option<&BlobOwner> {
+        self.0.get(target)?.get(digest)
+    }
+
+    /// Every `(target, digest, owner)`.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&TargetId, &Digest, &BlobOwner)> {
+        self.0
+            .iter()
+            .flat_map(|(t, m)| m.iter().map(move |(d, o)| (t, d, o)))
+    }
+}
+
 /// Persistent transfer state cache.
 ///
 /// Only `Verified` and `Completed` entries are persisted; transient states are
@@ -117,15 +155,14 @@ pub struct TransferStateCache {
     /// when a mount from it fails.
     committed_repos: HashMap<TargetId, HashSet<RepositoryName>>,
     /// Runtime-only: per-(target, repo) channel that turns `true` when the
-    /// repo's manifest commits or fails (resolved either way). Followers
+    /// repo's manifest commits or fails (resolved either way). Tasks
     /// subscribe through `unresolved_watches_for` and consume it with
     /// `wait_for(|&v| v)`, never `changed()`, which misses a value sent before
     /// they subscribed. Fresh each run.
     repo_resolved_watches: HashMap<TargetId, HashMap<RepositoryName, watch::Sender<bool>>>,
-    /// Runtime-only: the repo that uploads each blob wanted by two or more
-    /// repos of a target; the others wait for its commit and mount. Set once
-    /// per run, after discovery.
-    blob_owners: HashMap<TargetId, HashMap<Digest, RepositoryName>>,
+    /// Runtime-only: who uploads each blob wanted by two or more repos of a
+    /// target. Set once per run, after discovery.
+    blob_owners: BlobOwners,
 }
 
 impl TransferStateCache {
@@ -244,45 +281,31 @@ impl TransferStateCache {
             .map(|(r, _)| r.clone())
             .collect();
 
+        let watches = self
+            .repo_resolved_watches
+            .entry(target.clone())
+            .or_default();
         candidates
             .into_iter()
-            .map(|repo| self.repo_watch(target, &repo).subscribe())
-            .filter(|rx| !*rx.borrow())
+            .filter_map(|repo| {
+                let tx = watches
+                    .entry(repo)
+                    .or_insert_with(|| watch::channel(false).0);
+                let rx = tx.subscribe();
+                if *rx.borrow() { None } else { Some(rx) }
+            })
             .collect()
     }
 
     /// Replace the blob owners for this run.
-    pub(crate) fn set_blob_owners(
-        &mut self,
-        owners: HashMap<TargetId, HashMap<Digest, RepositoryName>>,
-    ) {
+    pub(crate) fn set_blob_owners(&mut self, owners: BlobOwners) {
         self.blob_owners = owners;
     }
 
-    /// The repo that uploads `digest` for `target`, if two or more of its
-    /// repos want the blob this run.
-    pub(crate) fn blob_owner(&self, target: &TargetId, digest: &Digest) -> Option<&RepositoryName> {
-        self.blob_owners.get(target)?.get(digest)
-    }
-
-    /// Subscribe to a repo's commit watch, creating it unfired if no one has.
-    /// Unlike [`Self::unresolved_watches_for`], a repo holding no copy of any
-    /// blob yet can be waited on.
-    pub(crate) fn subscribe_repo_resolved(
-        &mut self,
-        target: &TargetId,
-        repo: &RepositoryName,
-    ) -> watch::Receiver<bool> {
-        self.repo_watch(target, repo).subscribe()
-    }
-
-    /// The repo's watch sender, created unfired on first use.
-    fn repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) -> &watch::Sender<bool> {
-        self.repo_resolved_watches
-            .entry(target.clone())
-            .or_default()
-            .entry(repo.clone())
-            .or_insert_with(|| watch::channel(false).0)
+    /// The owner of `digest` for `target`, if two or more of its repos want
+    /// the blob this run.
+    pub(crate) fn blob_owner(&self, target: &TargetId, digest: &Digest) -> Option<&BlobOwner> {
+        self.blob_owners.owner(target, digest)
     }
 
     /// Record that a repo's manifest is committed, waking its watchers.
@@ -294,14 +317,20 @@ impl TransferStateCache {
         self.resolve_repo_watch(target, repo);
     }
 
-    /// Mark a repo's manifest commit as failed, unblocking followers.
+    /// Mark a repo's manifest commit as failed, unblocking the tasks waiting on it.
     pub fn notify_repo_failed(&mut self, target: &TargetId, repo: &RepositoryName) {
         self.resolve_repo_watch(target, repo);
     }
 
-    /// Fire the repo's watch, creating it if no follower has subscribed yet.
+    /// Fire the repo's watch, creating it if no task has subscribed yet.
     fn resolve_repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) {
-        self.repo_watch(target, repo).send_replace(true);
+        let tx = self
+            .repo_resolved_watches
+            .entry(target.clone())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| watch::channel(false).0);
+        tx.send_replace(true);
     }
 
     /// Start a run from the blob state a reload from disk would give: every
@@ -312,7 +341,7 @@ impl TransferStateCache {
     /// would push blobs a mount could have saved.
     pub(crate) fn start_run(&mut self) {
         self.repo_resolved_watches.clear();
-        self.blob_owners.clear();
+        self.blob_owners = BlobOwners::default();
         self.dedup.remember_present();
     }
 
@@ -493,7 +522,7 @@ impl TransferStateCache {
             snapshots,
             committed_repos: HashMap::new(),
             repo_resolved_watches: HashMap::new(),
-            blob_owners: HashMap::new(),
+            blob_owners: BlobOwners::default(),
         })
     }
 }
@@ -729,30 +758,30 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn blob_owner_lasts_one_run_and_its_repo_can_be_waited_on_before_it_holds_a_blob() {
+    #[test]
+    fn blob_owner_lasts_one_run() {
         let mut cache = TransferStateCache::new();
-        let owners = HashMap::from([(
-            target_id("reg.io"),
-            HashMap::from([(test_digest(), repo("repo/a"))]),
-        )]);
+        let (_tx, done) = watch::channel(false);
+        let mut owners = BlobOwners::default();
+        owners.insert(
+            &target_id("reg.io"),
+            &test_digest(),
+            BlobOwner {
+                repo: repo("repo/a"),
+                done,
+            },
+        );
         cache.set_blob_owners(owners);
-        assert_eq!(
-            cache.blob_owner(&target_id("reg.io"), &test_digest()),
-            Some(&repo("repo/a"))
-        );
-        assert_eq!(
-            cache.blob_owner(&target_id("other.io"), &test_digest()),
-            None
-        );
-
-        let mut rx = cache.subscribe_repo_resolved(&target_id("reg.io"), &repo("repo/a"));
-        assert!(!*rx.borrow(), "unfired before the owner commits");
-        cache.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
-        assert!(rx.wait_for(|&v| v).await.is_ok());
+        let owner = |cache: &TransferStateCache, reg| {
+            cache
+                .blob_owner(&target_id(reg), &test_digest())
+                .map(|o| o.repo.clone())
+        };
+        assert_eq!(owner(&cache, "reg.io"), Some(repo("repo/a")));
+        assert_eq!(owner(&cache, "other.io"), None, "ownership is per target");
 
         cache.start_run();
-        assert_eq!(cache.blob_owner(&target_id("reg.io"), &test_digest()), None);
+        assert_eq!(owner(&cache, "reg.io"), None);
     }
 
     #[test]

@@ -210,7 +210,7 @@ When source and target share a registry, or when multiple images share base laye
 
 After discovery, `assign_blob_owners()` names one owner repo for each blob that two or more repos of the same target need. The owner is the task with the smallest total blob bytes (an index counts every child), ties going to discovery order. The smallest image commits soonest, so the other repos wait the least for a repo to mount from. Tasks sharing one source manifest are one image bound to different targets, so ownership is decided per target. A blob needed by one repo has no owner, and two tags of one repo count as one repo.
 
-The owner map lives in the transfer state cache for the run. Before claiming a blob, a task whose repo is not the blob's owner waits for the owner repo's manifest commit (or failure), unless the blob is already at its repo or a mount source exists. It holds no claim while it waits, and the wait runs before the per-image blob semaphore. It then claims the blob and resolves a mount source as below, which finds the committed owner and mounts. If the owner fails or the deadline passes, the task takes the same path and pushes.
+The owner map lives in the transfer state cache for the run, and each owner task carries a signal that only it fires, on manifest commit or failure (another tag of the owner's repo does not fire it). Before claiming a blob, a task whose repo is not the blob's owner waits for that signal, but only when the target's batch check reported the blob missing at its repo: with no batch checker, or no answer for the digest, the blob may already be there and the wait would put every repo of a re-sync behind its owner before the HEAD that finds it. The wait is skipped too when the blob is already at its repo or a mount source exists. It holds no claim while it waits, and it runs before the per-image blob semaphore. The task then claims the blob and resolves a mount source as below, which finds the committed owner and mounts. If the owner fails or the deadline passes, the task takes the same path and pushes.
 
 Owner tasks are promoted first, ordered by (total bytes, discovery position), then every other task in discovery order. A task waits only on an owner with a strictly smaller key, so waits form no cycle, and each awaited owner holds an image slot before its dependents because the image semaphore is first-in first-out.
 
@@ -224,7 +224,7 @@ Per-(repo) `RepoBlobState` tracks each repo's lifecycle independently (`Verified
 
 An earlier run's repo is offered at once because its commit watch fires only if this run pushes an image to it. A repo whose tag is up to date, or that this run does not sync at all, never commits, so waiting on it would hold every shared blob for the full deadline and then push it. Its manifest most likely already references the blob, so the mount usually succeeds; when the registry refuses it, the fallback below pushes the blob at the cost of one request.
 
-`resolve_mount_source` is a re-check loop bounded by a per-blob deadline (default 60s, configurable via `EngineConfig::mount_source_wait_deadline`). The same deadline, started before the owner wait, bounds both waits for a blob. On each iteration, it queries `mount_sources` and returns the first match; if none exist, it subscribes to `unresolved_watches_for` (which filters on watch-not-yet-fired AND state-not-`Failed`) and waits via `futures_util::future::select_all` over the per-repo manifest-commit watches. On wake (any commit or failure fires its watch), it re-queries. On expiry, the resolver returns `None` and the caller falls back to push.
+`resolve_mount_source` is a re-check loop bounded by a per-blob deadline (default 60s, configurable via `EngineConfig::mount_source_wait_deadline`). The owner wait has its own deadline of the same length, started when that wait begins. On each iteration, it queries `mount_sources` and returns the first match; if none exist, it subscribes to `unresolved_watches_for` (which filters on watch-not-yet-fired AND state-not-`Failed`) and waits via `futures_util::future::select_all` over the per-repo manifest-commit watches. On wake (any commit or failure fires its watch), it re-queries. On expiry, the resolver returns `None` and the caller falls back to push.
 
 `mark_blob_repo_stale` provides lazy invalidation: on mount failure (ECR 202 / 4xx / 5xx), the source repo's state transitions to `Failed`, and subsequent `mount_sources` iteration excludes it. The task whose mount was refused pushes; later tasks for the same blob skip that source and take the next one. A refused mount does not skip the existence check, so a blob the repo already holds is not pushed again.
 
@@ -233,20 +233,6 @@ An earlier run's repo is offered at once because its commit watch fires only if 
 AWS launched opt-in `BLOB_MOUNTING` account setting in January 2026. Enable via `aws ecr put-account-setting --name BLOB_MOUNTING --value ENABLED`. Mount POST returns 201 when all conditions are met: BLOB_MOUNTING is ENABLED on the account, the source blob is referenced by a committed manifest (standalone blobs without manifests return 202), the `from` parameter specifies the source repo name, and both repos have identical encryption config (AES256 default works). Requirements: same account + region, identical encryption config, pusher needs `ecr:GetDownloadUrlForLayer` on source repo. Not supported for pull-through cache repos.
 
 Mount attempts are made unconditionally regardless of provider; the 202 fallback is cheap (~100ms) and successful mounts save entire blob uploads.
-
-### Measured impact
-
-Tested on c6in.large, Jupyter corpus (5 images, 1 tag each), cold sync to ECR us-east-1:
-
-| Metric | Before (no leader-follower) | After (leader-follower + blob concurrency) |
-|---|---|---|
-| Requests | 1,049 | 591 |
-| Response bytes | 11.5 GB | 4.9 GB |
-| Wall clock | 217.9s | 56.8s |
-| Mount attempts | 0 (short-circuited) | 192 |
-| Mount success | 0 | 192 (100%) |
-
-44% fewer API calls, 57% fewer bytes via cross-image staging dedup and 100% mount success, 3.8x faster wall clock via 6-concurrent blob transfers within each image.
 
 ## Transfer state cache
 
@@ -488,7 +474,7 @@ Rejected. A dependency-graph scheduler where every unit of work (check blob, tra
 
 The engine's core optimization -- progressive cache population -- is a runtime side effect of interleaved execution (early transfers teach the cache, later images mount instead of transferring, saving ~280 API calls in benchmarks). This cannot be expressed as static DAG edges. A scheduler either degenerates to runtime checks inside nodes (identical to the current code) or requires runtime graph mutation (the hardest DAG operation, with deadlock and corruption risks).
 
-Leader-follower wave barriers ("all leaders' manifests committed before any follower mounts") require barrier semantics that standard topological sort does not model. Every Rust scheduler crate (`dagx`, `dagrs`, `async_dag`, `fn_graph`) requires `Send`, incompatible with `Rc<RefCell<>>` on `current_thread`. Priority inversion (scheduler picks manifest-push nodes before blobs complete) can deadlock under load. Estimated LOC: 300-900 lines of scheduler infrastructure replacing ~454 lines of loop code, for a net-zero or net-negative reduction.
+Commit barriers ("all owners' manifests committed before any dependent mounts") require barrier semantics that standard topological sort does not model. Every Rust scheduler crate (`dagx`, `dagrs`, `async_dag`, `fn_graph`) requires `Send`, incompatible with `Rc<RefCell<>>` on `current_thread`. Priority inversion (scheduler picks manifest-push nodes before blobs complete) can deadlock under load. Estimated LOC: 300-900 lines of scheduler infrastructure replacing ~454 lines of loop code, for a net-zero or net-negative reduction.
 
 The `select!` loop is 210 lines with 5 branches -- below average for its responsibility surface. The `DiscoveryCounters` extraction (2026-04-21) addressed the "unwieldy" concern by grouping counter state and centralizing the route match, without architectural change.
 

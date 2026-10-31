@@ -1423,11 +1423,13 @@ async fn sync_committed_manifest_confirms_its_blobs() {
         .layer(b"shared-layer")
         .build();
     assert_eq!(first.layer_descs[0].digest, second.layer_descs[0].digest);
-    // With no blob wanted by two repos, the engine runs tags in discovery
-    // order at one image at a time, so the committed image is listed first.
-    // Were that order to change, the committed tag would find the shared
-    // layer dropped and have no blob push to fall back to, failing this test
-    // rather than passing on another path.
+    // The engine runs tags in the order they finish discovery, one image at a
+    // time, and the source client starts with a window of one request, so
+    // tags finish discovery in listing order: the committed image is listed
+    // first. Delaying a manifest does not reorder them, since the delayed
+    // request holds the window. Were the order to change, the committed tag
+    // would find the shared layer dropped and have no blob push to fall back
+    // to, failing this test rather than passing on another path.
     first
         .mount_source(&source_server, "repo", "committed")
         .await;

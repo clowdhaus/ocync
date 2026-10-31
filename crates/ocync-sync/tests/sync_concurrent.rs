@@ -1121,18 +1121,19 @@ struct DeadlockCase {
     name: &'static str,
     images: &'static [CaseImage],
     timeout: Duration,
-    /// Mounts the run must show. 0 where the second owner may legitimately
-    /// fall through to a push when no committed source appears in time.
+    /// Mounts the run must show.
     min_mounted: u64,
 }
 
 /// Neither case reaches the blob-semaphore deadlock (shared blob count is
 /// below `BLOB_CONCURRENCY`); that is `sync_cross_image_blob_claim_no_deadlock`.
 const DEADLOCK_CASES: &[DeadlockCase] = &[
-    // A and B share two layers; A also shares a layer with C and B another,
-    // so C waits on the owners of both.
+    // A and B share two layers; A also shares a layer with C and B another.
+    // By size A is 115 bytes, B 115 and C 84, so C owns the A-C and B-C layers
+    // and A (first of the tie) owns the A-B layers: A mounts one layer from C
+    // and B mounts all three, from A and C: four mounts.
     DeadlockCase {
-        name: "three images, two owners and a dependent",
+        name: "three images: C owns two layers, A owns two, B depends on both",
         images: &[
             CaseImage {
                 config: b"config-leader-a-deadlock",
@@ -1159,28 +1160,28 @@ const DEADLOCK_CASES: &[DeadlockCase] = &[
             },
         ],
         timeout: Duration::from_secs(5),
-        min_mounted: 1,
+        min_mounted: 4,
     },
     DeadlockCase {
         name: "two images sharing two layers",
         images: &[
             CaseImage {
-                config: b"two-leaders-cfg-a",
-                layers: &[b"two-leaders-shared-1", b"two-leaders-shared-2"],
+                config: b"two-owners-cfg-a",
+                layers: &[b"two-owners-shared-1", b"two-owners-shared-2"],
             },
             CaseImage {
-                config: b"two-leaders-cfg-b",
-                layers: &[b"two-leaders-shared-1", b"two-leaders-shared-2"],
+                config: b"two-owners-cfg-b",
+                layers: &[b"two-owners-shared-1", b"two-owners-shared-2"],
             },
         ],
         timeout: Duration::from_secs(10),
-        min_mounted: 0,
+        min_mounted: 2,
     },
 ];
 
 /// Images whose layers overlap never wait on each other's manifest commit in a
-/// cycle: whichever owner commits first becomes a mount source for the other,
-/// and if none commits in time the deadline trips and the waiter pushes.
+/// cycle: a repo waits only on the owner of a layer, an image with a smaller
+/// size, and mounts from it once it commits.
 #[tokio::test(flavor = "current_thread")]
 async fn overlapping_shared_blobs_complete_without_deadlock() {
     for case in DEADLOCK_CASES {
@@ -1601,68 +1602,140 @@ async fn mount_waits_for_committed_source() {
     );
 }
 
-/// A large image holds a small image's layers plus its own slow ones, and is
-/// elected to go first by anything that favours the image covering the most
-/// shared blobs. The small image owns the shared layers: it uploads them, and
-/// the large image waits for its commit and mounts them rather than uploading
-/// them itself and making the small image wait out the large one's own layers.
+/// A small and a large image sharing one layer, both repos accepting upload
+/// and mount (the owner is whichever the engine picks). Source mocks are the
+/// caller's, since the tests differ in what they delay.
+async fn shared_layer_images(target: &MockServer) -> (ManifestParts, ManifestParts) {
+    let small = ManifestBuilder::new(b"owner-small-cfg")
+        .layer(b"owner-shared")
+        .build();
+    let large = ManifestBuilder::new(b"owner-large-cfg")
+        .layer(b"owner-shared")
+        .layer(b"owner-large-only-1")
+        .layer(b"owner-large-only-2")
+        .build();
+    let blobs: Vec<Digest> = small.blob_digests().chain(large.blob_digests()).collect();
+    let blob_refs: Vec<&Digest> = blobs.iter().collect();
+    for repo in ["tgt-small", "tgt-large"] {
+        mount_target_fresh(target, repo, "v1", &blob_refs).await;
+        mount_blob_mount_accepted(target, repo, &small.layer_descs[0].digest).await;
+    }
+    (small, large)
+}
+
+/// `large` then `small`, each at a target whose batch check reports every
+/// blob missing, `small`'s only after `small_check_delay`.
+fn shared_layer_mappings(
+    source: &MockServer,
+    target: &MockServer,
+    small_check_delay: Duration,
+) -> Vec<ResolvedMapping> {
+    [("large", "tgt-large"), ("small", "tgt-small")]
+        .map(|(image, tgt)| {
+            let checker = SlowChecker::new("tgt-small", small_check_delay);
+            resolved_mapping(
+                mock_client(source),
+                &format!("src-{image}"),
+                tgt,
+                vec![batch_target("target", mock_client(target), checker)],
+                same_tags(&["v1"]),
+            )
+        })
+        .into()
+}
+
+/// Uploads of the shared layer (the small image's only one) into `repo`.
+async fn shared_layer_uploads(target: &MockServer, repo: &str, small: &ManifestParts) -> usize {
+    let scope = format!("/v2/{repo}/blobs/uploads/");
+    count_blob_uploads(
+        target,
+        PathMatch::Contains(&scope),
+        &small.layer_descs[0].digest,
+    )
+    .await
+}
+
+/// The large image finishes discovery first and the small image is slow to
+/// reach its blobs, so whoever claims first would upload the shared layer into
+/// the large image's repo. The small image owns it: the large one waits for
+/// its commit and mounts it, so the shared layer is never uploaded into the
+/// large image's repo.
 #[tokio::test(flavor = "current_thread")]
 async fn smallest_image_uploads_shared_blobs_and_the_large_one_mounts() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
-
-    let small = ManifestBuilder::new(b"owner-small-cfg")
-        .layer(b"owner-shared-1")
-        .layer(b"owner-shared-2")
-        .build();
-    let large = ManifestBuilder::new(b"owner-large-cfg")
-        .layer(b"owner-shared-1")
-        .layer(b"owner-shared-2")
-        .layer(b"owner-large-only-1")
-        .layer(b"owner-large-only-2")
-        .build();
-    small.mount_source(&source_server, "src-small", "v1").await;
-    large
-        .mount_source_delayed(
-            &source_server,
-            "src-large",
-            "v1",
-            Duration::from_millis(200),
-        )
-        .await;
-
-    let shared = [&small.layer_descs[0].digest, &small.layer_descs[1].digest];
-    let blobs: Vec<Digest> = small.blob_digests().chain(large.blob_digests()).collect();
-    let blob_refs: Vec<&Digest> = blobs.iter().collect();
-    for repo in ["tgt-small", "tgt-large"] {
-        mount_target_fresh(&target_server, repo, "v1", &blob_refs).await;
-    }
-    for digest in shared {
-        mount_blob_mount_accepted(&target_server, "tgt-large", digest).await;
-    }
-
-    let mappings = v1_mappings(
+    let (small, large) = shared_layer_images(&target_server).await;
+    large.mount_source(&source_server, "src-large", "v1").await;
+    mount_source_manifest_delayed(
         &source_server,
-        &target_server,
-        &[("src-small", "tgt-small"), ("src-large", "tgt-large")],
-    );
+        "src-small",
+        "v1",
+        &small.bytes,
+        Duration::from_millis(100),
+    )
+    .await;
+    small.mount_blob_pulls(&source_server, "src-small").await;
+
+    let mappings =
+        shared_layer_mappings(&source_server, &target_server, Duration::from_millis(300));
     let report = run_sync_with_concurrency(mappings, 10, BlobStage::disabled()).await;
 
     assert_all_synced(&report, 2, "both images should sync");
-    for digest in shared {
-        assert_eq!(
-            count_blob_uploads(&target_server, PathMatch::Contains("/tgt-small/"), digest).await,
-            1,
-            "the small image uploads the shared layer once"
-        );
-        assert_eq!(
-            count_blob_uploads(&target_server, PathMatch::Contains("/tgt-large/"), digest).await,
-            0,
-            "the large image never uploads a layer the small image owns"
-        );
-    }
-    assert_eq!(report.stats.blobs_mounted, 2, "both shared layers mount");
-    assert_eq!(count_mount_posts(&target_server).await, 2);
+    assert_eq!(
+        shared_layer_uploads(&target_server, "tgt-small", &small).await,
+        1,
+        "the small image uploads the shared layer once"
+    );
+    assert_eq!(
+        shared_layer_uploads(&target_server, "tgt-large", &small).await,
+        0,
+        "the large image never uploads the layer the small image owns"
+    );
+    assert_eq!(report.stats.blobs_mounted, 1, "the shared layer mounts");
+    assert_eq!(count_mount_posts(&target_server).await, 1);
+}
+
+/// The owner wait and the mount-source wait each get their own deadline. The
+/// small image's slow pull of the shared layer outlasts the deadline, so the
+/// large image gives up waiting for the owner's commit, then waits out the
+/// small image's upload for the claim; the mount-source wait that follows
+/// starts fresh and sees the commit. A deadline started before the owner wait
+/// would be spent by then and push the layer.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_wait_and_mount_source_wait_have_separate_deadlines() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (small, large) = shared_layer_images(&target_server).await;
+    large.mount_source(&source_server, "src-large", "v1").await;
+    // Pulls run one at a time, so only the layer is slow: the config follows
+    // at once and the commit lands right after the layer's upload.
+    mount_source_manifest(&source_server, "src-small", "v1", &small.bytes).await;
+    mount_blob_pull(
+        &source_server,
+        "src-small",
+        &small.config_desc.digest,
+        &small.config_data,
+    )
+    .await;
+    mount_blob_pull_delayed(
+        &source_server,
+        "src-small",
+        &small.layer_descs[0].digest,
+        &small.layers_data[0],
+        Duration::from_millis(600),
+    )
+    .await;
+
+    let mappings = shared_layer_mappings(&source_server, &target_server, Duration::ZERO);
+    let report = run_with_mount_wait(mappings, empty_cache(), Duration::from_millis(300)).await;
+
+    assert_all_synced(&report, 2, "both images should sync");
+    assert_eq!(
+        shared_layer_uploads(&target_server, "tgt-large", &small).await,
+        0,
+        "the large image mounts what the small image uploaded"
+    );
+    assert_eq!(report.stats.blobs_mounted, 1);
 }
 
 /// One `v1` mapping per repo (the same name at source and target), each with
@@ -1677,14 +1750,18 @@ fn mappings_with_own_clients(
         .into()
 }
 
-/// Run `mappings` against a 10ms mount-source wait deadline, failing the test
-/// if the run outlives its 10s guard.
-async fn run_with_short_mount_wait(
+/// A wait deadline short enough that a wait nothing ends trips at once.
+const SHORT_MOUNT_WAIT: Duration = Duration::from_millis(10);
+
+/// Run `mappings` against a `deadline` for the engine's per-blob waits,
+/// failing the test if the run outlives its 10s guard.
+async fn run_with_mount_wait(
     mappings: Vec<ResolvedMapping>,
     cache: Rc<RefCell<TransferStateCache>>,
+    deadline: Duration,
 ) -> SyncReport {
-    let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_mount_source_wait_deadline(Duration::from_millis(10));
+    let engine =
+        SyncEngine::new(fast_retry(), concurrency(10)).with_mount_source_wait_deadline(deadline);
     tokio::time::timeout(
         Duration::from_secs(10),
         engine.run(
@@ -1741,9 +1818,10 @@ async fn mount_resolver_timeout_falls_back_to_push() {
         .mount(&target_server)
         .await;
 
-    let report = run_with_short_mount_wait(
+    let report = run_with_mount_wait(
         mappings_with_own_clients(&source_server, &target_server, ["leader", "follower"]),
         empty_cache(),
+        SHORT_MOUNT_WAIT,
     )
     .await;
 
@@ -1821,9 +1899,10 @@ async fn prior_run_cycle_breaks_via_deadline() {
         repo("repo-a"),
     );
 
-    let report = run_with_short_mount_wait(
+    let report = run_with_mount_wait(
         mappings_with_own_clients(&source_server, &target_server, ["repo-a", "repo-b"]),
         cache,
+        SHORT_MOUNT_WAIT,
     )
     .await;
 

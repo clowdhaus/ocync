@@ -102,8 +102,6 @@ A repo cannot mount from another until that repo's manifest is committed. All ta
 
 ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when the `from` repo has a committed manifest, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](/design/engine#ecr-blob-mounting) for full requirements.
 
-In testing (5-image Jupyter corpus, cold sync to ECR), leader-follower election reduced requests by 44%, response bytes by 57%, and improved wall clock by 3.8x with 100% mount success. See [measured impact in the engine doc](/design/engine#measured-impact) for the full breakdown.
-
 ## Transfer state cache
 
 The cache eliminates redundant API calls by recording what is known about blob locations across all targets. A two-tier design provides both within-run and cross-run knowledge:
