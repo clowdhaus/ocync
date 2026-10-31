@@ -22,7 +22,7 @@ cargo xtask bench-remote --provider aws --scenario sync --tools ocync,dregsy,reg
 
 # Quick smoke test
 cargo xtask bench-remote --provider aws --scenario sync \
-  --tools ocync --limit 3
+  --tools ocync --limit 3 --rounds 3
 
 # All scenarios (cold+warm + partial + scale)
 cargo xtask bench-remote --provider aws --scenario all
@@ -71,7 +71,7 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 `bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to its manifest digest and the blob digests it holds, so runs on different dates sync the same content. It is tracked in git, sits beside the corpus it locks, and is written only by `cargo xtask bench-lock`. A prepare-only run reads no lock.
 
 - **`cargo xtask bench-lock`** resolves every ref in the corpus and the partial overrides and writes the lock. A ref that cannot be resolved fails the command and is named. Over unchanged sources it leaves the file, and its `locked_at`, untouched. It needs the network and Docker Hub credentials (anonymous works for a small corpus), and writes nothing to a cloud.
-- **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
+- **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario and round except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
 - **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and its sources have since moved, the error says so.
 - **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, under none, or over another corpus size; delete `bench/results/baseline.json` to record a new one.
 - A floating tag stays in the corpus only where the source publishes no immutable tag for the same content.
@@ -80,14 +80,14 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 The harness enforces these automatically -- do not bypass them.
 
-**Before the build, and again before every later scenario except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
+**Before the build, and again before every later scenario and round except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
 
 **Before any tool runs (once per run):**
 
 0. **CDN pre-warm** -- GET every blob the lock lists for the run's refs, with a registry token (an unauthenticated 401 is not cached) and reading the full body, 8 at a time per registry, within 8 minutes, then wait 6 minutes if any blob missed the CDN. Manifests are not warmed. A registry not fully warmed is warned about and recorded in the run record's `prewarm` field. Without this, the first tool meets a cold CDN and the last a warm one.
 
-**Before any tool runs (once per scenario):**
-1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
+**Before each round (once per scenario for scale and prepare):**
+1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The order and its seed are recorded.
 
 **Before every tool run (including the first):**
 2. **Drop OS page cache** -- `sudo sh -c 'sync && echo 3 > /proc/sys/vm/drop_caches'`. Without this, tool 2 benefits from tool 1's source blobs cached in RAM (55GB corpus = massive unfair advantage).
@@ -166,7 +166,7 @@ Terraform writes `bench.json` to the provider directory with connection details.
 
 ## Analyzing proxy logs
 
-Raw per-request data lives in `<tool>-<pass>-proxy.jsonl` files in `bench/results/<timestamp>/`, one per tool and pass (`<pass>` is `prime`, `cold`, `warm`, `partial`, `scale-<images>` or `prepare`, e.g. `ocync-scale-10-proxy.jsonl`).
+Raw per-request data lives in `<tool>-<pass>-proxy.jsonl` files in `bench/results/<timestamp>/`, one per tool and pass (`<pass>` is `prime`, `cold`, `warm`, `partial`, `scale-<images>` or `prepare`, e.g. `ocync-scale-10-proxy.jsonl`). Sync and partial passes are under `round-<n>/`.
 
 ```bash
 # Count requests by method
@@ -190,7 +190,7 @@ jq '[.response_bytes] | add' <tool>-<pass>-proxy.jsonl
 
 Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
 
-Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, the pre-warm outcome, and all 9 per-tool metrics per scenario.
+Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, the pre-warm outcome, and the per-tool metrics per scenario, one record per round for sync and partial.
 
 ## Competitor config gotchas
 

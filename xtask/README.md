@@ -21,7 +21,7 @@ Docker Hub credentials can alternatively be provided via `DOCKERHUB_USERNAME` an
 Primary entry point -- orchestrates benchmarks on a remote cloud instance via SSH.
 
 ```bash
-cargo xtask bench-remote --provider aws --scenario cold
+cargo xtask bench-remote --provider aws --scenario sync
 ```
 
 Pushes the current branch, SSHs into the bench instance, builds, runs benchmarks with live streamed output, then SCPs results back.
@@ -69,7 +69,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `<SCENARIO>` | subcommand | (required) | `cold`, `warm`, `partial`, `scale`, or `all` |
+| `<SCENARIO>` | subcommand | (required) | `sync`, `partial`, `scale`, `prepare`, or `all` |
 | `--tools` | comma-separated | `ocync` | Tools to benchmark: `ocync`, `ocync-baseline` (needs `--baseline-ref`), `dregsy`, `regsync` |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios, each running every tool once in a fresh random order |
 | `--baseline-ref` | hex commit id | | Also run the ocync built from this commit in every round, and compare it with the current one |
@@ -98,11 +98,11 @@ One run per tool cannot separate a difference between tools from run-to-run nois
 
 | Scenario | Description |
 |----------|-------------|
-| `cold` | Clean target, full sync -- measures raw transfer performance |
-| `warm` | Re-sync with nothing changed -- measures skip optimization |
+| `sync` | Clean target, full sync (cold), then a re-sync with nothing changed (warm) |
 | `partial` | Re-sync after ~5% of tags changed -- measures incremental sync |
 | `scale` | Increasing corpus sizes (10, 25, 50, all) -- ocync only |
-| `all` | Run cold, warm, partial, scale in sequence |
+| `prepare` | Resolve every mapping and stop -- ocync only |
+| `all` | Run every scenario in sequence |
 
 ## Usage examples
 
@@ -126,10 +126,10 @@ cargo xtask bench-remote --provider aws --scenario all
 cargo xtask bench-remote --provider aws --fetch
 
 # Kill a running benchmark and start fresh (without --force a live run is refused)
-cargo xtask bench-remote --provider aws --force --scenario cold
+cargo xtask bench-remote --provider aws --force --scenario sync
 
 # Regression check against baseline (on instance)
-cargo xtask bench --tools ocync --regression --threshold-pct 15 cold
+cargo xtask bench --tools ocync --regression --threshold-pct 15 sync
 
 # Tear down
 cd bench/terraform/aws && terraform destroy
