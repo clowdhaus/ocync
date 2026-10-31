@@ -700,13 +700,17 @@ const BLOB_CONCURRENCY: usize = 6;
 /// Default shutdown drain deadline in seconds.
 const DEFAULT_DRAIN_DEADLINE_SECS: u64 = 25;
 
+/// Longest wait for a source repo's manifest commit measured on the 55 GB
+/// benchmark corpus to ECR at caps 20 and 50: that repo also uploads its own
+/// large layers first.
+const LONGEST_MEASURED_COMMIT_WAIT: Duration = Duration::from_secs(149);
+
 /// Default per-blob wait for a source repo's manifest commit before a
-/// cross-repo mount.
-///
-/// Measured on the 55 GB benchmark corpus to ECR at caps 20 and 50: an image
-/// needed up to 149 s for the repo it mounts from to commit, because that repo
-/// also uploads its own large layers. A shorter wait uploads the blob again.
+/// cross-repo mount: longer than [`LONGEST_MEASURED_COMMIT_WAIT`], since a
+/// shorter wait uploads the blob again.
 const DEFAULT_MOUNT_SOURCE_WAIT: Duration = Duration::from_secs(180);
+
+const _: () = assert!(DEFAULT_MOUNT_SOURCE_WAIT.as_secs() > LONGEST_MEASURED_COMMIT_WAIT.as_secs());
 
 /// Default cadence for [`crate::progress::ProgressReporter::run_heartbeat`] callbacks.
 ///
@@ -1985,6 +1989,17 @@ impl<'a> BlobIoContext<'a> {
         }
     }
 
+    /// Give up a claimed blob because the image was cancelled: record it as
+    /// failed and wake the claim's waiters.
+    fn abandon_claim(&self, digest: &Digest) {
+        self.sink.fail(
+            digest.clone(),
+            self.target_repo.to_owned(),
+            "cancelled".into(),
+        );
+        self.sink.release_claim(digest);
+    }
+
     /// The failure recorded in this run for this task's copy of `digest`.
     fn recorded_failure(&self, digest: &Digest) -> Option<Arc<crate::Error>> {
         let failures = self.blob_failures.borrow();
@@ -2163,7 +2178,16 @@ async fn transfer_image_blobs(
                 BlobClaim::Failed(err) => return BlobResult::Failed(crate::Error::Shared(err)),
                 BlobClaim::Claimed => {}
             }
-            let mount_source = resolve_mount_source(ctx, &digest, cancel).await;
+            let mount_source = match resolve_mount_source(ctx, &digest, cancel).await {
+                MountSource::From(repo) => Some(repo),
+                MountSource::Push => None,
+                MountSource::Cancelled => {
+                    // Release the claim now: queuing for a permit behind the
+                    // image's in-flight uploads would hold it that much longer.
+                    BlobIoContext::from_ctx(ctx).abandon_claim(&digest);
+                    return BlobResult::Cancelled;
+                }
+            };
             let staging_claim = resolve_staging(ctx.staging, &digest).await;
 
             // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
@@ -2193,7 +2217,7 @@ async fn transfer_image_blobs(
             }
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
-                cancel.set();
+                cancel.cancel();
                 outcome.error = Some(err);
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
@@ -2204,7 +2228,7 @@ async fn transfer_image_blobs(
     outcome
 }
 
-/// Per-image cancel signal: set when one blob fails so the image's other
+/// Per-image cancel signal: raised when one blob fails so the image's other
 /// blobs stop waiting, including those parked on a claim or mount-source wait.
 #[derive(Default)]
 struct Cancel {
@@ -2213,22 +2237,21 @@ struct Cancel {
 }
 
 impl Cancel {
-    fn set(&self) {
+    fn cancel(&self) {
         self.flag.set(true);
         self.notify.notify_waiters();
     }
 
-    fn is_set(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.flag.get()
     }
 
-    /// Returns once [`set`](Self::set) has run. Interest is registered before
-    /// the flag is read, so a `set` between the two is not lost.
+    /// Returns once [`cancel`](Self::cancel) has run. A `Notified` future
+    /// receives `notify_waiters` from its creation, so creating it before the
+    /// flag check means a `cancel` between the two is not lost.
     async fn cancelled(&self) {
         let notified = self.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.is_set() {
+        if self.is_cancelled() {
             return;
         }
         notified.await;
@@ -2285,7 +2308,7 @@ async fn wait_for_blob_claim(
     // A copy that already failed between the same repos fails this one too,
     // unless a mount can avoid the copy.
     loop {
-        if cancel.is_set() {
+        if cancel.is_cancelled() {
             return BlobClaim::Cancelled;
         }
         if let Some(err) = BlobIoContext::from_ctx(ctx).recorded_failure(digest) {
@@ -2348,11 +2371,22 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
     }
 }
 
+/// What [`resolve_mount_source`] decided for a blob.
+enum MountSource {
+    /// Attempt a mount from this repository.
+    From(RepositoryName),
+    /// No mount source: push the blob.
+    Push,
+    /// The image was cancelled while waiting; the blob must not be transferred.
+    Cancelled,
+}
+
 /// Cross-repo mount-source resolver with bounded deadline.
 ///
-/// Loops until (a) a mount source emerges, (b) all candidate repos resolve
-/// without committing, or (c) the deadline expires. Returns the mount source
-/// to attempt, or `None` if the caller should fall back to push.
+/// Loops until (a) a mount source emerges ([`MountSource::From`]), (b) all
+/// candidate repos resolve without committing or (c) the deadline expires
+/// (both [`MountSource::Push`]), or (d) the image is cancelled
+/// ([`MountSource::Cancelled`]).
 ///
 /// Runs OUTSIDE the per-image blob semaphore (see [`BlobSink`]). `select_all`
 /// is cancel-safe: dropping the per-blob future releases all watches.
@@ -2360,7 +2394,7 @@ async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
     cancel: &Cancel,
-) -> Option<RepositoryName> {
+) -> MountSource {
     let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
     loop {
         let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
@@ -2370,12 +2404,12 @@ async fn resolve_mount_source(
                 .next()
                 .cloned()
             {
-                return Some(r);
+                return MountSource::From(r);
             }
             c.unresolved_watches_for(ctx.target_id, digest, ctx.target_repo)
         };
         if receivers.is_empty() {
-            return None;
+            return MountSource::Push;
         }
 
         let wait = wait_any_fired(receivers);
@@ -2388,10 +2422,9 @@ async fn resolve_mount_source(
                     target = %ctx.target_id.alias(),
                     "mount-source wait deadline reached, falling back to push"
                 );
-                return None;
+                return MountSource::Push;
             }
-            // The caller reaches `run_under_semaphore`, which sees the flag.
-            () = cancel.cancelled() => return None,
+            () = cancel.cancelled() => return MountSource::Cancelled,
         }
     }
 }
@@ -2425,13 +2458,8 @@ async fn run_under_semaphore(
     mount_source: Option<RepositoryName>,
     staging: StagingClaim<'_>,
 ) -> BlobResult {
-    if cancel.is_set() {
-        io.sink.fail(
-            digest.clone(),
-            io.target_repo.to_owned(),
-            "cancelled".into(),
-        );
-        io.sink.release_claim(digest);
+    if cancel.is_cancelled() {
+        io.abandon_claim(digest);
         return BlobResult::Cancelled;
     }
     transfer_claimed_blob(io, digest, size, batch_checked, mount_source, staging).await
@@ -3092,15 +3120,6 @@ mod tests {
     use ocync_distribution::spec::{Descriptor, MediaType};
 
     use super::*;
-
-    /// The default mount-source wait outlasts the longest commit wait measured
-    /// on the benchmark corpus (149 s); a shorter one uploads blobs a mount
-    /// would have saved.
-    #[test]
-    fn default_mount_source_wait_outlasts_the_longest_measured_commit_wait() {
-        let engine = SyncEngine::new(RetryConfig::default(), DEFAULT_MAX_CONCURRENT_TRANSFERS);
-        assert!(engine.mount_source_wait_deadline > Duration::from_secs(149));
-    }
 
     /// A transferred image reports its own byte count, blob stats and elapsed
     /// time, not the zeroed defaults of a skip.
