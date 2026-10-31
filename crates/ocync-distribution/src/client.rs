@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
-use crate::auth::{AuthProvider, Scope, Token};
+use crate::auth::{AuthProvider, Presents, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -394,6 +394,14 @@ impl RegistryClient {
     /// without auth.
     pub fn auth_name(&self) -> Option<&'static str> {
         self.auth.as_ref().map(|a| a.name())
+    }
+
+    /// Whether the configured auth provider presents credentials. Without
+    /// auth nothing is presented.
+    pub fn auth_presents(&self) -> Presents {
+        self.auth
+            .as_ref()
+            .map_or(Presents::Nothing, |a| a.presents())
     }
 
     /// Ping the registry's `/v2/` endpoint. A 200 or 401 is success: either

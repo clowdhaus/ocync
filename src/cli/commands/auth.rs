@@ -3,6 +3,8 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use ocync_distribution::auth::Presents;
+
 use crate::cli::config::load_config;
 use crate::cli::output::redact_url;
 use crate::cli::{CliError, ExitCode, Registry, RunCredentials, build_registry_client};
@@ -38,7 +40,7 @@ async fn run_check_to<W: Write>(configs: &[PathBuf], out: &mut W) -> Result<Exit
                 Ok(client) => match client.ping().await {
                     // `ping` accepts 401, so a registry read without credentials
                     // answers it too: say so rather than imply they work.
-                    Ok(()) if client.auth_name() == Some("anonymous") => {
+                    Ok(()) if client.auth_presents() == Presents::Nothing => {
                         let _ = writeln!(
                             out,
                             "  OK    {name} ({safe_url}) -- anonymous, no credentials checked"
@@ -160,12 +162,41 @@ mod tests {
         assert!(Worst::Failed > Worst::Clean);
     }
 
+    /// Points `DOCKER_CONFIG` at a directory and restores it on drop, holding
+    /// the shared environment lock meanwhile.
+    struct DockerConfigGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl DockerConfigGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let lock = crate::cli::test_support::lock_env();
+            let prior = std::env::var_os("DOCKER_CONFIG");
+            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
+            unsafe { std::env::set_var("DOCKER_CONFIG", dir) };
+            Self { _lock: lock, prior }
+        }
+    }
+
+    impl Drop for DockerConfigGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match &self.prior {
+                    Some(v) => std::env::set_var("DOCKER_CONFIG", v),
+                    None => std::env::remove_var("DOCKER_CONFIG"),
+                }
+            }
+        }
+    }
+
     /// A registry read anonymously says so, and one with credentials does
     /// not: `ping` accepts 401, so a bare OK would imply credentials were
     /// checked. Breaks if an anonymous registry prints a plain OK, or one
     /// with credentials is called anonymous.
     #[tokio::test]
-    async fn an_anonymous_registry_is_not_reported_as_a_plain_ok() {
+    async fn a_registry_read_without_credentials_is_not_reported_as_a_plain_ok() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -181,12 +212,18 @@ mod tests {
             &config,
             format!(
                 "registries:\n  open:\n    url: {uri}\n    auth_type: anonymous\n  \
+                 keyless:\n    url: {uri}\n    auth_type: docker_config\n  \
                  signed:\n    url: {uri}\n    auth_type: static_token\n    token: t\nmappings: []\n",
                 uri = server.uri()
             ),
         )
         .expect("write config");
+        // A docker config with no entry for the registry: named
+        // `docker-config`, but nothing is presented.
+        let docker = tempfile::tempdir().expect("tempdir");
+        std::fs::write(docker.path().join("config.json"), "{}").expect("write config.json");
 
+        let _docker_config = DockerConfigGuard::set(docker.path());
         let mut out = Vec::new();
         let code = run_check_to(&[config], &mut out).await.expect("runs");
         let out = String::from_utf8(out).expect("utf8");
@@ -198,6 +235,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no line for {name}: {out}"))
         };
         assert!(line("open").contains("anonymous"), "{out}");
+        assert!(line("keyless").contains("anonymous"), "{out}");
         assert!(!line("signed").contains("anonymous"), "{out}");
     }
 }

@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use super::docker::{DockerConfig, resolve_from_docker_config};
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
+use super::{AuthProvider, Credentials, Presents, Scope, Token, registry_origin, scopes_cache_key};
 use crate::error::Error;
 
 /// Where an [`Auth`] got the credentials it sends to the token
@@ -111,6 +111,13 @@ impl AuthProvider for Auth {
         }
     }
 
+    fn presents(&self) -> Presents {
+        match self.sign_in.credentials() {
+            Some(_) => Presents::Credentials,
+            None => Presents::Nothing,
+        }
+    }
+
     fn get_token(
         &self,
         scopes: &[Scope],
@@ -158,6 +165,28 @@ mod tests {
         Credentials::Basic {
             username: "testuser".into(),
             password: "testpass".into(),
+        }
+    }
+
+    /// A provider presents credentials only when its sign-in holds some, so
+    /// a docker config with no entry for the registry presents nothing
+    /// although it is not named anonymous. Breaks if a name stands in for
+    /// the answer or a sign-in is misread.
+    #[test]
+    fn presents_credentials_only_when_the_sign_in_holds_some() {
+        let registry: url::Url = "https://registry.example".parse().unwrap();
+        let http = crate::test_http_client();
+        for (sign_in, expected) in [
+            (SignIn::Anonymous, Presents::Nothing),
+            (SignIn::DockerConfig(None), Presents::Nothing),
+            (
+                SignIn::DockerConfig(Some(credentials())),
+                Presents::Credentials,
+            ),
+            (SignIn::Basic(credentials()), Presents::Credentials),
+        ] {
+            let auth = Auth::new(&registry, http.clone(), sign_in);
+            assert_eq!(auth.presents(), expected, "{}", auth.name());
         }
     }
 
