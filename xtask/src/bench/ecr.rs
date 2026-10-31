@@ -9,7 +9,6 @@ use ocync_distribution::Digest;
 use crate::bench::corpus::Corpus;
 use crate::bench::lock::{Entry, ImageRef, Lock};
 use crate::bench::report::ScenarioKind;
-use crate::bench::runner::Tool;
 
 /// Create an ECR client from the default AWS config.
 pub(crate) async fn client() -> Client {
@@ -196,7 +195,7 @@ pub(crate) struct Target<'a> {
 pub(crate) async fn verify_sync(
     target: &Target<'_>,
     corpus: &Corpus,
-    tool: Tool,
+    tool: &str,
     kind: ScenarioKind,
 ) -> Result<(), String> {
     let mut problems: Vec<String> = Vec::new();

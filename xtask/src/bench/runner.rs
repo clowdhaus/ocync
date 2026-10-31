@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::remote::{CommitSha, resolve_commit};
+use super::remote::{CommitSha, git, resolve_commit};
 
 /// Benchmark tool variant. Declaration order is the order of columns in the
 /// reports, so ocync leads.
@@ -16,7 +16,9 @@ pub(crate) enum Tool {
     /// The ocync OCI sync tool.
     Ocync,
     /// The ocync built from the `--baseline-ref` commit, run beside the
-    /// current build to tell a regression from run-to-run noise.
+    /// current build to tell a regression from run-to-run noise. Never named
+    /// on `--tools`: only `--baseline-ref` adds it.
+    #[value(skip)]
     OcyncBaseline,
     /// The dregsy OCI sync tool.
     Dregsy,
@@ -440,53 +442,70 @@ pub(crate) fn baseline_dir(commit: &CommitSha) -> PathBuf {
     Path::new(BASELINE_ROOT).join(commit.to_string())
 }
 
-/// Runs `git` with `args`, naming the command and git's first diagnostic line
-/// when it fails.
-async fn git(args: &[&str]) -> Result<(), String> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "git {} failed: {}",
-        args.join(" "),
-        first_line(&stderr, "").unwrap_or("no output")
-    ))
-}
-
-/// Checks `commit` out into its own git worktree and builds ocync there.
+/// Makes `commit` available as a clean git worktree of the repository at
+/// `repo`, and leaves no other baseline checkout there.
 ///
-/// The build gets a target directory inside the checkout, so it cannot replace
-/// the current build whatever `CARGO_TARGET_DIR` says. An existing checkout is
-/// reused only if it is at `commit`.
-pub(crate) async fn build_baseline(commit: &CommitSha) -> Result<(), String> {
-    let dir = baseline_dir(commit);
-    if !dir.join(".git").exists() {
-        // A checkout deleted behind git's back stays registered and would
-        // make the add refuse.
-        git(&["worktree", "prune"]).await?;
-        git(&[
-            "worktree",
-            "add",
-            "--detach",
-            &dir.to_string_lossy(),
-            &commit.to_string(),
-        ])
-        .await?;
+/// A checkout from an earlier run is reused only if it is at `commit` with
+/// nothing modified, since a benchmark of a tree that is not the commit says
+/// nothing about it.
+fn ensure_checkout(repo: &Path, commit: &CommitSha) -> Result<(), String> {
+    let err = |e: Box<dyn std::error::Error>| e.to_string();
+    let dir = repo.join(baseline_dir(commit));
+    let others = std::fs::read_dir(repo.join(BASELINE_ROOT))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| *path != dir);
+    for other in others {
+        git(
+            repo,
+            &["worktree", "remove", "--force", &other.to_string_lossy()],
+        )
+        .map_err(err)?;
     }
-    let head = resolve_commit(&dir, "HEAD").map_err(|e| e.to_string())?;
+    // A checkout deleted behind git's back stays registered and would make
+    // the add refuse.
+    git(repo, &["worktree", "prune"]).map_err(err)?;
+
+    if !dir.join(".git").exists() {
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &dir.to_string_lossy(),
+                &commit.to_string(),
+            ],
+        )
+        .map_err(err)?;
+    }
+    let head = resolve_commit(&dir, "HEAD").map_err(err)?;
     if head != *commit {
         return Err(format!(
             "{} is at {head}, not the baseline {commit}; remove it",
             dir.display()
         ));
     }
+    if !git(&dir, &["status", "--porcelain"])
+        .map_err(err)?
+        .is_empty()
+    {
+        return Err(format!(
+            "{} has local changes, so it is not the baseline {commit}; remove it",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
 
+/// Checks `commit` out into its own git worktree and builds ocync there.
+///
+/// The build gets a target directory inside the checkout, so it cannot replace
+/// the current build whatever `CARGO_TARGET_DIR` says.
+pub(crate) async fn build_baseline(commit: &CommitSha) -> Result<(), String> {
+    ensure_checkout(Path::new("."), commit)?;
     let status = tokio::process::Command::new("cargo")
         .args([
             "build",
@@ -497,7 +516,7 @@ pub(crate) async fn build_baseline(commit: &CommitSha) -> Result<(), String> {
             "--target-dir",
             "target",
         ])
-        .current_dir(&dir)
+        .current_dir(baseline_dir(commit))
         .status()
         .await
         .map_err(|e| format!("failed to spawn cargo build for the baseline: {e}"))?;
@@ -511,21 +530,55 @@ pub(crate) async fn build_baseline(commit: &CommitSha) -> Result<(), String> {
     }
 }
 
-/// Fails unless the baseline build accepts `config`, the one the run will give
-/// it, so a commit too old for the config is refused before any round runs.
-pub(crate) async fn check_baseline_config(root: &Path, config: &Path) -> Result<(), String> {
+/// The flags of `ocync sync` that every round passes, which a baseline must
+/// accept. `-v` is the short form of `--verbose`.
+const SYNC_FLAGS: [(&str, &str); 2] = [("--json", "--json"), ("--verbose", "-v")];
+
+/// The flags of [`SYNC_FLAGS`] that `help`, the output of `ocync sync --help`,
+/// does not list, by the long name.
+fn missing_sync_flags(help: &str) -> Vec<&'static str> {
+    let listed = |flag: &str| {
+        help.split(|c: char| c.is_whitespace() || c == ',')
+            .any(|word| word == flag)
+    };
+    SYNC_FLAGS
+        .iter()
+        .filter(|(long, short)| !listed(long) && !listed(short))
+        .map(|(long, _)| *long)
+        .collect()
+}
+
+/// Fails unless the baseline build for `commit` accepts what a round gives it:
+/// the config the run will generate, which `ocync validate` checks without
+/// touching a registry, and the flags `sync` is run with, which `sync --help`
+/// lists. A commit too old for either is refused before any round runs.
+pub(crate) fn check_baseline(commit: &CommitSha, config: &Path) -> Result<(), String> {
+    check_baseline_in(&baseline_dir(commit), config)
+}
+
+/// [`check_baseline`] for the checkout at `root`.
+fn check_baseline_in(root: &Path, config: &Path) -> Result<(), String> {
     let binary = tool_path(Tool::OcyncBaseline, root);
-    let output = tokio::process::Command::new(binary.as_ref())
-        .arg("validate")
-        .arg(config)
-        .output()
-        .await
-        .map_err(|e| format!("failed to run {binary} validate: {e}"))?;
-    if output.status.success() {
+    let run = |args: &[&str]| {
+        std::process::Command::new(binary.as_ref())
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to run {binary}: {e}"))
+    };
+
+    let help = run(&["sync", "--help"])?;
+    if let Some(flag) = missing_sync_flags(&String::from_utf8_lossy(&help.stdout)).first() {
+        return Err(format!(
+            "the baseline build's `sync --help` does not list {flag}, which every round passes"
+        ));
+    }
+
+    let validate = run(&["validate", &config.to_string_lossy()])?;
+    if validate.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&validate.stderr);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
     Err(format!(
         "the baseline build rejected the generated config: {}",
         first_line(&stderr, &stdout).unwrap_or("no output")
@@ -569,8 +622,11 @@ fn touch_rs_files(dir: &Path) {
 /// - ocync: `sync --config <path> --json`
 /// - dregsy: `-config <path>`
 /// - regsync: `once -c <path>`
+///
+/// `label` is how the tool is named to the operator in the streamed output.
 pub(crate) async fn run_tool(
     tool: Tool,
+    label: &str,
     config_path: &Path,
     proxy_url: Option<&str>,
     workspace_root: &Path,
@@ -649,7 +705,7 @@ pub(crate) async fn run_tool(
     let stdout_pipe = child.stdout.take().expect("stdout piped");
     let stderr_pipe = child.stderr.take().expect("stderr piped");
 
-    let tool_name = tool.to_string();
+    let tool_name = label.to_owned();
     let tool_name_err = tool_name.clone();
     // ocync --json writes structured JSON to stdout for the reporting
     // pipeline; don't echo it to the operator. Other tools write
@@ -696,7 +752,7 @@ pub(crate) async fn run_tool(
     let peak_rss_kb = parse_gnu_time_rss(&stderr);
 
     if !status.success() && !stderr.trim().is_empty() {
-        eprintln!("  {} stderr:\n{}", tool, textwrap_indent(&stderr, "    "));
+        eprintln!("  {label} stderr:\n{}", textwrap_indent(&stderr, "    "));
     }
 
     Ok(RunResult {
@@ -1014,10 +1070,6 @@ mod tests {
         .collect();
         assert_eq!(names.len(), 4, "{names:?}");
         assert_eq!(Tool::OcyncBaseline.to_string(), "ocync-baseline");
-        assert_eq!(
-            join_tools(&[Tool::Ocync, Tool::OcyncBaseline]),
-            "ocync,ocync-baseline"
-        );
         assert_eq!(Tool::OcyncBaseline.binary(), "ocync");
         assert_eq!(
             tool_path(Tool::OcyncBaseline, Path::new("/b")),
@@ -1029,30 +1081,127 @@ mod tests {
     }
 
     #[test]
-    fn a_baseline_that_rejects_the_config_fails_with_its_own_message() {
+    fn a_baseline_that_rejects_the_config_or_a_flag_fails_with_its_own_message() {
         use std::os::unix::fs::PermissionsExt;
 
-        // A stand-in for `ocync validate <config>`.
+        // A stand-in for `ocync`, answering `sync --help` and `validate`.
         let baseline = |script: &str| {
             let root = tempfile::tempdir().unwrap();
             let binary = tool_path(Tool::OcyncBaseline, root.path()).into_owned();
             std::fs::create_dir_all(Path::new(&binary).parent().unwrap()).unwrap();
             std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(check_baseline_config(root.path(), Path::new("config.yaml")))
+            check_baseline_in(root.path(), Path::new("config.yaml"))
         };
+        let help =
+            r#"[ "$1" = sync ] && echo "  -v, --verbose  --json  --config <path>" && exit 0"#;
 
-        assert_eq!(baseline(r#"[ "$1" = validate ] && exit 0"#), Ok(()));
         assert_eq!(
-            baseline(r#"echo "error: unknown field auth_type" >&2; exit 2"#),
+            baseline(&format!("{help}\n[ \"$1\" = validate ] && exit 0")),
+            Ok(())
+        );
+        assert_eq!(
+            baseline(&format!(
+                "{help}\necho \"error: unknown field auth_type\" >&2; exit 2"
+            )),
             Err("the baseline build rejected the generated config: \
                  error: unknown field auth_type"
                 .to_string())
         );
+        // Catches: a baseline too old for the flags every round passes being
+        // run, and failing in round 1 with the pre-warm already spent.
+        assert_eq!(
+            baseline(r#"[ "$1" = sync ] && echo "  --config <path>" && exit 0"#),
+            Err("the baseline build's `sync --help` does not list --json, \
+                 which every round passes"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn the_sync_flags_are_listed_in_either_form() {
+        for (help, missing) in [
+            ("  -v, --verbose  Increase\n      --json  Output", vec![]),
+            ("  -v  Increase\n  --json", vec![]),
+            ("  --verbose\n  --json", vec![]),
+            ("  --verbose-ish\n  --json", vec!["--verbose"]),
+            ("  -vv\n  --json-lines", vec!["--json", "--verbose"]),
+            ("", vec!["--json", "--verbose"]),
+        ] {
+            assert_eq!(missing_sync_flags(help), missing, "{help:?}");
+        }
+    }
+
+    /// A repository with two commits, and their ids, oldest first.
+    fn repo_with_two_commits() -> (tempfile::TempDir, [CommitSha; 2]) {
+        use super::super::remote::git_in;
+
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        let mut commits = Vec::new();
+        for message in ["one", "two"] {
+            git_in(
+                repo.path(),
+                &["commit", "-q", "--allow-empty", "-m", message],
+            );
+            commits.push(resolve_commit(repo.path(), "HEAD").unwrap());
+        }
+        let [first, second] = <[CommitSha; 2]>::try_from(commits).unwrap();
+        (repo, [first, second])
+    }
+
+    #[test]
+    fn a_checkout_is_reused_only_at_its_commit_and_clean_and_alone() {
+        use super::super::remote::git_in;
+
+        let (repo, [first, second]) = repo_with_two_commits();
+        let repo = repo.path();
+        let dir = |commit: &CommitSha| repo.join(baseline_dir(commit));
+        // The checkouts are git's own, so git's identity must not be needed.
+        let ensure = |commit: &CommitSha| ensure_checkout(repo, commit);
+
+        assert_eq!(ensure(&first), Ok(()));
+        assert!(dir(&first).join(".git").exists());
+        assert_eq!(ensure(&first), Ok(()), "a second run reuses it");
+
+        // Catches: reusing a checkout someone moved off its commit.
+        git_in(
+            &dir(&first),
+            &["checkout", "-q", "--detach", &second.to_string()],
+        );
+        let err = ensure(&first).unwrap_err();
+        assert!(
+            err.contains(&format!("is at {second}, not the baseline {first}")),
+            "{err}"
+        );
+        git_in(
+            &dir(&first),
+            &["checkout", "-q", "--detach", &first.to_string()],
+        );
+
+        // Catches: benchmarking a tree with local changes as if it were the
+        // commit.
+        std::fs::write(dir(&first).join("edited"), "x").unwrap();
+        let err = ensure(&first).unwrap_err();
+        assert!(err.contains("has local changes"), "{err}");
+        std::fs::remove_file(dir(&first).join("edited")).unwrap();
+        assert_eq!(ensure(&first), Ok(()));
+
+        // Catches: checkouts piling up, one build's worth of disk each.
+        assert_eq!(ensure(&second), Ok(()));
+        assert!(dir(&second).join(".git").exists());
+        assert!(!dir(&first).exists(), "the other checkout was kept");
+    }
+
+    #[test]
+    fn a_checkout_deleted_behind_gits_back_is_made_again() {
+        let (repo, [first, _]) = repo_with_two_commits();
+        let repo = repo.path();
+        ensure_checkout(repo, &first).unwrap();
+        std::fs::remove_dir_all(repo.join(baseline_dir(&first))).unwrap();
+
+        assert_eq!(ensure_checkout(repo, &first), Ok(()));
+        assert!(repo.join(baseline_dir(&first)).join(".git").exists());
     }
 
     #[test]

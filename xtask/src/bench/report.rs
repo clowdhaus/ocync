@@ -10,7 +10,7 @@ use crate::bench::lock::LockedAt;
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::Tool;
-use crate::bench::stats::{self, Ratio, Verdict};
+use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
 /// Serde helper: returns `true` when a `u64` is zero (for `skip_serializing_if`).
@@ -55,8 +55,22 @@ pub(crate) struct RunRecord {
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
-    /// Per-scenario results.
+    /// How many rounds were asked for and finished; absent for a run with no
+    /// repeated scenario and for records written before rounds existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rounds: Option<RoundCount>,
+    /// Per-scenario results, one per round of a repeated scenario.
     pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+/// How many rounds of the repeated scenarios a run was asked for and finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RoundCount {
+    /// Rounds asked for.
+    pub(crate) requested: u32,
+    /// Rounds the scenario that finished the fewest got to; fewer than
+    /// requested when the run stopped.
+    pub(crate) finished: u32,
 }
 
 impl RunRecord {
@@ -88,6 +102,7 @@ impl RunRecord {
                 images: report.corpus_size,
                 tags: report.total_tags,
             },
+            rounds: report.round_count(),
             scenarios: report
                 .scenarios
                 .iter()
@@ -503,18 +518,53 @@ pub(crate) struct BenchReport {
     pub(crate) prewarm: Option<Prewarm>,
     /// The commit the baseline build was made from; `None` without one.
     pub(crate) baseline: Option<CommitSha>,
+    /// The rounds the run was asked for, of which a stopped run finished fewer.
+    pub(crate) rounds: Rounds,
     /// Per-scenario results, one per round of a repeated scenario.
     pub(crate) scenarios: Vec<ScenarioResult>,
 }
 
+/// A tool's name where a person reads it. The baseline carries its commit,
+/// since "ocync-baseline" names no code; that name is for file names.
+pub(crate) fn tool_label(tool: Tool, baseline: Option<&CommitSha>) -> String {
+    match (tool, baseline) {
+        (Tool::OcyncBaseline, Some(commit)) => format!("ocync@{}", commit.short()),
+        _ => tool.to_string(),
+    }
+}
+
 impl BenchReport {
-    /// A tool's name in the reports. The baseline carries its commit, since
-    /// "ocync-baseline" names no code.
+    /// A tool's name in the reports.
     fn label(&self, tool: Tool) -> String {
-        match (tool, &self.baseline) {
-            (Tool::OcyncBaseline, Some(commit)) => format!("ocync@{}", commit.short()),
-            _ => tool.to_string(),
+        tool_label(tool, self.baseline.as_ref())
+    }
+
+    /// How many rounds a repeated scenario finished, in words: `5 rounds`, or
+    /// `3 of 5 rounds (stopped)` when the run stopped short.
+    fn rounds_note(&self, finished: usize) -> String {
+        let requested = self.rounds.get();
+        if finished == requested {
+            format!("{requested} rounds")
+        } else {
+            format!("{finished} of {requested} rounds (stopped)")
         }
+    }
+
+    /// The rounds asked for and the fewest any repeated scenario finished;
+    /// `None` when no scenario was repeated.
+    fn round_count(&self) -> Option<RoundCount> {
+        let finished = kinds(&self.scenarios)
+            .into_iter()
+            .filter_map(|kind| {
+                let rounds = rounds_of(&self.scenarios, kind);
+                rounds[0].round.map(|_| rounds.len())
+            })
+            .min()?;
+        let count = |n: usize| u32::try_from(n).expect("a run has fewer than 2^32 rounds");
+        Some(RoundCount {
+            requested: count(self.rounds.get()),
+            finished: count(finished),
+        })
     }
 }
 
@@ -552,21 +602,27 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 }
 
 /// Render the OCI 1.1 referrers footnote for a scenario, or `None` if no
-/// tool issued referrer calls.
+/// tool issued referrer calls in any round.
 ///
 /// ocync issues `GET /v2/<repo>/referrers/...` to discover artifact
 /// attestations (SBOM, SLSA) and transfers any referenced artifacts.
 /// Comparable tools do not implement this OCI 1.1 endpoint. The footnote
-/// surfaces the per-tool count so the Source blob GETs / Source blob
-/// bytes columns are not read as a fairness violation.
+/// surfaces the per-tool count, the median over the rounds, so the Source blob
+/// GETs / Source blob bytes columns are not read as a fairness violation.
 ///
 /// Returned string starts with a leading newline so it can be appended
 /// directly after a metric table without manual spacing.
-fn referrer_footnote(scenario: &ScenarioResult) -> Option<String> {
-    let calls: Vec<(Tool, u64)> = scenario
-        .runs
-        .iter()
-        .filter_map(|r| r.proxy_metrics.as_ref().map(|m| (r.tool, m.referrer_calls)))
+fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option<String> {
+    let calls: Vec<(Tool, u64)> = rounds_by_tool(rounds)
+        .into_iter()
+        .filter_map(|(tool, runs)| {
+            let median = spread_of(
+                runs.iter()
+                    .filter_map(|r| r.proxy_metrics.as_ref())
+                    .map(|m| m.referrer_calls),
+            )?;
+            Some((tool, median.median.round() as u64))
+        })
         .collect();
     if !calls.iter().any(|(_, n)| *n > 0) {
         return None;
@@ -581,7 +637,7 @@ fn referrer_footnote(scenario: &ScenarioResult) -> Option<String> {
     out.push_str("this artifact content for ocync.\n>\n> ");
     let parts: Vec<String> = calls
         .iter()
-        .map(|(tool, n)| format!("{tool}: {n}"))
+        .map(|&(tool, n)| format!("{}: {n}", report.label(tool)))
         .collect();
     out.push_str(&format!("Referrers calls -- {}.\n", parts.join(", ")));
     Some(out)
@@ -639,8 +695,8 @@ fn summary_markdown(report: &BenchReport) -> String {
     for kind in kinds(&report.scenarios) {
         let rounds = rounds_of(&report.scenarios, kind);
         out.push_str(&format!("## {}", kind.label()));
-        if rounds.len() > 1 {
-            out.push_str(&format!(" ({} rounds)", rounds.len()));
+        if rounds[0].round.is_some() {
+            out.push_str(&format!(" ({})", report.rounds_note(rounds.len())));
         }
         out.push_str("\n\n");
 
@@ -652,7 +708,7 @@ fn summary_markdown(report: &BenchReport) -> String {
             .collect();
         render_metric_table(report, &ran, &by_tool, &mut out);
         render_comparison(report, &rounds, &mut out);
-        if let Some(footnote) = referrer_footnote(rounds[0]) {
+        if let Some(footnote) = referrer_footnote(report, &rounds) {
             out.push_str(&footnote);
         }
         out.push('\n');
@@ -692,17 +748,16 @@ struct MetricRow {
     /// The value that decides the row's winner and that the spread is taken of.
     rank: fn(&ToolRun) -> Option<u64>,
     /// The second number of an `a/b` cell, when the row has one.
-    of: Option<fn(&ToolRun) -> u64>,
+    of: Option<fn(&ToolRun) -> Option<u64>>,
     format: fn(u64) -> String,
     lower_is_better: bool,
+    /// The words for ocync being lower and higher than another tool in every
+    /// round, for a row that is compared round by round.
+    verdict_words: Option<[&'static str; 2]>,
 }
 
 fn count(n: u64) -> String {
     n.to_string()
-}
-
-fn bytes(n: u64) -> String {
-    format_bytes(n)
 }
 
 /// The standard set of metric rows for benchmark comparison tables.
@@ -717,6 +772,7 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: |ms| format_duration(Duration::from_millis(ms)),
             lower_is_better: true,
+            verdict_words: Some(["faster", "slower"]),
         },
         MetricRow {
             label: "Peak RSS",
@@ -724,6 +780,7 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: |kb| format_bytes(kb * 1024),
             lower_is_better: true,
+            verdict_words: None,
         },
         MetricRow {
             label: "Requests",
@@ -731,13 +788,15 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: count,
             lower_is_better: true,
+            verdict_words: Some(["fewer", "more"]),
         },
         MetricRow {
             label: "Response bytes",
             rank: |r| proxy(r, |m| m.response_bytes),
             of: None,
-            format: bytes,
+            format: format_bytes,
             lower_is_better: true,
+            verdict_words: Some(["fewer", "more"]),
         },
         MetricRow {
             label: "Source blob GETs",
@@ -745,20 +804,23 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: count,
             lower_is_better: true,
+            verdict_words: None,
         },
         MetricRow {
             label: "Source blob bytes",
             rank: |r| proxy(r, |m| m.source_blob_bytes),
             of: None,
-            format: bytes,
+            format: format_bytes,
             lower_is_better: true,
+            verdict_words: None,
         },
         MetricRow {
             label: "Mounts (success/attempt)",
             rank: |r| proxy(r, |m| m.mount_successes),
-            of: Some(|r| proxy(r, |m| m.mount_attempts).unwrap_or(0)),
+            of: Some(|r| proxy(r, |m| m.mount_attempts)),
             format: count,
             lower_is_better: false,
+            verdict_words: None,
         },
         MetricRow {
             label: "Duplicate blob GETs",
@@ -766,13 +828,15 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: count,
             lower_is_better: true,
+            verdict_words: None,
         },
         MetricRow {
             label: "CDN hits/misses",
             rank: |r| proxy(r, |m| m.cdn_hits),
-            of: Some(|r| proxy(r, |m| m.cdn_misses).unwrap_or(0)),
+            of: Some(|r| proxy(r, |m| m.cdn_misses)),
             format: count,
             lower_is_better: false,
+            verdict_words: None,
         },
         MetricRow {
             label: "Rate-limit 429s",
@@ -780,6 +844,7 @@ fn metric_rows() -> [MetricRow; 10] {
             of: None,
             format: count,
             lower_is_better: true,
+            verdict_words: None,
         },
     ]
 }
@@ -789,27 +854,56 @@ fn spread_of(values: impl Iterator<Item = u64>) -> Option<stats::Spread> {
     stats::spread(&values.map(|v| v as f64).collect::<Vec<_>>())
 }
 
-/// A tool's cell in a row, with the rank that decides the row's winner: the
-/// median over its runs, followed by the lowest and highest in brackets when
-/// there is more than one. For an `a/b` row the range is of `a`.
-fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<(u64, String)> {
-    let rank = spread_of(runs.iter().filter_map(|r| (row.rank)(r)))?;
+/// A tool's cell in a row: its spread over the runs and how it reads.
+struct Cell {
+    spread: stats::Spread,
+    /// How many runs the spread is over.
+    runs: usize,
+    /// The median, followed by the lowest and highest in brackets when there
+    /// is more than one run. For an `a/b` row the range is of `a`.
+    text: String,
+}
+
+/// A tool's cell in a row, `None` when a run has no value for it.
+fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
+    let spread = spread_of(runs.iter().filter_map(|r| (row.rank)(r)))?;
     let shown = |value: f64| (row.format)(value.round() as u64);
-    let mut text = shown(rank.median);
+    let mut text = shown(spread.median);
     if let Some(of) = row.of {
-        let denominator = spread_of(runs.iter().map(|r| of(r)))?;
+        let denominator = spread_of(runs.iter().filter_map(|r| of(r)))?;
         text = format!("{text}/{}", shown(denominator.median));
     }
     if runs.len() > 1 {
-        text = format!("{text} ({}..{})", shown(rank.min), shown(rank.max));
+        text = format!("{text} ({}..{})", shown(spread.min), shown(spread.max));
     }
-    Some((rank.median.round() as u64, text))
+    Some(Cell {
+        spread,
+        runs: runs.len(),
+        text,
+    })
+}
+
+/// Whether a cell is bolded as the best of its row: the best median, and with
+/// rounds, only when its range overlaps no other tool's, since a median that
+/// another tool's rounds reach does not separate them.
+fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
+    let competitors = || cells.iter().flatten().filter(|c| !std::ptr::eq(*c, cell));
+    let best = competitors().all(|other| {
+        if row.lower_is_better {
+            cell.spread.median <= other.spread.median
+        } else {
+            cell.spread.median >= other.spread.median
+        }
+    });
+    let separate =
+        |other: &Cell| cell.spread.min > other.spread.max || other.spread.min > cell.spread.max;
+    best && competitors().next().is_some() && (cell.runs == 1 || competitors().all(separate))
 }
 
 /// Renders a metric comparison table into `out`.
 ///
-/// Columns are tool names, rows are metrics. The best value per row
-/// is bolded when more than one tool has data for that metric.
+/// Columns are tool names, rows are metrics. The best value per row is bolded
+/// when more than one tool has data for that metric, see [`is_bold`].
 fn render_metric_table(
     report: &BenchReport,
     columns: &[Tool],
@@ -828,27 +922,18 @@ fn render_metric_table(
     out.push('\n');
 
     for row in &metric_rows() {
-        let cells: Vec<Option<(u64, String)>> = columns
+        let cells: Vec<Option<Cell>> = columns
             .iter()
             .map(|col| by_tool.get(col).and_then(|runs| cell(row, runs)))
             .collect();
-        let ranks = cells
-            .iter()
-            .filter_map(|c| c.as_ref().map(|(rank, _)| *rank));
-        let winner = if row.lower_is_better {
-            ranks.clone().min()
-        } else {
-            ranks.clone().max()
-        };
-        let competing = ranks.count() > 1;
 
         out.push_str(&format!("| {} |", row.label));
         for cell in &cells {
             match cell {
-                Some((rank, text)) if competing && Some(*rank) == winner => {
-                    out.push_str(&format!(" **{text}** |"));
+                Some(cell) if is_bold(row, cell, &cells) => {
+                    out.push_str(&format!(" **{}** |", cell.text));
                 }
-                Some((_, text)) => out.push_str(&format!(" {text} |")),
+                Some(cell) => out.push_str(&format!(" {} |", cell.text)),
                 None => out.push_str(" -- |"),
             }
         }
@@ -856,40 +941,20 @@ fn render_metric_table(
     }
 }
 
-/// The metrics two tools are compared on round by round, each one lower is
-/// better on, with the words for ocync being lower and higher.
-type Compared = (&'static str, fn(&ToolRun) -> Option<f64>, [&'static str; 2]);
-
-const COMPARED: [Compared; 3] = [
-    (
-        "Wall clock",
-        |r| Some(r.wall_clock_secs),
-        ["faster", "slower"],
-    ),
-    (
-        "Requests",
-        |r| r.proxy_metrics.as_ref().map(|m| m.requests as f64),
-        ["fewer", "more"],
-    ),
-    (
-        "Response bytes",
-        |r| r.proxy_metrics.as_ref().map(|m| m.response_bytes as f64),
-        ["fewer", "more"],
-    ),
-];
-
-/// The ratio `other / ocync` of `value` in each round, `None` unless both
-/// tools have a value in every round.
-fn round_ratio(
-    rounds: &[&ScenarioResult],
-    other: Tool,
-    value: fn(&ToolRun) -> Option<f64>,
-) -> Option<Ratio> {
-    let pairs: Vec<(f64, f64)> = rounds
+/// The ratio `other / ocync` of a row's metric in each round, `None` unless
+/// both tools have a value in every round.
+fn round_ratio(rounds: &[&ScenarioResult], other: Tool, row: &MetricRow) -> Option<Ratio> {
+    let pairs: Vec<Pair> = rounds
         .iter()
         .map(|round| {
-            let run = |tool| round.runs.iter().find(|r| r.tool == tool);
-            Some((value(run(Tool::Ocync)?)?, value(run(other)?)?))
+            let value = |tool| {
+                let run = round.runs.iter().find(|r| r.tool == tool)?;
+                (row.rank)(run).map(|v| v as f64)
+            };
+            Some(Pair {
+                ocync: value(Tool::Ocync)?,
+                other: value(other)?,
+            })
         })
         .collect::<Option<_>>()?;
     stats::ratio(&pairs)
@@ -897,15 +962,18 @@ fn round_ratio(
 
 /// Renders how ocync compares with each other tool round by round: the median
 /// and range of the per-round ratio, the chance the range holds the true
-/// median, and what every round agrees on. Pairing within a round cancels
-/// drift that moved every tool in it.
+/// median, and, from [`stats::VERDICT_ROUNDS`] rounds, what every round agrees
+/// on with the chance that identical builds would agree this way. Pairing
+/// within a round cancels drift that moved every tool in it.
 fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut String) {
-    // Fewer rounds than a claim needs give no verdict: a run stopped after 2
-    // holds the true median in its range with 50% confidence, and one pass has
-    // nothing to pair.
+    // Fewer rounds than the range can be stated for, as when a run stopped
+    // early, or a single pass with nothing to pair.
     if rounds.len() < Rounds::MIN {
         return;
     }
+    let count = u32::try_from(rounds.len()).expect("a run has fewer than 2^32 rounds");
+    let identical = (1.0 - stats::confidence(count)) * 100.0;
+    let verdicts = rounds.len() >= stats::VERDICT_ROUNDS;
     let others: BTreeSet<Tool> = rounds
         .iter()
         .flat_map(|round| round.runs.iter().map(|r| r.tool))
@@ -913,23 +981,31 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
         .collect();
     let mut table = String::new();
     for other in others {
-        for (label, value, [lower, higher]) in COMPARED {
-            let Some(ratio) = round_ratio(rounds, other, value) else {
+        for row in metric_rows()
+            .iter()
+            .filter(|row| row.verdict_words.is_some())
+        {
+            let Some(Ratio { spread, verdict }) = round_ratio(rounds, other, row) else {
                 continue;
             };
-            let verdict = match ratio.verdict {
-                Verdict::Faster => lower,
-                Verdict::Slower => higher,
-                Verdict::NoMeasuredDifference => "no measured difference",
-            };
-            let Ratio { spread, .. } = ratio;
             table.push_str(&format!(
-                "| {} | {label} | {:.2} | {:.2}..{:.2} | {verdict} |\n",
+                "| {} | {} | {:.2} | {:.2}..{:.2} |",
                 report.label(other),
+                row.label,
                 spread.median,
                 spread.min,
                 spread.max,
             ));
+            if verdicts {
+                let [lower, higher] = row.verdict_words.expect("filtered above");
+                let (words, chance) = match verdict {
+                    Some(Verdict::OcyncLower) => (lower, format!("{identical:.2}%")),
+                    Some(Verdict::OcyncHigher) => (higher, format!("{identical:.2}%")),
+                    _ => ("no measured difference", "--".to_owned()),
+                };
+                table.push_str(&format!(" {words} | {chance} |"));
+            }
+            table.push('\n');
         }
     }
     if table.is_empty() {
@@ -937,13 +1013,25 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
     }
     out.push_str(&format!(
         "\nPer-round ratio of the other tool to ocync (above 1: ocync lower). The range \
-         is the lowest to the highest of {} rounds and holds the true median ratio with \
-         {:.2}% confidence. The verdict is ocync's, and a difference is claimed only when \
-         every round agrees.\n\n\
-         | Tool | Metric | Median ratio | Range | ocync is |\n|---|---|---:|---:|---|\n{table}",
-        rounds.len(),
-        stats::confidence(rounds.len()) * 100.0,
+         is the lowest to the highest of {count} rounds and holds the true median ratio \
+         with {:.2}% confidence.",
+        stats::confidence(count) * 100.0,
     ));
+    if verdicts {
+        out.push_str(
+            " A difference is claimed only when every round agrees, and the last column is \
+             the chance that identical builds would agree this way in every round.\n\n\
+             | Tool | Metric | Median ratio | Range | ocync is | Chance if identical |\n\
+             |---|---|---:|---:|---|---:|\n",
+        );
+    } else {
+        out.push_str(&format!(
+            " No verdict is given below {} rounds.\n\n\
+             | Tool | Metric | Median ratio | Range |\n|---|---|---:|---:|\n",
+            stats::VERDICT_ROUNDS
+        ));
+    }
+    out.push_str(&table);
 }
 
 /// Writes the benchmark summary to `output_dir`.
@@ -1013,11 +1101,11 @@ fn scenario_markdown(
         images = report.corpus_size,
         tags = report.total_tags,
         region = inst.region,
-        round_note = if rounds.len() > 1 {
+        round_note = if rounds[0].round.is_some() {
             format!(
-                " {} rounds, the tool order shuffled in each. A cell is the median over \
+                " {}, the tool order shuffled in each. A cell is the median over \
                  the rounds, with the lowest and highest in brackets.",
-                rounds.len()
+                report.rounds_note(rounds.len())
             )
         } else {
             String::new()
@@ -1027,7 +1115,7 @@ fn scenario_markdown(
     let columns = tool_columns(report);
     render_metric_table(report, &columns, &rounds_by_tool(rounds), &mut out);
     render_comparison(report, rounds, &mut out);
-    if let Some(footnote) = referrer_footnote(rounds[0]) {
+    if let Some(footnote) = referrer_footnote(report, rounds) {
         out.push_str(&footnote);
     }
 
@@ -1200,6 +1288,7 @@ mod tests {
     fn sample_report() -> BenchReport {
         BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1333,6 +1422,7 @@ mod tests {
     fn summary_markdown_empty_scenarios_omits_table() {
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1525,6 +1615,7 @@ mod tests {
     fn summary_markdown_single_tool_no_bold() {
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1569,6 +1660,7 @@ mod tests {
     fn scenario_markdown_warm_description() {
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1648,6 +1740,7 @@ mod tests {
     fn sample_report_with_metrics() -> BenchReport {
         BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1741,6 +1834,7 @@ mod tests {
         // NOT be bolded -- there's no competition.
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1798,6 +1892,7 @@ mod tests {
         // When two tools tie on a metric, both should be bolded.
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1878,6 +1973,7 @@ mod tests {
 
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus_size: 39,
@@ -1933,6 +2029,7 @@ mod tests {
         // Report with only a warm scenario.
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus_size: 39,
@@ -1965,6 +2062,7 @@ mod tests {
     fn summary_markdown_includes_referrer_footnote_when_present() {
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2020,6 +2118,7 @@ mod tests {
     fn summary_markdown_omits_referrer_footnote_when_no_calls() {
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2052,6 +2151,7 @@ mod tests {
         // referrers when ocync is in the run.
         let report = BenchReport {
             baseline: None,
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2082,12 +2182,15 @@ mod tests {
         assert!(md.contains("ocync: 79"), "count missing:\n{md}");
     }
 
-    /// A report of `rounds` rounds of the cold scenario, in which each tool ran
-    /// `(wall clock seconds, requests)` per round, the baseline built at HEAD.
-    fn rounds_report(tools: &[(Tool, &[(f64, u64)])]) -> BenchReport {
-        let rounds = tools[0].1.len();
+    /// What each tool did per round: `(wall clock seconds, requests)`.
+    type Rounds5 = [(f64, u64); 5];
+
+    /// A report of the first `finished` of 5 requested rounds of the cold
+    /// scenario, the baseline built at a fixed commit.
+    fn rounds_report(finished: usize, tools: &[(Tool, Rounds5)]) -> BenchReport {
         BenchReport {
-            baseline: Some(crate::bench::remote::resolve_commit(Path::new("."), "HEAD").unwrap()),
+            baseline: Some(CommitSha::fixture()),
+            rounds: Rounds::DEFAULT,
             timestamp: "2026-10-30-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2098,7 +2201,7 @@ mod tests {
                 .collect(),
             relay_versions: BTreeMap::new(),
             prewarm: None,
-            scenarios: (0..rounds)
+            scenarios: (0..finished)
                 .map(|round| ScenarioResult {
                     round: Some(round + 1),
                     shuffle_seed: 7,
@@ -2113,6 +2216,11 @@ mod tests {
                                 peak_rss_kb: None,
                                 proxy_metrics: Some(ProxyMetrics {
                                     requests: runs[round].1,
+                                    referrer_calls: if tool == Tool::OcyncBaseline {
+                                        runs[round].1
+                                    } else {
+                                        0
+                                    },
                                     ..Default::default()
                                 }),
                                 phase_timing_ms: BTreeMap::new(),
@@ -2124,102 +2232,225 @@ mod tests {
         }
     }
 
-    fn three_rounds() -> BenchReport {
-        rounds_report(&[
-            (Tool::Ocync, &[(40.0, 100), (48.0, 110), (44.0, 105)]),
-            (
-                Tool::OcyncBaseline,
-                &[(42.0, 100), (46.0, 110), (43.0, 105)],
-            ),
-            (Tool::Dregsy, &[(80.0, 300), (120.0, 330), (88.0, 315)]),
-            (Tool::Regsync, &[(20.0, 300), (29.0, 330), (22.0, 315)]),
-        ])
+    /// Five requested rounds of four tools. Against ocync, dregsy is 2 to 2.5
+    /// times as slow in every round, regsync a half to 0.6 as fast in every
+    /// round, and the baseline on both sides of equal.
+    fn five_rounds(finished: usize) -> BenchReport {
+        rounds_report(
+            finished,
+            &[
+                (
+                    Tool::Ocync,
+                    [
+                        (40.0, 100),
+                        (48.0, 110),
+                        (44.0, 105),
+                        (46.0, 108),
+                        (42.0, 102),
+                    ],
+                ),
+                (
+                    Tool::OcyncBaseline,
+                    [
+                        (42.0, 100),
+                        (46.0, 110),
+                        (43.0, 105),
+                        (47.0, 108),
+                        (41.0, 102),
+                    ],
+                ),
+                (
+                    Tool::Dregsy,
+                    [
+                        (80.0, 300),
+                        (120.0, 330),
+                        (88.0, 315),
+                        (92.0, 324),
+                        (84.0, 306),
+                    ],
+                ),
+                (
+                    Tool::Regsync,
+                    [
+                        (20.0, 300),
+                        (29.0, 330),
+                        (22.0, 315),
+                        (23.0, 324),
+                        (21.0, 306),
+                    ],
+                ),
+            ],
+        )
     }
 
     #[test]
-    fn rounds_are_shown_as_a_median_with_its_range_and_compared_per_round() {
-        let report = three_rounds();
-        let baseline = format!("ocync@{}", report.baseline.as_ref().unwrap().short());
-
-        let md = summary_markdown(&report);
+    fn five_rounds_show_ranges_verdicts_and_the_chance_of_identical_builds() {
+        let md = summary_markdown(&five_rounds(5));
 
         // Catches: a cell showing one round, a mean, or a median without its
-        // range, and the bold going to the first-listed tool.
-        assert!(md.contains("## Cold sync (3 rounds)\n"), "{md}");
+        // range; bold on a median another tool's rounds reach; the baseline
+        // under any name but its commit.
+        assert!(md.contains("## Cold sync (5 rounds)\n"), "{md}");
         assert!(
-            md.contains(&format!(
-                "| Metric | ocync | {baseline} | dregsy | regsync |"
-            )),
+            md.contains("| Metric | ocync | ocync@0123456 | dregsy | regsync |"),
             "{md}"
         );
         assert!(
             md.contains(
-                "| Wall clock | 44s (40s..48s) | 43s (42s..46s) | 1m 28s (1m 20s..2m) | **22s (20s..29s)** |"
+                "| Wall clock | 44s (40s..48s) | 43s (41s..47s) | 1m 28s (1m 20s..2m) | **22s (20s..29s)** |"
+            ),
+            "{md}"
+        );
+        // The ocync and baseline requests are equal and overlap, so neither is
+        // bolded, and neither is the rest.
+        assert!(
+            md.contains(
+                "| Requests | 105 (100..110) | 105 (100..110) | 315 (300..330) | 315 (300..330) |"
             ),
             "{md}"
         );
         assert!(
-            md.contains("| Requests | **105 (100..110)** | **105 (100..110)** | 315 (300..330) | 315 (300..330) |"),
-            "{md}"
-        );
-        // Each row is the other tool's per-round ratio to ocync. A confidence of
-        // 75% is for 3 rounds; the verdict words follow the metric.
-        assert!(
-            md.contains("holds the true median ratio with 75.00% confidence"),
+            md.contains("holds the true median ratio with 93.75% confidence"),
             "{md}"
         );
         for row in [
-            "| dregsy | Wall clock | 2.00 | 2.00..2.50 | faster |",
-            "| dregsy | Requests | 3.00 | 3.00..3.00 | fewer |",
-            "| regsync | Wall clock | 0.50 | 0.50..0.60 | slower |",
-            "| regsync | Requests | 3.00 | 3.00..3.00 | fewer |",
-            // One round above 1 and two below: no claim, and the tie at
-            // exactly 1 on requests is no claim either.
-            &format!("| {baseline} | Wall clock | 0.98 | 0.96..1.05 | no measured difference |"),
-            &format!("| {baseline} | Requests | 1.00 | 1.00..1.00 | no measured difference |"),
+            "| dregsy | Wall clock | 2.00 | 2.00..2.50 | faster | 6.25% |",
+            "| dregsy | Requests | 3.00 | 3.00..3.00 | fewer | 6.25% |",
+            "| regsync | Wall clock | 0.50 | 0.50..0.60 | slower | 6.25% |",
+            "| regsync | Requests | 3.00 | 3.00..3.00 | fewer | 6.25% |",
+            // Both sides of 1 on time and exactly 1 on requests: no claim.
+            "| ocync@0123456 | Wall clock | 0.98 | 0.96..1.05 | no measured difference | -- |",
+            "| ocync@0123456 | Requests | 1.00 | 1.00..1.00 | no measured difference | -- |",
         ] {
             assert!(md.contains(&format!("{row}\n")), "{row}\n{md}");
         }
         // Response bytes are zero for ocync in every round, so no ratio exists.
         assert!(!md.contains("| dregsy | Response bytes |"), "{md}");
+        // The footnote names the baseline by its commit and gives the median.
+        assert!(
+            md.contains("Referrers calls -- ocync: 0, ocync@0123456: 105,"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn three_and_four_rounds_show_ranges_and_claim_nothing() {
+        // Catches: a verdict at 3 or 4 rounds, where identical builds would
+        // show it one time in four or eight.
+        for (finished, confidence) in [(3, "75.00%"), (4, "87.50%")] {
+            let md = summary_markdown(&five_rounds(finished));
+
+            assert!(
+                md.contains(&format!(
+                    "## Cold sync ({finished} of 5 rounds (stopped))\n"
+                )),
+                "{md}"
+            );
+            assert!(
+                md.contains(&format!("with {confidence} confidence.")),
+                "{md}"
+            );
+            assert!(md.contains("No verdict is given below 5 rounds."), "{md}");
+            assert!(
+                md.contains("| dregsy | Wall clock | 2.00 | 2.00..2.50 |\n"),
+                "{md}"
+            );
+            assert!(
+                !md.contains("faster") && !md.contains("Chance if identical"),
+                "{md}"
+            );
+        }
     }
 
     #[test]
     fn a_run_stopped_short_of_the_fewest_rounds_claims_nothing() {
-        // Catches: a verdict printed at 50% confidence after a failed round
-        // leaves 2 finished, which the summary and the performance page would
-        // then publish.
-        let stopped = rounds_report(&[
-            (Tool::Ocync, &[(40.0, 100), (48.0, 110)]),
-            (Tool::Dregsy, &[(80.0, 300), (120.0, 330)]),
-        ]);
+        // Catches: ratios printed after a failed round leaves 2 finished.
+        let md = summary_markdown(&five_rounds(2));
 
-        let md = summary_markdown(&stopped);
-
-        assert!(md.contains("## Cold sync (2 rounds)"), "{md}");
         assert!(
-            md.contains("| Wall clock | **44s (40s..48s)** | 1m 40s (1m 20s..2m) |"),
+            md.contains("## Cold sync (2 of 5 rounds (stopped))"),
             "{md}"
         );
-        assert!(
-            !md.contains("Per-round ratio") && !md.contains("faster"),
-            "{md}"
+        assert!(md.contains("**24s (20s..29s)**"), "{md}");
+        assert!(!md.contains("Per-round ratio"), "{md}");
+    }
+
+    #[test]
+    fn a_median_is_bold_only_when_its_range_overlaps_no_other() {
+        let row = &metric_rows()[0];
+        let cell = |spread: (f64, f64, f64), runs| Cell {
+            spread: stats::Spread {
+                median: spread.0,
+                min: spread.1,
+                max: spread.2,
+            },
+            runs,
+            text: String::new(),
+        };
+        let bold = |cells: &[Option<Cell>]| {
+            cells
+                .iter()
+                .map(|c| c.as_ref().is_some_and(|c| is_bold(row, c, cells)))
+                .collect::<Vec<_>>()
+        };
+
+        // Catches: bold on the lower median when the ranges overlap, which
+        // reads as a win the rounds do not show.
+        let apart = [
+            Some(cell((20.0, 10.0, 30.0), 5)),
+            Some(cell((50.0, 40.0, 60.0), 5)),
+        ];
+        assert_eq!(bold(&apart), [true, false]);
+        let overlapping = [
+            Some(cell((20.0, 10.0, 45.0), 5)),
+            Some(cell((50.0, 40.0, 60.0), 5)),
+        ];
+        assert_eq!(bold(&overlapping), [false, false]);
+        // One round has no range to overlap, and a tie is bolded on both.
+        let single = [
+            Some(cell((20.0, 20.0, 20.0), 1)),
+            Some(cell((50.0, 50.0, 50.0), 1)),
+        ];
+        assert_eq!(bold(&single), [true, false]);
+        let tie = [
+            Some(cell((20.0, 20.0, 20.0), 1)),
+            Some(cell((20.0, 20.0, 20.0), 1)),
+        ];
+        assert_eq!(bold(&tie), [true, true]);
+        // Nothing to compete with, and a tool with no value.
+        assert_eq!(
+            bold(&[Some(cell((20.0, 10.0, 30.0), 5)), None]),
+            [false, false]
         );
     }
 
     #[test]
     fn the_performance_page_block_states_its_round_count() {
         // Catches: a published table that does not say how many rounds back it,
-        // and a run of one pass that claims some.
-        let report = three_rounds();
-        let cold = rounds_of(&report.scenarios, ScenarioKind::Cold);
-        let md = scenario_markdown(&report, &cold, "Cold sync");
+        // or that a run stopped short, and a run of one pass claiming some.
+        let report = five_rounds(5);
+        let md = scenario_markdown(
+            &report,
+            &rounds_of(&report.scenarios, ScenarioKind::Cold),
+            "Cold sync",
+        );
         assert!(
-            md.contains("3 rounds, the tool order shuffled in each."),
+            md.contains(" 5 rounds, the tool order shuffled in each."),
             "{md}"
         );
         assert!(
             md.contains("Per-round ratio of the other tool to ocync"),
+            "{md}"
+        );
+
+        let stopped = five_rounds(3);
+        let md = scenario_markdown(
+            &stopped,
+            &rounds_of(&stopped.scenarios, ScenarioKind::Cold),
+            "Cold sync",
+        );
+        assert!(
+            md.contains(" 3 of 5 rounds (stopped), the tool order"),
             "{md}"
         );
 
@@ -2235,13 +2466,10 @@ mod tests {
 
     #[test]
     fn a_record_keeps_every_round_and_names_the_baseline_by_its_commit() {
-        let report = three_rounds();
-        let baseline = format!("ocync@{}", report.baseline.as_ref().unwrap().short());
+        let record = RunRecord::of(&five_rounds(3), "abc1234".into(), None, None);
 
-        let record = RunRecord::of(&report, "abc1234".into(), None, None);
-
-        // Catches: rounds collapsed to one, a lost seed or order, and the
-        // baseline recorded under ocync's name.
+        // Catches: rounds collapsed to one, a lost seed or order, the baseline
+        // recorded under ocync's name, and a stopped run recorded as complete.
         let rounds: Vec<Option<usize>> = record.scenarios.iter().map(|s| s.round).collect();
         assert_eq!(rounds, [Some(1), Some(2), Some(3)]);
         let names: Vec<&str> = record.scenarios[1]
@@ -2249,28 +2477,38 @@ mod tests {
             .iter()
             .map(|t| t.tool.as_str())
             .collect();
-        assert_eq!(names, ["ocync", baseline.as_str(), "dregsy", "regsync"]);
+        assert_eq!(names, ["ocync", "ocync@0123456", "dregsy", "regsync"]);
         assert_eq!(record.scenarios[1].tool_order, names);
         assert_eq!(record.scenarios[1].shuffle_seed, 7);
         assert_eq!(record.scenarios[2].tools[0].wall_clock_secs, 44.0);
+        assert_eq!(
+            record.rounds,
+            Some(RoundCount {
+                requested: 5,
+                finished: 3
+            })
+        );
     }
 
     #[test]
     fn a_record_of_a_single_pass_has_no_round_and_still_parses() {
-        // Catches: a `round` field written for a scenario run once, which would
-        // change every record already archived, and one required to parse.
+        // Catches: a `round` or `rounds` field written for a scenario run once,
+        // which would change every record already archived, and one required
+        // to parse.
         let record = RunRecord::of(&sample_report(), "abc1234".into(), None, None);
         let json = serde_json::to_string(&record).unwrap();
-        assert!(!json.contains("\"round\""), "{json}");
+        assert!(!json.contains("\"round"), "{json}");
 
         let parsed: RunRecord = serde_json::from_str(&json).unwrap();
         assert!(parsed.scenarios.iter().all(|s| s.round.is_none()));
+        assert_eq!(parsed.rounds, None);
 
-        let rounds = RunRecord::of(&three_rounds(), "abc1234".into(), None, None);
+        let rounds = RunRecord::of(&five_rounds(5), "abc1234".into(), None, None);
+        let json = serde_json::to_string(&rounds).unwrap();
+        assert!(json.contains("\"round\":3"), "{json}");
         assert!(
-            serde_json::to_string(&rounds)
-                .unwrap()
-                .contains("\"round\":3")
+            json.contains("\"rounds\":{\"requested\":5,\"finished\":5}"),
+            "{json}"
         );
     }
 }

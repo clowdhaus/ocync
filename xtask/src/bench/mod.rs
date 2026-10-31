@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -75,26 +76,30 @@ impl std::fmt::Display for Rounds {
     }
 }
 
-/// Which tools a benchmark runs, shared by `bench` and `bench-remote`.
+/// What a benchmark runs and how often, shared by `bench` and `bench-remote`.
 #[derive(Args)]
 pub(crate) struct ToolSelection {
-    /// Comma-separated list of tools to benchmark. `ocync-baseline` needs
-    /// `--baseline-ref`.
+    /// Comma-separated list of tools to benchmark.
     #[arg(
         long,
         value_delimiter = ',',
         ignore_case = true,
-        default_value = "ocync",
-        requires_if("ocync-baseline", "baseline_ref")
+        default_value = "ocync"
     )]
     pub(crate) tools: Vec<Tool>,
 
     /// Also run the ocync built from this commit, a full or short hex id, in
-    /// every round, to tell a regression from run-to-run noise. Its checkout
-    /// and build live under `bench/.baseline/` and are reused by a later run
-    /// at the same commit.
+    /// every round of the sync and partial scenarios, to tell a regression
+    /// from run-to-run noise. Its checkout and build live under
+    /// `bench/.baseline/`, one commit at a time.
     #[arg(long, value_parser = parse_baseline_commit)]
     pub(crate) baseline_ref: Option<CommitSha>,
+
+    /// Rounds of the sync and partial scenarios, each running every tool once
+    /// in a fresh random order. Scale and prepare run one pass. Rounds
+    /// multiply the run time.
+    #[arg(long, default_value_t = Rounds::DEFAULT)]
+    pub(crate) rounds: Rounds,
 }
 
 impl ToolSelection {
@@ -115,12 +120,27 @@ impl ToolSelection {
     /// The directory a tool's binary is found under: the checkout of the
     /// baseline commit for the baseline, the workspace for every other tool.
     fn root(&self, tool: Tool) -> PathBuf {
-        match (tool, &self.baseline_ref) {
-            (Tool::OcyncBaseline, Some(commit)) => runner::baseline_dir(commit),
-            (Tool::OcyncBaseline, None) => {
-                unreachable!("clap requires --baseline-ref with ocync-baseline")
-            }
+        match &self.baseline_ref {
+            Some(commit) if tool == Tool::OcyncBaseline => runner::baseline_dir(commit),
             _ => PathBuf::from("."),
+        }
+    }
+
+    /// A tool's name where a person reads it.
+    fn label(&self, tool: Tool) -> String {
+        report::tool_label(tool, self.baseline_ref.as_ref())
+    }
+
+    /// Refuses a baseline for a scenario that has no rounds to put it in. Clap
+    /// cannot say this: the scenario is a subcommand of `bench` and an option
+    /// of `bench-remote`, so both call this before they do anything.
+    pub(crate) fn ensure_baseline_applies(&self, scenario: Scenario) -> Result<(), String> {
+        match (&self.baseline_ref, scenario) {
+            (Some(_), Scenario::Scale | Scenario::Prepare) => Err(format!(
+                "--baseline-ref applies to the sync and partial scenarios, not {}",
+                value_name(&scenario)
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -154,12 +174,6 @@ pub(crate) struct BenchArgs {
     /// to literal tags, which skips tag enumeration entirely.
     #[arg(long, default_value = "bench/corpus-prepare.yaml")]
     pub(crate) prepare_corpus: String,
-
-    /// Rounds of the sync and partial scenarios, each running every tool once
-    /// in a fresh random order. Scale and prepare run one pass. Rounds
-    /// multiply the run time.
-    #[arg(long, default_value_t = Rounds::DEFAULT)]
-    pub(crate) rounds: Rounds,
 
     /// Use first N images only.
     #[arg(long)]
@@ -447,6 +461,8 @@ fn git_ref() -> String {
 
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    args.tool_selection.ensure_baseline_applies(args.scenario)?;
+
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
     // Applying the guard to it would refuse the one scenario cheap enough to
@@ -481,7 +497,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         args.scenario,
         &corpus,
         args.paths.partial_overrides(),
-        args.rounds,
+        args.tool_selection.rounds,
     )?;
     let prepare = matches!(args.scenario, Scenario::Prepare | Scenario::All);
     let lock = (!transfers.is_empty())
@@ -510,10 +526,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let tools = args.tool_selection.run_tools();
     let tools = &tools;
 
+    let labels: Vec<String> = tools
+        .iter()
+        .map(|&t| args.tool_selection.label(t))
+        .collect();
     eprintln!(
         "bench: scenario={} tools={} images={} tags={}",
         value_name(&args.scenario),
-        runner::join_tools(tools),
+        labels.join(","),
         corpus.images.len(),
         corpus.total_tags(),
     );
@@ -529,9 +549,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         runner::build_ocync(workspace_root).await?;
     }
 
-    // The baseline is built and tried on the config before the pre-warm, so a
-    // commit that does not build, or rejects the config, costs minutes and not
-    // a run.
+    // The baseline is built and tried on the config and the flags before the
+    // pre-warm, so a commit that does not build, or that rejects what the
+    // rounds give it, costs minutes and not a run.
     if let Some(commit) = &args.tool_selection.baseline_ref {
         eprintln!("bench: building the baseline ocync at {commit}...");
         runner::build_baseline(commit).await?;
@@ -539,8 +559,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         let config = config_dir.path().join("baseline-check.yaml");
         std::fs::write(&config, config_gen::ocync_config(&corpus))
             .map_err(|e| format!("write config {}: {e}", config.display()))?;
-        runner::check_baseline_config(&args.tool_selection.root(Tool::OcyncBaseline), &config)
-            .await?;
+        runner::check_baseline(commit, &config)?;
     }
 
     // Check each tool binary and collect versions, along with any binary a tool
@@ -554,7 +573,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         if let (Tool::OcyncBaseline, Some(commit)) = (tool, &args.tool_selection.baseline_ref) {
             version = format!("{version} (commit {commit})");
         }
-        eprintln!("  {}: {version}", tool);
+        eprintln!("  {}: {version}", args.tool_selection.label(tool));
         tool_versions.insert(tool, version);
     }
 
@@ -607,112 +626,82 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         relay_versions,
         prewarm,
         baseline: args.tool_selection.baseline_ref.clone(),
+        rounds: args.tool_selection.rounds,
         scenarios: Vec::new(),
     };
 
     // A round or scenario after the first re-checks the sources, so a move
     // during a long run cannot put different content under later numbers. The
-    // first was checked before the build. Any failure stops the scenarios still to run;
-    // the finished ones are still reported and recorded, and the run then
+    // first was checked before the build. Any failure stops the passes still to
+    // run; the finished ones are still reported and recorded, and the run then
     // returns the reason.
     let mut stopped: Option<String> = None;
     if let Some(lock) = &lock {
-        for (position, transfer) in transfers.iter().enumerate() {
-            let refs = scenario_refs(transfer, &corpus);
-            if position > 0 {
-                let check = lock::ensure_unmoved(&http, lock, &refs, auth).await;
-                match lock::between_scenarios(check) {
-                    lock::Next::Proceed { warning } => {
-                        if let Some(warning) = warning {
-                            eprintln!("WARNING: {warning}");
+        let (finished, stop) = run_passes(
+            &transfers,
+            tools,
+            fresh_seed,
+            |tool| args.tool_selection.label(tool),
+            async |position, transfer, order| {
+                let refs = scenario_refs(transfer, &corpus);
+                if position > 0 {
+                    let check = lock::ensure_unmoved(&http, lock, &refs, auth).await;
+                    match lock::between_scenarios(check) {
+                        lock::Next::Proceed { warning } => {
+                            if let Some(warning) = warning {
+                                eprintln!("WARNING: {warning}");
+                            }
                         }
-                    }
-                    lock::Next::Stop(reason) => {
-                        stopped = Some(reason);
-                        break;
+                        lock::Next::Stop(reason) => return Err(reason),
                     }
                 }
-            }
 
-            // Randomize tool execution order to prevent systematic bias from
-            // CDN warming, network burst credit depletion, etc.
-            let mut shuffled = tools.to_vec();
-            let seed = shuffle_tools(&mut shuffled);
-            let tool_order: Vec<String> = shuffled.iter().map(ToString::to_string).collect();
-            eprintln!(
-                "bench: tool order for {transfer}: {} (seed: {seed})",
-                tool_order.join(", ")
-            );
-
-            let target = ecr::Target {
-                client: &ecr_client,
-                lock,
-            };
-            let in_round = |kind, runs, round| ScenarioResult {
-                kind,
-                round: Some(round),
-                runs,
-                shuffle_seed: seed,
-                tool_order: shuffled.clone(),
-            };
-            let outcome: Result<(), Box<dyn std::error::Error>> = async {
-                match transfer {
-                    Transfer::Sync { round } => {
-                        let (cold, warm) = run_sync(
-                            &args,
-                            &corpus,
-                            &target,
-                            &shuffled,
-                            &round_dir(&output_dir, *round),
-                        )
-                        .await?;
-                        report
-                            .scenarios
-                            .push(in_round(ScenarioKind::Cold, cold, *round));
-                        report
-                            .scenarios
-                            .push(in_round(ScenarioKind::Warm, warm, *round));
-                    }
-                    Transfer::Partial {
-                        round,
-                        corpus: partial_corpus,
-                    } => {
-                        let runs = run_partial(
-                            &args,
-                            &corpus,
-                            partial_corpus,
-                            &target,
-                            &shuffled,
-                            &round_dir(&output_dir, *round),
-                        )
-                        .await?;
-                        report
-                            .scenarios
-                            .push(in_round(ScenarioKind::Partial, runs, *round));
-                    }
-                    Transfer::Scale => {
-                        // Scale scenario uses ocync only per spec.
-                        if tools.contains(&Tool::Ocync) {
-                            let ocync_only = vec![Tool::Ocync];
-                            let scale_results =
-                                run_scale(&args, &corpus, &target, &ocync_only, &output_dir)
+                let target = ecr::Target {
+                    client: &ecr_client,
+                    lock,
+                };
+                let outcome: Result<Finished, Box<dyn std::error::Error>> = async {
+                    Ok(match transfer {
+                        Transfer::Sync { round } => {
+                            let logs = round_dir(&output_dir, *round);
+                            let (cold, warm) =
+                                run_sync(&args, &corpus, &target, order, &logs).await?;
+                            vec![(ScenarioKind::Cold, cold), (ScenarioKind::Warm, warm)]
+                        }
+                        Transfer::Partial {
+                            round,
+                            corpus: partial_corpus,
+                        } => {
+                            let logs = round_dir(&output_dir, *round);
+                            let runs =
+                                run_partial(&args, &corpus, partial_corpus, &target, order, &logs)
                                     .await?;
-                            report.scenarios.extend(scale_results);
-                        } else {
-                            eprintln!("bench: scale scenario requires ocync (skipping)");
+                            vec![(ScenarioKind::Partial, runs)]
                         }
+                        Transfer::Scale if tools.contains(&Tool::Ocync) => {
+                            // Scale scenario uses ocync only per spec.
+                            run_scale(&args, &corpus, &target, &[Tool::Ocync], &output_dir).await?
+                        }
+                        Transfer::Scale => {
+                            eprintln!("bench: scale scenario requires ocync (skipping)");
+                            Vec::new()
+                        }
+                    })
+                }
+                .await;
+                // A source that moved mid-scenario is not the tool's fault.
+                match outcome {
+                    Ok(finished) => Ok(finished),
+                    Err(error) => {
+                        let recheck = lock::ensure_unmoved(&http, lock, &refs, auth).await;
+                        Err(lock::explain(error.to_string(), recheck))
                     }
                 }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = outcome {
-                // A source that moved mid-scenario is not the tool's fault.
-                let recheck = lock::ensure_unmoved(&http, lock, &refs, auth).await;
-                stopped = Some(lock::explain(error.to_string(), recheck));
-                break;
-            }
-        }
+            },
+        )
+        .await;
+        report.scenarios.extend(finished);
+        stopped = stop;
     }
 
     if prepare && stopped.is_none() {
@@ -782,6 +771,59 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// The scenarios a pass finished, with each one's runs.
+type Finished = Vec<(ScenarioKind, Vec<ToolRun>)>;
+
+/// Runs the passes in order, and returns those finished with why the run
+/// stopped, if it did. A failed pass keeps every pass before it.
+///
+/// Every round gets its own tool order, drawn from `next_seed` as the round
+/// starts, so no tool is systematically first or last, and each result records
+/// the round, seed and order it ran with. `pass` is given its position and the
+/// order, and returns the reason to stop when it fails.
+async fn run_passes(
+    transfers: &[Transfer],
+    tools: &[Tool],
+    mut next_seed: impl FnMut() -> u64,
+    label: impl Fn(Tool) -> String,
+    mut pass: impl AsyncFnMut(usize, &Transfer, &[Tool]) -> Result<Finished, String>,
+) -> (Vec<ScenarioResult>, Option<String>) {
+    let mut done = Vec::new();
+    for (position, transfer) in transfers.iter().enumerate() {
+        let mut order = tools.to_vec();
+        let mut seed = 0;
+        if transfer.round().is_some() && tools.len() > 1 {
+            seed = next_seed();
+            shuffle_tools(&mut order, seed);
+            let names: Vec<String> = order.iter().map(|&t| label(t)).collect();
+            eprintln!(
+                "bench: tool order for {transfer}: {} (seed: {seed})",
+                names.join(", ")
+            );
+        }
+        match pass(position, transfer, &order).await {
+            Ok(finished) => {
+                done.extend(
+                    finished
+                        .into_iter()
+                        .map(|(kind, runs)| match transfer.round() {
+                            Some(round) => ScenarioResult {
+                                kind,
+                                round: Some(round),
+                                runs,
+                                shuffle_seed: seed,
+                                tool_order: order.clone(),
+                            },
+                            None => ScenarioResult::unshuffled(kind, runs),
+                        }),
+                )
+            }
+            Err(reason) => return (done, Some(reason)),
+        }
+    }
+    (done, None)
+}
+
 /// A pass of a scenario that syncs the main corpus, and so is checked against
 /// its lock: one round of a repeated scenario, or the single pass of scale.
 #[derive(Debug)]
@@ -795,11 +837,21 @@ enum Transfer {
     Partial {
         /// The round.
         round: usize,
-        /// The base corpus with the override tags applied.
-        corpus: Corpus,
+        /// The base corpus with the override tags applied, shared by the rounds.
+        corpus: Rc<Corpus>,
     },
     /// Sync at increasing corpus sizes.
     Scale,
+}
+
+impl Transfer {
+    /// The round of a repeated scenario this is; `None` for scale's one pass.
+    fn round(&self) -> Option<usize> {
+        match self {
+            Self::Sync { round } | Self::Partial { round, .. } => Some(*round),
+            Self::Scale => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Transfer {
@@ -825,10 +877,10 @@ fn plan(
     let sync = || rounds.clone().map(|round| Transfer::Sync { round });
     let partial = || {
         let overrides = corpus::load_overrides(overrides_path)?;
-        let changed = corpus.with_overrides(&overrides.overrides);
+        let changed = Rc::new(corpus.with_overrides(&overrides.overrides));
         Ok::<_, String>(rounds.clone().map(move |round| Transfer::Partial {
             round,
-            corpus: changed.clone(),
+            corpus: Rc::clone(&changed),
         }))
     };
     Ok(match requested {
@@ -885,7 +937,8 @@ fn cold_ocync_runs(scenarios: &[ScenarioResult]) -> Vec<&ToolRun> {
 
 /// The figures a stored baseline is compared on: the median over the rounds of
 /// the ocync run of the cold sync scenario, never a scale or prepare run.
-/// `None` when the report has no such run.
+/// `None` when the report has no such run, or a round of it has no proxy
+/// metrics.
 fn cold_ocync_median(
     scenarios: &[ScenarioResult],
     corpus: report::CorpusInfo,
@@ -895,18 +948,20 @@ fn cold_ocync_median(
     if runs.is_empty() {
         return None;
     }
-    let median = |value: fn(&ToolRun) -> f64| {
-        let values: Vec<f64> = runs.iter().map(|run| value(run)).collect();
-        stats::spread(&values).map_or(0.0, |spread| spread.median)
+    // A run with no value, as when the proxy was off, leaves the whole
+    // comparison out rather than counting as zero.
+    let median = |value: fn(&ToolRun) -> Option<f64>| -> Option<f64> {
+        let values: Vec<f64> = runs.iter().map(|run| value(run)).collect::<Option<_>>()?;
+        Some(stats::spread(&values)?.median)
     };
     Some(Baseline {
-        wall_clock_secs: median(|r| r.wall_clock_secs),
-        requests: median(|r| r.proxy_metrics.as_ref().map_or(0, |m| m.requests) as f64).round()
+        wall_clock_secs: median(|r| Some(r.wall_clock_secs))?,
+        requests: median(|r| r.proxy_metrics.as_ref().map(|m| m.requests as f64))?.round() as u64,
+        total_bytes: median(|r| r.proxy_metrics.as_ref().map(|m| m.response_bytes as f64))?.round()
             as u64,
-        total_bytes: median(|r| r.proxy_metrics.as_ref().map_or(0, |m| m.response_bytes) as f64)
-            .round() as u64,
         corpus_locked_at: corpus_locked_at.cloned(),
         corpus,
+        rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
     })
 }
 
@@ -945,7 +1000,7 @@ fn check_regression(
             regression::save_baseline(&baseline_path, &current)?;
         }
     } else {
-        eprintln!("bench: no cold sync ocync run; regression check skipped");
+        eprintln!("bench: no cold sync ocync run with proxy metrics; regression check skipped");
     }
 
     Ok(())
@@ -1028,8 +1083,10 @@ async fn run_single_tool(
     // The bench-proxy CA must be installed in the system trust store (via
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
+    let label = args.tool_selection.label(tool);
     let result = runner::run_tool(
         tool,
+        &label,
         &config_path,
         proxy_url.as_deref(),
         &args.tool_selection.root(tool),
@@ -1051,8 +1108,7 @@ async fn run_single_tool(
         .unwrap_or_else(|| "n/a".into());
     if let Some(ref metrics) = proxy_metrics {
         eprintln!(
-            "  {}: wall_clock={:.1}s status={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
-            tool,
+            "  {label}: wall_clock={:.1}s status={} rss={} requests={} response_bytes={} mounts={}/{} source_pulls={}/{}",
             result.wall_clock.as_secs_f64(),
             result.exit_status,
             rss_display,
@@ -1065,8 +1121,7 @@ async fn run_single_tool(
         );
     } else {
         eprintln!(
-            "  {}: wall_clock={:.1}s status={} rss={}",
-            tool,
+            "  {label}: wall_clock={:.1}s status={} rss={}",
             result.wall_clock.as_secs_f64(),
             result.exit_status,
             rss_display,
@@ -1082,7 +1137,7 @@ async fn run_single_tool(
 
     // Checked last so a source-registry error, which names the cause, is
     // reported first.
-    ensure_exited_zero(tool, pass, result.exit_status)?;
+    ensure_exited_zero(&label, pass, result.exit_status)?;
 
     Ok(ToolRun {
         tool,
@@ -1096,7 +1151,7 @@ async fn run_single_tool(
 /// Fails unless a tool pass exited 0. A pass that failed did less work, so its
 /// numbers cannot be compared; for `--dry-run` that includes a mapping that
 /// could not be resolved.
-fn ensure_exited_zero(tool: Tool, pass: Pass, status: ExitStatus) -> Result<(), String> {
+fn ensure_exited_zero(tool: &str, pass: Pass, status: ExitStatus) -> Result<(), String> {
     if status.success() {
         return Ok(());
     }
@@ -1163,6 +1218,7 @@ async fn run_sync(
     let mut warm_runs = Vec::new();
 
     for &tool in tools {
+        let label = args.tool_selection.label(tool);
         prepare_clean_slate();
 
         // Delete repos first to guarantee a truly empty target, then recreate.
@@ -1176,7 +1232,7 @@ async fn run_sync(
         // sees a fully populated cache.
         let config_dir = tempfile::tempdir()?;
 
-        progress(&format!("  cold: {tool}"));
+        progress(&format!("  cold: {label}"));
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             let cold = run_single_tool(
                 args,
@@ -1189,14 +1245,14 @@ async fn run_sync(
             )
             .await?;
             progress(&format!(
-                "  cold: {tool} complete ({:.1}s)",
+                "  cold: {label} complete ({:.1}s)",
                 cold.wall_clock_secs
             ));
             cold_runs.push(cold);
 
-            ecr::verify_sync(target, corpus, tool, ScenarioKind::Cold).await?;
+            ecr::verify_sync(target, corpus, &label, ScenarioKind::Cold).await?;
 
-            progress(&format!("  warm: {tool}"));
+            progress(&format!("  warm: {label}"));
             let warm = run_single_tool(
                 args,
                 tool,
@@ -1208,12 +1264,12 @@ async fn run_sync(
             )
             .await?;
             progress(&format!(
-                "  warm: {tool} complete ({:.1}s)",
+                "  warm: {label} complete ({:.1}s)",
                 warm.wall_clock_secs
             ));
             warm_runs.push(warm);
 
-            ecr::verify_sync(target, corpus, tool, ScenarioKind::Warm).await?;
+            ecr::verify_sync(target, corpus, &label, ScenarioKind::Warm).await?;
 
             Ok(())
         }
@@ -1245,10 +1301,11 @@ async fn run_partial(
     let mut runs = Vec::new();
 
     for &tool in tools {
+        let label = args.tool_selection.label(tool);
         prepare_clean_slate();
         ecr::delete_repos(target.client, base_corpus).await?;
         ecr::create_repos(target.client, base_corpus).await?;
-        progress(&format!("  partial: {} (priming)", tool));
+        progress(&format!("  partial: {label} (priming)"));
 
         let run_result: Result<(), Box<dyn std::error::Error>> = async {
             // Prime with base corpus (unmeasured). Reuse the same
@@ -1264,7 +1321,7 @@ async fn run_partial(
                 false,
             )
             .await?;
-            progress(&format!("  partial: {} measuring", tool));
+            progress(&format!("  partial: {label} measuring"));
 
             let run = run_single_tool(
                 args,
@@ -1277,12 +1334,12 @@ async fn run_partial(
             )
             .await?;
             progress(&format!(
-                "  partial: {} complete ({:.1}s)",
-                tool, run.wall_clock_secs
+                "  partial: {label} complete ({:.1}s)",
+                run.wall_clock_secs
             ));
             runs.push(run);
 
-            ecr::verify_sync(target, partial_corpus, tool, ScenarioKind::Partial).await?;
+            ecr::verify_sync(target, partial_corpus, &label, ScenarioKind::Partial).await?;
             Ok(())
         }
         .await;
@@ -1305,7 +1362,7 @@ async fn run_scale(
     target: &ecr::Target<'_>,
     tools: &[Tool],
     output_dir: &Path,
-) -> Result<Vec<ScenarioResult>, Box<dyn std::error::Error>> {
+) -> Result<Finished, Box<dyn std::error::Error>> {
     progress("bench: running scale scenario");
     let total = corpus.images.len();
     let mut sizes: Vec<usize> = [10, 25, 50, total]
@@ -1323,10 +1380,11 @@ async fn run_scale(
         let mut runs = Vec::new();
 
         for &tool in tools {
+            let label = args.tool_selection.label(tool);
             prepare_clean_slate();
             ecr::delete_repos(target.client, &subset).await?;
             ecr::create_repos(target.client, &subset).await?;
-            progress(&format!("  scale: {} @ {size} images", tool));
+            progress(&format!("  scale: {label} @ {size} images"));
 
             let run_result: Result<(), Box<dyn std::error::Error>> = async {
                 let config_dir = tempfile::tempdir()?;
@@ -1343,7 +1401,7 @@ async fn run_scale(
                 runs.push(run);
 
                 let kind = ScenarioKind::Scale { images: size };
-                ecr::verify_sync(target, &subset, tool, kind).await?;
+                ecr::verify_sync(target, &subset, &label, kind).await?;
                 Ok(())
             }
             .await;
@@ -1355,10 +1413,7 @@ async fn run_scale(
             cooldown().await;
         }
 
-        scale_results.push(ScenarioResult::unshuffled(
-            ScenarioKind::Scale { images: size },
-            runs,
-        ));
+        scale_results.push((ScenarioKind::Scale { images: size }, runs));
     }
 
     Ok(scale_results)
@@ -1683,20 +1738,21 @@ async fn cooldown() {
     tokio::time::sleep(Duration::from_secs(10)).await;
 }
 
-/// Shuffle a tool list in-place using Fisher-Yates with a timestamp seed.
-/// Not cryptographic -- just enough to randomize execution order across runs.
-/// Returns the seed used for reproducibility.
-fn shuffle_tools(tools: &mut [Tool]) -> u64 {
-    if tools.len() <= 1 {
-        return 0;
-    }
+/// A seed for a shuffle: the clock, hashed. Not cryptographic, just enough to
+/// randomize execution order across rounds and runs.
+fn fresh_seed() -> u64 {
     let mut hasher = DefaultHasher::new();
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
         .hash(&mut hasher);
-    let seed = hasher.finish();
+    hasher.finish()
+}
+
+/// Shuffle a tool list in-place using Fisher-Yates driven by `seed`, so the
+/// order a recorded seed produced can be reproduced.
+fn shuffle_tools(tools: &mut [Tool], seed: u64) {
     let mut state = seed;
     for i in (1..tools.len()).rev() {
         // xorshift64 step for cheap pseudo-randomness.
@@ -1706,7 +1762,6 @@ fn shuffle_tools(tools: &mut [Tool]) -> u64 {
         let j = (state as usize) % (i + 1);
         tools.swap(i, j);
     }
-    seed
 }
 
 /// Attempt to drop the OS page cache via `/proc/sys/vm/drop_caches`.
@@ -1843,7 +1898,7 @@ mod tests {
 
         let pass = Pass::Measured(ScenarioKind::Scale { images: 10 });
         assert_eq!(
-            ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(0)),
+            ensure_exited_zero("ocync", pass, ExitStatus::from_raw(0)),
             Ok(())
         );
         for (name, raw_status, expected) in [
@@ -1859,7 +1914,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                ensure_exited_zero(Tool::Ocync, pass, ExitStatus::from_raw(raw_status)),
+                ensure_exited_zero("ocync", pass, ExitStatus::from_raw(raw_status)),
                 Err(expected.to_string()),
                 "{name}"
             );
@@ -1980,7 +2035,9 @@ mod tests {
             (&["--rounds", "many", "sync"][..], None),
         ] {
             match (parse_bench(argv), rounds) {
-                (Ok(args), Some(rounds)) => assert_eq!(args.rounds.get(), rounds, "{argv:?}"),
+                (Ok(args), Some(rounds)) => {
+                    assert_eq!(args.tool_selection.rounds.get(), rounds, "{argv:?}")
+                }
                 (Err(err), None) => assert_eq!(err.kind(), ErrorKind::ValueValidation, "{argv:?}"),
                 (got, want) => panic!("{argv:?}: wanted {want:?}, got ok={}", got.is_ok()),
             }
@@ -2006,8 +2063,8 @@ mod tests {
                 vec![Tool::Dregsy, Tool::Ocync, Tool::OcyncBaseline],
             ),
             (
-                &["--tools", "ocync-baseline,ocync"][..],
-                vec![Tool::OcyncBaseline, Tool::Ocync],
+                &["--tools", "ocync,dregsy"][..],
+                vec![Tool::Ocync, Tool::Dregsy, Tool::OcyncBaseline],
             ),
         ] {
             let argv: Vec<&str> = ["--baseline-ref", short]
@@ -2031,18 +2088,19 @@ mod tests {
             [Tool::Ocync]
         );
 
-        // Catches: the baseline tool running with no commit to build, in any
-        // spelling, and a commit given in a form that can move or is not one.
+        // Catches: the baseline named as a tool, which would run with no commit
+        // to build, in any spelling, and a commit given in a form that can move
+        // or is not one.
         for (name, argv, kind) in [
             (
                 "tool alone",
                 &["--tools", "ocync-baseline", "sync"][..],
-                ErrorKind::MissingRequiredArgument,
+                ErrorKind::InvalidValue,
             ),
             (
                 "tool in capitals",
                 &["--tools", "OCYNC-BASELINE", "sync"][..],
-                ErrorKind::MissingRequiredArgument,
+                ErrorKind::InvalidValue,
             ),
             (
                 "a branch name",
@@ -2070,6 +2128,35 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: accepted"));
             assert_eq!(err.kind(), kind, "{name}");
         }
+    }
+
+    #[test]
+    fn a_baseline_is_refused_for_scenarios_with_no_rounds() {
+        // Catches: building a baseline for a scale or prepare run, which has no
+        // round to put it in, and refusing it for the scenarios that do.
+        let head =
+            command_stdout(std::process::Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
+        let selection = |scenario: &str| {
+            parse_bench(&["--baseline-ref", &head, scenario])
+                .unwrap()
+                .tool_selection
+        };
+        for scenario in [Scenario::Sync, Scenario::Partial, Scenario::All] {
+            let selection = selection(&value_name(&scenario));
+            assert_eq!(selection.ensure_baseline_applies(scenario), Ok(()));
+        }
+        for scenario in [Scenario::Scale, Scenario::Prepare] {
+            let selection = selection(&value_name(&scenario));
+            assert_eq!(
+                selection.ensure_baseline_applies(scenario),
+                Err(format!(
+                    "--baseline-ref applies to the sync and partial scenarios, not {}",
+                    value_name(&scenario)
+                ))
+            );
+        }
+        let none = parse_bench(&["scale"]).unwrap().tool_selection;
+        assert_eq!(none.ensure_baseline_applies(Scenario::Scale), Ok(()));
     }
 
     #[test]
@@ -2124,18 +2211,28 @@ mod tests {
     }
 
     #[test]
-    fn the_regression_check_compares_the_median_round() {
-        // Catches: taking the first round, which is arbitrary, and the mean.
+    fn the_regression_check_compares_the_median_round_of_ocync_alone() {
+        // Catches: taking the first round, which is arbitrary, the mean, and
+        // the baseline run, listed first in each round with other numbers.
         let round = |round, secs, requests| {
-            let mut run = tool_run(Tool::Ocync, secs);
-            run.proxy_metrics = Some(proxy::ProxyMetrics {
-                requests,
-                response_bytes: requests * 1000,
-                ..Default::default()
-            });
+            let run = |tool, secs: f64, requests: u64| {
+                let mut run = tool_run(tool, secs);
+                run.proxy_metrics = Some(proxy::ProxyMetrics {
+                    requests,
+                    response_bytes: requests * 1000,
+                    ..Default::default()
+                });
+                run
+            };
             ScenarioResult {
                 round: Some(round),
-                ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![run])
+                ..ScenarioResult::unshuffled(
+                    ScenarioKind::Cold,
+                    vec![
+                        run(Tool::OcyncBaseline, secs * 7.0, requests * 7),
+                        run(Tool::Ocync, secs, requests),
+                    ],
+                )
             }
         };
         let scenarios = [
@@ -2150,7 +2247,155 @@ mod tests {
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
         assert_eq!(median.total_bytes, 300_000);
+        assert_eq!(median.rounds, 3);
         assert!(cold_ocync_median(&[], corpus(), None).is_none());
+    }
+
+    #[test]
+    fn a_round_without_proxy_metrics_leaves_the_regression_check_out_instead_of_counting_zero() {
+        // Catches: `--no-proxy` saving a baseline of 0 requests and 0 bytes
+        // that every later run then regresses against.
+        let scenario = ScenarioResult {
+            round: Some(1),
+            ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![tool_run(Tool::Ocync, 10.0)])
+        };
+        let corpus = report::CorpusInfo { images: 2, tags: 2 };
+
+        assert!(cold_ocync_median(&[scenario], corpus, None).is_none());
+    }
+
+    /// What a fake pass returns for one run of `tool`.
+    fn finished(kind: ScenarioKind, tools: &[Tool]) -> Finished {
+        vec![(kind, tools.iter().map(|&t| tool_run(t, 1.0)).collect())]
+    }
+
+    const TOOLS: [Tool; 4] = [
+        Tool::Ocync,
+        Tool::OcyncBaseline,
+        Tool::Dregsy,
+        Tool::Regsync,
+    ];
+
+    fn syncs(rounds: usize) -> Vec<Transfer> {
+        (1..=rounds).map(|round| Transfer::Sync { round }).collect()
+    }
+
+    #[test]
+    fn every_round_shuffles_the_tool_order_with_a_seed_of_its_own() {
+        // Catches: the shuffle moving out of the round loop, which gives every
+        // round one order and one seed.
+        let mut seeds = [3, 100].into_iter();
+        let (done, stop) = block_on(run_passes(
+            &syncs(2),
+            &TOOLS,
+            || seeds.next().unwrap(),
+            |tool| tool.to_string(),
+            async |_, transfer, order| {
+                let Transfer::Sync { .. } = transfer else {
+                    unreachable!()
+                };
+                Ok(finished(ScenarioKind::Cold, order))
+            },
+        ));
+
+        assert_eq!(stop, None);
+        let seen: Vec<(Option<usize>, u64, Vec<Tool>)> = done
+            .iter()
+            .map(|r| (r.round, r.shuffle_seed, r.tool_order.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    Some(1),
+                    3,
+                    vec![
+                        Tool::Dregsy,
+                        Tool::OcyncBaseline,
+                        Tool::Ocync,
+                        Tool::Regsync
+                    ]
+                ),
+                (
+                    Some(2),
+                    100,
+                    vec![
+                        Tool::OcyncBaseline,
+                        Tool::Dregsy,
+                        Tool::Regsync,
+                        Tool::Ocync
+                    ]
+                ),
+            ]
+        );
+        // The runs were made in the order recorded.
+        let ran: Vec<Tool> = done[1].runs.iter().map(|r| r.tool).collect();
+        assert_eq!(ran, done[1].tool_order);
+    }
+
+    #[test]
+    fn a_failure_in_round_three_keeps_rounds_one_and_two() {
+        // Catches: a failed pass dropping the finished ones, or the run going
+        // on past it.
+        let mut asked = Vec::new();
+        let (done, stop) = block_on(run_passes(
+            &syncs(5),
+            &TOOLS,
+            || 1,
+            |tool| tool.to_string(),
+            async |position, _, order| {
+                asked.push(position);
+                if position == 2 {
+                    return Err("round 3 failed".to_owned());
+                }
+                Ok(finished(ScenarioKind::Cold, order))
+            },
+        ));
+
+        assert_eq!(stop.as_deref(), Some("round 3 failed"));
+        assert_eq!(
+            done.iter().map(|r| r.round).collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        assert_eq!(asked, [0, 1, 2], "the run went on past the failure");
+    }
+
+    #[test]
+    fn scale_is_one_unshuffled_pass_after_the_rounds() {
+        let transfers = [Transfer::Sync { round: 1 }, Transfer::Scale];
+        let (done, stop) = block_on(run_passes(
+            &transfers,
+            &TOOLS,
+            || 5,
+            |tool| tool.to_string(),
+            async |_, transfer, order| {
+                let kind = match transfer {
+                    Transfer::Scale => ScenarioKind::Scale { images: 10 },
+                    _ => ScenarioKind::Cold,
+                };
+                Ok(finished(kind, order))
+            },
+        ));
+
+        assert_eq!(stop, None);
+        let scale = &done[1];
+        assert_eq!((scale.round, scale.shuffle_seed), (None, 0));
+        assert!(scale.tool_order.is_empty());
+        assert_eq!(scale.runs.len(), 4, "scale gets the order as it was given");
+    }
+
+    #[test]
+    fn a_seed_reproduces_its_shuffle() {
+        let shuffled = |seed| {
+            let mut tools = TOOLS;
+            shuffle_tools(&mut tools, seed);
+            tools
+        };
+        assert_eq!(shuffled(3), shuffled(3));
+        assert_ne!(shuffled(3), shuffled(100));
+        let mut one = [Tool::Ocync];
+        shuffle_tools(&mut one, 3);
+        assert_eq!(one, [Tool::Ocync]);
     }
 
     fn two_image_corpus() -> Corpus {
@@ -2461,22 +2706,6 @@ images:
         let map = parse_timing_file(&path);
         assert_eq!(map.len(), 1);
         assert_eq!(map["ok"], 42);
-    }
-
-    #[test]
-    fn shuffle_tools_returns_seed() {
-        let mut tools = vec![Tool::Ocync, Tool::Dregsy, Tool::Regsync];
-        let seed = shuffle_tools(&mut tools);
-        // Seed should be non-zero (timestamp-based).
-        assert_ne!(seed, 0);
-    }
-
-    #[test]
-    fn shuffle_tools_single_tool_returns_zero_seed() {
-        let mut tools = vec![Tool::Ocync];
-        let seed = shuffle_tools(&mut tools);
-        assert_eq!(seed, 0, "single-tool list needs no shuffle");
-        assert_eq!(tools[0], Tool::Ocync);
     }
 
     #[test]

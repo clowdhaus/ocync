@@ -46,8 +46,8 @@ A run of the sync and partial scenarios has at least 3 rounds, 5 by default. Eac
 
 - Each tool's metric is reported as its median, with the minimum and maximum.
 - A speed comparison is the median of the per-round ratios between two tools. Pairing within a round cancels drift that affects every tool in that round.
-- The interval reported with it is the lowest to the highest per-round ratio. Without assuming any distribution, that range holds the true median with 93.75% confidence at 5 rounds and 75% at 3, and the confidence is stated with it. A resampling (bootstrap) interval is not used: with this few rounds it reports more confidence than it has.
-- A difference is claimed only when every round's ratio falls on the same side of 1. Otherwise it is reported as no measured difference.
+- The interval reported with it is the lowest to the highest per-round ratio. Without assuming any distribution, that range holds the true median with 93.75% confidence at 5 rounds and 75% at 3, and the confidence is stated with it. A verdict is given only from 5 rounds, with the chance that identical builds would show it printed beside it. A resampling (bootstrap) interval is not used: with this few rounds it reports more confidence than it has.
+- A difference is claimed only from 5 rounds, and only when every round's ratio falls on the same side of 1. Otherwise it is reported as no measured difference, or, below 5 rounds, not at all.
 - Wall clock, requests and response bytes are compared this way. Every round's results are kept in the run record, so the medians can be recomputed.
 
 A baseline build of ocync, from a commit given with `--baseline-ref`, takes part in every round as one more tool, run with the config generated for ocync. Its verdict against the current build is the regression check: old and new ocync measured in the same rounds, not compared across months.

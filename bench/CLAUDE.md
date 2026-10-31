@@ -24,6 +24,10 @@ cargo xtask bench-remote --provider aws --scenario sync --tools ocync,dregsy,reg
 cargo xtask bench-remote --provider aws --scenario sync \
   --tools ocync --limit 3 --rounds 3
 
+# ocync at a commit against the current build, same rounds (sync and partial only;
+# the commit must be on a branch of origin, and a verdict needs 5 or more rounds)
+cargo xtask bench-remote --provider aws --scenario sync --baseline-ref <commit>
+
 # All scenarios (cold+warm + partial + scale)
 cargo xtask bench-remote --provider aws --scenario all
 
