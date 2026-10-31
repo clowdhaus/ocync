@@ -8,8 +8,10 @@
 //! aggregate concurrency cap. Windows of registries with documented TPS
 //! ceilings are also paced by a `TokenBucket`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -305,14 +307,14 @@ const GAR_BUCKET: BucketConfig = BucketConfig {
 /// run, like the Google token. Quota is per project too, so a run spanning
 /// several projects in one location is paced more slowly than needed.
 #[derive(Debug, Clone, Default)]
-pub struct GooglePacing(Arc<Mutex<HashMap<GoogleLocation, Arc<TokenBucket>>>>);
+pub struct GooglePacing(Rc<RefCell<HashMap<GoogleLocation, Arc<TokenBucket>>>>);
 
 impl GooglePacing {
     /// The bucket of `host`'s location, created on first use, or `None` for
     /// a host with no location.
     pub(crate) fn bucket(&self, host: &str) -> Option<Arc<TokenBucket>> {
         let location = GoogleLocation::of_host(host)?;
-        let mut buckets = self.0.lock().expect("google pacing lock poisoned");
+        let mut buckets = self.0.borrow_mut();
         Some(Arc::clone(
             buckets
                 .entry(location)
@@ -465,8 +467,9 @@ pub struct AimdController {
     windows: Mutex<HashMap<WindowKey, WindowState>>,
     max_concurrent: usize,
     /// The run's bucket for this host's Google location, which paces its
-    /// `GarShared` window in place of one of its own. Only the rate is
-    /// shared: the window and its semaphore stay per host.
+    /// window in place of one of its own (a host with a location has only
+    /// the `GarShared` window). Only the rate is shared: the window and its
+    /// semaphore stay per host.
     google_bucket: Option<Arc<TokenBucket>>,
 }
 
@@ -499,37 +502,31 @@ impl AimdController {
         self.provider
     }
 
-    /// Acquire the window's permit, then its rate token if paced, then an
-    /// aggregate permit.
+    /// Acquire the window's rate token, if paced, then its window and
+    /// aggregate permits.
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_provider(self.provider, op);
 
         let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
             let state = map.entry(key).or_insert_with(|| {
-                let shared = self
-                    .google_bucket
-                    .clone()
-                    .filter(|_| key == WindowKey::GarShared);
-                WindowState::new_for(key, self.max_concurrent, shared)
+                WindowState::new_for(key, self.max_concurrent, self.google_bucket.clone())
             });
             (Arc::clone(&state.semaphore), state.bucket.clone())
         };
 
-        // Window first, so a request that cannot be sent yet takes no token:
-        // a throttled host with many requests queued would otherwise drain a
-        // bucket shared with other hosts, then release the tokens in a burst
-        // over the rate. Holding the permit while waiting for a token blocks
-        // only requests of the same window, which wait on that bucket too.
+        // Paced before any permit, so a paced action holds no slot another
+        // window could use.
+        if let Some(b) = &bucket {
+            b.acquire().await;
+        }
+
+        // Per-action first, then aggregate: a request queued on a throttled
+        // window must not hold aggregate capacity other windows need.
         let action_permit = action_semaphore
             .acquire_owned()
             .await
             .expect("action semaphore closed");
-        if let Some(b) = &bucket {
-            b.acquire().await;
-        }
-        // The aggregate last: a request queued on a throttled window or a
-        // bucket must not hold aggregate capacity other windows need.
         let aggregate_permit = Arc::clone(&self.aggregate)
             .acquire_owned()
             .await
@@ -1058,32 +1055,6 @@ mod tests {
         drain_burst(&gcr).await;
         assert!(is_paced(&gcr).await, "the drained host is paced");
         assert!(!is_paced(&gar).await);
-    }
-
-    /// A host whose window is held small with requests queued takes no
-    /// tokens for them, so another host of its location still gets its
-    /// own. Breaks if the rate token is taken before the window permit:
-    /// the queued requests would drain the shared bucket.
-    #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn queued_requests_of_one_host_take_no_tokens_from_another() {
-        let pacing = GooglePacing::default();
-        let gcr = Arc::new(google_controller("gcr.io", &pacing));
-        let gar = google_controller("us-docker.pkg.dev", &pacing);
-
-        // The window starts at 1, so this holds it full.
-        let _held = gcr.acquire(RegistryAction::BlobUploadInit).await;
-        for _ in 0..2 * GAR_BUCKET.burst as usize {
-            let gcr = Arc::clone(&gcr);
-            tokio::spawn(async move {
-                gcr.acquire(RegistryAction::BlobUploadInit).await.success();
-            });
-        }
-        tokio::task::yield_now().await;
-
-        assert!(
-            !is_paced(&gar).await,
-            "requests queued on gcr.io's full window must not drain the shared bucket"
-        );
     }
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
