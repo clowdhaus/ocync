@@ -47,11 +47,11 @@ static ECR_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Compiled regex for Google Artifact Registry hostnames.
 ///
-/// Pattern: `<region>-docker.pkg.dev`
+/// Pattern: `<region>-docker.pkg.dev`, capturing the region.
 ///
 /// Source: <https://cloud.google.com/artifact-registry/docs/repositories/repo-locations>
 static GAR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[-a-z0-9]+-docker\.pkg\.dev$").unwrap());
+    LazyLock::new(|| Regex::new(r"^([-a-z0-9]+)-docker\.pkg\.dev$").unwrap());
 
 /// Compiled regex for Azure Container Registry hostnames.
 ///
@@ -90,6 +90,33 @@ impl AzureCloud {
         } else {
             Self::Public
         }
+    }
+}
+
+/// The Google location whose request quota a Gar or Gcr host draws on:
+/// `<loc>-docker.pkg.dev` is `<loc>`, and the multi-regional Container
+/// Registry hosts are `us` (`gcr.io`, `us.gcr.io`), `europe` and `asia`.
+/// Google's public mirrors (`mirror.gcr.io`, `k8s.gcr.io`) draw on no user
+/// project's quota and have none.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GoogleLocation(String);
+
+impl GoogleLocation {
+    /// The location of `host`, compared by the same normal form provider
+    /// detection uses, or `None` for a host with no quota location.
+    pub(crate) fn of_host(host: &str) -> Option<Self> {
+        let host = normalize_host(host);
+        let location = match detect_provider_kind(&host)? {
+            ProviderKind::Gar => GAR_RE.captures(&host)?.get(1)?.as_str(),
+            ProviderKind::Gcr => match host.as_str() {
+                "gcr.io" | "us.gcr.io" => "us",
+                "eu.gcr.io" => "europe",
+                "asia.gcr.io" => "asia",
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(Self(location.to_owned()))
     }
 }
 
@@ -256,6 +283,39 @@ mod tests {
         ];
         for (host, cloud) in cases {
             assert_eq!(AzureCloud::of_host(host), cloud, "{host}");
+        }
+    }
+
+    /// A host maps to the Google location whose quota it draws on, or to
+    /// none, whatever its case, port or trailing dot. Breaks if `gcr.io`
+    /// hosts stop mapping to their multi-region, a public mirror is given a
+    /// location, or a non-Google host gets one.
+    #[test]
+    fn google_location_of_host_table() {
+        let cases = [
+            ("gcr.io", Some("us")),
+            ("us.gcr.io", Some("us")),
+            ("eu.gcr.io", Some("europe")),
+            ("asia.gcr.io", Some("asia")),
+            ("us-docker.pkg.dev", Some("us")),
+            ("europe-docker.pkg.dev", Some("europe")),
+            ("us-central1-docker.pkg.dev", Some("us-central1")),
+            ("US-Central1-Docker.PKG.DEV:443", Some("us-central1")),
+            ("GCR.io.", Some("us")),
+            ("mirror.gcr.io", None),
+            ("k8s.gcr.io", None),
+            ("docker.pkg.dev", None),
+            ("us-docker.pkg.dev.evil.com", None),
+            ("ghcr.io", None),
+            ("registry.example.com", None),
+            ("", None),
+        ];
+        for (host, expected) in cases {
+            assert_eq!(
+                GoogleLocation::of_host(host),
+                expected.map(|l| GoogleLocation(l.to_owned())),
+                "{host}"
+            );
         }
     }
 }

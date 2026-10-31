@@ -8,14 +8,16 @@
 //! aggregate concurrency cap. Windows of registries with documented TPS
 //! ceilings are also paced by a `TokenBucket`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::detect::{ProviderKind, detect_provider_kind};
+use crate::auth::detect::{GoogleLocation, ProviderKind, detect_provider_kind};
 
 /// Default congestion epoch - prevents multiple halvings from the same burst.
 const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
@@ -284,6 +286,43 @@ pub(crate) struct BucketConfig {
     pub(crate) burst: f64,
 }
 
+impl BucketConfig {
+    /// A full bucket with this rate and burst.
+    fn bucket(self) -> Arc<TokenBucket> {
+        Arc::new(TokenBucket::new(self.rate_per_sec, self.burst))
+    }
+}
+
+/// GAR/GCR: 60,000 RPM total (~1000 RPS) and 18,000 RPM writes (~300 RPS)
+/// per project per region. 240 TPS shared keeps 20% margin under the write
+/// ceiling, the tighter of the two.
+const GAR_BUCKET: BucketConfig = BucketConfig {
+    rate_per_sec: 240.0,
+    burst: 30.0,
+};
+
+/// The GAR/GCR rate buckets of one run, one per Google location, so every
+/// host drawing on a location's quota (`gcr.io`, `us.gcr.io` and
+/// `us-docker.pkg.dev` all draw on `us`) is paced together. Create one per
+/// run, like the Google token. Quota is per project too, so a run spanning
+/// several projects in one location is paced more slowly than needed.
+#[derive(Debug, Clone, Default)]
+pub struct GooglePacing(Rc<RefCell<HashMap<GoogleLocation, Arc<TokenBucket>>>>);
+
+impl GooglePacing {
+    /// The bucket of `host`'s location, created on first use, or `None` for
+    /// a host with no location.
+    pub(crate) fn bucket(&self, host: &str) -> Option<Arc<TokenBucket>> {
+        let location = GoogleLocation::of_host(host)?;
+        let mut buckets = self.0.borrow_mut();
+        Some(Arc::clone(
+            buckets
+                .entry(location)
+                .or_insert_with(|| GAR_BUCKET.bucket()),
+        ))
+    }
+}
+
 /// Token-bucket configuration for the given window key, or `None` if rate
 /// gating is not configured for this window (AIMD alone governs concurrency).
 ///
@@ -323,10 +362,7 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         // GHCR: single 2000 RPM (~33 RPS) aggregate cap per authenticated
         // principal. 20 TPS leaves 40% headroom for tail bursts.
         WindowKey::GhcrShared => cfg(20.0, 10.0),
-        // GAR/GCR: 60,000 RPM total (~1000 RPS) and 18,000 RPM writes
-        // (~300 RPS) per project per region. 240 TPS shared keeps 20%
-        // margin under the write ceiling, the tighter of the two.
-        WindowKey::GarShared => cfg(240.0, 30.0),
+        WindowKey::GarShared => GAR_BUCKET,
         // ACR Premium SKU historical defaults: ~10,000 ReadOps/min (167 RPS)
         // and ~2,000 WriteOps/min (33 RPS). Microsoft removed the explicit
         // table in 2026-03; values preserved from the prior published
@@ -359,13 +395,18 @@ struct WindowState {
 }
 
 impl WindowState {
-    /// Build a fresh window for `key` capped at `max_concurrent`.
-    fn new_for(key: WindowKey, max_concurrent: usize) -> Self {
+    /// Build a fresh window for `key` capped at `max_concurrent`, paced by
+    /// `shared_bucket` when it has one, else by the key's own bucket.
+    fn new_for(
+        key: WindowKey,
+        max_concurrent: usize,
+        shared_bucket: Option<Arc<TokenBucket>>,
+    ) -> Self {
         let initial = DEFAULT_INITIAL_WINDOW.min(max_concurrent as f64);
         let window = AimdWindow::new(initial, max_concurrent);
         let limit = window.limit();
-        let bucket = bucket_config_for_window(key)
-            .map(|c| Arc::new(TokenBucket::new(c.rate_per_sec, c.burst)));
+        let bucket =
+            shared_bucket.or_else(|| bucket_config_for_window(key).map(BucketConfig::bucket));
         Self {
             window,
             semaphore: Arc::new(Semaphore::new(limit)),
@@ -425,11 +466,26 @@ pub struct AimdController {
     aggregate: Arc<Semaphore>,
     windows: Mutex<HashMap<WindowKey, WindowState>>,
     max_concurrent: usize,
+    /// The run's bucket for this host's Google location, which paces its
+    /// window in place of one of its own (a host with a location has only
+    /// the `GarShared` window). Only the rate is shared: the window and its
+    /// semaphore stay per host.
+    google_bucket: Option<Arc<TokenBucket>>,
 }
 
 impl AimdController {
     /// A controller for `host` with `max_concurrent` as the aggregate limit.
     pub fn new(host: &str, max_concurrent: NonZeroUsize) -> Self {
+        Self::with_google_bucket(host, max_concurrent, None)
+    }
+
+    /// A controller whose `GarShared` window is paced by `google_bucket`,
+    /// the run's bucket for the host's Google location.
+    pub(crate) fn with_google_bucket(
+        host: &str,
+        max_concurrent: NonZeroUsize,
+        google_bucket: Option<Arc<TokenBucket>>,
+    ) -> Self {
         let max_concurrent = max_concurrent.get();
         Self {
             host: host.to_owned(),
@@ -437,6 +493,7 @@ impl AimdController {
             aggregate: Arc::new(Semaphore::new(max_concurrent)),
             windows: Mutex::new(HashMap::new()),
             max_concurrent,
+            google_bucket,
         }
     }
 
@@ -452,9 +509,9 @@ impl AimdController {
 
         let (action_semaphore, bucket) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
-            let state = map
-                .entry(key)
-                .or_insert_with(|| WindowState::new_for(key, self.max_concurrent));
+            let state = map.entry(key).or_insert_with(|| {
+                WindowState::new_for(key, self.max_concurrent, self.google_bucket.clone())
+            });
             (Arc::clone(&state.semaphore), state.bucket.clone())
         };
 
@@ -564,6 +621,26 @@ impl Drop for AimdPermit<'_> {
             );
         }
     }
+}
+
+/// Drain the Google burst of `ctrl`.
+#[cfg(test)]
+pub(crate) async fn drain_burst(ctrl: &AimdController) {
+    for _ in 0..GAR_BUCKET.burst as usize {
+        ctrl.acquire(RegistryAction::BlobUploadInit).await.success();
+    }
+}
+
+/// Whether the next request of `ctrl` is held by its rate bucket: the
+/// refill of one token takes 4ms at 240/s, so 1ms is not enough.
+#[cfg(test)]
+pub(crate) async fn is_paced(ctrl: &AimdController) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(1),
+        ctrl.acquire(RegistryAction::BlobUploadInit),
+    )
+    .await
+    .is_err()
 }
 
 #[cfg(test)]
@@ -935,6 +1012,50 @@ mod tests {
     }
 
     // - AimdController bucket integration --
+
+    fn google_controller(host: &str, pacing: &GooglePacing) -> AimdController {
+        AimdController::with_google_bucket(
+            host,
+            NonZeroUsize::new(100).unwrap(),
+            pacing.bucket(host),
+        )
+    }
+
+    /// Hosts of one Google location, built with one run's pacing, draw on
+    /// one bucket, and a host of another location or a public mirror does
+    /// not. Breaks if each host keeps its own bucket (the second host would
+    /// not wait), if the buckets are shared across locations (`europe`
+    /// would wait), or if a public mirror is given a location.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn hosts_of_one_google_location_share_a_bucket() {
+        let pacing = GooglePacing::default();
+        let gcr = google_controller("gcr.io", &pacing);
+        let gar = google_controller("us-docker.pkg.dev", &pacing);
+        let europe = google_controller("europe-docker.pkg.dev", &pacing);
+        let mirror = google_controller("mirror.gcr.io", &pacing);
+
+        drain_burst(&gcr).await;
+        assert!(
+            is_paced(&gar).await,
+            "us-docker.pkg.dev must wait on the burst gcr.io drained"
+        );
+        assert!(!is_paced(&europe).await, "europe has its own bucket");
+        assert!(
+            !is_paced(&mirror).await,
+            "a public mirror has its own bucket"
+        );
+    }
+
+    /// Without the run's pacing, each host is paced by its own bucket.
+    /// Breaks if the shared bucket becomes the default.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn hosts_without_google_pacing_keep_their_own_bucket() {
+        let gcr = AimdController::new("gcr.io", NonZeroUsize::new(100).unwrap());
+        let gar = AimdController::new("us-docker.pkg.dev", NonZeroUsize::new(100).unwrap());
+        drain_burst(&gcr).await;
+        assert!(is_paced(&gcr).await, "the drained host is paced");
+        assert!(!is_paced(&gar).await);
+    }
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn controller_paces_ecr_blob_upload_init() {
