@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
 use ocync_distribution::Digest;
+use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
 use corpus::Corpus;
@@ -140,6 +141,19 @@ impl ToolSelection {
     /// A tool's name where a person reads it.
     fn label(&self, tool: Tool) -> String {
         report::tool_label(tool, self.baseline_ref.as_ref())
+    }
+
+    /// Refuses a transfer cap when no ocync build runs to take it. Called
+    /// beside [`Self::ensure_baseline_applies`], for the same two commands.
+    pub(crate) fn ensure_cap_applies(&self) -> Result<(), String> {
+        if self.max_concurrent_transfers.is_some() && !self.run_tools().contains(&Tool::Ocync) {
+            return Err(
+                "--max-concurrent-transfers applies to ocync, and this run builds none: \
+                 add ocync to --tools or give --baseline-ref"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 
     /// Refuses a baseline for a scenario that has no rounds to put it in. Clap
@@ -485,6 +499,7 @@ fn git_ref() -> String {
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    args.tool_selection.ensure_cap_applies()?;
 
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
@@ -522,6 +537,20 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         args.paths.partial_overrides(),
         args.tool_selection.rounds,
     )?;
+    // The comparison happens after the rounds, but a cap that will refuse it is
+    // known now, before an hour of them.
+    if args.regression
+        && args.tool_selection.run_tools().contains(&Tool::Ocync)
+        && transfers
+            .iter()
+            .any(|transfer| matches!(transfer, Transfer::Sync { .. }))
+    {
+        let cap = args
+            .tool_selection
+            .max_concurrent_transfers
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS);
+        regression::ensure_baseline_cap(&baseline_path(), cap)?;
+    }
     let prepare = matches!(args.scenario, Scenario::Prepare | Scenario::All);
     let lock = (!transfers.is_empty())
         .then(|| lock::Lock::load(&args.paths.lock_path()))
@@ -1024,6 +1053,11 @@ fn cold_ocync_median(
     })
 }
 
+/// Where the stored baseline of `--regression` lives.
+fn baseline_path() -> PathBuf {
+    PathBuf::from("bench/results/baseline.json")
+}
+
 /// Compare the current ocync run against a stored baseline.
 ///
 /// Returns an error if regression is detected.
@@ -1032,7 +1066,7 @@ fn check_regression(
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = PathBuf::from("bench/results/baseline.json");
+    let baseline_path = baseline_path();
 
     let corpus = report::CorpusInfo {
         images: report.corpus_size,
@@ -1041,7 +1075,7 @@ fn check_regression(
     if let Some(current) = cold_ocync_median(
         &report.scenarios,
         corpus,
-        report.max_concurrent_transfers,
+        report.ocync_transfer_cap(),
         corpus_locked_at,
     ) {
         if baseline_path.exists() {
@@ -2293,6 +2327,62 @@ mod tests {
     }
 
     #[test]
+    fn a_transfer_cap_is_refused_when_no_ocync_build_runs() {
+        // Catches: a cap accepted by a run that has no ocync to apply it to,
+        // which then labels dregsy's numbers with a setting it never had.
+        let head =
+            command_stdout(std::process::Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
+        let refusal = "--max-concurrent-transfers applies to ocync, and this run builds none: \
+                       add ocync to --tools or give --baseline-ref";
+        for (argv, refused) in [
+            (&["--tools", "dregsy", "sync"][..], false),
+            (
+                &[
+                    "--tools",
+                    "dregsy",
+                    "--max-concurrent-transfers",
+                    "20",
+                    "sync",
+                ][..],
+                true,
+            ),
+            (
+                &[
+                    "--tools",
+                    "ocync,dregsy",
+                    "--max-concurrent-transfers",
+                    "20",
+                    "sync",
+                ][..],
+                false,
+            ),
+            (
+                &[
+                    "--tools",
+                    "dregsy",
+                    "--baseline-ref",
+                    &head,
+                    "--max-concurrent-transfers",
+                    "20",
+                    "sync",
+                ][..],
+                false,
+            ),
+        ] {
+            let selection = parse_bench(argv).unwrap().tool_selection;
+            assert_eq!(
+                selection.ensure_cap_applies(),
+                if refused {
+                    Err(refusal.to_owned())
+                } else {
+                    Ok(())
+                },
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rounds_repeat_sync_and_partial_and_leave_scale_and_prepare_at_one_pass() {
         // Catches: scale repeating, which multiplies its four corpus sizes, and
         // a sync with fewer rounds than asked for.
@@ -2375,12 +2465,13 @@ mod tests {
         ];
         let corpus = || report::CorpusInfo { images: 2, tags: 2 };
 
-        let median = cold_ocync_median(&scenarios, corpus(), None, None).unwrap();
+        let median = cold_ocync_median(&scenarios, corpus(), NonZeroUsize::new(20), None).unwrap();
 
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
         assert_eq!(median.total_bytes, 300_000);
         assert_eq!(median.rounds, 3);
+        assert_eq!(median.max_concurrent_transfers, NonZeroUsize::new(20));
         assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
     }
 

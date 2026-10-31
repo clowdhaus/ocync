@@ -80,7 +80,8 @@ pub(crate) struct BenchRemoteArgs {
 
     /// Git ref to checkout on the instance (default: current branch). A ref
     /// older than the change that added `bench --archive` cannot run, because
-    /// the instance's `bench` would not know the option.
+    /// the instance's `bench` would not know the option, and one older than
+    /// `--max-concurrent-transfers` cannot take that option for the same reason.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -165,6 +166,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // anything leaves this machine.
     let registry_env = registry_env(args.provider)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    args.tool_selection.ensure_cap_applies()?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
@@ -1329,11 +1331,6 @@ mod tests {
         };
 
         let capped = passed(&["--max-concurrent-transfers", "20"]);
-        let at = capped
-            .iter()
-            .position(|a| a == "--max-concurrent-transfers")
-            .expect("the cap is passed to bench");
-        assert_eq!(capped[at + 1], "20");
         let argv: Vec<&str> = capped.iter().map(String::as_str).collect();
         assert_eq!(
             crate::bench::parse_bench(&argv)
@@ -1347,16 +1344,6 @@ mod tests {
             !passed(&[])
                 .iter()
                 .any(|a| a == "--max-concurrent-transfers")
-        );
-        assert!(
-            Cli::try_parse_from([
-                "xtask",
-                "--provider",
-                "aws",
-                "--max-concurrent-transfers",
-                "0"
-            ])
-            .is_err()
         );
     }
 

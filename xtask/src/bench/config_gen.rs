@@ -289,55 +289,19 @@ images:
     }
 
     #[test]
-    fn a_transfer_cap_writes_a_global_block_and_no_cap_writes_none() {
+    fn a_transfer_cap_prepends_a_global_block_and_no_cap_writes_none() {
         // Catches: the cap silently dropped (ocync then runs at its default
         // and the measurement is of the wrong cap), and a `global:` block
-        // written when none was asked for (changing every run without it).
-        let corpus: Corpus = serde_yaml::from_str(
-            r#"
-corpus:
-  target_registry: "111111111111.dkr.ecr.us-east-1.amazonaws.com"
-  target_prefix: "bench"
-
-images:
-  - source: "cgr.dev/chainguard/static"
-    tags: ["latest"]
-"#,
-        )
-        .unwrap();
-
-        let capped = ocync_config(&corpus, NonZeroUsize::new(20));
+        // written when none was asked for.
+        let corpus = test_corpus();
         assert_eq!(
-            capped,
-            "\
-global:
-  max_concurrent_transfers: 20
-
-registries:
-  cgr-dev:
-    url: cgr.dev
-  ecr:
-    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
-    auth_type: ecr
-
-mappings:
-  - from: \"chainguard/static\"
-    to: \"bench/chainguard-static\"
-    source: cgr-dev
-    targets: [ecr]
-    tags:
-      glob:
-        - \"latest\"
-"
+            ocync_config(&corpus, NonZeroUsize::new(20)),
+            format!(
+                "global:\n  max_concurrent_transfers: 20\n\n{}",
+                ocync_config(&corpus, None)
+            )
         );
-
-        let uncapped = ocync_config(&corpus, None);
-        assert!(!uncapped.contains("global:"), "{uncapped}");
-        assert!(uncapped.starts_with("registries:\n"), "{uncapped}");
-        assert_eq!(
-            capped.strip_prefix("global:\n  max_concurrent_transfers: 20\n\n"),
-            Some(uncapped.as_str())
-        );
+        assert!(!ocync_config(&corpus, None).contains("global:"));
     }
 
     #[test]

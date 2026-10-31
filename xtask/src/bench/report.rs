@@ -6,6 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::lock::LockedAt;
@@ -68,17 +69,32 @@ pub(crate) struct RunRecord {
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
-    /// The cap on concurrent image transfers the run set for ocync. Runs under
-    /// different caps are different series; absent when the run kept ocync's
-    /// default and from records written before the option existed.
+    /// The cap on concurrent image transfers the current ocync ran with, the
+    /// default's value when none was given. Runs under different caps are
+    /// different series; absent when no ocync ran and from records written
+    /// before the cap was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
+    /// The cap the baseline build ran with; absent without a baseline build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline_max_concurrent_transfers: Option<BaselineCap>,
     /// How many rounds were asked for and finished; absent for a run with no
     /// repeated scenario and for records written before rounds existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rounds: Option<RoundCount>,
     /// Per-scenario results, one per round of a repeated scenario.
     pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+/// The cap the baseline build ran with. Its default is unknown: the build is an
+/// older commit, whose own default may differ from the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BaselineCap {
+    /// The cap the run gave it.
+    Given(NonZeroUsize),
+    /// None was given, so it ran at its own default.
+    OwnDefault,
 }
 
 /// How many rounds of the repeated scenarios a run was asked for and finished.
@@ -120,7 +136,8 @@ impl RunRecord {
                 images: report.corpus_size,
                 tags: report.total_tags,
             },
-            max_concurrent_transfers: report.max_concurrent_transfers,
+            max_concurrent_transfers: report.ocync_transfer_cap(),
+            baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
             rounds: report.round_count(),
             scenarios: report
                 .scenarios
@@ -537,8 +554,8 @@ pub(crate) struct BenchReport {
     pub(crate) prewarm: Option<Prewarm>,
     /// The commit the baseline build was made from; `None` without one.
     pub(crate) baseline: Option<CommitSha>,
-    /// The cap on concurrent image transfers the run set for ocync; `None`
-    /// when it kept ocync's default.
+    /// The cap on concurrent image transfers the run gave ocync, the current
+    /// build and the baseline alike; `None` when it kept their defaults.
     pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
     /// The rounds the run was asked for, of which a stopped run finished fewer.
     pub(crate) rounds: Rounds,
@@ -559,6 +576,23 @@ pub(crate) fn tool_label(tool: Tool, baseline: Option<&CommitSha>) -> String {
 }
 
 impl BenchReport {
+    /// The cap the current ocync ran with: the one given, else the engine's
+    /// default. `None` when no ocync ran.
+    pub(crate) fn ocync_transfer_cap(&self) -> Option<NonZeroUsize> {
+        self.tool_versions.contains_key(&Tool::Ocync).then(|| {
+            self.max_concurrent_transfers
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS)
+        })
+    }
+
+    /// The cap the baseline build ran with. `None` without a baseline build.
+    fn baseline_transfer_cap(&self) -> Option<BaselineCap> {
+        self.baseline.as_ref().map(|_| {
+            self.max_concurrent_transfers
+                .map_or(BaselineCap::OwnDefault, BaselineCap::Given)
+        })
+    }
+
     /// A tool's name in the reports.
     fn label(&self, tool: Tool) -> String {
         tool_label(tool, self.baseline.as_ref())
@@ -696,9 +730,9 @@ fn summary_markdown(report: &BenchReport) -> String {
         "Corpus: {} images, {} total tags\n\n",
         report.corpus_size, report.total_tags
     ));
-    if let Some(cap) = report.max_concurrent_transfers {
+    if let Some(cap) = report.ocync_transfer_cap() {
         out.push_str(&format!(
-            "ocync ran with `max_concurrent_transfers: {cap}`, not its default\n\n"
+            "ocync ran with `max_concurrent_transfers: {cap}`\n\n"
         ));
     }
     if let Some(note) = report.prewarm.as_ref().and_then(Prewarm::note) {
@@ -1207,8 +1241,12 @@ pub(crate) struct PageBlocks {
 }
 
 impl PageBlocks {
-    /// The blocks `report` produces.
+    /// The blocks `report` produces. A run that gave a transfer cap produces
+    /// none: the page shows ocync as it runs out of the box.
     pub(crate) fn of(report: &BenchReport) -> Self {
+        if report.max_concurrent_transfers.is_some() {
+            return Self::default();
+        }
         let block = |kind, description| {
             let rounds = rounds_of(&report.scenarios, kind);
             (!rounds.is_empty()).then(|| scenario_markdown(report, &rounds, description))
@@ -1631,31 +1669,58 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_transfer_cap_is_recorded_and_stated_only_when_set() {
-        // Catches: a run under a cap whose record and summary read as one
-        // under ocync's default, so its numbers land in the wrong series.
-        let mut record = sample_record();
-        assert_eq!(record.max_concurrent_transfers, None);
-        let without = serde_json::to_string(&record).unwrap();
-        assert!(!without.contains("max_concurrent_transfers"), "{without}");
-
-        record.max_concurrent_transfers = NonZeroUsize::new(20);
-        let with = serde_json::to_string(&record).unwrap();
-        assert!(with.contains(r#""max_concurrent_transfers":20"#), "{with}");
-        let reread: RunRecord = serde_json::from_str(&with).unwrap();
-        assert_eq!(reread.max_concurrent_transfers, NonZeroUsize::new(20));
-
-        let mut report = sample_report();
-        let md = summary_markdown(&report);
-        assert!(!md.contains("max_concurrent_transfers"), "{md}");
-        report.max_concurrent_transfers = NonZeroUsize::new(20);
-        let md = summary_markdown(&report);
-        assert!(
-            md.contains("ocync ran with `max_concurrent_transfers: 20`, not its default\n"),
-            "{md}"
+    fn the_cap_ocync_ran_with_is_recorded_and_a_capped_run_writes_no_page_blocks() {
+        // Catches: a run at ocync's default recorded as uncapped, so a later
+        // default sits in the same series as the old one; a capped run
+        // published on the page as ocync's out-of-the-box result; the baseline
+        // build's default taken to be the current one's.
+        let default = DEFAULT_MAX_CONCURRENT_TRANSFERS;
+        let mut report = five_rounds(1);
+        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, Some(default));
+        assert_eq!(
+            record.baseline_max_concurrent_transfers,
+            Some(BaselineCap::OwnDefault)
         );
-        let of = RunRecord::of(&report, "abc1234".into(), None, None);
-        assert_eq!(of.max_concurrent_transfers, NonZeroUsize::new(20));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains(r#""baseline_max_concurrent_transfers":"own_default""#),
+            "{json}"
+        );
+        assert!(summary_markdown(&report).contains(&format!(
+            "ocync ran with `max_concurrent_transfers: {default}`\n"
+        )),);
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.max_concurrent_transfers = NonZeroUsize::new(20);
+        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert_eq!(
+            record.baseline_max_concurrent_transfers,
+            NonZeroUsize::new(20).map(BaselineCap::Given)
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""max_concurrent_transfers":20"#), "{json}");
+        assert!(
+            json.contains(r#""baseline_max_concurrent_transfers":{"given":20}"#),
+            "{json}"
+        );
+        let reread: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reread.baseline_max_concurrent_transfers,
+            record.baseline_max_concurrent_transfers
+        );
+        assert!(
+            summary_markdown(&report).contains("ocync ran with `max_concurrent_transfers: 20`\n")
+        );
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+
+        let mut no_ocync = sample_report();
+        no_ocync.tool_versions.remove(&Tool::Ocync);
+        let record = RunRecord::of(&no_ocync, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, None);
+        assert_eq!(record.baseline_max_concurrent_transfers, None);
+        assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
     }
 
     #[test]
