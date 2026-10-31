@@ -2,6 +2,7 @@
 #
 # Each entry replaces the tags for the matching source image.
 # Used by the "partial" benchmark scenario to measure incremental sync.
+# Each override shares exactly one tag with corpus.yaml; re-pin both together.
 
 overrides:
   # Chainguard paid-tier tags (3.11/3.12 etc) aren't anonymously accessible,

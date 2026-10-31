@@ -15,10 +15,12 @@
 #
 # Content is fixed by bench/corpus.lock.json, which records every tag's manifest
 # digest. A tag that moves is refused at the start of a run; `cargo xtask
-# bench-lock` writes a new lock, which starts a new comparison series. Tags are
-# version or date tags where the source publishes one with the same
-# digest as `latest`. Tags left on `latest` have no such tag served anonymously
-# (Chainguard free tier, SOCI workshop images); the lock is what holds them.
+# bench-lock` writes a new lock, which starts a new comparison series. Each tag
+# is the most specific one the source publishes for its content. Patch tags
+# (Corretto, postgres, redis) can still be rebuilt in place. Floating tags remain
+# where nothing more specific is served anonymously: Chainguard free tier and
+# SOCI workshop `latest`, and ubuntu, whose ECR Public repo has only channel
+# tags. Alpine floats on purpose, see below.
 #
 # Ordering: mount-exercising images first (Jupyter family shares GB-sized base
 # layers across distinct source names and therefore distinct target repos --

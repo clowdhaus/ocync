@@ -78,7 +78,7 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 - **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario and round except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
 - **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and its sources have since moved, the error says so.
 - **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, under none, or over another corpus size; delete `bench/results/baseline.json` to record a new one.
-- A floating tag stays in the corpus only where the source publishes no immutable tag for the same content.
+- A floating tag stays in the corpus only where the source publishes no more specific tag for the same content, or, as with alpine, where the corpus comment says the shared index is what it measures.
 
 ## Benchmark fairness invariants
 
