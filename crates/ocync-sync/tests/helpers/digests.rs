@@ -4,7 +4,7 @@
 #![allow(dead_code, unused_imports, unreachable_pub)]
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::RepositoryName;
+use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
 
 /// A sha256 digest from a short suffix, zero-padded to 64 hex chars.
 pub fn make_digest(suffix: &str) -> Digest {
@@ -33,4 +33,9 @@ pub fn digest_c() -> Digest {
 /// A repository name that must be valid.
 pub fn repo(name: &str) -> RepositoryName {
     RepositoryName::new(name).unwrap()
+}
+
+/// A registry authority, the key the cache records blobs under.
+pub fn authority(name: &str) -> RegistryAuthority {
+    RegistryAuthority::new(name)
 }

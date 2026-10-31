@@ -38,6 +38,16 @@ pub fn mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClien
     )
 }
 
+/// The cache key of `server`, which the engine derives from the client's URL.
+pub fn mock_authority(server: &MockServer) -> RegistryAuthority {
+    mock_client(server).registry_authority().unwrap()
+}
+
+/// The cache key of `server` as reached through [`ecr_mock_client`].
+pub fn ecr_mock_authority(server: &MockServer) -> RegistryAuthority {
+    ecr_mock_client(server).registry_authority().unwrap()
+}
+
 /// A client whose base URL has an ECR hostname but whose traffic is resolved
 /// to `server`, to reach ECR-specific paths (mount short-circuit) locally.
 pub fn ecr_mock_client(server: &MockServer) -> Arc<ocync_distribution::RegistryClient> {
@@ -82,7 +92,7 @@ pub fn empty_cache() -> Rc<RefCell<TransferStateCache>> {
 
 /// A cache holding each of `digests` as completed at `repo_name` on `target`.
 pub fn cache_with(
-    target: &str,
+    target: &RegistryAuthority,
     repo: &RepositoryName,
     digests: &[&Digest],
 ) -> Rc<RefCell<TransferStateCache>> {
@@ -108,6 +118,7 @@ pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
 pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
     TargetEntry {
         name: RegistryAlias::new(name),
+        authority: client.registry_authority().unwrap(),
         client,
         batch_checker: None,
         existing_tags: HashSet::new(),

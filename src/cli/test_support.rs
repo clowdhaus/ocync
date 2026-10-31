@@ -58,6 +58,7 @@ pub(crate) fn mapping_with_tags_and_report(
         target_repo: RepositoryName::new("repo").unwrap(),
         targets: vec![TargetEntry {
             name: RegistryAlias::new("target"),
+            authority: RegistryAuthority::new("target.test:443"),
             client,
             batch_checker: None,
             existing_tags: HashSet::new(),

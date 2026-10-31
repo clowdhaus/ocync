@@ -109,11 +109,11 @@ impl fmt::Display for ImageRef {
     }
 }
 
-/// A registry identifier used as the blob deduplication key.
+/// A registry identifier used as the in-run copy and failure key.
 ///
 /// The config-defined name (e.g. `us-ecr`) or the bare hostname for ad-hoc
-/// commands. Must be unique per mapping: it is the outer key of the blob
-/// dedup map.
+/// commands. Must be unique per mapping. It is not a cache key: the transfer
+/// state cache, which outlives a config edit, is keyed by [`RegistryAuthority`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegistryAlias(String);
 
@@ -237,9 +237,13 @@ impl ResolvedMapping {
 
 /// A single target registry entry.
 pub struct TargetEntry {
-    /// Registry identifier and blob dedup key, unique per [`ResolvedMapping`]
-    /// (see [`RegistryAlias`]).
+    /// Registry identifier, unique per [`ResolvedMapping`] (see
+    /// [`RegistryAlias`]).
     pub name: RegistryAlias,
+    /// Address of this target registry. Keys the transfer state cache, so what
+    /// a run learns about a registry's blobs follows its address, not the alias
+    /// a config calls it by.
+    pub authority: RegistryAuthority,
     /// Client for this target registry.
     pub client: Arc<RegistryClient>,
     /// Optional batch blob checker for this target (ECR batch API). When
@@ -258,6 +262,7 @@ impl Clone for TargetEntry {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            authority: self.authority.clone(),
             client: Arc::clone(&self.client),
             batch_checker: self.batch_checker.clone(),
             existing_tags: self.existing_tags.clone(),
@@ -269,6 +274,7 @@ impl fmt::Debug for TargetEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TargetEntry")
             .field("name", &self.name)
+            .field("authority", &self.authority)
             .field("client", &self.client)
             .field("batch_checker", &self.batch_checker.as_ref().map(|_| ".."))
             .field("existing_tags", &self.existing_tags.len())
@@ -417,8 +423,10 @@ struct TransferTask {
     source_data: Rc<PulledManifest>,
     /// Source client for pulling blobs.
     source_client: Arc<RegistryClient>,
-    /// Target registry name (dedup key).
+    /// Target registry name (in-run dedup key and log label).
     target_name: RegistryAlias,
+    /// Target registry address (transfer state cache key).
+    target_authority: RegistryAuthority,
     /// Target client for pushing.
     target_client: Arc<RegistryClient>,
     /// Source image reference (repo + tag, for display/logging and blob pulls).
@@ -1156,9 +1164,9 @@ impl SyncEngine {
                         .map(|t| SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source))
                 })
                 .collect();
-            let live_targets: HashSet<String> = mappings
+            let live_targets: HashSet<RegistryAuthority> = mappings
                 .iter()
-                .flat_map(|m| m.targets.iter().map(|t| t.name.to_string()))
+                .flat_map(|m| m.targets.iter().map(|t| t.authority.clone()))
                 .collect();
             let mut cache_mut = cache.borrow_mut();
             cache_mut.prune_snapshots(&live_keys);
@@ -1417,17 +1425,20 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
         let repo = target.repo.clone();
         let tag = target.tag.clone();
         let name = entry.name.clone();
+        let authority = entry.authority.clone();
         let checker = entry.batch_checker.clone();
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;
-            (name, client, checker, result)
+            (name, authority, client, checker, result)
         });
     }
 
     let mut skipped = Vec::new();
     let mut mismatched = Vec::new();
 
-    while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
+    while let Some((target_name, target_authority, target_client, batch_checker, result)) =
+        head_checks.next().await
+    {
         match result {
             Ok(Some(digest)) if digest == *compare_digest => {
                 debug!(
@@ -1456,6 +1467,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                 }
                 mismatched.push(TargetEntry {
                     name: target_name,
+                    authority: target_authority,
                     client: target_client,
                     batch_checker,
                     existing_tags: HashSet::new(),
@@ -1555,16 +1567,19 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         let repo = target.repo.clone();
         let tag = target.tag.clone();
         let name = entry.name.clone();
+        let authority = entry.authority.clone();
         let checker = entry.batch_checker.clone();
         head_checks.push(async move {
             let result = client.manifest_head(&repo, &tag).await;
-            (name, client, checker, result)
+            (name, authority, client, checker, result)
         });
     }
 
     let mut active_items = Vec::new();
 
-    while let Some((target_name, target_client, batch_checker, result)) = head_checks.next().await {
+    while let Some((target_name, target_authority, target_client, batch_checker, result)) =
+        head_checks.next().await
+    {
         match result {
             Ok(Some(digest)) if digest == *source_digest => {
                 debug!(
@@ -1595,6 +1610,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                     source_data: Rc::clone(&source_data),
                     source_client: Arc::clone(source_client),
                     target_name,
+                    target_authority,
                     target_client,
                     source: source.clone(),
                     target: target.clone(),
@@ -1637,6 +1653,7 @@ async fn execute_item(
         source_repo: &item.source.repo,
         target_client: &item.target_client,
         target_name: &item.target_name,
+        target_authority: &item.target_authority,
         target_repo: &item.target.repo,
         batch_checker: item.batch_checker.as_ref(),
         mount_source_wait_deadline,
@@ -1650,7 +1667,7 @@ async fn execute_item(
         // fall through to HEAD+push.
         cache
             .borrow_mut()
-            .notify_repo_failed(&item.target_name, &item.target.repo);
+            .notify_repo_failed(&item.target_authority, &item.target.repo);
         let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
@@ -1664,7 +1681,7 @@ async fn execute_item(
             // cross-repo mount source.
             cache
                 .borrow_mut()
-                .mark_repo_committed(&item.target_name, &item.target.repo);
+                .mark_repo_committed(&item.target_authority, &item.target.repo);
 
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
@@ -1715,7 +1732,7 @@ async fn execute_item(
             // Unblock followers waiting on this repo's manifest commit.
             cache
                 .borrow_mut()
-                .notify_repo_failed(&item.target_name, &item.target.repo);
+                .notify_repo_failed(&item.target_authority, &item.target.repo);
 
             if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
@@ -1920,6 +1937,9 @@ fn child_blobs(child: &ManifestPull) -> Vec<&Descriptor> {
 /// `resolve_staging`).
 struct BlobSink<'a> {
     cache: &'a Rc<RefCell<TransferStateCache>>,
+    /// Cache key of the target. The alias stays on the context for in-run keys
+    /// and logs.
+    target_authority: &'a RegistryAuthority,
     target_name: &'a RegistryAlias,
 }
 
@@ -1927,31 +1947,31 @@ impl<'a> BlobSink<'a> {
     fn complete(&self, digest: Digest, repo: RepositoryName) {
         self.cache
             .borrow_mut()
-            .set_blob_completed(self.target_name, digest, repo);
+            .set_blob_completed(self.target_authority, digest, repo);
     }
 
     fn fail(&self, digest: Digest, repo: RepositoryName, error: String) {
         self.cache
             .borrow_mut()
-            .set_blob_failed(self.target_name, digest, repo, error);
+            .set_blob_failed(self.target_authority, digest, repo, error);
     }
 
     fn exists(&self, digest: Digest, repo: RepositoryName) {
         self.cache
             .borrow_mut()
-            .set_blob_verified(self.target_name, digest, repo);
+            .set_blob_verified(self.target_authority, digest, repo);
     }
 
     fn release_claim(&self, digest: &Digest) {
         self.cache
             .borrow_mut()
-            .release_blob_claim(self.target_name, digest);
+            .release_blob_claim(self.target_authority, digest);
     }
 
     fn mark_repo_stale(&self, digest: &Digest, repo: &RepositoryName) {
         self.cache
             .borrow_mut()
-            .mark_blob_repo_stale(self.target_name, digest, repo);
+            .mark_blob_repo_stale(self.target_authority, digest, repo);
     }
 }
 
@@ -1974,6 +1994,7 @@ impl<'a> BlobIoContext<'a> {
         Self {
             sink: BlobSink {
                 cache: ctx.cache,
+                target_authority: ctx.target_authority,
                 target_name: ctx.target_name,
             },
             blob_failures: &ctx.shared.blob_failures,
@@ -2059,6 +2080,7 @@ struct TransferContext<'a> {
     source_repo: &'a RepositoryName,
     target_client: &'a RegistryClient,
     target_name: &'a RegistryAlias,
+    target_authority: &'a RegistryAuthority,
     target_repo: &'a RepositoryName,
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
     /// Per-blob deadline for mount-source resolution.
@@ -2114,12 +2136,12 @@ async fn transfer_image_blobs(
                 // run's entry for any other is dropped, since the repository
                 // may have lost it.
                 c.forget_remembered_blobs(
-                    ctx.target_name,
+                    ctx.target_authority,
                     ctx.target_repo,
                     all_digests.iter().filter(|d| !available.contains(*d)),
                 );
                 for digest in available {
-                    c.set_blob_verified(ctx.target_name, digest, ctx.target_repo.to_owned());
+                    c.set_blob_verified(ctx.target_authority, digest, ctx.target_repo.to_owned());
                 }
                 checked
             }
@@ -2133,7 +2155,7 @@ async fn transfer_image_blobs(
                 // trusting them would wait out the manifest commit gate on the
                 // failed API for a blob that may be gone.
                 ctx.cache.borrow_mut().forget_remembered_blobs(
-                    ctx.target_name,
+                    ctx.target_authority,
                     ctx.target_repo,
                     &all_digests,
                 );
@@ -2246,7 +2268,7 @@ async fn wait_for_blob_claim(
 ) -> BlobClaim {
     let skip = {
         let c = ctx.cache.borrow();
-        c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
+        c.blob_present_at(ctx.target_authority, digest, ctx.target_repo)
     };
     if skip {
         return BlobClaim::Skipped;
@@ -2262,7 +2284,7 @@ async fn wait_for_blob_claim(
             let mountable = ctx
                 .cache
                 .borrow()
-                .mount_sources(ctx.target_name, digest, ctx.target_repo)
+                .mount_sources(ctx.target_authority, digest, ctx.target_repo)
                 .next()
                 .is_some();
             if !mountable {
@@ -2271,7 +2293,7 @@ async fn wait_for_blob_claim(
         }
         let action = {
             let mut c = ctx.cache.borrow_mut();
-            c.claim_blob_upload(ctx.target_name, digest, ctx.target_repo)
+            c.claim_blob_upload(ctx.target_authority, digest, ctx.target_repo)
         };
         match action {
             crate::plan::ClaimAction::Wait { holder, notify } => {
@@ -2285,7 +2307,7 @@ async fn wait_for_blob_claim(
                 // A batch check may have populated our repo's state during the wait.
                 let skip = {
                     let c = ctx.cache.borrow();
-                    c.blob_present_at(ctx.target_name, digest, ctx.target_repo)
+                    c.blob_present_at(ctx.target_authority, digest, ctx.target_repo)
                 };
                 if skip {
                     return BlobClaim::Skipped;
@@ -2332,13 +2354,13 @@ async fn resolve_mount_source(
         let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
             let mut c = ctx.cache.borrow_mut();
             if let Some(r) = c
-                .mount_sources(ctx.target_name, digest, ctx.target_repo)
+                .mount_sources(ctx.target_authority, digest, ctx.target_repo)
                 .next()
                 .cloned()
             {
                 return Some(r);
             }
-            c.unresolved_watches_for(ctx.target_name, digest, ctx.target_repo)
+            c.unresolved_watches_for(ctx.target_authority, digest, ctx.target_repo)
         };
         if receivers.is_empty() {
             return None;
@@ -2752,12 +2774,12 @@ fn settle_blobs(
         Ok(()) => {
             ctx.cache
                 .borrow_mut()
-                .confirm_blobs(ctx.target_name, ctx.target_repo, digests);
+                .confirm_blobs(ctx.target_authority, ctx.target_repo, digests);
             false
         }
         Err(e) if e.manifest_refusal() == Some(ManifestRefusal::Invalid) => {
             let dropped = ctx.cache.borrow_mut().forget_remembered_blobs(
-                ctx.target_name,
+                ctx.target_authority,
                 ctx.target_repo,
                 digests,
             );
@@ -3346,6 +3368,7 @@ mod tests {
             source_data,
             source_client: Arc::clone(&client),
             target_name: RegistryAlias::new("test-target"),
+            target_authority: RegistryAuthority::new("test.example.com:443"),
             target_client: client,
             source: ImageRef {
                 repo: RepositoryName::new(format!("source/{tag}")).unwrap(),

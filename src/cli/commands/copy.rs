@@ -73,6 +73,10 @@ pub(crate) async fn run(
     // rate-limit budget. False without `--config`: there is no override flag.
     let head_first = source.config().map(|r| r.head_first).unwrap_or(false);
 
+    let target_authority = target_client
+        .registry_authority()
+        .map_err(|e| CliError::Input(format!("destination '{}': {e}", args.destination)))?;
+
     let mapping = ResolvedMapping {
         source_authority,
         source_client,
@@ -80,6 +84,7 @@ pub(crate) async fn run(
         target_repo: args.destination.repository().clone(),
         targets: vec![TargetEntry {
             name: RegistryAlias::new(dst_hostname),
+            authority: target_authority,
             client: target_client,
             batch_checker,
             existing_tags: HashSet::new(),

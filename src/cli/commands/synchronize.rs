@@ -1416,13 +1416,20 @@ fn build_targets(
     let mut worst_err: Option<CliError> = None;
     let mut codes = Vec::new();
     for name in target_names {
-        match client_for(clients, &name, from, RegistryRole::Target) {
-            Ok(client) => targets.push(TargetEntry {
+        let entry = client_for(clients, &name, from, RegistryRole::Target).and_then(|client| {
+            let authority = client.registry_authority().map_err(|e| {
+                CliError::Input(format!("target '{name}' of mapping '{from}': {e}"))
+            })?;
+            Ok(TargetEntry {
                 batch_checker: batch_checkers.get(&name).cloned(),
-                name: RegistryAlias::new(name),
+                name: RegistryAlias::new(&name),
+                authority,
                 client,
                 existing_tags: HashSet::new(),
-            }),
+            })
+        });
+        match entry {
+            Ok(entry) => targets.push(entry),
             Err(err) => {
                 dropped.push(DroppedTarget {
                     from: from.to_owned(),

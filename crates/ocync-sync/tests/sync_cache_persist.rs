@@ -14,7 +14,7 @@ use ocync_distribution::Digest;
 use ocync_distribution::spec::{PlatformFilter, RegistryAuthority};
 use ocync_sync::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 
-use digests::{digest_a, digest_b, repo};
+use digests::{authority, digest_a, digest_b, repo};
 
 fn snap_key_at(authority: &RegistryAuthority, repo_name: &str, tag: &str) -> SnapshotKey {
     SnapshotKey::new(authority, &repo(repo_name), tag)
@@ -49,7 +49,7 @@ fn long_ttl() -> Duration {
 /// A cache with one completed blob, persisted to `path`.
 fn persist_one_completed_blob(path: &Path) {
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&authority("reg.io"), digest_a(), repo("repo/a"));
     cache.persist(path).unwrap();
 }
 
@@ -90,8 +90,12 @@ fn round_trip_stable_blobs_survive() {
         let mut cache = TransferStateCache::new();
         for (registry, state, digest, repo_name) in &entries {
             match state {
-                Stable::Verified => cache.set_blob_verified(registry, digest(), repo(repo_name)),
-                Stable::Completed => cache.set_blob_completed(registry, digest(), repo(repo_name)),
+                Stable::Verified => {
+                    cache.set_blob_verified(&authority(registry), digest(), repo(repo_name))
+                }
+                Stable::Completed => {
+                    cache.set_blob_completed(&authority(registry), digest(), repo(repo_name))
+                }
             }
         }
         cache.persist(&path).unwrap();
@@ -99,11 +103,11 @@ fn round_trip_stable_blobs_survive() {
         let loaded = TransferStateCache::load(&path, long_ttl());
         for (registry, state, digest, repo_name) in &entries {
             assert!(
-                loaded.blob_present_at(registry, &digest(), &repo(repo_name)),
+                loaded.blob_present_at(&authority(registry), &digest(), &repo(repo_name)),
                 "{name}: {state:?} blob at {registry} should survive"
             );
             assert!(
-                !loaded.blob_present_at("other.io", &digest(), &repo(repo_name)),
+                !loaded.blob_present_at(&authority("other.io"), &digest(), &repo(repo_name)),
                 "{name}: blob must not appear at a registry it was not recorded at"
             );
         }
@@ -116,18 +120,18 @@ fn round_trip_mount_source_survives() {
     let path = dir.path().join("cache.bin");
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/a"));
-    cache.set_blob_completed("reg.io", digest_a(), repo("repo/b"));
+    cache.set_blob_completed(&authority("reg.io"), digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&authority("reg.io"), digest_a(), repo("repo/b"));
 
     cache.persist(&path).unwrap();
 
     let mut loaded = TransferStateCache::load(&path, long_ttl());
     // Committed repos are runtime-only: a loaded `Verified` entry is offered
     // as a mount source only once its repo is committed.
-    loaded.mark_repo_committed("reg.io", &repo("repo/a"));
+    loaded.mark_repo_committed(&authority("reg.io"), &repo("repo/a"));
     assert_eq!(
         loaded
-            .mount_sources("reg.io", &digest_a(), &repo("repo/b"))
+            .mount_sources(&authority("reg.io"), &digest_a(), &repo("repo/b"))
             .next()
             .cloned(),
         Some(repo("repo/a"))
@@ -150,7 +154,7 @@ fn ttl_expires_old_caches_and_zero_never_does() {
         let loaded = TransferStateCache::load(&path, ttl);
         assert_eq!(loaded.is_empty(), !expect_kept, "{name}");
         assert_eq!(
-            loaded.blob_present_at("reg.io", &digest_a(), &repo("repo/a")),
+            loaded.blob_present_at(&authority("reg.io"), &digest_a(), &repo("repo/a")),
             expect_kept,
             "{name}"
         );
@@ -205,14 +209,14 @@ fn transient_blobs_are_not_persisted() {
     let cases: [(&str, Mark); 2] = [
         ("failed", |cache| {
             cache.set_blob_failed(
-                "reg.io",
+                &authority("reg.io"),
                 digest_a(),
                 repo("repo/a"),
                 "connection refused".into(),
             );
         }),
         ("uploading (in progress)", |cache| {
-            cache.claim_blob_upload("reg.io", &digest_a(), &repo("repo/a"));
+            cache.claim_blob_upload(&authority("reg.io"), &digest_a(), &repo("repo/a"));
         }),
     ];
     for (name, mark_transient) in cases {
@@ -229,11 +233,11 @@ fn transient_blobs_are_not_persisted() {
             "{name} blob should not be persisted"
         );
 
-        cache.set_blob_completed("reg.io", digest_b(), repo("repo/b"));
+        cache.set_blob_completed(&authority("reg.io"), digest_b(), repo("repo/b"));
         cache.persist(&path).unwrap();
         let loaded = TransferStateCache::load(&path, long_ttl());
         assert!(
-            loaded.blob_present_at("reg.io", &digest_b(), &repo("repo/b")),
+            loaded.blob_present_at(&authority("reg.io"), &digest_b(), &repo("repo/b")),
             "{name}: the completed blob should survive persist"
         );
     }
@@ -284,8 +288,8 @@ fn blobs_and_source_snapshots_round_trip_together() {
     ];
 
     let mut cache = TransferStateCache::new();
-    cache.set_blob_verified("reg1.io", digest_a(), repo("repo/a"));
-    cache.set_blob_completed("reg2.io", digest_b(), repo("repo/b"));
+    cache.set_blob_verified(&authority("reg1.io"), digest_a(), repo("repo/a"));
+    cache.set_blob_completed(&authority("reg2.io"), digest_b(), repo("repo/b"));
     for (key, snap) in &snapshots {
         cache.set_source_snapshot(key.clone(), snap.clone());
     }
@@ -293,8 +297,8 @@ fn blobs_and_source_snapshots_round_trip_together() {
 
     let loaded = TransferStateCache::load(&path, long_ttl());
 
-    assert!(loaded.blob_present_at("reg1.io", &digest_a(), &repo("repo/a")));
-    assert!(loaded.blob_present_at("reg2.io", &digest_b(), &repo("repo/b")));
+    assert!(loaded.blob_present_at(&authority("reg1.io"), &digest_a(), &repo("repo/a")));
+    assert!(loaded.blob_present_at(&authority("reg2.io"), &digest_b(), &repo("repo/b")));
     for (key, want) in &snapshots {
         let got = loaded
             .source_snapshot(key)
