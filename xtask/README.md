@@ -35,7 +35,7 @@ A run already in progress on the instance, including one still checking out or b
 | `--tools` | string | `ocync` | Tools to benchmark |
 | `--limit` | integer | all | Use first N corpus images only |
 | `--skip-registries` | string | | Comma-separated source registries to skip |
-| `--skip-prewarm` | flag | | Skip CDN pre-warming |
+| `--skip-prewarm` | flag | | Skip CDN pre-warming (it otherwise runs for at most 8 minutes, then waits 6 for the CDN to settle) |
 | `--no-proxy` | flag | | Run without bench-proxy on the instance |
 | `--fetch` | flag | | Copy the newest results on the instance without running (a live run's partial results once its benchmark has started); conflicts with every run option |
 | `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |

@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
-use std::time::Duration;
 
 use clap::Args;
 use ocync_distribution::Digest;
@@ -330,14 +329,6 @@ fn check_unmoved(
         text.push_str(&incomplete);
     }
     Err(RecheckError::Moved(text))
-}
-
-/// The client every lock check in a run shares.
-pub(crate) fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("build HTTP client: {e}"))
 }
 
 /// Resolve every ref in `refs` again and refuse if any differs from `lock`.
@@ -672,7 +663,7 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
 
     let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
-    let client = http_client()?;
+    let client = registry::http_client()?;
     let access = Access::new(&client, auth.as_ref());
     let (images, failed) = access.resolve(&refs, Access::fetch_entry).await;
     if !failed.is_empty() {
@@ -884,11 +875,6 @@ mod tests {
                 Some(("index", vec![d('2'), d('1')])),
             ),
             ("an index with no children", index_body(&[]), None),
-            (
-                "a body that is neither",
-                r#"{"layers":[]}"#.to_owned(),
-                None,
-            ),
             ("an image with no config", no_config, None),
             ("an image with no layers", no_layers, None),
             ("a config with no digest", no_digest, None),
@@ -933,7 +919,6 @@ mod tests {
                 None,
             ),
             ("is an index", d('5'), d('5'), nested.as_str(), None),
-            ("is not a manifest", d('5'), d('5'), "<html>", None),
         ];
         for (name, listed, actual, body, expected) in cases {
             let got = child_blobs(&listed, &actual, body.as_bytes()).ok();

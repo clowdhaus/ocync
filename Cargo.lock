@@ -4108,11 +4108,9 @@ version = "0.8.2"
 dependencies = [
  "aws-config",
  "aws-sdk-ecr",
- "bytes",
  "clap",
  "futures-util",
  "http",
- "http-body",
  "ocync-distribution",
  "reqwest",
  "serde",

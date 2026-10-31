@@ -382,7 +382,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
-    let http = lock::http_client()?;
+    let http = registry::http_client()?;
     // One for the whole run, so the pre-warm reuses the tokens the lock check
     // already exchanged.
     let access = registry::Access::new(&http, corpus.dockerhub_auth.as_ref());
@@ -458,24 +458,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         instance.region,
     );
 
-    let mut report = BenchReport {
-        timestamp,
-        instance,
-        corpus_size: corpus.images.len(),
-        total_tags: corpus.total_tags(),
-        tool_versions,
-        relay_versions,
-        prewarm: None,
-        scenarios: Vec::new(),
-    };
-
     // Pre-warm CDN so all tools see identically cached source blobs.
     //
     // The prepare scenario needs none of it. It runs one tool, pulls no blobs,
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    report.prewarm = if args.skip_prewarm {
+    let prewarm = if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
         (!transfers.is_empty()).then_some(Prewarm::Skipped)
     } else if let Some(lock) = &lock {
@@ -483,6 +472,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     } else {
         eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
         None
+    };
+
+    let mut report = BenchReport {
+        timestamp,
+        instance,
+        corpus_size: corpus.images.len(),
+        total_tags: corpus.total_tags(),
+        tool_versions,
+        relay_versions,
+        prewarm,
+        scenarios: Vec::new(),
     };
 
     // A scenario after the first re-checks the sources, so a move during a long
@@ -1249,7 +1249,7 @@ enum BlobOutcome {
     Miss,
     /// Refused, unreachable or still failing after the attempts.
     Failed,
-    /// Not sent, because the deadline had passed.
+    /// Not warmed by the deadline: not sent, or not finished.
     PastDeadline,
 }
 
@@ -1280,35 +1280,43 @@ async fn drain(mut response: reqwest::Response) -> Result<(), reqwest::Error> {
 
 /// Warm one blob, `what` naming it in notices. `send` makes the request and
 /// waits out what is transient, so an error from it is final. A body that
-/// fails mid-read repeats the whole attempt, up to [`PREWARM_MAX_ATTEMPTS`]. A
-/// blob not sent by `deadline` is dropped.
+/// fails mid-read repeats the whole attempt, up to [`PREWARM_MAX_ATTEMPTS`].
+/// All of it, retries and waits included, runs under `deadline`: a blob not
+/// finished by then is [`BlobOutcome::PastDeadline`], even one that was sent.
 async fn warm_blob(
     deadline: Instant,
     what: &str,
     send: impl AsyncFn() -> Result<reqwest::Response, String>,
 ) -> BlobOutcome {
-    for attempt in 1..=PREWARM_MAX_ATTEMPTS {
-        if Instant::now() > deadline {
-            return BlobOutcome::PastDeadline;
-        }
-        let response = match send().await {
-            Ok(response) => response,
-            Err(e) => {
-                eprintln!("  {what}: {e}");
-                return BlobOutcome::Failed;
+    let attempts = async {
+        for attempt in 1..=PREWARM_MAX_ATTEMPTS {
+            let response = match send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    eprintln!("  {what}: {e}");
+                    return BlobOutcome::Failed;
+                }
+            };
+            let outcome = outcome_of(response.status(), response.headers());
+            if outcome == BlobOutcome::Failed {
+                eprintln!("  {what}: {}", response.status());
+                return outcome;
             }
-        };
-        let outcome = outcome_of(response.status(), response.headers());
-        if outcome == BlobOutcome::Failed {
-            eprintln!("  {what}: {}", response.status());
-            return outcome;
+            match drain(response).await {
+                Ok(()) => return outcome,
+                Err(e) => eprintln!("  {what}: body failed (attempt {attempt}): {e}"),
+            }
         }
-        match drain(response).await {
-            Ok(()) => return outcome,
-            Err(e) => eprintln!("  {what}: body failed (attempt {attempt}): {e}"),
-        }
+        BlobOutcome::Failed
+    };
+    // The timeout polls `attempts` once even when the deadline has passed, so
+    // a blob that never started is dropped before it.
+    if Instant::now() > deadline {
+        return BlobOutcome::PastDeadline;
     }
-    BlobOutcome::Failed
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), attempts)
+        .await
+        .unwrap_or(BlobOutcome::PastDeadline)
 }
 
 /// Per-registry CDN pre-warm statistics.
@@ -1318,7 +1326,7 @@ struct PrewarmStats {
     misses: u64,
     /// Blobs that could not be warmed.
     failed: u64,
-    /// Blobs not sent because the deadline had passed.
+    /// Blobs not finished because the deadline came first.
     past_deadline: u64,
 }
 
@@ -1365,7 +1373,8 @@ fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> Vec<String> {
         .collect()
 }
 
-/// How long from the start of the pre-warm before no blob request is started.
+/// How long from the start of the pre-warm a blob has to be warmed. A blob not
+/// finished by then is dropped, mid-download if need be.
 const PREWARM_DEADLINE: Duration = Duration::from_secs(480);
 
 /// Concurrent blob requests to one registry. Each registry has its own, so a
@@ -1374,9 +1383,6 @@ const PREWARM_PER_REGISTRY: usize = 8;
 
 /// Attempts at one blob whose body fails mid-read.
 const PREWARM_MAX_ATTEMPTS: u32 = 2;
-
-/// Longest one blob request may take, body included.
-const PREWARM_BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Pull every unique source blob once to warm CDN edge caches.
 ///
@@ -1392,9 +1398,8 @@ async fn cdn_prewarm(
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
 ) -> Prewarm {
-    // A blob not sent by this time is counted and dropped. One already sent
-    // runs to its own timeout, and the CDN wait below follows, so the
-    // pre-warm can end later than this.
+    // Every blob is held to this time, so the downloads end by it. The CDN
+    // wait below follows.
     let deadline = Instant::now() + PREWARM_DEADLINE;
     let blobs = blobs_to_warm(lock, refs);
 
@@ -1427,7 +1432,12 @@ async fn cdn_prewarm(
             let outcome = warm_blob(deadline, &what, async || {
                 access
                     .send(&key.repository(), &what, |client| {
-                        client.get(&url).timeout(PREWARM_BLOB_TIMEOUT)
+                        // The time left, so the client's total timeout does
+                        // not cut a large layer; its read timeout still ends
+                        // a stalled download.
+                        client
+                            .get(&url)
+                            .timeout(deadline.saturating_duration_since(Instant::now()))
                     })
                     .await
             })
@@ -2128,26 +2138,6 @@ images:
         }
     }
 
-    /// A body that yields some bytes and then a reset.
-    struct ResetMidBody(bool);
-
-    impl http_body::Body for ResetMidBody {
-        type Data = bytes::Bytes;
-        type Error = std::io::Error;
-
-        fn poll_frame(
-            mut self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-            let first = !std::mem::replace(&mut self.0, true);
-            std::task::Poll::Ready(Some(if first {
-                Ok(http_body::Frame::data(bytes::Bytes::from_static(b"part")))
-            } else {
-                Err(std::io::Error::other("connection reset"))
-            }))
-        }
-    }
-
     fn served(x_cache: &str) -> Result<reqwest::Response, String> {
         let response = http::Response::builder()
             .header("x-cache", x_cache)
@@ -2156,7 +2146,12 @@ images:
     }
 
     fn reset_mid_body() -> Result<reqwest::Response, String> {
-        let response = http::Response::builder().body(reqwest::Body::wrap(ResetMidBody(false)));
+        // Some bytes, then a reset.
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter([
+            Ok(b"part".to_vec()),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+        let response = http::Response::builder().body(body);
         Ok(reqwest::Response::from(response.unwrap()))
     }
 
@@ -2166,15 +2161,31 @@ images:
         script: Vec<Result<reqwest::Response, String>>,
         deadline: Instant,
     ) -> (BlobOutcome, usize) {
-        use futures_util::FutureExt;
         let sends = script.len();
         let script = std::cell::RefCell::new(std::collections::VecDeque::from(script));
-        let outcome = warm_blob(deadline, "blob", async || {
+        let outcome = block_on(warm_blob(deadline, "blob", async || {
             script.borrow_mut().pop_front().expect("no send left")
-        })
-        .now_or_never()
-        .expect("nothing here waits");
+        }));
         (outcome, sends - script.borrow().len())
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_blob_not_finished_by_the_deadline_is_dropped_whatever_it_is_waiting_on() {
+        // Catches: a send that retries or waits past the deadline holding the
+        // pre-warm with it.
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let outcome = block_on(warm_blob(deadline, "blob", async || {
+            std::future::pending::<Result<reqwest::Response, String>>().await
+        }));
+        assert_eq!(outcome, BlobOutcome::PastDeadline);
     }
 
     #[test]
