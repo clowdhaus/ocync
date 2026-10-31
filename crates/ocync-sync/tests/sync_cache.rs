@@ -398,6 +398,65 @@ async fn sync_cache_persist_and_load_round_trip() {
     );
 }
 
+/// A target whose `url` changes under a kept alias is a different registry: a
+/// cache an earlier run persisted holds nothing for it, so the next run uploads
+/// every blob and never reaches the manifest-refused recovery.
+#[tokio::test]
+async fn sync_cache_does_not_carry_blobs_to_a_new_target_address() {
+    let source_server = MockServer::start().await;
+    let target_a = MockServer::start().await;
+    let target_b = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"moved-config")
+        .layer(b"moved-layer")
+        .build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+    parts.mount_target(&target_a, "repo", "v1").await;
+
+    // Run 1: alias `target` at server A, cache persisted afterwards.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let cache_path = tmp_dir.path().join("sync_cache.bin");
+    let cache = empty_cache();
+    let mapping =
+        mapping_from_servers(&source_server, &target_a, "repo", vec![TagPair::same("v1")]);
+    let report = run_sync_with_cache(vec![mapping], Rc::clone(&cache)).await;
+    assert_eq!(report.stats.blobs_transferred, 2);
+    cache.borrow().persist(&cache_path).unwrap();
+
+    // Run 2: same alias, repo and cache file, new address. B receives every
+    // blob, and its one manifest PUT is not a retry after a refusal.
+    mount_manifest_head_not_found(&target_b, "repo", "v1").await;
+    for digest in parts.blob_digests() {
+        mount_blob_not_found(&target_b, "repo", &digest).await;
+    }
+    mount_blob_push_expecting(&target_b, "repo", 2, "moved target").await;
+    manifest_push_mock("repo", "v1")
+        .expect(1)
+        .named("moved target: manifest PUT")
+        .mount(&target_b)
+        .await;
+
+    let loaded = Rc::new(RefCell::new(TransferStateCache::load(
+        &cache_path,
+        Duration::from_secs(3600),
+    )));
+    assert!(
+        loaded.borrow().blob_present_at(
+            &mock_authority(&target_a),
+            &parts.config_desc.digest,
+            &repo("repo")
+        ),
+        "the cache does hold the blobs for A, so only the key can keep them from B"
+    );
+    let mapping =
+        mapping_from_servers(&source_server, &target_b, "repo", vec![TagPair::same("v1")]);
+    let report = run_sync_with_cache(vec![mapping], loaded).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_transferred, 2);
+    assert_eq!(report.stats.blobs_skipped, 0);
+}
+
 /// After a mount failure triggers lazy invalidation, the cache entry is
 /// cleared and the blob is recorded as completed via the fallback push.
 #[tokio::test]

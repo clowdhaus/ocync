@@ -388,6 +388,45 @@ mod tests {
     use super::test_support::{authority, other_digest, repo, test_digest};
     use super::*;
 
+    /// What a target holds follows its address: a blob recorded at one
+    /// authority is not present, claimed or offered as a mount source at
+    /// another, for the same repo.
+    #[test]
+    fn blob_state_is_per_authority() {
+        let d = test_digest();
+        let mut map = BlobDedupMap::default();
+        map.set_blob_completed(&authority("a.io:443"), &d, &repo("x"));
+        assert!(map.blob_present_at(&authority("a.io:443"), &d, &repo("x")));
+        assert!(
+            !map.blob_present_at(&authority("b.io:443"), &d, &repo("x")),
+            "same repo and digest at another address is unknown"
+        );
+        assert_eq!(map.repos_iter(&authority("b.io:443"), &d).count(), 0);
+
+        assert!(matches!(
+            map.claim_blob_upload(&authority("a.io:443"), &d, &repo("x")),
+            ClaimAction::Claimed
+        ));
+        assert!(
+            matches!(
+                map.claim_blob_upload(&authority("b.io:443"), &d, &repo("x")),
+                ClaimAction::Claimed
+            ),
+            "a claim at A does not make B wait"
+        );
+
+        let live = HashSet::from([authority("a.io:443")]);
+        map.retain_targets(&live);
+        assert!(
+            map.repo_state(&authority("b.io:443"), &d, &repo("x"))
+                .is_none()
+        );
+        assert!(
+            map.repo_state(&authority("a.io:443"), &d, &repo("x"))
+                .is_some()
+        );
+    }
+
     /// A new run marks present states `Remembered`, which a missing batch
     /// answer drops. State this run recorded, at the same repo or
     /// another, is kept, and `Remembered` persists as `Verified`.

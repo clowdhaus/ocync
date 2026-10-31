@@ -161,12 +161,24 @@ fn ttl_expires_old_caches_and_zero_never_does() {
     }
 }
 
+/// `bytes` with the header's version replaced and the CRC recomputed, so only
+/// the version can make the load discard it.
+fn with_version(mut bytes: Vec<u8>, version: u8) -> Vec<u8> {
+    // The version is the first byte of the postcard header, at offset 4 (after
+    // the 4-byte header length). The trailing 4 bytes are the CRC.
+    bytes[4] = version;
+    let payload_len = bytes.len() - 4;
+    let crc = crc32fast::hash(&bytes[..payload_len]);
+    bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
 /// A file that cannot be read back as a cache is discarded, never an error.
 #[test]
 fn unreadable_files_load_as_empty() {
     // Turns a valid cache file's bytes into the file under test; `None` leaves no file.
     type Damage = fn(Vec<u8>) -> Option<Vec<u8>>;
-    let cases: [(&str, Damage); 5] = [
+    let cases: [(&str, Damage); 6] = [
         ("missing file", |_| None),
         ("not a cache", |_| {
             Some(b"this is not valid cache data at all".to_vec())
@@ -177,14 +189,13 @@ fn unreadable_files_load_as_empty() {
             bytes[mid] ^= 0xFF;
             Some(bytes)
         }),
-        ("wrong version with a valid CRC", |mut bytes| {
-            // The version is the first byte of the postcard header, at offset 4
-            // (after the 4-byte header length). The trailing 4 bytes are the CRC.
-            bytes[4] = 99;
-            let payload_len = bytes.len() - 4;
-            let crc = crc32fast::hash(&bytes[..payload_len]);
-            bytes[payload_len..].copy_from_slice(&crc.to_le_bytes());
-            Some(bytes)
+        ("wrong version with a valid CRC", |bytes| {
+            Some(with_version(bytes, 99))
+        }),
+        // Version 1 keyed blobs by config alias, so a file from before the key
+        // became the registry address must not be trusted.
+        ("version 1, keyed by alias", |bytes| {
+            Some(with_version(bytes, 1))
         }),
     ];
     for (name, damage) in cases {
