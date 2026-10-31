@@ -124,12 +124,13 @@ pub(crate) struct Config {
 /// Global engine settings that apply across all sync operations.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct GlobalConfig {
-    /// Maximum concurrent image syncs (default: 10).
+    /// Maximum concurrent image syncs (default: 20).
     ///
-    /// Default derived as `blob_upload_concurrency / BLOB_CONCURRENCY = 64
-    /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
-    /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
-    /// across major container registries).
+    /// The per-target blob upload cap (64) bounds HTTP/2 blob streams
+    /// whatever this value, so images beyond it wait for an upload slot
+    /// rather than opening more streams. Raising it past 20 made no
+    /// measurable difference on a cold sync and made fewer cross-repo
+    /// mounts.
     #[serde(
         default = "default_max_concurrent_transfers",
         deserialize_with = "transfers_at_least_one"
@@ -1437,8 +1438,9 @@ mappings:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let global = config.global.as_ref().unwrap();
         assert_eq!(
-            global.max_concurrent_transfers,
-            ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS,
+            global.max_concurrent_transfers.get(),
+            20,
+            "the documented default; update the docs and schema with it",
         );
     }
 

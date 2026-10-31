@@ -684,14 +684,13 @@ struct PromoteContext<'a> {
 
 /// Default cap for concurrent image transfers (the global image semaphore).
 ///
-/// Per-target `RegistryClient::blob_upload_sem` caps long-lived HTTP/2 blob
-/// streams at 64 (registries advertise `SETTINGS_MAX_CONCURRENT_STREAMS` of
-/// 100-128, less metadata headroom). With `BLOB_CONCURRENCY` = 6 per image,
-/// 10 images gives 10 * 6 = 60 streams at saturation, inside that budget.
-/// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
-/// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
-/// value only helps workloads that mostly skip or mount, via config.
-pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
+/// The per-target upload cap (`DEFAULT_BLOB_UPLOAD_CONCURRENCY` in
+/// `ocync-distribution`, 64) bounds HTTP/2 blob streams whatever the image
+/// cap, so 20 images * `BLOB_CONCURRENCY` (6) = 120 blob tasks wait on that
+/// cap rather than opening streams. 20 is the measured point: about 12%
+/// faster than 10 on the cold corpus with no more requests, while 50 was no
+/// faster and made fewer cross-repo mounts, so it uploaded more.
+pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 
 /// Maximum concurrent blob transfers within a single image (skopeo's default).
 /// Each `RegistryClient` separately caps uploads and downloads across images.
