@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-10-31-025837",
+  "locked_at": "2026-10-31-031753",
   "images": {
     "cgr.dev/chainguard/busybox:latest": {
       "digest": "sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218",
@@ -566,7 +566,7 @@
         "sha256:dbe8dc8ef95930238aa47854da520254840038464d040bdebccd9d756d4c4fe2"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:11": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:11.0.33": {
       "digest": "sha256:5c047ea4b1b63952dc2d8c43b99096d3b238137d2b5e60556ed771fe573da269",
       "children": [
         "sha256:55419cd94faa27ff97e424ecb9a454a73e6b420a5b981415a11e65dc86ac1446",
@@ -581,7 +581,7 @@
         "sha256:a1a6125542a8ac07b830fe4e5f494cda45ca9d99d22c9dd5a738665d686e1cbd"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:17": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:17.0.21": {
       "digest": "sha256:52bfe5bfef9204b5da96ea5d8b2c5e9cafd2af1d1f8a771078929fde9cac827c",
       "children": [
         "sha256:17a0d086599c3334618b5430b4a8eb61195f576db7d8b4008b73e3afbc273a3c",
@@ -596,7 +596,7 @@
         "sha256:e67c378b0333a8c5099313ab4ed451f1835beca72ebb11bb855f5a71d4a68e17"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:21": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:21.0.13": {
       "digest": "sha256:a9589d4842ace85a42dfb131b0c1d20ddeb259570d859d3bbd114423fd574318",
       "children": [
         "sha256:15419cd08f1469f3c02a125016a6604f9d214ab45080447167e6f8e72bc054f1",
@@ -611,7 +611,7 @@
         "sha256:fd6fd6d463d2ef82c116e5016b315b123de454e8b4fbc69b2d194a528948a13f"
       ]
     },
-    "public.ecr.aws/amazonlinux/amazonlinux:2": {
+    "public.ecr.aws/amazonlinux/amazonlinux:2.0.20261102.0": {
       "digest": "sha256:957ff255a4ca9c60138ea636b8ae09e29ba146ea7bc95d0dae3923a5faeeb122",
       "children": [
         "sha256:eda2ad19d8d9a98e9a63373a15cdb41a62f7a6370e795764c54ba685c09a387e",
@@ -624,7 +624,7 @@
         "sha256:ec84068a79e503a31a893b9fd91255e63276a7d88c803d10789070f5f0d1907a"
       ]
     },
-    "public.ecr.aws/amazonlinux/amazonlinux:2023": {
+    "public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261102.0": {
       "digest": "sha256:381352c430f36d8aa6b8b670de06e7e4e5642fe0cb9dbd463bb8d1e79aefc0c7",
       "children": [
         "sha256:3bbae8a3ad757535c4a031e6dbc67b18e6e6cb120436c3f067841da262993455",
@@ -844,7 +844,7 @@
         "sha256:f89dc04d14086cefb9b07b9f81f656de51a0c107670c4e5368310b6c2ae1be65"
       ]
     },
-    "public.ecr.aws/docker/library/golang:1.21": {
+    "public.ecr.aws/docker/library/golang:1.21.13": {
       "digest": "sha256:4746d26432a9117a5f58e95cb9f954ddf0de128e9d5816886514199316e4a2fb",
       "children": [
         "sha256:e6ba96dde4af9f4e06caba475fa65e94e4c54fe4aa3e9f4f504c02178eb8934e",
@@ -965,7 +965,7 @@
         "sha256:fe645af3342e465899318dc4be86189d8911f07a9c14ca6893cead0ef762992f"
       ]
     },
-    "public.ecr.aws/docker/library/golang:1.22": {
+    "public.ecr.aws/docker/library/golang:1.22.12": {
       "digest": "sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02",
       "children": [
         "sha256:1f298b0c9fecdf504389a0329236f948cc04a566a2bb32337207cbaaa2f8177c",
@@ -1101,7 +1101,7 @@
         "sha256:ff303475ed1f572c926ff74379056def666d7a2df1be19913476e1e30c5f2681"
       ]
     },
-    "public.ecr.aws/docker/library/nginx:1.26": {
+    "public.ecr.aws/docker/library/nginx:1.26.3": {
       "digest": "sha256:41b194461e4bae16f9b25d68b0976ed4735b89ca625c89aad88e1c1c3b7e8860",
       "children": [
         "sha256:c8042489f41ddaf05b7dfbe1e32d5227f94f1b002aca8e3b7b9c9d0cee6b0fed",
@@ -1211,7 +1211,7 @@
         "sha256:f8b2e5dba997a5bb85649169a512bcdd9250c0d229745b54479bf0ce005923e1"
       ]
     },
-    "public.ecr.aws/docker/library/nginx:1.27": {
+    "public.ecr.aws/docker/library/nginx:1.27.5": {
       "digest": "sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d",
       "children": [
         "sha256:fafd5f55296511cd0f1c991efa0cb85f323449bf643f3b6d760c6542f020d6e5",
@@ -1321,7 +1321,7 @@
         "sha256:ff490355ee7c902ef816a5ff4875be7641c21b17cf3aba419bd18f61b59f1fec"
       ]
     },
-    "public.ecr.aws/docker/library/postgres:15": {
+    "public.ecr.aws/docker/library/postgres:15.19": {
       "digest": "sha256:64b99032e218b66b1d1a6334995056e1aa57f50a0c522cc856e72dff0e4b0d63",
       "children": [
         "sha256:7da5d534f1ffcdb2f69efa6e466a7a29ff89eefd611c7b50c4d69aa77fd4a822",
@@ -1488,7 +1488,7 @@
         "sha256:f9917c3ac06743ceb3dabd99aaad10dc9f451711dc58061ff9240a024c2a0a76"
       ]
     },
-    "public.ecr.aws/docker/library/postgres:16": {
+    "public.ecr.aws/docker/library/postgres:16.15": {
       "digest": "sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c",
       "children": [
         "sha256:b95b87e93ceb7594715d5c71fb6e09f6fc878851ab537735d617325eb9ba8b1b",
@@ -1655,7 +1655,7 @@
         "sha256:fc5640635fea5540cb65da4902982d805090721e063ee328382766664d8d98bf"
       ]
     },
-    "public.ecr.aws/docker/library/redis:6": {
+    "public.ecr.aws/docker/library/redis:6.2.24": {
       "digest": "sha256:71075871d0c318a0a835648a954e32d2b88d7b2a75c89a034ad0aa404e0319c9",
       "children": [
         "sha256:13d6d1e01c742fa698d8de5e8b2b8f9942499da0e222332ae6622704b4e5454c",
@@ -1723,7 +1723,7 @@
         "sha256:f7923e4daec1052f2e738a239e3682d01f04c43f9e476c6334425e18f0403ad9"
       ]
     },
-    "public.ecr.aws/docker/library/redis:7": {
+    "public.ecr.aws/docker/library/redis:7.4.12": {
       "digest": "sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5",
       "children": [
         "sha256:a7aad82554197a54c653388bfded882a59d6b4a02468484bc31bae6772dcc42c",
@@ -1791,7 +1791,7 @@
         "sha256:f8a5b91eb3c714608db691f319b8c60d622538d6ec6d309e9c751fe78d2bdb13"
       ]
     },
-    "public.ecr.aws/lambda/nodejs:18": {
+    "public.ecr.aws/lambda/nodejs:18.2026.04.30.01": {
       "digest": "sha256:daf6a5c0a2b36153b94c91f3563e8ef89b3b19e4129963c6ccb07b8c5251f7ef",
       "children": [
         "sha256:c3fe6ff9c75a5d6b0c8ba4c1224ef0c3a3a869c94487e1c786503d8e872b5e2e",
@@ -1814,7 +1814,7 @@
         "sha256:e725a81c56a0c8a899b7067df3675a4d57232d83b213483b22f5721844c03a1e"
       ]
     },
-    "public.ecr.aws/lambda/nodejs:20": {
+    "public.ecr.aws/lambda/nodejs:20.2026.04.12.14": {
       "digest": "sha256:a4440274d6f0fb4e6cb92cd5f2a97254efe6612f631d9974b197ecbd4a61fcab",
       "children": [
         "sha256:2c2357d244ca4b8c599b7fb080bd5fdc2b655a572b344978ce8fde5bd8005d6b",
@@ -1837,7 +1837,7 @@
         "sha256:fee28591ce9e55d7dfd06f1ef542367d4d2822a8d9d056df3b66f1fb4cfb6dc2"
       ]
     },
-    "public.ecr.aws/lambda/python:3.10": {
+    "public.ecr.aws/lambda/python:3.10.2026.10.31.02": {
       "digest": "sha256:d4f9e61faf4a525c275d9f5601f095cc6372b78227d702bb7c71ae17ded0c9e9",
       "children": [
         "sha256:cfc8f68d5198af683e6ab2f3ab1f10aaccde48f6ea3cd8ca8ef479a00a337d50",
@@ -1860,7 +1860,7 @@
         "sha256:faa709820ff7692266a2dd3a29b412c501aec1dd72bf69888a12f47c3dadf644"
       ]
     },
-    "public.ecr.aws/lambda/python:3.11": {
+    "public.ecr.aws/lambda/python:3.11.2026.10.31.02": {
       "digest": "sha256:005594dbdcc42b7093f5da95082599eeda2f21f430240b874cf85639371e91fd",
       "children": [
         "sha256:ce7bf562b078f7c2e13fe834e58c6501e7feb660de5c996e2ac164d3d3684fa1",
@@ -1883,7 +1883,7 @@
         "sha256:f4e9e7da474f6bb2cea186ac80dd14aa78e0db0399f521d7d1878af8f997f57a"
       ]
     },
-    "public.ecr.aws/lambda/python:3.12": {
+    "public.ecr.aws/lambda/python:3.12.2026.10.31.02": {
       "digest": "sha256:4f9132fef5abe6f09ffdf865b7ae8a644bf65b81a77b39f40e5012b06609ba0d",
       "children": [
         "sha256:d69eb7e5a313444d1e2054a3a64ec94d72232e6ba4e1ede8518f2d9cad37bf5f",
