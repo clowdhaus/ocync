@@ -106,11 +106,15 @@ impl GoogleLocation {
     /// detection uses, or `None` for a host with no quota location.
     pub(crate) fn of_host(host: &str) -> Option<Self> {
         let host = normalize_host(host);
-        let location = match host.as_str() {
-            "gcr.io" | "us.gcr.io" => "us",
-            "eu.gcr.io" => "europe",
-            "asia.gcr.io" => "asia",
-            _ => GAR_RE.captures(&host)?.get(1)?.as_str(),
+        let location = match detect_provider_kind(&host)? {
+            ProviderKind::Gar => GAR_RE.captures(&host)?.get(1)?.as_str(),
+            ProviderKind::Gcr => match host.as_str() {
+                "gcr.io" | "us.gcr.io" => "us",
+                "eu.gcr.io" => "europe",
+                "asia.gcr.io" => "asia",
+                _ => return None,
+            },
+            _ => return None,
         };
         Some(Self(location.to_owned()))
     }
@@ -301,6 +305,7 @@ mod tests {
             ("mirror.gcr.io", None),
             ("k8s.gcr.io", None),
             ("docker.pkg.dev", None),
+            ("us-docker.pkg.dev.evil.com", None),
             ("ghcr.io", None),
             ("registry.example.com", None),
             ("", None),

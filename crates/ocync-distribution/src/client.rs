@@ -92,7 +92,7 @@ pub struct RegistryClientBuilder {
     accept_invalid_certs: bool,
     force_http1: bool,
     h2_adaptive_window: bool,
-    google_pacing: Option<GooglePacing>,
+    google_pacing: GooglePacing,
 }
 
 impl std::fmt::Debug for RegistryClientBuilder {
@@ -119,7 +119,7 @@ impl RegistryClientBuilder {
             accept_invalid_certs: false,
             force_http1: false,
             h2_adaptive_window: true,
-            google_pacing: None,
+            google_pacing: GooglePacing::default(),
         }
     }
 
@@ -139,7 +139,7 @@ impl RegistryClientBuilder {
     /// Pace a Google host's requests together with the other hosts of the
     /// same run in its location. Default: the host is paced alone.
     pub fn google_pacing(mut self, pacing: GooglePacing) -> Self {
-        self.google_pacing = Some(pacing);
+        self.google_pacing = pacing;
         self
     }
 
@@ -244,13 +244,12 @@ impl RegistryClientBuilder {
         let http = http_builder.build()?;
         let blob_download_http = base_builder().http1_only().build()?;
 
-        let mut aimd = AimdController::new(
-            self.url.host_str().unwrap_or("unknown"),
+        let host = self.url.host_str().unwrap_or("unknown");
+        let aimd = AimdController::with_google_bucket(
+            host,
             self.max_concurrent,
+            self.google_pacing.bucket(host),
         );
-        if let Some(pacing) = &self.google_pacing {
-            aimd = aimd.with_google_pacing(pacing);
-        }
         Ok(RegistryClient {
             base_url: self.url,
             authority,
@@ -852,18 +851,8 @@ mod tests {
             client("https://gcr.io"),
             client("https://us-docker.pkg.dev"),
         );
-        for _ in 0..30 {
-            gcr.aimd.acquire(RegistryAction::BlobHead).await.success();
-        }
-        let held = tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            gar.aimd.acquire(RegistryAction::BlobHead),
-        )
-        .await;
-        assert!(
-            held.is_err(),
-            "us-docker.pkg.dev must wait on the burst gcr.io drained"
-        );
+        crate::aimd::drain_burst(&gcr.aimd).await;
+        assert!(crate::aimd::is_paced(&gar.aimd).await);
     }
 
     #[test]
