@@ -14,16 +14,17 @@ use serde_json::json;
 
 use super::credentials::imds::TOKEN_HEADER;
 
-/// The request headers compared, as upstream compares them.
-const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER];
+/// The request headers compared, as upstream compares them, and the one
+/// header a Google metadata probe must carry.
+const COMPARED_HEADERS: &[&str] = &["content-type", TOKEN_HEADER, "metadata-flavor"];
 
 /// One exchange as a traffic file records it: the request, the answer's
 /// head and the answer's body.
-pub(super) type Recorded = [serde_json::Value; 3];
+pub(crate) type Recorded = [serde_json::Value; 3];
 
 /// Exchange `id`: a `method` request to `uri` with `headers`, answered with
 /// `status`, `response_headers` and `body`.
-pub(super) fn record(
+pub(crate) fn record(
     id: u64,
     method: &http::Method,
     uri: &str,
@@ -58,7 +59,7 @@ struct Exchange {
 
 /// The exchanges not answered yet.
 #[derive(Debug)]
-pub(super) struct Replay {
+pub(crate) struct Replay {
     pending: Mutex<VecDeque<Exchange>>,
 }
 
@@ -175,13 +176,13 @@ impl Replay {
     }
 
     /// `exchanges`, answered in order.
-    pub(super) fn of(exchanges: impl IntoIterator<Item = Recorded>) -> Self {
+    pub(crate) fn of(exchanges: impl IntoIterator<Item = Recorded>) -> Self {
         let events: Vec<_> = exchanges.into_iter().flatten().collect();
         Self::from_json(&json!({ "events": events }).to_string())
     }
 
     /// The same exchanges, with the one at `index` answered after `delay`.
-    pub(super) fn delayed(self, index: usize, delay: Duration) -> Self {
+    pub(crate) fn delayed(self, index: usize, delay: Duration) -> Self {
         self.pending.lock().unwrap()[index].delay = delay;
         self
     }
@@ -225,7 +226,7 @@ impl Replay {
     }
 
     /// Every recorded exchange was answered.
-    pub(super) fn assert_done(&self) {
+    pub(crate) fn assert_done(&self) {
         let pending = self.pending.lock().unwrap();
         assert!(
             pending.is_empty(),

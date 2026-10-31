@@ -3,9 +3,13 @@
 //!
 //! The credentials come from the file `GOOGLE_APPLICATION_CREDENTIALS`
 //! names, else from gcloud's well-known file, else from the metadata server
-//! of the GCE or GKE host. A file holds a service account key, an authorized
-//! user's refresh token, an external account (Workload Identity Federation)
-//! or a service account impersonated with any of those.
+//! of the GCE or GKE host. Loading finds only a file. The metadata server is
+//! [`Credentials::metadata`](crate::google::Credentials::metadata); a caller
+//! that can fall back to anonymous asks
+//! [`is_on_google_cloud`](crate::google::is_on_google_cloud) first. A file
+//! holds a service account key, an authorized user's refresh token, an
+//! external account (Workload Identity Federation) or a service account
+//! impersonated with any of those.
 
 mod aws_source;
 mod external_account;
@@ -599,6 +603,10 @@ impl SourceAuth {
     }
 }
 
+pub(crate) use self::metadata::is_on_google_cloud;
+#[cfg(test)]
+pub(crate) use self::metadata::{probe_answer, probing};
+
 /// Credentials that obtain access tokens.
 #[derive(Debug)]
 pub(crate) struct Credentials(Kind);
@@ -614,28 +622,34 @@ enum Kind {
 }
 
 impl Credentials {
-    /// The Application Default Credentials of `host`, asking for the
-    /// registry scope. An external account with an AWS subject token
-    /// takes its AWS credentials from `aws_credentials`.
+    /// The credentials the file of `host` holds, asking for the registry
+    /// scope, or `None` when it has no file (see [`find_file`]). An external
+    /// account with an AWS subject token takes its AWS credentials from
+    /// `aws_credentials`.
     pub(crate) async fn load(
         host: &Host,
         clients: &Clients,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Self, Error> {
+    ) -> Result<Option<Self>, Error> {
         let setup = Setup {
             host,
             clients,
             aws_credentials,
         };
-        match find_file(host)? {
-            None => metadata::Server::new(&host.env, Scopes::Registry)
-                .map(|server| Self(Kind::Metadata(server))),
-            Some(contents) => {
-                let json: Value = crate::json::parse(&contents).map_err(Error::Parse)?;
-                let kind = CredentialType::of(&json)?;
-                Self::from_json(kind, json, Scopes::Registry, &setup).await
-            }
-        }
+        let Some(contents) = find_file(host)? else {
+            return Ok(None);
+        };
+        let json: Value = crate::json::parse(&contents).map_err(Error::Parse)?;
+        let kind = CredentialType::of(&json)?;
+        Self::from_json(kind, json, Scopes::Registry, &setup)
+            .await
+            .map(Some)
+    }
+
+    /// The metadata server of `host`, at `GCE_METADATA_HOST` when it is set.
+    pub(crate) fn metadata(host: &Host) -> Result<Self, Error> {
+        metadata::Server::new(&host.env, Scopes::Registry)
+            .map(|server| Self(Kind::Metadata(server)))
     }
 
     /// The credentials of type `kind` that `json` describes.
@@ -734,9 +748,9 @@ struct Setup<'a> {
     aws_credentials: &'a AwsCredentialProviders,
 }
 
-/// The contents of the credentials file, or `None` to use the metadata
-/// server: the file `GOOGLE_APPLICATION_CREDENTIALS` names, which must
-/// exist, else gcloud's well-known file if it does.
+/// The contents of the credentials file, or `None` when there is none. The
+/// file `GOOGLE_APPLICATION_CREDENTIALS` names must exist. Without that
+/// variable, gcloud's well-known file is used if it exists.
 fn find_file(host: &Host) -> Result<Option<Vec<u8>>, Error> {
     if let Some(path) = host.env.get_os(CREDENTIALS_VARIABLE) {
         let path = PathBuf::from(path);

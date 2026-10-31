@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{AuthProvider, Scope, Token};
+use super::{AuthProvider, Presents, Scope, Token};
 use crate::error::Error;
 
 /// Auth provider that returns a pre-configured bearer token, such as a CI
@@ -44,6 +44,10 @@ impl StaticTokenAuth {
 impl AuthProvider for StaticTokenAuth {
     fn name(&self) -> &'static str {
         "static-token"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(

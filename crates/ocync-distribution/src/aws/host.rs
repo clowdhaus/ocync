@@ -28,7 +28,7 @@ pub(crate) struct Host {
     pub(crate) fs: Fs,
     pub(crate) platform: Platform,
     pub(super) clock: Clock,
-    pub(super) network: Network,
+    pub(crate) network: Network,
     pub(super) dns: Dns,
     pub(super) sso_sessions: Sessions,
 }
@@ -116,7 +116,7 @@ impl Clock {
 
 /// Where HTTP requests go.
 #[derive(Debug, Clone)]
-pub(super) enum Network {
+pub(crate) enum Network {
     /// The network, through a client each source configures.
     Real,
     /// Recorded exchanges, answered in order.
@@ -126,7 +126,7 @@ pub(super) enum Network {
 
 impl Network {
     /// The transport for a source whose client `builder` configures.
-    pub(super) fn transport(
+    pub(crate) fn transport(
         &self,
         builder: reqwest::ClientBuilder,
     ) -> Result<Transport, reqwest::Error> {
@@ -160,7 +160,7 @@ pub(crate) fn credential_endpoint_client(timeouts: Timeouts) -> reqwest::ClientB
 
 /// Sends a source's requests.
 #[derive(Debug, Clone)]
-pub(super) enum Transport {
+pub(crate) enum Transport {
     /// Over the network.
     Client(reqwest::Client),
     /// To recorded exchanges.
@@ -170,7 +170,7 @@ pub(super) enum Transport {
 
 impl Transport {
     /// Send `request` and return the answer's head; the body streams.
-    pub(super) async fn send(
+    pub(crate) async fn send(
         &self,
         request: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest::Error> {

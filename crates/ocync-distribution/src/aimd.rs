@@ -771,7 +771,8 @@ mod tests {
 
     /// Each registry meters actions by its own published quotas: ECR per
     /// action, ECR Public by its five groups, Docker Hub with HEADs and
-    /// manifest reads apart, GAR and GHCR as one shared cap, ACR as reads
+    /// manifest reads apart, GAR and GHCR as one shared cap (`mirror.gcr.io`
+    /// too, a Google host), ACR as reads
     /// and writes, and an unknown registry by five coarse groups. Breaks if
     /// an action lands in another window, so its throttling slows actions
     /// the registry meters apart, or escapes a shared cap.
@@ -792,18 +793,19 @@ mod tests {
             "ghcr.io",
             "myreg.azurecr.io",
             "quay.io",
+            "mirror.gcr.io",
         ];
         #[rustfmt::skip]
-        let rows: [(RegistryAction, [WindowKey; 8]); 9] = [
-            (ManifestHead, [K::Ecr(ManifestHead), K::Ecr(ManifestHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads)]),
-            (BlobHead, [K::Ecr(BlobHead), K::Ecr(BlobHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads)]),
-            (ManifestRead, [K::Ecr(ManifestRead), K::Ecr(ManifestRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::ManifestRead), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads)]),
-            (BlobRead, [K::Ecr(BlobRead), K::Ecr(BlobRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads)]),
-            (TagList, [K::Ecr(TagList), K::Ecr(TagList), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::TagList)]),
-            (ManifestWrite, [K::Ecr(ManifestWrite), K::Ecr(ManifestWrite), K::EcrPublic(Public::ManifestWrite), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::ManifestWrite)]),
-            (BlobUploadInit, [K::Ecr(BlobUploadInit), K::Ecr(BlobUploadInit), K::EcrPublic(Public::BlobUploadInit), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
-            (BlobUploadChunk, [K::Ecr(BlobUploadChunk), K::Ecr(BlobUploadChunk), K::EcrPublic(Public::BlobUploadChunk), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
-            (BlobUploadComplete, [K::Ecr(BlobUploadComplete), K::Ecr(BlobUploadComplete), K::EcrPublic(Public::BlobUploadComplete), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads)]),
+        let rows: [(RegistryAction, [WindowKey; 9]); 9] = [
+            (ManifestHead, [K::Ecr(ManifestHead), K::Ecr(ManifestHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads), K::GarShared]),
+            (BlobHead, [K::Ecr(BlobHead), K::Ecr(BlobHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads), K::GarShared]),
+            (ManifestRead, [K::Ecr(ManifestRead), K::Ecr(ManifestRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::ManifestRead), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads), K::GarShared]),
+            (BlobRead, [K::Ecr(BlobRead), K::Ecr(BlobRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads), K::GarShared]),
+            (TagList, [K::Ecr(TagList), K::Ecr(TagList), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::TagList), K::GarShared]),
+            (ManifestWrite, [K::Ecr(ManifestWrite), K::Ecr(ManifestWrite), K::EcrPublic(Public::ManifestWrite), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::ManifestWrite), K::GarShared]),
+            (BlobUploadInit, [K::Ecr(BlobUploadInit), K::Ecr(BlobUploadInit), K::EcrPublic(Public::BlobUploadInit), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads), K::GarShared]),
+            (BlobUploadChunk, [K::Ecr(BlobUploadChunk), K::Ecr(BlobUploadChunk), K::EcrPublic(Public::BlobUploadChunk), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads), K::GarShared]),
+            (BlobUploadComplete, [K::Ecr(BlobUploadComplete), K::Ecr(BlobUploadComplete), K::EcrPublic(Public::BlobUploadComplete), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads), K::GarShared]),
         ];
         for (action, keys) in rows {
             for (host, key) in hosts.into_iter().zip(keys) {

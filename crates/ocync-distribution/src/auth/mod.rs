@@ -251,10 +251,24 @@ pub(crate) enum Refusal {
     Stale,
 }
 
+/// Whether an auth provider presents credentials to the registry, in the
+/// token request it makes or in the requests themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presents {
+    /// A password, token or cloud identity goes to the registry.
+    Credentials,
+    /// Nothing identifies the caller, whatever the provider is named.
+    Nothing,
+}
+
 /// A provider of authentication tokens for a registry.
 pub trait AuthProvider: Send + Sync {
     /// Human-readable name of this provider (e.g. "anonymous", "docker-config").
     fn name(&self) -> &'static str;
+
+    /// Whether this provider presents credentials. A claim about security,
+    /// so every provider states it.
+    fn presents(&self) -> Presents;
 
     /// Obtain a token valid for the given scopes.
     fn get_token(

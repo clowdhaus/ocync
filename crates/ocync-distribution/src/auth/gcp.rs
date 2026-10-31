@@ -20,7 +20,7 @@ use tokio::sync::OnceCell;
 
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
+use super::{AuthProvider, Credentials, Presents, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{Error, error_chain};
@@ -46,7 +46,64 @@ trait GcpTokenSource: Send + Sync + fmt::Debug {
 /// doomed requests. Create one per run: the next run, such as the next
 /// watch cycle, reads the credentials again.
 #[derive(Default)]
-pub struct SharedGoogleToken(OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>);
+pub struct SharedGoogleToken {
+    /// The token of the credentials file, or `None` when there is no file.
+    file: OnceCell<Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>>>,
+    /// Whether the machine is on Google Cloud, asked only for a registry
+    /// chosen by its hostname.
+    residency: Residency,
+    /// The metadata server's token, for a registry that goes there when
+    /// there is no file.
+    metadata: OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>,
+}
+
+/// Whether the machine is on Google Cloud, asked at most once for as long
+/// as the value or its clones live. A machine does not move between the runs
+/// of a process, so [`Self::process`] is the one every run of the process
+/// shares, and a watch loop does not ask again each cycle.
+#[derive(Debug, Clone, Default)]
+pub struct Residency(Arc<OnceCell<bool>>);
+
+impl Residency {
+    /// The answer shared by every run of this process.
+    pub fn process() -> Self {
+        static PROCESS: std::sync::LazyLock<Residency> =
+            std::sync::LazyLock::new(Residency::default);
+        PROCESS.clone()
+    }
+
+    /// An answer already known, so the machine is not asked.
+    pub fn known(on_google_cloud: bool) -> Self {
+        Self(Arc::new(OnceCell::new_with(Some(on_google_cloud))))
+    }
+
+    async fn get(&self, host: &crate::aws::Host) -> bool {
+        *self
+            .0
+            .get_or_init(|| async {
+                let on_google_cloud = google::is_on_google_cloud(host).await;
+                if !on_google_cloud {
+                    tracing::info!(
+                        "no Google credentials found and not on Google Cloud, reading Google \
+                         registries with docker config or anonymously"
+                    );
+                }
+                on_google_cloud
+            })
+            .await
+    }
+}
+
+impl SharedGoogleToken {
+    /// Credentials for one run that ask `residency` whether the machine is
+    /// on Google Cloud, so runs sharing it ask once.
+    pub fn with_residency(residency: Residency) -> Self {
+        Self {
+            residency,
+            ..Self::default()
+        }
+    }
+}
 
 impl fmt::Debug for SharedGoogleToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -55,21 +112,66 @@ impl fmt::Debug for SharedGoogleToken {
 }
 
 impl SharedGoogleToken {
-    /// The cached token of `host`'s credentials, loaded on first use.
-    async fn cached_token(
+    /// The cached token of `host`'s credentials file, loaded on first use.
+    async fn file(
+        &self,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>> {
+        self.file
+            .get_or_init(|| async {
+                Ok(AdcTokenSource::load(host, aws_credentials)
+                    .await?
+                    .map(|source| Arc::new(CachedGoogleToken::new(source))))
+            })
+            .await
+            .clone()
+    }
+
+    /// The cached token of the metadata server of `host`.
+    async fn metadata(
+        &self,
+        host: &crate::aws::Host,
+    ) -> Result<Arc<CachedGoogleToken>, Arc<google::Error>> {
+        self.metadata
+            .get_or_init(|| async {
+                Ok(Arc::new(CachedGoogleToken::new(AdcTokenSource::metadata(
+                    host,
+                )?)))
+            })
+            .await
+            .clone()
+    }
+
+    /// The cached token of `host`'s credentials for a registry the user
+    /// named: the file, else the metadata server, whether or not one is
+    /// there. The machine is not asked whether it is on Google Cloud.
+    async fn configured(
         &self,
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
     ) -> Result<Arc<CachedGoogleToken>, Arc<google::Error>> {
-        self.0
-            .get_or_init(|| async {
-                AdcTokenSource::load(host, aws_credentials)
-                    .await
-                    .map(|source| Arc::new(CachedGoogleToken::new(source)))
-                    .map_err(Arc::new)
-            })
-            .await
-            .clone()
+        match self.file(host, aws_credentials).await? {
+            Some(token) => Ok(token),
+            None => self.metadata(host).await,
+        }
+    }
+
+    /// The cached token of `host`'s credentials for a registry chosen by
+    /// its hostname: the file, else the metadata server if the machine is on
+    /// Google Cloud, else `None`.
+    async fn detected(
+        &self,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+    ) -> Result<Option<Arc<CachedGoogleToken>>, Arc<google::Error>> {
+        if let Some(token) = self.file(host, aws_credentials).await? {
+            return Ok(Some(token));
+        }
+        if !self.residency.get(host).await {
+            return Ok(None);
+        }
+        self.metadata(host).await.map(Some)
     }
 }
 
@@ -163,6 +265,11 @@ fn credentials_failed(registry: &str, stage: Stage, error: &google::Error) -> Er
     )
 }
 
+/// The error for `registry` when Google's credentials failed to load.
+fn setup_failed(registry: &url::Url, error: &google::Error) -> Error {
+    credentials_failed(registry.host_str().unwrap_or_default(), Stage::Setup, error)
+}
+
 /// Default [`GcpTokenSource`]: the run's Application Default Credentials.
 #[derive(Debug)]
 struct AdcTokenSource {
@@ -171,16 +278,25 @@ struct AdcTokenSource {
 }
 
 impl AdcTokenSource {
-    /// The Application Default Credentials of `host`.
+    /// The credentials file of `host`, or `None` when it has none.
     async fn load(
         host: &crate::aws::Host,
         aws_credentials: &AwsCredentialProviders,
-    ) -> Result<Self, google::Error> {
+    ) -> Result<Option<Self>, google::Error> {
         let clients = google::Clients::new()?;
-        let credentials = google::Credentials::load(host, &clients, aws_credentials).await?;
+        Ok(google::Credentials::load(host, &clients, aws_credentials)
+            .await?
+            .map(|credentials| Self {
+                credentials,
+                clients,
+            }))
+    }
+
+    /// The metadata server of `host`.
+    fn metadata(host: &crate::aws::Host) -> Result<Self, google::Error> {
         Ok(Self {
-            credentials,
-            clients,
+            credentials: google::Credentials::metadata(host)?,
+            clients: google::Clients::new()?,
         })
     }
 }
@@ -244,6 +360,29 @@ impl GcpAuth {
         .await
     }
 
+    /// [`Self::new`] for a registry chosen by its hostname rather than
+    /// named by the user, which returns `None` when the run has no Google
+    /// credentials: no file, and a machine that is not on Google Cloud. The
+    /// caller then reads the registry as it reads any other, with docker
+    /// config or anonymously. A machine is asked whether it is on Google
+    /// Cloud only here, once per run, and only when there is no file; a
+    /// source that exists but fails is still an error.
+    pub async fn detected(
+        registry: &url::Url,
+        http: reqwest::Client,
+        aws_credentials: &AwsCredentialProviders,
+        shared_token: &SharedGoogleToken,
+    ) -> Result<Option<Self>, Error> {
+        Self::detected_on_host(
+            registry,
+            http,
+            &crate::aws::Host::current(),
+            aws_credentials,
+            shared_token,
+        )
+        .await
+    }
+
     /// [`Self::new`] with the credentials of `host`.
     async fn on_host(
         registry: &url::Url,
@@ -253,12 +392,25 @@ impl GcpAuth {
         shared_token: &SharedGoogleToken,
     ) -> Result<Self, Error> {
         let cached_token = shared_token
-            .cached_token(host, aws_credentials)
+            .configured(host, aws_credentials)
             .await
-            .map_err(|e| {
-                credentials_failed(registry.host_str().unwrap_or_default(), Stage::Setup, &e)
-            })?;
+            .map_err(|e| setup_failed(registry, &e))?;
         Ok(Self::with_token(registry, http, cached_token))
+    }
+
+    /// [`Self::detected`] with the credentials of `host`.
+    async fn detected_on_host(
+        registry: &url::Url,
+        http: reqwest::Client,
+        host: &crate::aws::Host,
+        aws_credentials: &AwsCredentialProviders,
+        shared_token: &SharedGoogleToken,
+    ) -> Result<Option<Self>, Error> {
+        let cached_token = shared_token
+            .detected(host, aws_credentials)
+            .await
+            .map_err(|e| setup_failed(registry, &e))?;
+        Ok(cached_token.map(|token| Self::with_token(registry, http, token)))
     }
 
     fn with_token(
@@ -320,6 +472,10 @@ impl GcpAuth {
 impl AuthProvider for GcpAuth {
     fn name(&self) -> &'static str {
         "gcp"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(
@@ -984,6 +1140,171 @@ mod tests {
         );
         auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+    }
+
+    /// A provider for a registry chosen by its hostname.
+    async fn detected(
+        registry: &str,
+        host: &crate::aws::Host,
+        shared: &SharedGoogleToken,
+    ) -> Result<Option<GcpAuth>, Error> {
+        GcpAuth::detected_on_host(
+            &registry.parse().unwrap(),
+            crate::test_http_client(),
+            host,
+            &AwsCredentialProviders::default(),
+            shared,
+        )
+        .await
+    }
+
+    /// A registry chosen by its hostname, on a machine with no Google file
+    /// that is not on Google Cloud, gets no Google provider, so the caller
+    /// reads it as any other. The machine is asked once for the run however
+    /// many registries (a second probe fails the replay). Breaks if a
+    /// missing source is an error, a Google provider is built, or each
+    /// registry probes.
+    #[tokio::test]
+    async fn a_detected_registry_with_no_source_gets_no_provider() {
+        let replay = google::probe_answer(serde_json::json!({"Server": ["EC2ws"]}));
+        let host = google::probing(crate::aws::Platform::Unix, &[], None, &replay);
+        let shared = SharedGoogleToken::default();
+
+        for registry in ["https://us-docker.pkg.dev", "https://gcr.io"] {
+            assert!(detected(registry, &host, &shared).await.unwrap().is_none());
+        }
+        replay.assert_done();
+    }
+
+    /// A registry chosen by its hostname uses the Google file when there is
+    /// one, without asking whether the machine is on Google Cloud (the
+    /// replay answers nothing, so a probe fails the test). Breaks if a file
+    /// is passed over for the probe.
+    #[tokio::test]
+    async fn a_detected_registry_uses_the_google_file() {
+        let host = user_host_with_file();
+        let shared = SharedGoogleToken::default();
+        assert!(
+            detected("https://gcr.io", &host, &shared)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// On Google Cloud a metadata server that fails is an error, never a
+    /// fall through to anonymous: the registry is not asked for anything.
+    /// Breaks if a machine with credentials it cannot fetch reads
+    /// anonymously.
+    #[tokio::test]
+    async fn on_google_cloud_a_failing_metadata_server_is_an_error() {
+        let metadata = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&metadata)
+            .await;
+        let registry = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&registry)
+            .await;
+        let host = google::tests::host(
+            crate::aws::Platform::Unix,
+            &[(
+                "GCE_METADATA_HOST",
+                metadata.uri().trim_start_matches("http://"),
+            )],
+            &[],
+        );
+        let auth = detected(&registry.uri(), &host, &SharedGoogleToken::default())
+            .await
+            .unwrap()
+            .expect("a Google provider on Google Cloud");
+
+        let error = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("GCP access token request failed"),
+            "{error}"
+        );
+    }
+
+    /// A registry the user named asks the metadata server without asking
+    /// whether the machine is on Google Cloud, and registries that do share
+    /// its one token request. The host's replay answers nothing, so a probe
+    /// fails the test. Breaks if a named registry probes or each loads its
+    /// own metadata token.
+    #[tokio::test]
+    async fn configured_registries_with_no_file_share_one_metadata_token() {
+        let metadata = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.mds", "token_type": "Bearer", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&metadata)
+            .await;
+        let registry = MockServer::start().await;
+        testing::challenge(&registry, "us-docker.pkg.dev")
+            .mount(&registry)
+            .await;
+        testing::token("registry").mount(&registry).await;
+        let host = google::tests::host(
+            crate::aws::Platform::Unix,
+            &[(
+                "GCE_METADATA_HOST",
+                metadata.uri().trim_start_matches("http://"),
+            )],
+            &[],
+        );
+        let shared = SharedGoogleToken::default();
+
+        for repo in ["a", "b", "c"] {
+            let auth = GcpAuth::on_host(
+                &registry.uri().parse().unwrap(),
+                crate::test_http_client(),
+                &host,
+                &AwsCredentialProviders::default(),
+                &shared,
+            )
+            .await
+            .unwrap();
+            auth.get_token(&[Scope::pull(repo)]).await.unwrap();
+        }
+    }
+
+    /// A named registry on a machine with no Google file and no named
+    /// metadata server is still given the metadata server and not asked
+    /// whether it exists: the empty replay fails the test on any request.
+    /// Breaks if a named registry falls through or probes.
+    #[tokio::test]
+    async fn a_configured_registry_with_no_source_is_not_probed() {
+        let host = google::tests::host(crate::aws::Platform::Unix, &[], &[]);
+        GcpAuth::on_host(
+            &"https://us-docker.pkg.dev".parse().unwrap(),
+            crate::test_http_client(),
+            &host,
+            &AwsCredentialProviders::default(),
+            &SharedGoogleToken::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A host whose `GOOGLE_APPLICATION_CREDENTIALS` file is an authorized
+    /// user's.
+    fn user_host_with_file() -> crate::aws::Host {
+        adc_host(&serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "client",
+            "client_secret": "secret",
+            "refresh_token": "refresh",
+            "token_uri": "http://127.0.0.1:9/token",
+        }))
     }
 
     #[tokio::test]

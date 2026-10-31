@@ -163,6 +163,8 @@ ocync auth check -c config.yaml -c config2.yaml
 |---|---|
 | `-c`, `--config` | Path to config file (required, repeatable for multiple configs) |
 
+A registry reached without credentials is reported OK and marked anonymous, because its `/v2/` endpoint answers either way.
+
 ## Exit codes
 
 | Code | Meaning |

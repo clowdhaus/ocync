@@ -19,7 +19,7 @@ use ocync_distribution::auth::detect::{ProviderKind, detect_provider_kind};
 use ocync_distribution::auth::docker::DockerConfig;
 use ocync_distribution::auth::ecr::EcrAuth;
 use ocync_distribution::auth::ecr_public::EcrPublicAuth;
-use ocync_distribution::auth::gcp::{GcpAuth, SharedGoogleToken};
+use ocync_distribution::auth::gcp::{GcpAuth, Residency, SharedGoogleToken};
 use ocync_distribution::auth::static_token::StaticTokenAuth;
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 use ocync_sync::RunOutcome;
@@ -205,13 +205,24 @@ impl<'a> Registry<'a> {
 
 /// The credentials one run's clients share: AWS credentials by profile and
 /// region, and Google's Application Default Credentials. Create one per run:
-/// the next run, such as the next watch cycle, loads them afresh.
-#[derive(Debug, Default)]
+/// the next run, such as the next watch cycle, loads them afresh, except
+/// whether the machine is on Google Cloud, which every run of the process
+/// shares.
+#[derive(Debug)]
 pub(crate) struct RunCredentials {
     /// AWS credential providers keyed by profile and region.
     pub(crate) aws: AwsCredentialProviders,
     /// The shared Google token.
     pub(crate) gcp: SharedGoogleToken,
+}
+
+impl Default for RunCredentials {
+    fn default() -> Self {
+        Self {
+            aws: AwsCredentialProviders::default(),
+            gcp: SharedGoogleToken::with_residency(Residency::process()),
+        }
+    }
 }
 
 /// Build a [`RegistryClient`] for `registry`, using the appropriate auth
@@ -318,8 +329,18 @@ pub(crate) async fn build_registry_client(
                     RegistryClient::builder(url).auth(auth)
                 }
                 Some(ProviderKind::Gar | ProviderKind::Gcr) => {
-                    let auth = GcpAuth::new(&url, http, aws_credentials, &credentials.gcp).await?;
-                    RegistryClient::builder(url).auth(auth)
+                    match GcpAuth::detected(&url, http.clone(), aws_credentials, &credentials.gcp)
+                        .await?
+                    {
+                        Some(auth) => RegistryClient::builder(url).auth(auth),
+                        None => {
+                            // Public Google registries answer anonymously, and
+                            // `docker login` or gcloud's credential helper may
+                            // hold credentials for this one.
+                            let auth = default_auth(&url, http, endpoint).await?;
+                            RegistryClient::builder(url).auth(auth)
+                        }
+                    }
                 }
                 Some(ProviderKind::Acr) => {
                     let auth = AcrAuth::new(&url).await?;
@@ -327,23 +348,8 @@ pub(crate) async fn build_registry_client(
                 }
                 Some(ProviderKind::Ghcr | ProviderKind::DockerHub | ProviderKind::Chainguard)
                 | None => {
-                    // Docker config falls back to an anonymous exchange without creds.
-                    match DockerConfig::load_default() {
-                        Ok(config) => {
-                            let auth =
-                                configured::Auth::docker_config(&url, http, endpoint, &config)
-                                    .await?;
-                            RegistryClient::builder(url).auth(auth)
-                        }
-                        Err(_) => {
-                            tracing::debug!(
-                                registry = bare_host,
-                                "no docker config found, using anonymous auth"
-                            );
-                            let auth = configured::Auth::anonymous(&url, http);
-                            RegistryClient::builder(url).auth(auth)
-                        }
-                    }
+                    let auth = default_auth(&url, http, endpoint).await?;
+                    RegistryClient::builder(url).auth(auth)
                 }
             }
         }
@@ -356,6 +362,23 @@ pub(crate) async fn build_registry_client(
     builder
         .build()
         .map_err(|e| CliError::Input(format!("failed to build client for '{bare_host}': {e}")))
+}
+
+/// The auth of a host with no cloud provider: docker config, which falls
+/// back to an anonymous exchange without credentials for the host, else
+/// anonymous when there is no docker config.
+async fn default_auth(
+    url: &Url,
+    http: reqwest::Client,
+    endpoint: &str,
+) -> Result<configured::Auth, CliError> {
+    match DockerConfig::load_default() {
+        Ok(config) => Ok(configured::Auth::docker_config(url, http, endpoint, &config).await?),
+        Err(_) => {
+            tracing::debug!(registry = %url, "no docker config found, using anonymous auth");
+            Ok(configured::Auth::anonymous(url, http))
+        }
+    }
 }
 
 /// Initialize the tracing subscriber based on CLI flags.

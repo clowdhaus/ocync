@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, RegistryAction};
-use crate::auth::{AuthProvider, Scope, Token};
+use crate::auth::{AuthProvider, Presents, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -396,6 +396,14 @@ impl RegistryClient {
         self.auth.as_ref().map(|a| a.name())
     }
 
+    /// Whether the configured auth provider presents credentials. Without
+    /// auth nothing is presented.
+    pub fn auth_presents(&self) -> Presents {
+        self.auth
+            .as_ref()
+            .map_or(Presents::Nothing, |a| a.presents())
+    }
+
     /// Ping the registry's `/v2/` endpoint. A 200 or 401 is success: either
     /// confirms it speaks the OCI Distribution protocol.
     pub async fn ping(&self) -> Result<(), Error> {
@@ -688,6 +696,10 @@ mod tests {
     impl AuthProvider for StubAuth {
         fn name(&self) -> &'static str {
             "stub"
+        }
+
+        fn presents(&self) -> Presents {
+            Presents::Credentials
         }
 
         fn get_token(

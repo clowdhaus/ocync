@@ -52,7 +52,7 @@ impl Fixture {
     }
 }
 
-async fn load(host: &Host) -> Result<Credentials, Error> {
+async fn load(host: &Host) -> Result<Option<Credentials>, Error> {
     Credentials::load(
         host,
         &Clients::new().unwrap(),
@@ -123,23 +123,23 @@ fn reads_a_path_that_is_not_utf8() {
 /// `load_adc_no_well_known_path_fallback_to_mds`,
 /// `load_adc_no_file_at_well_known_path_fallback_to_mds` and
 /// `create_access_token_credentials_fallback_to_mds`: the file the variable
-/// names comes first and must exist, then the well-known file, then the
-/// metadata server. Breaks if the order changes, a missing named file
-/// falls back, or no file is an error.
+/// names comes first and must exist, then the well-known file, and with
+/// neither there is no file, whatever the caller does next. Breaks if the
+/// order changes, a missing named file falls back, or no file is an error.
 #[tokio::test]
 async fn finds_the_credentials_in_order() {
     let well_known = "/home/u/.config/gcloud/application_default_credentials.json";
     let user = b"{\"type\":\"authorized_user\"}".to_vec();
     let named = [(CREDENTIALS_VARIABLE, "/keys/sa.json"), ("HOME", "/home/u")];
-    type Check = fn(&Result<Credentials, Error>) -> bool;
+    type Check = fn(&Result<Option<Credentials>, Error>) -> bool;
     type Case<'a> = (
         &'a str,
         &'a [(&'a str, &'a str)],
         Vec<(&'a str, Vec<u8>)>,
         Check,
     );
-    let service_account: Check = |r| matches!(r, Ok(Credentials(Kind::ServiceAccount(_))));
-    let metadata: Check = |r| matches!(r, Ok(Credentials(Kind::Metadata(_))));
+    let service_account: Check = |r| matches!(r, Ok(Some(Credentials(Kind::ServiceAccount(_)))));
+    let none: Check = |r| matches!(r, Ok(None));
     let missing: Check = |r| match r {
         Err(e @ Error::MissingFile(_)) => e.to_string().contains(CREDENTIALS_VARIABLE),
         _ => false,
@@ -166,13 +166,8 @@ async fn finds_the_credentials_in_order() {
             vec![(well_known, service_account_bytes())],
             service_account,
         ),
-        ("no home", &[], vec![], metadata),
-        (
-            "no well-known file",
-            &[("HOME", "/home/u")],
-            vec![],
-            metadata,
-        ),
+        ("no home", &[], vec![], none),
+        ("no well-known file", &[("HOME", "/home/u")], vec![], none),
     ];
     for (case, vars, files, expected) in cases {
         let host = host(Platform::Unix, vars, &files);

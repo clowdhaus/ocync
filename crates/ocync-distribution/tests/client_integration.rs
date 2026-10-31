@@ -9,7 +9,7 @@ use http::StatusCode;
 use ocync_distribution::Error;
 use ocync_distribution::RepositoryName;
 use ocync_distribution::aimd::RegistryAction;
-use ocync_distribution::auth::{AuthProvider, Scope, Token};
+use ocync_distribution::auth::{AuthProvider, Presents, Scope, Token};
 use ocync_distribution::client::RegistryClientBuilder;
 use url::Url;
 use wiremock::matchers::{
@@ -75,6 +75,10 @@ impl AuthProvider for MockAuth {
         "mock"
     }
 
+    fn presents(&self) -> Presents {
+        Presents::Credentials
+    }
+
     fn get_token(
         &self,
         scopes: &[Scope],
@@ -116,6 +120,10 @@ impl RotatingMockAuth {
 impl AuthProvider for RotatingMockAuth {
     fn name(&self) -> &'static str {
         "rotating-mock"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(

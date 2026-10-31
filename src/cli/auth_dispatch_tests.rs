@@ -8,13 +8,11 @@
 //! `DOCKER_CONFIG` to a tempdir under the shared environment lock, a hand-rolled
 //! mutex (`serial_test` is not a workspace dependency).
 
-use std::ffi::OsString;
-use std::sync::MutexGuard;
-
 use ocync_distribution::RegistryClient;
+use ocync_distribution::auth::gcp::{Residency, SharedGoogleToken};
 
 use crate::cli::config::{AuthType, BasicCredentials, RegistryConfig};
-use crate::cli::test_support::lock_env;
+use crate::cli::test_support::EnvGuard;
 use crate::cli::{CliError, Registry, RunCredentials, build_registry_client};
 
 /// Build the client for `cfg`, with credentials of its own.
@@ -22,35 +20,16 @@ async fn build(cfg: &RegistryConfig) -> Result<RegistryClient, CliError> {
     build_registry_client(Registry::Configured(cfg), &RunCredentials::default()).await
 }
 
-/// Sets `DOCKER_CONFIG` and restores its prior value on drop, holding the
-/// shared environment lock meanwhile.
-struct EnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    prior: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set_docker_config(value: &std::path::Path) -> Self {
-        let lock = lock_env();
-        let prior = std::env::var_os("DOCKER_CONFIG");
-        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
-        unsafe {
-            std::env::set_var("DOCKER_CONFIG", value);
-        }
-        Self { _lock: lock, prior }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
-        unsafe {
-            match &self.prior {
-                Some(v) => std::env::set_var("DOCKER_CONFIG", v),
-                None => std::env::remove_var("DOCKER_CONFIG"),
-            }
-        }
-    }
+/// `DOCKER_CONFIG` as [`EnvGuard::set_docker_config`], and a Google metadata
+/// server at a closed port. A host naming one is on Google Cloud, so a
+/// registry detected as Google's gets the Google provider without the
+/// machine's DMI name being read or the metadata IP probed: nothing is
+/// contacted.
+fn docker_config_and_offline_google(dir: &std::path::Path) -> EnvGuard {
+    EnvGuard::set(&[
+        ("DOCKER_CONFIG", Some(dir.as_os_str())),
+        ("GCE_METADATA_HOST", Some("127.0.0.1:9".as_ref())),
+    ])
 }
 
 /// A tempdir holding a valid (empty) docker `config.json`.
@@ -108,7 +87,7 @@ async fn assert_dispatch(cases: Vec<(&str, RegistryConfig, &str)>) {
 #[tokio::test]
 async fn dispatches_without_a_docker_config() {
     let dir = tempdir_without_config();
-    let _g = EnvGuard::set_docker_config(dir.path());
+    let _g = docker_config_and_offline_google(dir.path());
     // `token` is a serde alias for `static_token`; the docs promise both spellings.
     let token_alias: AuthType = serde_yaml::from_str("token").expect("alias parses");
     assert_eq!(token_alias, AuthType::StaticToken);
@@ -237,6 +216,41 @@ async fn autodetect_falls_back_to_anonymous_without_a_docker_config() {
         ("docker.io", config("docker.io", None), "anonymous"),
     ])
     .await;
+}
+
+/// A registry detected as Google's, on a machine with no Google credentials
+/// and not on Google Cloud, is read as any other host is: with the docker
+/// config when there is one, else anonymously. Not as `gcp`, whose
+/// credentials do not exist, and not anonymously past a docker config that
+/// may hold the host's credentials. Breaks if the fall-through is dropped,
+/// swapped for the anonymous provider, or swapped for the Google one.
+#[tokio::test]
+async fn a_detected_google_host_with_no_credentials_reads_as_any_host() {
+    let home = tempfile::tempdir().expect("create tempdir");
+    for (docker_config, expected) in [
+        (Some(tempdir_with_config()), "docker-config"),
+        (None, "anonymous"),
+    ] {
+        let no_config = tempdir_without_config();
+        let dir = docker_config.as_ref().unwrap_or(&no_config);
+        let _env = EnvGuard::set(&[
+            ("DOCKER_CONFIG", Some(dir.path().as_os_str())),
+            ("HOME", Some(home.path().as_os_str())),
+            ("GOOGLE_APPLICATION_CREDENTIALS", None),
+            ("GCE_METADATA_HOST", None),
+        ]);
+        let credentials = RunCredentials {
+            gcp: SharedGoogleToken::with_residency(Residency::known(false)),
+            ..RunCredentials::default()
+        };
+        for host in ["us-docker.pkg.dev", "gcr.io", "mirror.gcr.io"] {
+            let client =
+                build_registry_client(Registry::Configured(&config(host, None)), &credentials)
+                    .await
+                    .unwrap_or_else(|e| panic!("{host}: {e}"));
+            assert_eq!(client.auth_name(), Some(expected), "{host}");
+        }
+    }
 }
 
 /// An ECR hostname that names no region is a setup error, not refused

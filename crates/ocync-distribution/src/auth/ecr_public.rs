@@ -23,7 +23,7 @@ use super::detect::ECR_PUBLIC_HOST;
 use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
-use super::{AuthProvider, Credentials, Scope, Token, scopes_cache_key};
+use super::{AuthProvider, Credentials, Presents, Scope, Token, scopes_cache_key};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
 
@@ -211,6 +211,10 @@ impl EcrPublicAuth {
 impl AuthProvider for EcrPublicAuth {
     fn name(&self) -> &'static str {
         "ecr-public"
+    }
+
+    fn presents(&self) -> Presents {
+        Presents::Credentials
     }
 
     fn get_token(
