@@ -83,7 +83,8 @@ The harness enforces these automatically -- do not bypass them.
 **Before the build, and again before every later scenario except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
 
 **Before any tool runs (once per run):**
-0. **CDN pre-warm** -- GET every blob the lock lists for the run's refs, 8 at a time per registry, within 8 minutes, then wait 6 minutes if any blob missed the CDN. A registry not fully warmed is warned about and recorded in the run record's `prewarm` field. Without this, the first tool meets a cold CDN and the last a warm one.
+
+0. **CDN pre-warm** -- GET every blob the lock lists for the run's refs, with a registry token (an unauthenticated 401 is not cached) and reading the full body, 8 at a time per registry, within 8 minutes, then wait 6 minutes if any blob missed the CDN. Manifests are not warmed. A registry not fully warmed is warned about and recorded in the run record's `prewarm` field. Without this, the first tool meets a cold CDN and the last a warm one.
 
 **Before any tool runs (once per scenario):**
 1. **Randomize tool order** -- Fisher-Yates shuffle so no tool systematically runs first or last. The randomized order is logged for traceability.
