@@ -688,9 +688,10 @@ struct PromoteContext<'a> {
 /// streams at 64 (registries advertise `SETTINGS_MAX_CONCURRENT_STREAMS` of
 /// 100-128, less metadata headroom). With `BLOB_CONCURRENCY` = 6 per image,
 /// 10 images gives 10 * 6 = 60 streams at saturation, inside that budget.
-/// A cap of 50 (300 streams) deadlocks HTTP/2 against every registry probed
-/// (see `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution`). A higher
-/// value only helps workloads that mostly skip or mount, via config.
+/// Blob downloads use HTTP/1.1 and uploads are capped per target, so a cap of
+/// 50 completed cold syncs to ECR over HTTP/2 without a stall; other
+/// registries are unmeasured there. A higher cap keeps every mount only while
+/// `DEFAULT_MOUNT_SOURCE_WAIT` outlasts the source image's commit.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Maximum concurrent blob transfers within a single image (skopeo's default).
