@@ -15,7 +15,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::runner::join_tools;
-use super::{Provider, Scenario, ToolSelection, value_name};
+use super::{Provider, Rounds, Scenario, ToolSelection, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -60,6 +60,8 @@ pub(crate) struct BenchRemoteArgs {
             "force",
             "git_ref",
             "tools",
+            "baseline_ref",
+            "rounds",
             "scenario",
             "limit",
             "skip_registries",
@@ -80,6 +82,11 @@ pub(crate) struct BenchRemoteArgs {
 
     #[command(flatten)]
     pub(crate) tool_selection: ToolSelection,
+
+    /// Rounds of the sync and partial scenarios (passed through to
+    /// `cargo xtask bench`).
+    #[arg(long, default_value_t = Rounds::DEFAULT)]
+    pub(crate) rounds: Rounds,
 
     /// Scenario to run (passed through to `cargo xtask bench`).
     #[arg(long, value_enum, default_value = "all")]
@@ -172,8 +179,13 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // The benchmark's arguments, unquoted: `remote_script` quotes each one.
     let mut bench_args = vec![
         "--tools".to_string(),
-        join_tools(&args.tool_selection.tools),
+        join_tools(&args.tool_selection.run_tools()),
+        "--rounds".to_string(),
+        args.rounds.to_string(),
     ];
+    if let Some(commit) = &args.tool_selection.baseline_ref {
+        bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
+    }
     if let Some(limit) = args.limit {
         bench_args.extend(["--limit".to_string(), limit.to_string()]);
     }
@@ -566,11 +578,10 @@ echo "[bench-remote] exit code: $BENCH_EXIT"
 exit "$BENCH_EXIT""#;
 
 /// Removes untracked files left by previous builds, keeping the build cache,
-/// results and the run's own files. The run-file pattern is quoted so the
+/// results, the baseline checkouts and the run's own files. The run-file pattern is quoted so the
 /// shell cannot expand it against the files present. Runs with fd 9 closed
 /// like every git command in the script, see [`remote_script`].
-const GIT_CLEAN: &str =
-    "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/ 9>&-";
+const GIT_CLEAN: &str = "git clean -fdx -e target/ -e bench/results/ -e 'bench/.bench-run.*' -e bench/.tmp/ -e bench/.baseline/ 9>&-";
 
 /// Shell that starts the benchmark runner in the background in the script's
 /// own process group, passing `bench_args` as one quoted word each so no
@@ -725,10 +736,15 @@ fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::erro
 
 /// A full commit object name: 40 lowercase hex digits, safe to place in a
 /// shell command unescaped.
-#[derive(Debug)]
-struct CommitSha(String);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommitSha(String);
 
 impl CommitSha {
+    /// The leading 7 digits, for a label a reader can type.
+    pub(crate) fn short(&self) -> &str {
+        &self.0[..7]
+    }
+
     /// Accepts only 40 lowercase hex digits.
     fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
         if s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -746,7 +762,10 @@ impl std::fmt::Display for CommitSha {
 }
 
 /// Resolves `git_ref` to the commit it names in the repository at `repo`.
-fn resolve_commit(repo: &Path, git_ref: &str) -> Result<CommitSha, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_commit(
+    repo: &Path,
+    git_ref: &str,
+) -> Result<CommitSha, Box<dyn std::error::Error>> {
     CommitSha::parse(&git_rev_parse(
         repo,
         &["--verify", &format!("{git_ref}^{{commit}}")],
@@ -868,10 +887,14 @@ mod tests {
     #[test]
     fn fetch_conflicts_with_every_run_option() {
         use clap::Parser;
+        let head =
+            crate::bench::command_stdout(Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
         for extra in [
             &["--force"][..],
             &["--git-ref", "main"][..],
             &["--tools", "ocync"][..],
+            &["--rounds", "3"][..],
+            &["--baseline-ref", &head][..],
             &["--scenario", "sync"][..],
             &["--limit", "3"][..],
             &["--skip-registries", "docker.io"][..],
@@ -1102,6 +1125,9 @@ mod tests {
             std::fs::write(&file, "").unwrap();
             file
         });
+        let baseline_build = bench.join(".baseline/0123456/target/release/ocync");
+        std::fs::create_dir_all(baseline_build.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_build, "").unwrap();
         let stray = bench.join("stray");
         std::fs::write(&stray, "").unwrap();
 
@@ -1117,6 +1143,7 @@ mod tests {
         for file in &run_files {
             assert!(file.exists(), "{} was cleaned", file.display());
         }
+        assert!(baseline_build.exists(), "the baseline build was cleaned");
         assert!(!stray.exists(), "the stray file survived");
     }
 

@@ -7,12 +7,17 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use super::remote::{CommitSha, resolve_commit};
+
 /// Benchmark tool variant. Declaration order is the order of columns in the
 /// reports, so ocync leads.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, clap::ValueEnum)]
 pub(crate) enum Tool {
     /// The ocync OCI sync tool.
     Ocync,
+    /// The ocync built from the `--baseline-ref` commit, run beside the
+    /// current build to tell a regression from run-to-run noise.
+    OcyncBaseline,
     /// The dregsy OCI sync tool.
     Dregsy,
     /// The regsync OCI sync tool.
@@ -23,16 +28,28 @@ impl Tool {
     /// Returns the binary name for this tool.
     pub(crate) fn binary(&self) -> &'static str {
         match self {
-            Tool::Ocync => "ocync",
+            Tool::Ocync | Tool::OcyncBaseline => "ocync",
             Tool::Dregsy => "dregsy",
             Tool::Regsync => "regsync",
         }
     }
+
+    /// Whether the tool is an ocync build, run with the same config and
+    /// arguments whichever commit it was built from.
+    pub(crate) fn is_ocync(self) -> bool {
+        matches!(self, Tool::Ocync | Tool::OcyncBaseline)
+    }
 }
 
+/// The name a tool carries in file names and run records. Distinct from
+/// [`Tool::binary`] because the baseline shares ocync's binary name, and its
+/// config and proxy log must not overwrite ocync's.
 impl std::fmt::Display for Tool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.binary())
+        f.write_str(match self {
+            Tool::OcyncBaseline => "ocync-baseline",
+            other => other.binary(),
+        })
     }
 }
 
@@ -131,7 +148,7 @@ fn relay_version_after_failed_lookup(reported: Option<String>, reason: &str) -> 
 fn version_args(tool: Tool) -> &'static [&'static str] {
     match tool {
         Tool::Dregsy => &["--version"],
-        Tool::Regsync | Tool::Ocync => &["version"],
+        Tool::Regsync | Tool::Ocync | Tool::OcyncBaseline => &["version"],
     }
 }
 
@@ -145,7 +162,7 @@ fn version_args(tool: Tool) -> &'static [&'static str] {
 fn reports_version(tool: Tool) -> bool {
     match tool {
         Tool::Dregsy => false,
-        Tool::Regsync | Tool::Ocync => true,
+        Tool::Regsync | Tool::Ocync | Tool::OcyncBaseline => true,
     }
 }
 
@@ -163,7 +180,7 @@ fn relay_binaries(tool: Tool) -> &'static [&'static str] {
     match tool {
         Tool::Dregsy => &["skopeo", "docker-credential-ecr-login"],
         Tool::Regsync => &["docker-credential-ecr-login"],
-        Tool::Ocync => &[],
+        Tool::Ocync | Tool::OcyncBaseline => &[],
     }
 }
 
@@ -300,14 +317,15 @@ async fn go_module_version(binary: &str) -> Result<String, String> {
 
 /// Resolves the binary a tool is executed as.
 ///
-/// ocync runs from the workspace release build rather than `PATH`, since that
-/// is what `build_ocync` just produced. A `PATH` lookup would find whatever
+/// ocync runs from the release build under `workspace_root` rather than
+/// `PATH`, since that is what `build_ocync` just produced. For the baseline the
+/// caller passes the root of its own checkout, see [`baseline_dir`]. A `PATH` lookup would find whatever
 /// was installed when the instance was created, which can be months older, so
 /// version probes must resolve the same way runs do or the record names a
 /// binary that produced none of the numbers.
 fn tool_path(tool: Tool, workspace_root: &Path) -> std::borrow::Cow<'static, str> {
     match tool {
-        Tool::Ocync => workspace_root
+        Tool::Ocync | Tool::OcyncBaseline => workspace_root
             .join("target/release/ocync")
             .to_string_lossy()
             .into_owned()
@@ -413,6 +431,107 @@ pub(crate) async fn build_ocync(workspace_root: &Path) -> Result<(), String> {
     }
 }
 
+/// Where baseline checkouts live, one directory per commit.
+const BASELINE_ROOT: &str = "bench/.baseline";
+
+/// The checkout the baseline build lives in. One per commit, so a second run
+/// at the same commit reuses the checkout and its build.
+pub(crate) fn baseline_dir(commit: &CommitSha) -> PathBuf {
+    Path::new(BASELINE_ROOT).join(commit.to_string())
+}
+
+/// Runs `git` with `args`, naming the command and git's first diagnostic line
+/// when it fails.
+async fn git(args: &[&str]) -> Result<(), String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "git {} failed: {}",
+        args.join(" "),
+        first_line(&stderr, "").unwrap_or("no output")
+    ))
+}
+
+/// Checks `commit` out into its own git worktree and builds ocync there.
+///
+/// The build gets a target directory inside the checkout, so it cannot replace
+/// the current build whatever `CARGO_TARGET_DIR` says. An existing checkout is
+/// reused only if it is at `commit`.
+pub(crate) async fn build_baseline(commit: &CommitSha) -> Result<(), String> {
+    let dir = baseline_dir(commit);
+    if !dir.join(".git").exists() {
+        // A checkout deleted behind git's back stays registered and would
+        // make the add refuse.
+        git(&["worktree", "prune"]).await?;
+        git(&[
+            "worktree",
+            "add",
+            "--detach",
+            &dir.to_string_lossy(),
+            &commit.to_string(),
+        ])
+        .await?;
+    }
+    let head = resolve_commit(&dir, "HEAD").map_err(|e| e.to_string())?;
+    if head != *commit {
+        return Err(format!(
+            "{} is at {head}, not the baseline {commit}; remove it",
+            dir.display()
+        ));
+    }
+
+    let status = tokio::process::Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "ocync",
+            "--target-dir",
+            "target",
+        ])
+        .current_dir(&dir)
+        .status()
+        .await
+        .map_err(|e| format!("failed to spawn cargo build for the baseline: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo build of the baseline {} failed ({status})",
+            commit.short()
+        ))
+    }
+}
+
+/// Fails unless the baseline build accepts `config`, the one the run will give
+/// it, so a commit too old for the config is refused before any round runs.
+pub(crate) async fn check_baseline_config(root: &Path, config: &Path) -> Result<(), String> {
+    let binary = tool_path(Tool::OcyncBaseline, root);
+    let output = tokio::process::Command::new(binary.as_ref())
+        .arg("validate")
+        .arg(config)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run {binary} validate: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "the baseline build rejected the generated config: {}",
+        first_line(&stderr, &stdout).unwrap_or("no output")
+    ))
+}
+
 /// Touch all `.rs` files under `dir` to set their mtime to now.
 ///
 /// This is a local-path defense for `build_ocync()`. In the remote bench
@@ -459,7 +578,9 @@ pub(crate) async fn run_tool(
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
     let mut args: Vec<&str> = match tool {
-        Tool::Ocync => vec!["sync", "--config", &config_str, "--json", "-v"],
+        Tool::Ocync | Tool::OcyncBaseline => {
+            vec!["sync", "--config", &config_str, "--json", "-v"]
+        }
         Tool::Dregsy => vec!["-config", &config_str],
         Tool::Regsync => vec!["once", "-c", &config_str],
     };
@@ -478,7 +599,7 @@ pub(crate) async fn run_tool(
     let binary = tool_path(tool, workspace_root);
 
     // For ocync, set OCYNC_TIMING_FILE so the engine writes phase timing JSONL.
-    let timing_path = if tool == Tool::Ocync {
+    let timing_path = if tool.is_ocync() {
         Some(
             config_path
                 .parent()
@@ -533,7 +654,7 @@ pub(crate) async fn run_tool(
     // ocync --json writes structured JSON to stdout for the reporting
     // pipeline; don't echo it to the operator. Other tools write
     // human-readable progress to stdout, so stream those.
-    let echo_stdout = tool != Tool::Ocync;
+    let echo_stdout = !tool.is_ocync();
     let stdout_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout_pipe);
         let mut line = String::new();
@@ -875,6 +996,63 @@ mod tests {
         );
         assert_eq!(tool_path(Tool::Dregsy, root), "dregsy");
         assert_eq!(tool_path(Tool::Regsync, root), "regsync");
+    }
+
+    #[test]
+    fn the_baseline_is_ocyncs_binary_in_its_own_checkout_under_its_own_name() {
+        // Catches: the baseline resolving to the current build, which would
+        // compare ocync with itself, and sharing ocync's name, which would let
+        // its config and proxy log overwrite ocync's.
+        let names: BTreeSet<String> = [
+            Tool::Ocync,
+            Tool::OcyncBaseline,
+            Tool::Dregsy,
+            Tool::Regsync,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(Tool::OcyncBaseline.to_string(), "ocync-baseline");
+        assert_eq!(
+            join_tools(&[Tool::Ocync, Tool::OcyncBaseline]),
+            "ocync,ocync-baseline"
+        );
+        assert_eq!(Tool::OcyncBaseline.binary(), "ocync");
+        assert_eq!(
+            tool_path(Tool::OcyncBaseline, Path::new("/b")),
+            "/b/target/release/ocync"
+        );
+        assert!(Tool::Ocync.is_ocync() && Tool::OcyncBaseline.is_ocync());
+        assert!(!Tool::Dregsy.is_ocync() && !Tool::Regsync.is_ocync());
+        assert!(relay_binaries(Tool::OcyncBaseline).is_empty());
+    }
+
+    #[test]
+    fn a_baseline_that_rejects_the_config_fails_with_its_own_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A stand-in for `ocync validate <config>`.
+        let baseline = |script: &str| {
+            let root = tempfile::tempdir().unwrap();
+            let binary = tool_path(Tool::OcyncBaseline, root.path()).into_owned();
+            std::fs::create_dir_all(Path::new(&binary).parent().unwrap()).unwrap();
+            std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(check_baseline_config(root.path(), Path::new("config.yaml")))
+        };
+
+        assert_eq!(baseline(r#"[ "$1" = validate ] && exit 0"#), Ok(()));
+        assert_eq!(
+            baseline(r#"echo "error: unknown field auth_type" >&2; exit 2"#),
+            Err("the baseline build rejected the generated config: \
+                 error: unknown field auth_type"
+                .to_string())
+        );
     }
 
     #[test]

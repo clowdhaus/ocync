@@ -23,6 +23,7 @@ docs/superpowers/
 bench/results/*/
 bench/.bench-run.*
 bench/.tmp/
+bench/.baseline/
 .superpowers/
 .playwright-mcp/
 

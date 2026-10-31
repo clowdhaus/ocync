@@ -26,7 +26,7 @@ They live with the integration tests in `crates/ocync-distribution/tests/`. The 
 
 It lives in `xtask/src/bench/` and runs on one instance through `cargo xtask bench-remote`. All tools run on the same instance, taking turns. One instance per tool would multiply the cost by the number of tools; taking turns in a fresh random order every round, and comparing tools within the same round, is how the shared machine is kept fair.
 
-> **Status: Planned.** Today each tool runs once per scenario in one shuffled order, and `bench-remote` drives only the AWS instance. The Google Cloud and Azure hosts in `bench/terraform/` are for measuring sign-in by hand until they can be driven (#168).
+> **Status: Planned.** `bench-remote` drives only the AWS instance. The Google Cloud and Azure hosts in `bench/terraform/` are for measuring sign-in by hand until they can be driven (#168).
 
 ## Accuracy rules
 
@@ -34,9 +34,7 @@ The harness is to enforce each rule. A rule marked Planned is not built yet. A r
 
 ### A fixed corpus
 
-Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before the run and again before every later scenario, the harness resolves every source tag again and stops if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
-
-> **Status: Planned.** Re-resolving the tags before each round comes with repeated rounds.
+Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before the run and again before every later round and scenario, the harness resolves every source tag again and stops if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
 
 ### Content verified, not only tags
 
@@ -44,14 +42,15 @@ After every tool's pass, every target tag must resolve to the same manifest dige
 
 ### Repeated, interleaved rounds
 
-> **Status: Planned.** Today each tool runs once per scenario, in one shuffled order.
-
-A run has at least 3 rounds, 5 by default. Each round runs every tool once, cold then warm, in a fresh random order. The order and seed are recorded.
+A run of the sync and partial scenarios has at least 3 rounds, 5 by default. Each round runs every tool once, cold then warm, in a fresh random order. The order and seed are recorded. Scale and prepare run ocync alone, so they have no ratio to take and run one pass.
 
 - Each tool's metric is reported as its median, with the minimum and maximum.
 - A speed comparison is the median of the per-round ratios between two tools. Pairing within a round cancels drift that affects every tool in that round.
 - The interval reported with it is the lowest to the highest per-round ratio. Without assuming any distribution, that range holds the true median with 93.75% confidence at 5 rounds and 75% at 3, and the confidence is stated with it. A resampling (bootstrap) interval is not used: with this few rounds it reports more confidence than it has.
 - A difference is claimed only when every round's ratio falls on the same side of 1. Otherwise it is reported as no measured difference.
+- Wall clock, requests and response bytes are compared this way. Every round's results are kept in the run record, so the medians can be recomputed.
+
+A baseline build of ocync, from a commit given with `--baseline-ref`, takes part in every round as one more tool, run with the config generated for ocync. Its verdict against the current build is the regression check: old and new ocync measured in the same rounds, not compared across months.
 
 ### Proxy overhead measured before it is trusted
 

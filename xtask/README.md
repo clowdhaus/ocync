@@ -33,6 +33,8 @@ A run already in progress on the instance, including one still checking out or b
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
 | `--tools` | string | `ocync` | Tools to benchmark |
+| `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios (see [Rounds](#rounds-and-the-baseline-build)) |
+| `--baseline-ref` | commit | | Also run the ocync built from this commit (see [Rounds](#rounds-and-the-baseline-build)) |
 | `--limit` | integer | all | Use first N corpus images only |
 | `--skip-registries` | string | | Comma-separated source registries to skip |
 | `--skip-prewarm` | flag | | Skip CDN pre-warming (it otherwise runs for at most 8 minutes, then waits 6 for the CDN after any miss) |
@@ -68,11 +70,12 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `<SCENARIO>` | subcommand | (required) | `cold`, `warm`, `partial`, `scale`, or `all` |
-| `--tools` | comma-separated | `ocync,dregsy,regsync` | Tools to benchmark |
+| `--tools` | comma-separated | `ocync` | Tools to benchmark: `ocync`, `ocync-baseline` (needs `--baseline-ref`), `dregsy`, `regsync` |
+| `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios, each running every tool once in a fresh random order |
+| `--baseline-ref` | hex commit id | | Also run the ocync built from this commit in every round, and compare it with the current one |
 | `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML |
 | `--partial-overrides` | path | `bench/corpus-partial-overrides.yaml` | Partial sync tag overrides |
 | `--limit` | integer | all | Use first N corpus images only |
-| `--iterations` | integer | `1` | Cold scenario iterations (picks median by wall-clock) |
 | `--proxy-port` | u16 | `8080` | Bench-proxy listen port |
 | `--proxy-binary` | path | `target/release/bench-proxy` | Path to bench-proxy binary |
 | `--proxy-ca` | path | `/etc/bench-proxy/ca.pem` | Bench-proxy CA certificate |
@@ -80,6 +83,16 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | `--output` | path | `bench/results/<timestamp>` | Output directory for results |
 | `--regression` | flag | | Compare against baseline, exit non-zero on regression |
 | `--threshold-pct` | u32 | `20` | Regression threshold percentage |
+
+## Rounds and the baseline build
+
+One run per tool cannot separate a difference between tools from run-to-run noise. The sync and partial scenarios therefore run in `--rounds` rounds (5 by default, never fewer than 3): each round runs every tool once, cold then warm, in a fresh random order. The source tags are checked against the lock again before every round after the first. The pre-warm runs once, before round 1. Scale and prepare run ocync alone and run one pass whatever `--rounds` says.
+
+**Rounds multiply run time.** A full comparison at the default is five times one pass, and every round deletes and recreates the target repositories and waits 10 s between tools. Use `--rounds 3` for a smoke test.
+
+`summary.md` and the performance page show each metric as its median with the lowest and highest round, and, for each other tool, the median and range of the per-round ratio of that tool to ocync. The range holds the true median ratio with a confidence of `1 - 2 * 0.5^n` (75% at 3 rounds, 93.75% at 5), stated beside it. A difference is claimed only when every round agrees; otherwise it reads "no measured difference". Wall clock, requests and response bytes are compared this way. The run record keeps every round's results with its index, order and seed.
+
+`--baseline-ref <commit>` adds the tool `ocync-baseline` (shown as `ocync@<short id>`), the ocync built from that commit, to every round. A short hex id is resolved to the full one before anything runs, and a branch name is refused. The harness checks the commit out as a git worktree in `bench/.baseline/<id>`, builds it there with its own target directory, and reuses both on a later run at the same commit. It runs the baseline with the config it generates for ocync, so a commit that does not build, or whose `ocync validate` rejects that config, fails the run before the pre-warm. The comparison against `ocync` in the summary is the regression check; `--regression` and `bench/results/baseline.json` keep working and now compare ocync's median over the rounds. Only a commit with `ocync validate` and the `sync --json` flags can be a baseline, and on `bench-remote` the commit must be one the instance can fetch, such as an ancestor of the pushed branch.
 
 ## Scenarios
 
@@ -97,11 +110,14 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 # Spin up infrastructure
 cd bench/terraform/aws && terraform init && terraform apply
 
-# Quick smoke test (1 tool, 3 images, 1 iteration)
-cargo xtask bench-remote --provider aws --tools ocync --limit 3 --scenario cold
+# Quick smoke test (1 tool, 3 images, the fewest rounds)
+cargo xtask bench-remote --provider aws --tools ocync --limit 3 --rounds 3 --scenario sync
 
-# Full 3-tool cold comparison (3 iterations, picks median)
-cargo xtask bench-remote --provider aws --iterations 3 --scenario cold
+# Full 3-tool sync comparison (5 rounds)
+cargo xtask bench-remote --provider aws --tools ocync,dregsy,regsync --scenario sync
+
+# Has ocync regressed since a commit? Old and new ocync in the same rounds
+cargo xtask bench-remote --provider aws --baseline-ref <commit> --scenario sync
 
 # All scenarios
 cargo xtask bench-remote --provider aws --scenario all
@@ -124,7 +140,7 @@ cd bench/terraform/aws && terraform destroy
 | File | Description |
 |------|-------------|
 | `bench/results/<timestamp>/summary.md` | Comparison table with per-scenario metrics |
-| `bench/results/<timestamp>/<tool>-<pass>-proxy.jsonl` | Raw per-request proxy log per tool and pass (e.g. `ocync-scale-10-proxy.jsonl`) |
+| `bench/results/<timestamp>/<tool>-<pass>-proxy.jsonl` | Raw per-request proxy log per tool and pass (e.g. `ocync-scale-10-proxy.jsonl`); for the sync and partial scenarios under `round-<n>/` |
 | `bench/results/{registry}.json` | Per-registry run record archive (tracked in git) |
 | `bench/results/baseline.json` | Regression baseline (created on first `--regression` run) |
 
