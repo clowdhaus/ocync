@@ -134,8 +134,14 @@ impl TokenBucket {
                     s.tokens -= 1.0;
                     return;
                 }
-                let need = 1.0 - s.tokens;
-                Duration::from_secs_f64(need / self.rate_per_sec)
+                let wait = Duration::from_secs_f64((1.0 - s.tokens) / self.rate_per_sec);
+                if wait.is_zero() {
+                    // A shortfall below a nanosecond would never be waited
+                    // out: a zero sleep leaves paused test time standing.
+                    s.tokens = (s.tokens - 1.0).max(0.0);
+                    return;
+                }
+                wait
             };
             // The lock is released before sleeping, or every consumer
             // would serialize on it.
@@ -648,6 +654,19 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A shortfall below a nanosecond is granted at once, without sleeping.
+    /// Taking the zero sleep instead spins forever under paused time, which
+    /// hangs this test.
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn acquire_grants_a_sub_nanosecond_shortfall() {
+        let bucket = TokenBucket::new(1.0, 1.0);
+        bucket.state.lock().unwrap().tokens = 1.0 - 1e-12;
+        let start = tokio::time::Instant::now();
+        bucket.acquire().await;
+        assert_eq!(tokio::time::Instant::now(), start, "acquire slept");
+        assert_eq!(bucket.state.lock().unwrap().tokens, 0.0);
+    }
 
     // ---------------------------------------------------------------------------
     // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
