@@ -13,7 +13,7 @@ use ocync_distribution::sha256::Sha256;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
+use crate::bench::corpus::{self, CorpusPaths, ImageEntry};
 use crate::bench::registry::{self, Access, Repository};
 
 /// The digest of `bytes`.
@@ -345,16 +345,14 @@ pub(crate) fn http_client() -> Result<reqwest::Client, String> {
 /// Probes with HEAD, which costs no body, and falls back to a GET only for a
 /// registry that sends no digest header.
 pub(crate) async fn ensure_unmoved(
-    client: &reqwest::Client,
+    access: &Access<'_>,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
-    auth: Option<&DockerHubAuth>,
 ) -> Result<(), RecheckError> {
     eprintln!(
         "bench: checking {} source refs against the lock...",
         refs.len()
     );
-    let access = Access::new(client, auth);
     let (resolved, failed) = access.resolve(refs, Access::fetch_digest).await;
     check_unmoved(lock, &resolved, &failed)
 }
@@ -517,9 +515,9 @@ impl Access<'_> {
             repo.path
         );
         let response = self
-            .send(repo, Some(&format!("{repo}:{reference}")), |token| {
-                self.request(method.clone(), &url)
-                    .bearer_auth(token)
+            .send(repo, &format!("{repo}:{reference}"), |client| {
+                client
+                    .request(method.clone(), &url)
                     .header("Accept", MANIFEST_ACCEPT)
             })
             .await
@@ -902,17 +900,12 @@ mod tests {
             ("not JSON", "<html>".to_owned(), None),
         ];
         for (name, body, expected) in cases {
-            let got = ManifestBody::parse(body.as_bytes()).ok().map(|m| match m {
-                ManifestBody::Image { config, layers } => (
-                    "image",
-                    std::iter::once(config)
-                        .chain(layers)
-                        .map(|x| x.digest)
-                        .collect(),
+            let got = ManifestBody::parse(body.as_bytes()).ok().map(|m| match &m {
+                ManifestBody::Index { manifests } => (
+                    "index",
+                    manifests.iter().map(|x| x.digest.clone()).collect(),
                 ),
-                ManifestBody::Index { manifests } => {
-                    ("index", manifests.into_iter().map(|x| x.digest).collect())
-                }
+                ManifestBody::Image { .. } => ("image", m.into_blobs().unwrap()),
             });
             assert_eq!(got, expected, "{name}");
         }

@@ -383,7 +383,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
     let http = lock::http_client()?;
-    let auth = corpus.dockerhub_auth.as_ref();
+    // One for the whole run, so the pre-warm reuses the tokens the lock check
+    // already exchanged.
+    let access = registry::Access::new(&http, corpus.dockerhub_auth.as_ref());
     let refs: BTreeSet<_> = transfers
         .iter()
         .flat_map(|transfer| scenario_refs(transfer, &corpus))
@@ -391,7 +393,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a moved source costs
         // seconds rather than a wasted run.
-        lock::ensure_unmoved(&http, lock, &refs, auth)
+        lock::ensure_unmoved(&access, lock, &refs)
             .await
             .map_err(|e| match e {
                 lock::RecheckError::Lookup(text) => format!(
@@ -477,7 +479,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
         (!transfers.is_empty()).then_some(Prewarm::Skipped)
     } else if let Some(lock) = &lock {
-        Some(cdn_prewarm(lock, &refs, auth, &http).await)
+        Some(cdn_prewarm(&access, lock, &refs).await)
     } else {
         eprintln!("bench: skipping CDN pre-warm (prepare transfers nothing)");
         None
@@ -493,7 +495,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         for (position, transfer) in transfers.iter().enumerate() {
             let refs = scenario_refs(transfer, &corpus);
             if position > 0 {
-                let check = lock::ensure_unmoved(&http, lock, &refs, auth).await;
+                let check = lock::ensure_unmoved(&access, lock, &refs).await;
                 match lock::between_scenarios(check) {
                     lock::Next::Proceed { warning } => {
                         if let Some(warning) = warning {
@@ -560,7 +562,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             .await;
             if let Err(error) = outcome {
                 // A source that moved mid-scenario is not the tool's fault.
-                let recheck = lock::ensure_unmoved(&http, lock, &refs, auth).await;
+                let recheck = lock::ensure_unmoved(&access, lock, &refs).await;
                 stopped = Some(lock::explain(error.to_string(), recheck));
                 break;
             }
@@ -1238,87 +1240,6 @@ fn prepare_clean_slate() {
     clean_staging_tmpdir();
 }
 
-/// Per-registry rate controller for CDN blob pre-warm.
-///
-/// Uses multiplicative increase / multiplicative decrease (MIMD) with
-/// congestion epoch suppression. Each registry gets its own controller
-/// so a slow registry doesn't throttle fast ones.
-struct PrewarmRateController {
-    /// Minimum spacing between send slots for this registry.
-    interval: Duration,
-    /// The latest send slot given out for this registry.
-    last_slot: Instant,
-    /// No slot falls before this, after a throttle that asked for a pause.
-    hold_until: Instant,
-    /// Last time a throttle (429) was processed.
-    last_throttle: Instant,
-    /// Congestion epoch -- prevents cascade halvings from burst 429s.
-    epoch: Duration,
-}
-
-impl PrewarmRateController {
-    /// Floor: 20 req/sec max.
-    const MIN_INTERVAL: Duration = Duration::from_millis(50);
-    /// Ceiling: never wait longer than 30s between requests.
-    const MAX_INTERVAL: Duration = Duration::from_secs(30);
-    /// Congestion epoch: 100ms (matches AIMD design).
-    const DEFAULT_EPOCH: Duration = Duration::from_millis(100);
-
-    /// Create a new controller with the given initial interval, whose first
-    /// slot is `now`.
-    fn new(initial_interval: Duration, now: Instant) -> Self {
-        Self {
-            interval: initial_interval,
-            last_slot: now - initial_interval,
-            hold_until: now,
-            last_throttle: now - Self::DEFAULT_EPOCH - Duration::from_millis(1),
-            epoch: Self::DEFAULT_EPOCH,
-        }
-    }
-
-    /// Claim the next send slot and return how long from `now` to wait for it,
-    /// or `None`, claiming nothing, when the slot falls after `deadline`. The
-    /// slot is taken at once, so requests that ask together are spaced one
-    /// interval apart instead of all waiting for the same moment.
-    fn reserve(&mut self, now: Instant, deadline: Instant) -> Option<Duration> {
-        let slot = (self.last_slot + self.interval)
-            .max(now)
-            .max(self.hold_until);
-        if slot > deadline {
-            return None;
-        }
-        self.last_slot = slot;
-        Some(slot - now)
-    }
-
-    /// Whether a throttle came after `reserved_at`, so a slot claimed then was
-    /// spaced for an interval that no longer holds.
-    fn throttled_since(&self, reserved_at: Instant) -> bool {
-        self.last_throttle > reserved_at
-    }
-
-    /// Record a successful response -- multiplicative increase.
-    ///
-    /// Decreases interval by 10% (floor [`MIN_INTERVAL`](Self::MIN_INTERVAL)).
-    fn on_success(&mut self) {
-        self.interval = self.interval.mul_f64(0.9).max(Self::MIN_INTERVAL);
-    }
-
-    /// Record a 429 throttle at `now` -- multiplicative decrease, and no slot
-    /// for `pause`.
-    ///
-    /// Doubles interval (cap [`MAX_INTERVAL`](Self::MAX_INTERVAL)). If a
-    /// throttle already occurred within the congestion epoch, the doubling is
-    /// suppressed.
-    fn on_throttle(&mut self, now: Instant, pause: Duration) {
-        if now.duration_since(self.last_throttle) > self.epoch {
-            self.interval = (self.interval * 2).min(Self::MAX_INTERVAL);
-            self.last_throttle = now;
-        }
-        self.hold_until = self.hold_until.max(now + pause);
-    }
-}
-
 /// How one blob's pre-warm ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlobOutcome {
@@ -1332,32 +1253,21 @@ enum BlobOutcome {
     PastDeadline,
 }
 
-/// What one blob response means for the pre-warm.
-#[derive(Debug, PartialEq, Eq)]
-enum Step {
-    /// The blob was served from the cache.
-    Hit,
-    /// The blob was served from the origin.
-    Miss,
-    /// The registry is throttling (429): back off and try again.
-    Throttled,
-    /// The registry is failing (5xx): try again.
-    Transient,
-    /// The registry refused the blob; asking again will not help.
-    Failed,
-}
-
-/// Classify a blob response by its status and `X-Cache` header.
-fn outcome_of(status: reqwest::StatusCode, x_cache: Option<&str>) -> Step {
-    if status.is_success() || status.is_redirection() {
-        let hit = x_cache.is_some_and(|v| v.to_ascii_lowercase().contains("hit"));
-        if hit { Step::Hit } else { Step::Miss }
-    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        Step::Throttled
-    } else if registry::transient(status) {
-        Step::Transient
+/// Classify the final response to a blob request. A hit is what `CloudFront`
+/// (`X-Cache`) or Cloudflare (`CF-Cache-Status`) says it is; any other
+/// success is a miss. A status that is not 2xx, an unfollowed redirect
+/// included, warmed nothing.
+fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> BlobOutcome {
+    if !status.is_success() {
+        return BlobOutcome::Failed;
+    }
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let hit = header("x-cache").is_some_and(|v| v.to_ascii_lowercase().contains("hit"))
+        || header("cf-cache-status").is_some_and(|v| v.eq_ignore_ascii_case("hit"));
+    if hit {
+        BlobOutcome::Hit
     } else {
-        Step::Failed
+        BlobOutcome::Miss
     }
 }
 
@@ -1366,6 +1276,39 @@ fn outcome_of(status: reqwest::StatusCode, x_cache: Option<&str>) -> Step {
 async fn drain(mut response: reqwest::Response) -> Result<(), reqwest::Error> {
     while response.chunk().await?.is_some() {}
     Ok(())
+}
+
+/// Warm one blob, `what` naming it in notices. `send` makes the request and
+/// waits out what is transient, so an error from it is final. A body that
+/// fails mid-read repeats the whole attempt, up to [`PREWARM_MAX_ATTEMPTS`]. A
+/// blob not sent by `deadline` is dropped.
+async fn warm_blob(
+    deadline: Instant,
+    what: &str,
+    send: impl AsyncFn() -> Result<reqwest::Response, String>,
+) -> BlobOutcome {
+    for attempt in 1..=PREWARM_MAX_ATTEMPTS {
+        if Instant::now() > deadline {
+            return BlobOutcome::PastDeadline;
+        }
+        let response = match send().await {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!("  {what}: {e}");
+                return BlobOutcome::Failed;
+            }
+        };
+        let outcome = outcome_of(response.status(), response.headers());
+        if outcome == BlobOutcome::Failed {
+            eprintln!("  {what}: {}", response.status());
+            return outcome;
+        }
+        match drain(response).await {
+            Ok(()) => return outcome,
+            Err(e) => eprintln!("  {what}: body failed (attempt {attempt}): {e}"),
+        }
+    }
+    BlobOutcome::Failed
 }
 
 /// Per-registry CDN pre-warm statistics.
@@ -1426,11 +1369,11 @@ fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> Vec<String> {
 const PREWARM_DEADLINE: Duration = Duration::from_secs(480);
 
 /// Concurrent blob requests to one registry. Each registry has its own, so a
-/// throttled one cannot hold the slots another needs.
-const PREWARM_PER_REGISTRY: usize = 5;
+/// slow one cannot hold the slots another needs.
+const PREWARM_PER_REGISTRY: usize = 8;
 
-/// Attempts at one blob while its registry throttles or fails.
-const PREWARM_MAX_ATTEMPTS: u32 = 3;
+/// Attempts at one blob whose body fails mid-read.
+const PREWARM_MAX_ATTEMPTS: u32 = 2;
 
 /// Longest one blob request may take, body included.
 const PREWARM_BLOB_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1445,29 +1388,26 @@ const PREWARM_BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// The outcome says which registries were not warmed, for the run record.
 async fn cdn_prewarm(
+    access: &registry::Access<'_>,
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
-    auth: Option<&corpus::DockerHubAuth>,
-    client: &reqwest::Client,
 ) -> Prewarm {
-    // A request not sent by this time is counted and dropped. One already
-    // sent runs to its own timeout, and the CDN wait below follows, so the
+    // A blob not sent by this time is counted and dropped. One already sent
+    // runs to its own timeout, and the CDN wait below follows, so the
     // pre-warm can end later than this.
-    let start = Instant::now();
-    let deadline = start + PREWARM_DEADLINE;
-    let access = registry::Access::new(client, auth);
+    let deadline = Instant::now() + PREWARM_DEADLINE;
     let blobs = blobs_to_warm(lock, refs);
 
     // Blob URLs are served via 302 redirects to CloudFront -- completely
     // different cache keys from manifests. Without this pass the first
     // tool to run pays a CDN miss penalty on every blob.
     //
-    // Each registry has its own concurrency limit and its own pacing, so a
-    // slow registry does not hold back fast ones.
+    // Each registry has its own concurrency limit, so a slow registry does
+    // not hold back fast ones.
     let hosts: BTreeSet<&str> = blobs.iter().map(|(key, _)| key.host.as_str()).collect();
     eprintln!(
         "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} concurrent per registry, \
-         {} at most across {} registries, paced)...",
+         {} at most across {} registries)...",
         blobs.len(),
         PREWARM_PER_REGISTRY * hosts.len(),
         hosts.len()
@@ -1476,102 +1416,22 @@ async fn cdn_prewarm(
         .iter()
         .map(|host| (*host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY)))
         .collect();
-    let pacing: std::cell::RefCell<HashMap<&str, PrewarmRateController>> = std::cell::RefCell::new(
-        hosts
-            .iter()
-            .map(|host| {
-                (
-                    *host,
-                    PrewarmRateController::new(Duration::from_millis(500), start),
-                )
-            })
-            .collect(),
-    );
 
     let outcomes = futures_util::future::join_all(blobs.iter().map(|(key, digest)| {
-        let (permits, pacing, access) = (&permits, &pacing, &access);
+        let permits = &permits;
         async move {
             let host = key.host.as_str();
             let _permit = permits[host].acquire().await.unwrap();
             let url = format!("https://{host}/v2/{}/blobs/{digest}", key.path);
-            let mut attempts = 0;
-            let outcome = loop {
-                let reserved_at = Instant::now();
-                let Some(wait) = pacing
-                    .borrow_mut()
-                    .get_mut(host)
-                    .unwrap()
-                    .reserve(reserved_at, deadline)
-                else {
-                    break BlobOutcome::PastDeadline;
-                };
-                tokio::time::sleep(wait).await;
-                // A throttle while this request waited changed the spacing it
-                // was given, so it asks again.
-                if pacing.borrow()[host].throttled_since(reserved_at) {
-                    continue;
-                }
-                let sent = access
-                    .send(&key.repository(), None, |token| {
-                        access
-                            .request(reqwest::Method::GET, &url)
-                            .timeout(PREWARM_BLOB_TIMEOUT)
-                            .bearer_auth(token)
+            let what = format!("blob pre-warm {host}/{}@{digest}", key.path);
+            let outcome = warm_blob(deadline, &what, async || {
+                access
+                    .send(&key.repository(), &what, |client| {
+                        client.get(&url).timeout(PREWARM_BLOB_TIMEOUT)
                     })
-                    .await;
-                attempts += 1;
-                let why = match sent {
-                    Ok(response) => {
-                        let x_cache = response
-                            .headers()
-                            .get("x-cache")
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_owned);
-                        match outcome_of(response.status(), x_cache.as_deref()) {
-                            step @ (Step::Hit | Step::Miss) => {
-                                if let Err(e) = drain(response).await {
-                                    eprintln!("  blob pre-warm: {host} {digest}: body: {e}");
-                                    break BlobOutcome::Failed;
-                                }
-                                pacing.borrow_mut().get_mut(host).unwrap().on_success();
-                                break if step == Step::Hit {
-                                    BlobOutcome::Hit
-                                } else {
-                                    BlobOutcome::Miss
-                                };
-                            }
-                            Step::Throttled => {
-                                let retry_after = response
-                                    .headers()
-                                    .get("retry-after")
-                                    .and_then(|v| v.to_str().ok());
-                                let pause = registry::backoff(attempts - 1, retry_after);
-                                pacing
-                                    .borrow_mut()
-                                    .get_mut(host)
-                                    .unwrap()
-                                    .on_throttle(Instant::now(), pause);
-                                "429".to_owned()
-                            }
-                            Step::Transient => response.status().to_string(),
-                            Step::Failed => {
-                                eprintln!(
-                                    "  blob pre-warm: {host} {digest}: {}",
-                                    response.status()
-                                );
-                                break BlobOutcome::Failed;
-                            }
-                        }
-                    }
-                    Err(e) => e,
-                };
-                if attempts >= PREWARM_MAX_ATTEMPTS {
-                    eprintln!(
-                        "  blob pre-warm: {host} {digest}: failed after {attempts} attempts: {why}"
-                    );
-                    break BlobOutcome::Failed;
-                }
-            };
+                    .await
+            })
+            .await;
             (host, outcome)
         }
     }))
@@ -1583,13 +1443,12 @@ async fn cdn_prewarm(
     }
     for (registry, s) in &stats {
         eprintln!(
-            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline, {}ms/req",
+            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline",
             s.hits + s.misses,
             s.hits,
             s.misses,
             s.failed,
-            s.past_deadline,
-            pacing.borrow()[registry].interval.as_millis()
+            s.past_deadline
         );
     }
     eprintln!("bench: blob CDN pre-warm done");
@@ -2225,129 +2084,142 @@ images:
         assert_eq!(tools[0], Tool::Ocync);
     }
 
-    /// A controller at 500 ms spacing whose first slot is the returned `now`.
-    fn controller() -> (PrewarmRateController, Instant) {
-        let now = Instant::now();
-        (
-            PrewarmRateController::new(Duration::from_millis(500), now),
-            now,
-        )
-    }
-
     #[test]
-    fn prewarm_rate_controller_ramps_up() {
-        let (mut ctrl, _) = controller();
-        let initial = ctrl.interval;
-        for _ in 0..10 {
-            ctrl.on_success();
-        }
-        // 10 successes: 500 * 0.9^10 ~= 174ms
-        assert!(ctrl.interval < initial);
-        assert!(ctrl.interval > PrewarmRateController::MIN_INTERVAL);
-    }
-
-    #[test]
-    fn prewarm_rate_controller_spaces_requests_that_ask_together() {
-        // Catches: every request asking at once being told to wait for the same
-        // moment, so none is paced.
-        let (mut ctrl, now) = controller();
-        let deadline = now + Duration::from_secs(60);
-        let waits: Vec<_> = (0..3).map(|_| ctrl.reserve(now, deadline)).collect();
-        let ms = Duration::from_millis;
-        assert_eq!(waits, [Some(ms(0)), Some(ms(500)), Some(ms(1000))]);
-    }
-
-    #[test]
-    fn prewarm_rate_controller_claims_no_slot_past_the_deadline() {
-        // Catches: a slot claimed for a request that will never be sent, which
-        // delays every request behind it.
-        let (mut ctrl, now) = controller();
-        let ms = Duration::from_millis;
-        let deadline = now + ms(700);
-        assert_eq!(ctrl.reserve(now, deadline), Some(ms(0)));
-        assert_eq!(ctrl.reserve(now, deadline), Some(ms(500)));
-        assert_eq!(ctrl.reserve(now, deadline), None);
-        // The refused request took nothing: the next slot is still 1000 ms out.
-        assert_eq!(ctrl.reserve(now, now + ms(2000)), Some(ms(1000)));
-    }
-
-    #[test]
-    fn prewarm_rate_controller_a_throttle_slows_and_pauses_and_voids_earlier_slots() {
-        // Catches: a request that claimed its slot before a 429 sending on the
-        // spacing the 429 just made too tight, and a Retry-After not honored.
-        let (mut ctrl, now) = controller();
-        let ms = Duration::from_millis;
-        let deadline = now + Duration::from_secs(60);
-        ctrl.reserve(now, deadline);
-        let later = now + ms(10);
-        assert!(!ctrl.throttled_since(later));
-        ctrl.on_throttle(later, Duration::from_secs(3));
-        assert!(ctrl.throttled_since(now));
-        assert!(!ctrl.throttled_since(later + ms(1)));
-        assert_eq!(ctrl.interval, ms(1000));
-        // The pause holds every slot until 3 s after the throttle.
-        assert_eq!(ctrl.reserve(later, deadline), Some(ms(3000)));
-    }
-
-    #[test]
-    fn prewarm_rate_controller_caps_backoff() {
-        let (mut ctrl, mut now) = controller();
-        // Throttle repeatedly, each outside the last one's epoch.
-        for _ in 0..20 {
-            now += ctrl.epoch + Duration::from_millis(1);
-            ctrl.on_throttle(now, Duration::ZERO);
-        }
-        assert_eq!(ctrl.interval, PrewarmRateController::MAX_INTERVAL);
-    }
-
-    #[test]
-    fn prewarm_rate_controller_epoch_suppresses_burst() {
-        let (mut ctrl, now) = controller();
-        ctrl.on_throttle(now, Duration::ZERO);
-        let after_first = ctrl.interval;
-        assert_eq!(after_first, Duration::from_secs(1));
-        // Second throttle within epoch -- should be suppressed.
-        ctrl.on_throttle(now + Duration::from_millis(1), Duration::ZERO);
-        assert_eq!(
-            ctrl.interval, after_first,
-            "second throttle within epoch should be suppressed"
-        );
-    }
-
-    #[test]
-    fn prewarm_rate_controller_floor() {
-        let (mut ctrl, _) = controller();
-        for _ in 0..200 {
-            ctrl.on_success();
-        }
-        assert_eq!(ctrl.interval, PrewarmRateController::MIN_INTERVAL);
-    }
-
-    #[test]
-    fn a_blob_response_is_classified_by_status_and_cache_header() {
-        // Catches: an error page counted as a warmed blob, a throttle or an
-        // outage given up on at once, and a refusal asked for again.
-        let cases = [
-            (200, Some("Hit from cloudfront"), Step::Hit),
-            (200, Some("RefreshHit from cloudfront"), Step::Hit),
-            (200, Some("Miss from cloudfront"), Step::Miss),
-            (200, None, Step::Miss),
-            (206, Some("Hit from cloudfront"), Step::Hit),
-            (302, None, Step::Miss),
-            (429, None, Step::Throttled),
-            (500, None, Step::Transient),
-            (503, Some("Hit from cloudfront"), Step::Transient),
-            (404, None, Step::Failed),
-            (403, Some("Hit from cloudfront"), Step::Failed),
-            (401, None, Step::Failed),
+    fn a_blob_response_is_classified_by_status_and_cache_headers() {
+        // Catches: an error page or an unfollowed redirect counted as a warmed
+        // blob, and a hit read off the wrong header.
+        type Headers<'a> = &'a [(&'a str, &'a str)];
+        let cases: [(u16, Headers<'_>, BlobOutcome); 11] = [
+            (200, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
+            (
+                200,
+                &[("x-cache", "RefreshHit from cloudfront")],
+                BlobOutcome::Hit,
+            ),
+            (200, &[("cf-cache-status", "HIT")], BlobOutcome::Hit),
+            (
+                200,
+                &[("x-cache", "Miss from cloudfront")],
+                BlobOutcome::Miss,
+            ),
+            (200, &[("cf-cache-status", "MISS")], BlobOutcome::Miss),
+            (200, &[], BlobOutcome::Miss),
+            (206, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
+            (
+                302,
+                &[("x-cache", "Hit from cloudfront")],
+                BlobOutcome::Failed,
+            ),
+            (404, &[], BlobOutcome::Failed),
+            (
+                403,
+                &[("x-cache", "Hit from cloudfront")],
+                BlobOutcome::Failed,
+            ),
+            (503, &[], BlobOutcome::Failed),
         ];
-        for (status, x_cache, expected) in cases {
+        for (status, headers, expected) in cases {
             let status = reqwest::StatusCode::from_u16(status).unwrap();
-            assert_eq!(
-                outcome_of(status, x_cache),
-                expected,
-                "{status} {x_cache:?}"
-            );
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(*name, value.parse().unwrap());
+            }
+            assert_eq!(outcome_of(status, &map), expected, "{status} {headers:?}");
         }
+    }
+
+    /// A body that yields some bytes and then a reset.
+    struct ResetMidBody(bool);
+
+    impl http_body::Body for ResetMidBody {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            let first = !std::mem::replace(&mut self.0, true);
+            std::task::Poll::Ready(Some(if first {
+                Ok(http_body::Frame::data(bytes::Bytes::from_static(b"part")))
+            } else {
+                Err(std::io::Error::other("connection reset"))
+            }))
+        }
+    }
+
+    fn served(x_cache: &str) -> Result<reqwest::Response, String> {
+        let response = http::Response::builder()
+            .header("x-cache", x_cache)
+            .body("blob bytes");
+        Ok(reqwest::Response::from(response.unwrap()))
+    }
+
+    fn reset_mid_body() -> Result<reqwest::Response, String> {
+        let response = http::Response::builder().body(reqwest::Body::wrap(ResetMidBody(false)));
+        Ok(reqwest::Response::from(response.unwrap()))
+    }
+
+    /// Warm a blob whose sends answer `script` in turn, and report the
+    /// outcome and how many sends were made.
+    fn warmed(
+        script: Vec<Result<reqwest::Response, String>>,
+        deadline: Instant,
+    ) -> (BlobOutcome, usize) {
+        use futures_util::FutureExt;
+        let sends = script.len();
+        let script = std::cell::RefCell::new(std::collections::VecDeque::from(script));
+        let outcome = warm_blob(deadline, "blob", async || {
+            script.borrow_mut().pop_front().expect("no send left")
+        })
+        .now_or_never()
+        .expect("nothing here waits");
+        (outcome, sends - script.borrow().len())
+    }
+
+    #[test]
+    fn a_blob_is_warmed_only_by_a_response_read_in_full() {
+        let open = Instant::now() + Duration::from_secs(10);
+        // Catches: a 2xx that says hit not being counted as one.
+        assert_eq!(
+            warmed(vec![served("Hit from cloudfront")], open),
+            (BlobOutcome::Hit, 1)
+        );
+        // Catches: a body that fails mid-read counted as warmed, or given up on
+        // without the second attempt.
+        assert_eq!(
+            warmed(vec![reset_mid_body(), served("Miss from cloudfront")], open),
+            (BlobOutcome::Miss, 2)
+        );
+        // Catches: a body that keeps failing passing as a hit or miss, or being
+        // attempted more than the limit.
+        assert_eq!(
+            warmed(
+                vec![
+                    reset_mid_body(),
+                    reset_mid_body(),
+                    served("Hit from cloudfront")
+                ],
+                open
+            ),
+            (BlobOutcome::Failed, 2)
+        );
+        // Catches: a send error, which already waited out its retries, being
+        // sent again.
+        assert_eq!(
+            warmed(
+                vec![Err("returned 503 (5 attempts)".into()), served("Hit")],
+                open
+            ),
+            (BlobOutcome::Failed, 1)
+        );
+        // Catches: a request sent after the deadline.
+        assert_eq!(
+            warmed(
+                vec![served("Hit from cloudfront")],
+                Instant::now() - Duration::from_secs(1)
+            ),
+            (BlobOutcome::PastDeadline, 0)
+        );
     }
 }

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use reqwest::{Method, StatusCode};
+use reqwest::StatusCode;
 
 use crate::bench::corpus::DockerHubAuth;
 
@@ -84,7 +84,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// How long to wait before retry number `attempt` (from 0): the registry's
 /// `Retry-After` seconds when it sent them, else doubling from 2 s, never more
 /// than [`MAX_BACKOFF`].
-pub(crate) fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
+fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
     let secs = retry_after
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or_else(|| 2u64.saturating_pow(attempt.saturating_add(1)));
@@ -93,7 +93,7 @@ pub(crate) fn backoff(attempt: u32, retry_after: Option<&str>) -> Duration {
 
 /// Whether a response status is worth another attempt: the registry is
 /// throttling (429) or failing (5xx), not refusing the request.
-pub(crate) fn transient(status: StatusCode) -> bool {
+fn transient(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
@@ -181,11 +181,6 @@ impl<'a> Access<'a> {
         }
     }
 
-    /// A request on the shared client, for [`Self::send`] to authorize.
-    pub(crate) fn request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
-        self.client.request(method, url)
-    }
-
     /// The token for `repo`, exchanged for the first time it is asked, or when
     /// the one held is `rejected`, which the registry refused. A token another
     /// request already replaced is returned as it is.
@@ -202,21 +197,19 @@ impl<'a> Access<'a> {
         exchanged
     }
 
-    /// Send, with the token for `repo`, the request `build` makes. With a
-    /// `retrying` label a transient failure is retried by [`send_retrying`].
+    /// Send the request `build` makes on the shared client, with the bearer
+    /// token for `repo`. A transient failure is retried by [`send_retrying`],
+    /// and `what` names the request in its retry notice.
     pub(crate) async fn send(
         &self,
         repo: &Repository<'_>,
-        retrying: Option<&str>,
-        build: impl Fn(&str) -> reqwest::RequestBuilder,
+        what: &str,
+        build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
         send_renewing(
             async || self.token(repo, None).await,
             async |old| self.token(repo, Some(old)).await,
-            async |token| match retrying {
-                Some(what) => send_retrying(what, || build(token)).await,
-                None => build(token).send().await.map_err(|e| e.to_string()),
-            },
+            async |token| send_retrying(what, || build(self.client).bearer_auth(token)).await,
         )
         .await
     }
