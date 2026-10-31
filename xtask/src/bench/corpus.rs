@@ -70,7 +70,7 @@ pub(crate) struct Corpus {
 /// Corpus-level settings (target registry, prefix).
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CorpusSettings {
-    /// ECR target registry hostname.
+    /// Target registry hostname.
     pub(crate) target_registry: String,
     /// Prefix for all target repos.
     pub(crate) target_prefix: String,
@@ -572,7 +572,7 @@ images:
     #[test]
     fn prepare_corpus_tags_are_all_wildcards() {
         // Env var only has to expand; the prepare scenario never writes here.
-        unsafe { std::env::set_var("BENCH_TARGET_REGISTRY", "example.invalid") };
+        unsafe { std::env::set_var(crate::bench::target::ENV_REGISTRY, "example.invalid") };
         let corpus = load("../bench/corpus-prepare.yaml")
             .or_else(|_| load("bench/corpus-prepare.yaml"))
             .expect("the prepare corpus parses");

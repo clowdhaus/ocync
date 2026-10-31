@@ -108,12 +108,11 @@ pub(crate) struct RoundCount {
 }
 
 impl RunRecord {
-    /// The record of a finished live run, `report` as measured on a registry of
-    /// `provider`, synced against the lock written at `corpus_locked_at`.
+    /// The record of a finished live run, `report` as measured on the machine
+    /// it names, synced against the lock written at `corpus_locked_at`.
     pub(crate) fn of(
         report: &BenchReport,
         git_ref: String,
-        provider: Option<Provider>,
         corpus_locked_at: Option<LockedAt>,
     ) -> Self {
         Self {
@@ -121,7 +120,7 @@ impl RunRecord {
             git_ref,
             corpus_locked_at,
             machine: MachineInfo {
-                provider,
+                provider: report.instance.provider(),
                 instance_type: report.instance.instance_type.clone(),
                 arch: report.instance.arch.clone(),
                 vcpus: report.instance.vcpus,
@@ -205,8 +204,8 @@ impl Prewarm {
 /// Machine metadata for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct MachineInfo {
-    /// Cloud of the target registry, absent when the registry belongs to none
-    /// of the three clouds.
+    /// Cloud the benchmark ran in, whichever cloud the target registry is in;
+    /// absent when the machine could not be identified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) provider: Option<Provider>,
     /// Instance type (e.g. `c6in.4xlarge`), or `"unknown"`.
@@ -411,6 +410,12 @@ pub(crate) struct InstanceInfo {
 }
 
 impl InstanceInfo {
+    /// The cloud the benchmark ran in: AWS when EC2's metadata service
+    /// answered. Only EC2 is read, so no other cloud is named.
+    pub(crate) fn provider(&self) -> Option<Provider> {
+        (self.instance_type != "unknown").then_some(Provider::Aws)
+    }
+
     /// Collect instance metadata from EC2 IMDS + `DescribeInstanceTypes`.
     ///
     /// IMDS provides the instance type and region. The AWS CLI
@@ -1343,13 +1348,13 @@ pub(crate) struct Deferred {
 }
 
 impl Deferred {
-    /// The deferred output of `report`, its `record` going to the archive
-    /// `archive_key`.
-    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, report: &BenchReport) -> Self {
+    /// The deferred output of a run: its `record` going to the archive
+    /// `archive_key`, and the `page` blocks.
+    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, page: PageBlocks) -> Self {
         Self {
             archive_key: archive_key.to_string(),
             record,
-            page: PageBlocks::of(report),
+            page,
         }
     }
 
@@ -1711,7 +1716,7 @@ pub(crate) mod tests {
         // build's default taken to be the current one's.
         let default = DEFAULT_MAX_CONCURRENT_TRANSFERS;
         let mut report = five_rounds(1);
-        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
         assert_eq!(record.max_concurrent_transfers, Some(default));
         assert_eq!(
             record.baseline_max_concurrent_transfers,
@@ -1732,7 +1737,7 @@ pub(crate) mod tests {
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
 
         report.max_concurrent_transfers = NonZeroUsize::new(20);
-        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
         assert_eq!(record.max_concurrent_transfers, NonZeroUsize::new(20));
         assert_eq!(
             record.baseline_max_concurrent_transfers,
@@ -1756,7 +1761,7 @@ pub(crate) mod tests {
 
         let mut no_ocync = sample_report();
         no_ocync.tool_versions.remove(&Tool::Ocync);
-        let record = RunRecord::of(&no_ocync, "abc1234".into(), None, None);
+        let record = RunRecord::of(&no_ocync, "abc1234".into(), None);
         assert_eq!(record.max_concurrent_transfers, None);
         assert_eq!(record.baseline_max_concurrent_transfers, None);
         assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
@@ -1791,6 +1796,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_machines_cloud_is_aws_only_when_ec2_answered() {
+        let mut instance = test_instance();
+        assert_eq!(instance.provider(), Some(Provider::Aws));
+        instance.instance_type = "unknown".into();
+        assert_eq!(instance.provider(), None);
+    }
+
+    #[test]
     fn a_run_record_carries_the_pre_warm_and_no_relay_as_an_empty_map() {
         // Catches: a record written with the pre-warm or the relays dropped,
         // which reads as "not recorded" instead of the run's own answer.
@@ -1798,7 +1811,7 @@ pub(crate) mod tests {
         report.prewarm = Some(Prewarm::Done {
             unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
         });
-        let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
         let written = serde_json::to_value(&record).unwrap();
         assert_eq!(written["relays"], serde_json::json!({}));
         assert_eq!(
@@ -1810,12 +1823,7 @@ pub(crate) mod tests {
     #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
-        let record = RunRecord::of(
-            &sample_report(),
-            "abc1234".into(),
-            Some(Provider::Aws),
-            None,
-        );
+        let record = RunRecord::of(&sample_report(), "abc1234".into(), None);
         append_record(dir.path(), "ecr", record).unwrap();
 
         let path = dir.path().join("ecr.json");
@@ -1832,12 +1840,7 @@ pub(crate) mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "[]").unwrap();
 
-        let record = RunRecord::of(
-            &sample_report(),
-            "abc1234".into(),
-            Some(Provider::Aws),
-            None,
-        );
+        let record = RunRecord::of(&sample_report(), "abc1234".into(), None);
         append_record(dir.path(), "ecr", record).unwrap();
 
         let records: Vec<RunRecord> =
@@ -1852,22 +1855,12 @@ pub(crate) mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "not json").unwrap();
 
-        let record = RunRecord::of(
-            &sample_report(),
-            "abc1234".into(),
-            Some(Provider::Aws),
-            None,
-        );
+        let record = RunRecord::of(&sample_report(), "abc1234".into(), None);
         assert!(append_record(dir.path(), "ecr", record).is_err());
     }
 
     fn sample_record() -> RunRecord {
-        RunRecord::of(
-            &sample_report(),
-            "abc1234".into(),
-            Some(Provider::Aws),
-            None,
-        )
+        RunRecord::of(&sample_report(), "abc1234".into(), None)
     }
 
     #[test]
@@ -1952,7 +1945,7 @@ pub(crate) mod tests {
         assert!(Deferred::read(run.path()).unwrap().is_none());
 
         let report = sample_report();
-        Deferred::new("ecr", Some(sample_record()), &report)
+        Deferred::new("ecr", Some(sample_record()), PageBlocks::of(&report))
             .write(run.path())
             .unwrap();
 
@@ -1982,9 +1975,13 @@ pub(crate) mod tests {
         let broken = "<!-- BENCH:END -->\n<!-- BENCH:START -->\n";
         std::fs::write(&page, broken).unwrap();
 
-        Deferred::new("ecr", Some(sample_record()), &sample_report())
-            .apply(local.path(), &page)
-            .unwrap();
+        Deferred::new(
+            "ecr",
+            Some(sample_record()),
+            PageBlocks::of(&sample_report()),
+        )
+        .apply(local.path(), &page)
+        .unwrap();
 
         assert_eq!(std::fs::read_to_string(&page).unwrap(), broken);
         assert!(local.path().join("ecr.json").exists(), "the record is kept");
@@ -1994,7 +1991,7 @@ pub(crate) mod tests {
     fn a_deferred_run_not_comparable_to_the_archive_appends_no_record() {
         let local = tempfile::tempdir().unwrap();
         let page = local.path().join("performance.md");
-        Deferred::new("ecr", None, &sample_report())
+        Deferred::new("ecr", None, PageBlocks::of(&sample_report()))
             .apply(local.path(), &page)
             .unwrap();
         assert!(!local.path().join("ecr.json").exists());
@@ -2924,7 +2921,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_record_keeps_every_round_and_names_the_baseline_by_its_commit() {
-        let record = RunRecord::of(&five_rounds(3), "abc1234".into(), None, None);
+        let record = RunRecord::of(&five_rounds(3), "abc1234".into(), None);
 
         // Catches: rounds collapsed to one, a lost seed or order, the baseline
         // recorded under ocync's name, and a stopped run recorded as complete.
@@ -2954,7 +2951,7 @@ pub(crate) mod tests {
         // scenario that failed in round 1 left the run recorded as complete.
         let mut report = five_rounds(5);
         report.repeated = vec![ScenarioKind::Cold, ScenarioKind::Partial];
-        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
         assert_eq!(
             record.rounds,
             Some(RoundCount {
@@ -2969,7 +2966,7 @@ pub(crate) mod tests {
         // Catches: a `round` or `rounds` field written for a scenario run once,
         // which would change every record already archived, and one required
         // to parse.
-        let record = RunRecord::of(&sample_report(), "abc1234".into(), None, None);
+        let record = RunRecord::of(&sample_report(), "abc1234".into(), None);
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("\"round"), "{json}");
 
@@ -2977,7 +2974,7 @@ pub(crate) mod tests {
         assert!(parsed.scenarios.iter().all(|s| s.round.is_none()));
         assert_eq!(parsed.rounds, None);
 
-        let rounds = RunRecord::of(&five_rounds(5), "abc1234".into(), None, None);
+        let rounds = RunRecord::of(&five_rounds(5), "abc1234".into(), None);
         let json = serde_json::to_string(&rounds).unwrap();
         assert!(json.contains("\"round\":3"), "{json}");
         assert!(

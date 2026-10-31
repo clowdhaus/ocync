@@ -14,9 +14,12 @@ use std::process::{Command, Stdio};
 use clap::Args;
 use serde::Deserialize;
 
+use super::gar::{ArtifactRegistryTarget, ENV_CREDENTIALS};
+use super::gcloud::{Gcloud, Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
-use super::{Provider, RunTimestamp, Scenario, ToolSelection, value_name};
+use super::target::{ENV_REGISTRY, Kind, ensure_artifact_registry_applies};
+use super::{Provider, RunTimestamp, Scenario, ToolSelection, captured, finish_pass, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -43,6 +46,10 @@ fn ssh_args(config: &BenchConfig) -> Vec<&str> {
     args
 }
 
+/// Where on the instance the Google federation file is copied to, relative to
+/// the bench user's home.
+const REMOTE_CREDENTIALS: &str = ".bench-gar-credentials.json";
+
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
@@ -50,6 +57,12 @@ pub(crate) struct BenchRemoteArgs {
     /// `bench/terraform/<provider>/bench.json`.
     #[arg(long)]
     pub(crate) provider: Provider,
+
+    /// Registry the instance syncs into. Artifact Registry needs the Google
+    /// stack applied (`bench/terraform/gcp`) and `gcloud` signed in here: this
+    /// command makes a repository for each round and deletes them when it ends.
+    #[arg(long, value_enum, default_value = "ecr")]
+    pub(crate) target: Kind,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -60,6 +73,7 @@ pub(crate) struct BenchRemoteArgs {
         conflicts_with_all = [
             "force",
             "git_ref",
+            "target",
             "tools",
             "baseline_ref",
             "rounds",
@@ -82,6 +96,7 @@ pub(crate) struct BenchRemoteArgs {
     /// older than the change that added `bench --archive` cannot run, because
     /// the instance's `bench` would not know the option, and one older than
     /// `--max-concurrent-transfers` cannot take that option for the same reason.
+    /// An Artifact Registry run needs a ref with `--target`.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -164,12 +179,24 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
 
     // Decided before the push, so a provider with no setup is refused before
     // anything leaves this machine.
-    let registry_env = registry_env(args.provider)?;
+    ensure_placement(args.provider)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    if args.target == Kind::ArtifactRegistry {
+        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
+    }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
+
+    // Held, with the Terraform outputs read, until this function returns,
+    // and so also after the push: a missing apply is refused before anything
+    // leaves this machine, and a second Artifact Registry run on this machine
+    // cannot sweep the repositories made below.
+    let (_local_run, outputs) = match args.target {
+        Kind::Ecr => (None, None),
+        Kind::ArtifactRegistry => (Some(lock_local_run()?), Some(Outputs::read()?)),
+    };
 
     let git_ref = match &args.git_ref {
         Some(r) => r.clone(),
@@ -191,19 +218,73 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // This run's start time, chosen here: it names the results directory the
-    // fetch takes and stamps the run's record. A run that wrote no results
-    // leaves nothing at that path, and no earlier run's directory can stand in
-    // for it.
+    // fetch takes and stamps the run's record.
     let timestamp = RunTimestamp::now();
-    let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
 
-    let bench_args = bench_args(&args, &timestamp);
+    // Made after the push, so a refused or failed push creates nothing. The
+    // local lock above covers another run on this machine; the probe covers
+    // one whose local process died but whose benchmark is still going on the
+    // instance, which the sweep would otherwise empty. Dropped on every way out
+    // of this function, which deletes the repositories.
+    let mut provisioned = match outputs {
+        None => None,
+        Some(outputs) => {
+            may_provision(
+                RunLock::parse(&ssh_run(&config, &run_lock_probe())?)?,
+                ExistingRun::from_force(args.force),
+            )?;
+            Some(Provisioned::create(
+                Gcloud::installed(),
+                outputs,
+                &timestamp,
+                args.tool_selection.rounds,
+            )?)
+        }
+    };
 
-    let script = remote_script(
+    let (end, result) = run_on_instance(
+        &args,
+        &config,
         &git_ref,
         &git_sha,
+        &timestamp,
+        provisioned.as_ref(),
+    );
+    let cleanup = provisioned
+        .as_mut()
+        .map_or(Ok(()), |provisioned| provisioned.settle(end));
+    finish_pass(result, cleanup)
+}
+
+/// Runs the benchmark on the instance and fetches its results, and says
+/// whether the run's end is known.
+fn run_on_instance(
+    args: &BenchRemoteArgs,
+    config: &BenchConfig,
+    git_ref: &str,
+    git_sha: &CommitSha,
+    timestamp: &RunTimestamp,
+    provisioned: Option<&Provisioned>,
+) -> (RunEnd, Result<(), Box<dyn std::error::Error>>) {
+    // The directory the fetch takes, named by this run's start time. A run
+    // that wrote no results leaves nothing at that path, and no earlier run's
+    // directory can stand in for it.
+    let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
+
+    if let Some(provisioned) = provisioned
+        && let Err(e) = copy_credentials(config, &provisioned.credentials_file)
+    {
+        // Before any run exists on the instance.
+        return (RunEnd::Settled, Err(e));
+    }
+
+    let bench_args = bench_args(args, timestamp);
+
+    let script = remote_script(
+        git_ref,
+        git_sha,
         &bench_args,
-        registry_env,
+        &registry_env(provisioned.map(|p| &p.target)),
         ExistingRun::from_force(args.force),
     );
 
@@ -212,21 +293,22 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         config.user, config.host
     );
 
-    let exit_code = match ssh_stream(&config, &script)? {
-        RemoteOutcome::Refused => {
-            return Err(
-                "a benchmark is still running on the instance; pass --force to kill it, \
-                 or --fetch to copy the newest results there (a live run's partial results \
-                 once its benchmark has started)"
-                    .into(),
-            );
-        }
+    let outcome = match ssh_stream(config, &script) {
+        Ok(outcome) => outcome,
+        Err(e) => return (RunEnd::Unknown, Err(e)),
+    };
+    let end = outcome.end();
+    let exit_code = match outcome {
+        RemoteOutcome::Refused => return (end, Err(LIVE_RUN_REFUSAL.into())),
         RemoteOutcome::FailedBeforeStart(code) => {
-            return Err(format!(
-                "remote script exited with code {code} before the benchmark started; \
-                 not fetching results"
-            )
-            .into());
+            return (
+                end,
+                Err(format!(
+                    "remote script exited with code {code} before the benchmark started; \
+                     not fetching results"
+                )
+                .into()),
+            );
         }
         RemoteOutcome::Ran(code) => code,
     };
@@ -237,8 +319,8 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("bench-remote: fetching results...");
     }
 
-    let results = fetch_run_results(&config, &args.output, &results_dir);
-    run_result(exit_code, results)
+    let results = fetch_run_results(config, &args.output, &results_dir);
+    (end, run_result(exit_code, results))
 }
 
 /// What the fetch of a run's results directory found.
@@ -298,6 +380,11 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
         "--rounds".to_string(),
         args.tool_selection.rounds.to_string(),
     ];
+    // Only for Artifact Registry, so an ECR run still works on a `--git-ref`
+    // whose `bench` has no such option.
+    if args.target == Kind::ArtifactRegistry {
+        bench_args.extend(["--target".to_string(), value_name(&args.target)]);
+    }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
     }
@@ -320,17 +407,55 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     bench_args
 }
 
-/// The shell that points the benchmark at `provider`'s registry on the
-/// instance, or the reason there is none yet.
-fn registry_env(provider: Provider) -> Result<&'static str, String> {
-    match provider {
-        Provider::Aws => Ok(
-            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport BENCH_TARGET_REGISTRY=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com",
-        ),
-        Provider::Gcp | Provider::Azure => Err(format!(
+/// Fails unless `provider` has registry env setup.
+fn ensure_placement(provider: Provider) -> Result<(), String> {
+    if provider != Provider::Aws {
+        return Err(format!(
             "provider '{provider}' not yet supported. Add registry env setup for this provider."
-        )),
+        ));
     }
+    Ok(())
+}
+
+/// The shell that points the benchmark at its target registry on the instance:
+/// ECR in the instance's own account, or the repositories this machine made.
+fn registry_env(target: Option<&ArtifactRegistryTarget>) -> String {
+    match target {
+        None => format!(
+            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport {ENV_REGISTRY}=${{ACCOUNT}}.dkr.ecr.${{REGION}}.amazonaws.com"
+        ),
+        // Every value was parsed as an id or a host, so none holds shell syntax.
+        Some(target) => target
+            .env()
+            .iter()
+            .map(|(name, value)| format!("export {name}={value}"))
+            .chain([format!(
+                "export {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\""
+            )])
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Copies the Google federation file to the instance, readable by its user
+/// alone: it is created closed before any content is in it.
+fn copy_credentials(config: &BenchConfig, local: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    ssh_run(
+        config,
+        &format!("umask 077 && touch {REMOTE_CREDENTIALS} && chmod 600 {REMOTE_CREDENTIALS}"),
+    )?;
+    let status = Command::new("scp")
+        .args(ssh_args(config))
+        .arg(local)
+        .arg(format!(
+            "{}@{}:{REMOTE_CREDENTIALS}",
+            config.user, config.host
+        ))
+        .status()?;
+    if !status.success() {
+        return Err("scp of the Google credentials file failed".into());
+    }
+    Ok(())
 }
 
 /// A line the remote script prints that says how far it got.
@@ -353,6 +478,10 @@ impl Sentinel {
     }
 }
 
+/// The exit code `ssh` itself ends with when it cannot connect or the
+/// connection drops.
+const SSH_FAILED_EXIT: i32 = 255;
+
 /// How the remote script ended.
 #[derive(Debug, PartialEq, Eq)]
 enum RemoteOutcome {
@@ -366,6 +495,21 @@ enum RemoteOutcome {
 }
 
 impl RemoteOutcome {
+    /// Whether the script's own exit was read. `ssh` exits with
+    /// [`SSH_FAILED_EXIT`] when the connection fails or drops, which leaves the
+    /// detached script and benchmark running, and a script is not told apart
+    /// from it by its own code. A refusal is the guard's line, so no run of
+    /// ours exists.
+    fn end(&self) -> RunEnd {
+        match self {
+            Self::Refused => RunEnd::Settled,
+            Self::FailedBeforeStart(code) | Self::Ran(code) if *code == SSH_FAILED_EXIT => {
+                RunEnd::Unknown
+            }
+            Self::FailedBeforeStart(_) | Self::Ran(_) => RunEnd::Settled,
+        }
+    }
+
     /// The outcome of a script whose first sentinel line was `sentinel`.
     /// A refusal is the line, whatever the exit code: `set -e` makes any
     /// failing command exit with any code, the refusal's own `exit 3`
@@ -513,18 +657,13 @@ fn fetch_results(
 
 /// Run a single command on the remote instance and capture its stdout.
 fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("ssh")
-        .args(ssh_args(config))
-        .arg(format!("{}@{}", config.user, config.host))
-        .arg(command)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssh command failed: {stderr}").into());
-    }
-
-    Ok(String::from_utf8(output.stdout)?)
+    Ok(captured(
+        Command::new("ssh")
+            .args(ssh_args(config))
+            .arg(format!("{}@{}", config.user, config.host))
+            .arg(command),
+    )
+    .map_err(|e| format!("ssh command failed: {e}"))?)
 }
 
 /// Escapes a string for use inside single quotes in a shell command.
@@ -533,6 +672,60 @@ fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::e
 /// literal single-quote, restart single-quote).
 fn shell_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
+}
+
+/// Why a run is refused while another benchmark holds the instance.
+const LIVE_RUN_REFUSAL: &str = "a benchmark is still running on the instance; pass --force to kill it, \
+     or --fetch to copy the newest results there (a live run's partial results \
+     once its benchmark has started)";
+
+/// The run lock, relative to the repository on the instance.
+const RUN_LOCK: &str = "bench/.bench-run.lock";
+
+/// Whether a benchmark holds the instance's run lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunLock {
+    /// No run holds it, or the instance has no repository yet.
+    Free,
+    /// A run holds it.
+    Held,
+}
+
+impl RunLock {
+    /// The answer [`run_lock_probe`] printed.
+    fn parse(output: &str) -> Result<Self, String> {
+        match output.trim() {
+            "free" => Ok(Self::Free),
+            "held" => Ok(Self::Held),
+            other => Err(format!("run lock probe printed {other:?}")),
+        }
+    }
+}
+
+/// Asks the instance whether its run lock is held, without taking it for
+/// longer than the question. Only [`FLOCK_HELD_EXIT`] means held, as in
+/// [`existing_run_guard`]; any other `flock` failure is an error, never taken
+/// for a free lock. No repository yet means no run.
+fn run_lock_probe() -> String {
+    format!(
+        r#"cd ~/ocync 2>/dev/null || {{ echo free; exit 0; }}
+rc=0; flock -n -E {FLOCK_HELD_EXIT} {RUN_LOCK} true || rc=$?
+case "$rc" in
+  0) echo free ;;
+  {FLOCK_HELD_EXIT}) echo held ;;
+  *) echo "flock failed (exit $rc); is util-linux installed?" >&2; exit 1 ;;
+esac"#
+    )
+}
+
+/// Refuses to touch Artifact Registry while a live run would be refused: the
+/// leftover sweep would delete that run's repositories. `--force` kills the
+/// run, so its repositories go with it.
+fn may_provision(lock: RunLock, existing: ExistingRun) -> Result<(), String> {
+    match (lock, existing) {
+        (RunLock::Held, ExistingRun::Refuse) => Err(LIVE_RUN_REFUSAL.into()),
+        _ => Ok(()),
+    }
 }
 
 /// What to do with a benchmark still running on the instance.
@@ -702,7 +895,7 @@ if [ ! -d ~/ocync ]; then
 fi
 
 cd ~/ocync
-LOCK_FILE=bench/.bench-run.lock
+LOCK_FILE={RUN_LOCK}
 PGID_FILE=bench/.bench-run.pgid
 LOG_FILE=bench/.bench-run.log
 EXIT_FILE=bench/.bench-run.exit
@@ -788,16 +981,9 @@ exit $EXIT
 /// Runs `git` with `args` in `repo` and returns its trimmed output, or an error
 /// carrying git's own message.
 pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git").current_dir(repo).args(args).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    let stdout = captured(Command::new("git").current_dir(repo).args(args))
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    Ok(stdout.trim().to_owned())
 }
 
 /// Runs `git rev-parse` with `args` in `repo`.
@@ -1056,6 +1242,7 @@ mod tests {
         for extra in [
             &["--force"][..],
             &["--git-ref", "main"][..],
+            &["--target", "ecr"][..],
             &["--tools", "ocync"][..],
             &["--rounds", "3"][..],
             &["--max-concurrent-transfers", "20"][..],
@@ -1105,11 +1292,8 @@ mod tests {
 
     #[test]
     fn a_provider_without_registry_setup_is_refused_by_name() {
-        assert!(
-            registry_env(Provider::Aws)
-                .unwrap()
-                .contains("BENCH_TARGET_REGISTRY")
-        );
+        assert!(registry_env(None).contains(ENV_REGISTRY));
+        assert_eq!(ensure_placement(Provider::Aws), Ok(()));
         for (provider, expected) in [
             (
                 Provider::Gcp,
@@ -1120,7 +1304,67 @@ mod tests {
                 "provider 'azure' not yet supported. Add registry env setup for this provider.",
             ),
         ] {
-            assert_eq!(registry_env(provider), Err(expected.to_string()));
+            assert_eq!(ensure_placement(provider), Err(expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn the_instance_is_told_its_repositories_and_where_the_credentials_are() {
+        let target = ArtifactRegistryTarget {
+            location: "europe-west9".parse().unwrap(),
+            project: "example-project".parse().unwrap(),
+            repositories: ["run-r1", "run-r2", "run-r3"]
+                .map(|id| id.parse().unwrap())
+                .to_vec(),
+        };
+        assert_eq!(
+            registry_env(Some(&target)),
+            "export BENCH_TARGET_REGISTRY=europe-west9-docker.pkg.dev\n\
+             export BENCH_GAR_PROJECT=example-project\n\
+             export BENCH_GAR_REPOSITORIES=run-r1,run-r2,run-r3\n\
+             export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.bench-gar-credentials.json\""
+        );
+    }
+
+    #[test]
+    fn the_target_reaches_the_benchmark_on_the_instance() {
+        // Catches: `bench-remote` choosing Artifact Registry and the instance
+        // defaulting to ECR, or an ECR run sending an option that a `--git-ref`
+        // older than the target flag does not know.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            let bench_args = bench_args(&args, &timestamp);
+            let argv: Vec<&str> = bench_args.iter().map(String::as_str).collect();
+            (
+                bench_args.contains(&"--target".to_owned()),
+                crate::bench::parse_bench(&argv).unwrap().target,
+            )
+        };
+        assert_eq!(passed(&[]), (false, Kind::Ecr));
+        assert_eq!(
+            passed(&["--target", "artifact-registry"]),
+            (true, Kind::ArtifactRegistry)
+        );
+    }
+
+    #[test]
+    fn only_a_read_exit_settles_the_end_of_a_run() {
+        // Catches: deleting the repositories under a benchmark that goes on
+        // pushing after `ssh` dropped.
+        for (outcome, expected) in [
+            (RemoteOutcome::Refused, RunEnd::Settled),
+            (RemoteOutcome::FailedBeforeStart(3), RunEnd::Settled),
+            (RemoteOutcome::Ran(0), RunEnd::Settled),
+            (RemoteOutcome::Ran(1), RunEnd::Settled),
+            (RemoteOutcome::FailedBeforeStart(255), RunEnd::Unknown),
+            (RemoteOutcome::Ran(255), RunEnd::Unknown),
+        ] {
+            assert_eq!(outcome.end(), expected, "{outcome:?}");
         }
     }
 
@@ -1141,7 +1385,7 @@ mod tests {
                 "ocync".to_string(),
                 "all".to_string(),
             ],
-            "export BENCH_TARGET_REGISTRY=registry.example.com",
+            &format!("export {ENV_REGISTRY}=registry.example.com"),
             existing,
         )
     }
@@ -1463,7 +1707,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
 
     #[test]
     fn the_fetch_copies_a_present_run_once_and_an_absent_one_not_at_all() {
-        use crate::bench::report::{Deferred, RunRecord, tests::sample_report};
+        use crate::bench::report::{Deferred, PageBlocks, RunRecord, tests::sample_report};
         let work = tempfile::tempdir().unwrap();
         let archive = work.path().join("bench/results/ecr.json");
         let records = || -> usize {
@@ -1472,10 +1716,10 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
                 .unwrap_or(0)
         };
         let report = sample_report();
-        let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
+        let record = RunRecord::of(&report, "abc1234".into(), None);
 
         let with_record = tempfile::tempdir().unwrap();
-        Deferred::new("ecr", Some(record), &report)
+        Deferred::new("ecr", Some(record), PageBlocks::of(&report))
             .write(with_record.path())
             .unwrap();
         let without_record = tempfile::tempdir().unwrap();
@@ -1611,6 +1855,61 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
             command.env("PATH", path);
         }
         command.output().unwrap()
+    }
+
+    /// A held lock without `--force` refuses before any repository is swept
+    /// or made; an unreadable probe is an error, never taken as free.
+    #[test]
+    fn a_live_run_keeps_its_repositories() {
+        assert_eq!(
+            may_provision(RunLock::Held, ExistingRun::Refuse),
+            Err(LIVE_RUN_REFUSAL.to_string())
+        );
+        assert_eq!(may_provision(RunLock::Held, ExistingRun::Kill), Ok(()));
+        assert_eq!(may_provision(RunLock::Free, ExistingRun::Refuse), Ok(()));
+        assert_eq!(RunLock::parse("held\n"), Ok(RunLock::Held));
+        assert_eq!(RunLock::parse("free\n"), Ok(RunLock::Free));
+        assert_eq!(
+            RunLock::parse(""),
+            Err("run lock probe printed \"\"".to_string())
+        );
+    }
+
+    // The probe is shell for the Linux bench instance: it needs util-linux
+    // `flock`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_lock_probe_says_held_only_for_a_held_lock() {
+        // Catches: any `flock` failure, such as a missing binary, read as a
+        // live run (or a free lock), and a held lock read as free.
+        let home = tempfile::tempdir().unwrap();
+        let probe = |path: Option<&str>| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(run_lock_probe())
+                .env("HOME", home.path());
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            let out = command.output().unwrap();
+            (out.status.success(), String::from_utf8(out.stdout).unwrap())
+        };
+
+        assert_eq!(probe(None), (true, "free\n".into()), "no repository yet");
+
+        let bench = home.path().join("ocync/bench");
+        std::fs::create_dir_all(&bench).unwrap();
+        assert_eq!(probe(None), (true, "free\n".into()), "lock not taken");
+
+        let lock = std::fs::File::create(bench.join(".bench-run.lock")).unwrap();
+        lock.lock().unwrap();
+        assert_eq!(probe(None), (true, "held\n".into()), "lock held");
+        assert_eq!(
+            probe(Some("/nonexistent")),
+            (false, String::new()),
+            "flock missing"
+        );
     }
 
     // The generated script targets the Linux bench instance: it needs
