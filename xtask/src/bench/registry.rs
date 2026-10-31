@@ -7,9 +7,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use tokio::sync::OnceCell;
 
 use crate::bench::corpus::DockerHubAuth;
 
@@ -20,7 +22,7 @@ const DOCKER_HUB_API_HOST: &str = "registry-1.docker.io";
 const DOCKER_HUB_NAMES: [&str; 3] = ["docker.io", DOCKER_HUB_API_HOST, "index.docker.io"];
 
 /// The registry a repository lives on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Host<'a> {
     /// Docker Hub, named `docker.io`, `index.docker.io` or its API host in a
     /// corpus source, and served from its API host.
@@ -40,7 +42,7 @@ impl<'a> Host<'a> {
 }
 
 /// A repository on a registry, as a corpus source names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Repository<'a> {
     /// The registry holding the repository.
     pub(crate) host: Host<'a>,
@@ -151,13 +153,19 @@ impl From<&Repository<'_>> for RepoKey {
 /// its body.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Longest the client waits to connect, so a registry that drops the
+/// connection attempt does not hold a request for the system's own limit.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The client [`Access`] sends through. It has no total timeout, so a large
-/// blob is not cut mid-download; [`READ_TIMEOUT`] ends a request that stalls
-/// before its headers or between chunks. A body that trickles without ever
-/// stalling that long is not capped, which only a caller that bounds its own
-/// time, as the pre-warm does, can handle.
+/// blob is not cut mid-download; [`CONNECT_TIMEOUT`] bounds the connection and
+/// [`READ_TIMEOUT`] a request that stalls before its headers or between
+/// chunks. A body that trickles without ever stalling that long is not capped,
+/// which only a caller that bounds its own time, as the pre-warm does, can
+/// handle.
 pub(crate) fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))
@@ -176,8 +184,12 @@ pub(crate) struct Access<'a> {
     auth: Option<&'a DockerHubAuth>,
     /// Latest exchange for each repository; a failure is kept so it is
     /// reported for every tag and not retried at once.
-    tokens: RefCell<HashMap<RepoKey, Result<String, String>>>,
+    tokens: Tokens,
 }
+
+/// The token exchange of each repository, one cell per repository so that
+/// requests made together share one exchange.
+type Tokens = RefCell<HashMap<RepoKey, Rc<OnceCell<Result<String, String>>>>>;
 
 impl<'a> Access<'a> {
     /// Access through `client`, with Docker Hub credentials if given.
@@ -190,19 +202,12 @@ impl<'a> Access<'a> {
     }
 
     /// The token for `repo`, exchanged for the first time it is asked, or when
-    /// the one held is `rejected`, which the registry refused. A token another
-    /// request already replaced is returned as it is.
+    /// the one held is `rejected`, which the registry refused.
     async fn token(&self, repo: &Repository<'_>, rejected: Option<&str>) -> Result<String, String> {
-        let key = RepoKey::from(repo);
-        let held = self.tokens.borrow().get(&key).cloned();
-        if let Some(held) =
-            held.filter(|held| rejected.is_none() || held.as_deref().ok() != rejected)
-        {
-            return held;
-        }
-        let exchanged = oci_token(self.client, repo, self.auth).await;
-        self.tokens.borrow_mut().insert(key, exchanged.clone());
-        exchanged
+        cached_token(&self.tokens, RepoKey::from(repo), rejected, async || {
+            oci_token(self.client, repo, self.auth).await
+        })
+        .await
     }
 
     /// Send the request `build` makes on the shared client, with the bearer
@@ -221,6 +226,31 @@ impl<'a> Access<'a> {
         )
         .await
     }
+}
+
+/// The token for `key`: the one held, or the one `exchange` yields. Requests
+/// that ask before any is held share one exchange, and if the task running it
+/// is dropped the next to ask runs it. A held token that is `rejected` is
+/// replaced; one another request already replaced is returned as it is.
+async fn cached_token(
+    held: &Tokens,
+    key: RepoKey,
+    rejected: Option<&str>,
+    exchange: impl AsyncFnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let cell = {
+        let mut held = held.borrow_mut();
+        let cell = Rc::clone(held.entry(key.clone()).or_default());
+        let refused = rejected.is_some() && cell.get().and_then(|t| t.as_deref().ok()) == rejected;
+        if refused {
+            let fresh = Rc::<OnceCell<_>>::default();
+            held.insert(key, Rc::clone(&fresh));
+            fresh
+        } else {
+            cell
+        }
+    };
+    cell.get_or_init(|| exchange()).await.clone()
 }
 
 /// Send with the current token. A 401 means the token expired, so exchange for
@@ -328,6 +358,44 @@ mod tests {
     use futures_util::FutureExt;
 
     use super::*;
+
+    #[test]
+    fn requests_made_together_share_one_token_exchange() {
+        // Catches: every task of a registry running its own exchange before the
+        // first has stored a token.
+        let held = Tokens::default();
+        let exchanges = Cell::new(0);
+        let ask = |rejected: Option<&'static str>| {
+            cached_token(
+                &held,
+                RepoKey {
+                    host: "r.example".into(),
+                    path: "a/b".into(),
+                },
+                rejected,
+                async || {
+                    exchanges.set(exchanges.get() + 1);
+                    // Let the others ask while this exchange is in flight.
+                    tokio::task::yield_now().await;
+                    Ok(format!("t{}", exchanges.get()))
+                },
+            )
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (a, b, c) =
+            runtime.block_on(futures_util::future::join3(ask(None), ask(None), ask(None)));
+        assert_eq!(
+            (a, b, c),
+            (Ok("t1".into()), Ok("t1".into()), Ok("t1".into()))
+        );
+        assert_eq!(exchanges.get(), 1);
+        // Rejected: replaced once, however many requests found it refused.
+        let (a, b) = runtime.block_on(futures_util::future::join(ask(Some("t1")), ask(Some("t1"))));
+        assert_eq!((a, b), (Ok("t2".into()), Ok("t2".into())));
+        assert_eq!(exchanges.get(), 2);
+    }
 
     #[test]
     fn split_source_maps_docker_hub_to_its_api_host() {

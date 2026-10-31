@@ -174,7 +174,14 @@ impl Lock {
             )
         })?;
         Self::parse(&raw).map_err(|e| {
-            format!("corpus lock {shown}: {e}; re-create it with `cargo xtask bench-lock`")
+            // Only a lock from before blobs were recorded needs writing again;
+            // re-locking also moves floating tags and starts a new series.
+            let hint = if e.contains("missing field `blobs`") {
+                "; it predates recorded blobs, so re-create it with `cargo xtask bench-lock`"
+            } else {
+                ""
+            };
+            format!("corpus lock {shown}: {e}{hint}")
         })
     }
 
@@ -929,21 +936,31 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_without_blobs_is_refused_with_the_command_that_writes_one() {
-        // Catches: a lock from before blobs were recorded failing with a bare
-        // parse error.
+    fn only_a_lock_from_before_blobs_is_told_to_be_re_created() {
+        // Catches: a typo in the lock, or a mangled digest, sending the
+        // operator to re-lock, which moves floating tags and starts a new
+        // series.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corpus.lock.json");
-        let old = format!(
-            r#"{{"locked_at":"2026-10-30-120000","images":{{"s/a:1":{{"digest":"{}","children":[]}}}}}}"#,
-            d('1')
-        );
-        std::fs::write(&path, old).unwrap();
-        let error = Lock::load(&path).unwrap_err();
-        assert!(
-            error.contains("blobs") && error.contains("cargo xtask bench-lock"),
-            "{error}"
-        );
+        let lock = |blobs: &str, locked_at: &str| {
+            format!(
+                r#"{{"locked_at":"{locked_at}","images":{{"s/a:1":{{"digest":"{}","children":[]{blobs}}}}}}}"#,
+                d('1')
+            )
+        };
+        let cases = [
+            (lock("", "2026-10-30-120000"), true),
+            (lock(r#","blobs":[]"#, "yesterday"), false),
+            (
+                lock(r#","blobs":["sha256:xyz"]"#, "2026-10-30-120000"),
+                false,
+            ),
+        ];
+        for (text, hinted) in cases {
+            std::fs::write(&path, &text).unwrap();
+            let error = Lock::load(&path).unwrap_err();
+            assert_eq!(error.contains("cargo xtask bench-lock"), hinted, "{error}");
+        }
     }
 
     #[test]

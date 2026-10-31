@@ -12,7 +12,7 @@ pub(crate) mod report;
 pub(crate) mod runner;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -1252,7 +1252,8 @@ enum BlobOutcome {
 }
 
 /// Classify the final response to a blob request. A hit is what `CloudFront`
-/// (`X-Cache`) or Cloudflare (`CF-Cache-Status`) says it is; any other
+/// (`X-Cache`) or Cloudflare (`CF-Cache-Status`: `HIT`, `REVALIDATED`,
+/// `UPDATING` or `STALE`, each served from its cache) says it is; any other
 /// success is a miss. A status that is not 2xx, an unfollowed redirect
 /// included, warmed nothing.
 fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> BlobOutcome {
@@ -1261,7 +1262,11 @@ fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap)
     }
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
     let hit = header("x-cache").is_some_and(|v| v.to_ascii_lowercase().contains("hit"))
-        || header("cf-cache-status").is_some_and(|v| v.eq_ignore_ascii_case("hit"));
+        || header("cf-cache-status").is_some_and(|v| {
+            ["HIT", "REVALIDATED", "UPDATING", "STALE"]
+                .iter()
+                .any(|state| v.eq_ignore_ascii_case(state))
+        });
     if hit {
         BlobOutcome::Hit
     } else {
@@ -1343,12 +1348,13 @@ impl PrewarmStats {
 
 /// The (repository, digest) of every blob the pre-warm fetches: all those the
 /// lock records for the refs the run syncs, deduplicated, so every tag is
-/// covered.
+/// covered. In a fixed order, so a pre-warm cut by the deadline leaves the
+/// same blobs warm each run.
 fn blobs_to_warm<'a>(
     lock: &'a lock::Lock,
     refs: &'a BTreeSet<lock::ImageRef>,
-) -> HashSet<(registry::Repository<'a>, &'a Digest)> {
-    let mut blobs = HashSet::new();
+) -> Vec<(registry::Repository<'a>, &'a Digest)> {
+    let mut blobs = Vec::new();
     for image in refs {
         let repo = registry::split_source(&image.source)
             .expect("ensure_unmoved refuses a source with no registry");
@@ -1358,15 +1364,17 @@ fn blobs_to_warm<'a>(
             .expect("ensure_unmoved refuses a ref the lock lacks");
         blobs.extend(entry.blobs.iter().map(|blob| (repo, blob)));
     }
+    blobs.sort_by_cached_key(|(repo, blob)| (repo.to_string(), blob.to_string()));
+    blobs.dedup();
     blobs
 }
 
-/// Hosts with a blob that was not warmed.
-fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> Vec<String> {
+/// Registries with a blob that was not warmed, and how many.
+fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> BTreeMap<String, u64> {
     stats
         .iter()
-        .filter(|(_, s)| s.failed + s.past_deadline > 0)
-        .map(|(host, _)| (*host).to_owned())
+        .map(|(host, s)| ((*host).to_owned(), s.failed + s.past_deadline))
+        .filter(|(_, blobs)| *blobs > 0)
         .collect()
 }
 
@@ -1385,7 +1393,7 @@ const PREWARM_MAX_ATTEMPTS: u32 = 2;
 /// each by `deadline`, and count the outcomes by registry. `send` requests one
 /// blob, `what` naming it in notices.
 async fn warm_blobs<'a>(
-    blobs: &HashSet<(registry::Repository<'a>, &'a Digest)>,
+    blobs: &[(registry::Repository<'a>, &'a Digest)],
     deadline: Instant,
     send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
 ) -> BTreeMap<&'a str, PrewarmStats> {
@@ -1434,16 +1442,9 @@ async fn cdn_prewarm(
     let access = registry::Access::new(client, auth);
     let blobs = blobs_to_warm(lock, refs);
 
-    // Blob URLs are served via 302 redirects to CloudFront -- completely
-    // different cache keys from manifests. Without this pass the first
-    // tool to run pays a CDN miss penalty on every blob.
-    let hosts: BTreeSet<&str> = blobs.iter().map(|(repo, _)| repo.host.api_host()).collect();
     eprintln!(
-        "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} concurrent per registry, \
-         {} at most across {} registries)...",
-        blobs.len(),
-        PREWARM_PER_REGISTRY * hosts.len(),
-        hosts.len()
+        "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} at a time per registry)...",
+        blobs.len()
     );
     let stats = warm_blobs(&blobs, deadline, async |repo, digest, what| {
         let url = format!(
@@ -1467,17 +1468,23 @@ async fn cdn_prewarm(
     eprintln!("bench: blob CDN pre-warm done");
     let unwarmed = unwarmed(&stats);
     if !unwarmed.is_empty() {
+        let registries: Vec<&str> = unwarmed.keys().map(String::as_str).collect();
         eprintln!(
             "WARNING: pre-warm: not warmed: {}; the tool that runs first may pay the CDN misses and tool order matters",
-            unwarmed.join(", ")
+            registries.join(", ")
         );
     }
 
     // Wait for CDN propagation. CloudFront edges need time to fully
-    // populate after the first request hits the origin.
-    let wait_secs = 360; // 6 minutes
-    eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
-    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+    // populate after the first request hits the origin. With nothing warmed
+    // there is nothing to wait for.
+    if stats.values().any(|s| s.hits + s.misses > 0) {
+        let wait_secs = 360; // 6 minutes
+        eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
+        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+    } else {
+        eprintln!("bench: no blob was warmed, so not waiting for the CDN");
+    }
     Prewarm::Done { unwarmed }
 }
 
@@ -1861,11 +1868,11 @@ images:
             .filter(|image| !image.source.ends_with("unsynced"))
             .cloned()
             .collect();
-        let mut got: Vec<(String, String)> = blobs_to_warm(&lock, &refs)
+        let got: Vec<(String, String)> = blobs_to_warm(&lock, &refs)
             .into_iter()
             .map(|(repo, digest)| (repo.to_string(), digest.hex()[..1].to_owned()))
             .collect();
-        got.sort();
+        // Already in order: the same blobs go first each run.
         let want = [
             ("quay.io/org/app", "1"),
             ("quay.io/org/app", "2"),
@@ -1899,7 +1906,13 @@ images:
             s.record(BlobOutcome::PastDeadline);
             s
         });
-        assert_eq!(unwarmed(&stats), ["failed.example", "late.example"]);
+        assert_eq!(
+            unwarmed(&stats),
+            BTreeMap::from([
+                ("failed.example".to_owned(), 1),
+                ("late.example".to_owned(), 1)
+            ])
+        );
     }
 
     #[test]
@@ -2097,7 +2110,7 @@ images:
         // Catches: an error page or an unfollowed redirect counted as a warmed
         // blob, and a hit read off the wrong header.
         type Headers<'a> = &'a [(&'a str, &'a str)];
-        let cases: [(u16, Headers<'_>, BlobOutcome); 11] = [
+        let cases: [(u16, Headers<'_>, BlobOutcome); 16] = [
             (200, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
             (
                 200,
@@ -2105,6 +2118,11 @@ images:
                 BlobOutcome::Hit,
             ),
             (200, &[("cf-cache-status", "HIT")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "REVALIDATED")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "UPDATING")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "STALE")], BlobOutcome::Hit),
+            (200, &[("cf-cache-status", "EXPIRED")], BlobOutcome::Miss),
+            (200, &[("cf-cache-status", "DYNAMIC")], BlobOutcome::Miss),
             (
                 200,
                 &[("x-cache", "Miss from cloudfront")],
@@ -2205,7 +2223,7 @@ images:
             .map(|i| format!("a{i}"))
             .collect();
         let fine_paths: Vec<String> = (0..4).map(|i| format!("b{i}")).collect();
-        let blobs: HashSet<_> = hung_paths
+        let blobs: Vec<_> = hung_paths
             .iter()
             .map(|path| (Host::Other("hung.example"), path))
             .chain(

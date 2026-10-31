@@ -123,9 +123,10 @@ pub(crate) enum Prewarm {
     Skipped,
     /// Ran.
     Done {
-        /// Registries with a blob that failed or was not finished by the
-        /// deadline, started or not; empty when every blob was warmed.
-        unwarmed: Vec<String>,
+        /// For each registry with a blob that failed or was not finished by
+        /// the deadline, started or not, how many; empty when every blob was
+        /// warmed.
+        unwarmed: BTreeMap<String, u64>,
     },
 }
 
@@ -137,7 +138,11 @@ impl Prewarm {
             Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
             Self::Done { unwarmed } if unwarmed.is_empty() => None,
             Self::Done { unwarmed } => {
-                Some(format!("Pre-warm: not warmed for {}", unwarmed.join(", ")))
+                let counts: Vec<String> = unwarmed
+                    .iter()
+                    .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
+                    .collect();
+                Some(format!("Pre-warm: not warmed for {}", counts.join(", ")))
             }
         }
     }
@@ -1208,60 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn run_record_roundtrip() {
-        let record = RunRecord {
-            timestamp: "2026-04-18-021040".into(),
-            git_ref: "d121864".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c6in.4xlarge".into(),
-                arch: "x86_64".into(),
-                vcpus: 16,
-                memory_gib: 32.0,
-                network: "Up to 50 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: None,
-            },
-            relays: None,
-            prewarm: None,
-            corpus: CorpusInfo {
-                images: 42,
-                tags: 55,
-            },
-            scenarios: vec![ScenarioRecord {
-                name: "Cold sync".into(),
-                shuffle_seed: 0,
-                tool_order: Vec::new(),
-                tools: vec![ToolRecord {
-                    tool: "ocync".into(),
-                    version: "0.1.0".into(),
-                    wall_clock_secs: 273.0,
-                    peak_rss_kb: Some(59468),
-                    metrics: ProxyMetrics {
-                        requests: 4131,
-                        response_bytes: 16_900_000_000,
-                        source_blob_gets: 726,
-                        source_blob_bytes: 77200,
-                        mount_successes: 362,
-                        mount_attempts: 379,
-                        ..Default::default()
-                    },
-                    phase_timing_ms: BTreeMap::new(),
-                }],
-            }],
-        };
-        let json = serde_json::to_string_pretty(&record).unwrap();
-        let parsed: RunRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.timestamp, "2026-04-18-021040");
-        assert_eq!(parsed.git_ref, "d121864");
-        assert_eq!(parsed.machine.provider, Some(Provider::Aws));
-        assert_eq!(parsed.machine.memory_gib, 32.0);
-        assert_eq!(parsed.corpus.images, 42);
-        assert_eq!(parsed.scenarios[0].tools[0].metrics.requests, 4131);
-    }
-
-    #[test]
     fn the_tracked_archive_still_parses() {
         let archive = include_str!("../../../bench/results/ecr.json");
         let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
@@ -1307,12 +1258,17 @@ mod tests {
         // Catches: an unwarmed registry recorded nowhere a reader of the
         // numbers would see it.
         let unwarmed = Prewarm::Done {
-            unwarmed: vec!["quay.io".to_owned()],
+            unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
         };
         let cases = [
-            (Prewarm::Done { unwarmed: vec![] }, None),
+            (
+                Prewarm::Done {
+                    unwarmed: BTreeMap::new(),
+                },
+                None,
+            ),
             (Prewarm::Skipped, Some("Pre-warm: skipped (--skip-prewarm)")),
-            (unwarmed, Some("Pre-warm: not warmed for quay.io")),
+            (unwarmed, Some("Pre-warm: not warmed for quay.io (3 blobs)")),
         ];
         for (outcome, line) in cases {
             let mut report = sample_report();
@@ -1331,42 +1287,26 @@ mod tests {
         // which reads as "not recorded" instead of the run's own answer.
         let mut report = sample_report();
         report.prewarm = Some(Prewarm::Done {
-            unwarmed: vec!["quay.io".to_owned()],
+            unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
         });
         let record = RunRecord::of(&report, "abc1234".into(), Some(Provider::Aws), None);
         let written = serde_json::to_value(&record).unwrap();
         assert_eq!(written["relays"], serde_json::json!({}));
         assert_eq!(
             written["prewarm"],
-            serde_json::json!({"done": {"unwarmed": ["quay.io"]}})
+            serde_json::json!({"done": {"unwarmed": {"quay.io": 3}}})
         );
     }
 
     #[test]
     fn append_record_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
-        let record = RunRecord {
-            timestamp: "2026-04-18-100000".into(),
-            git_ref: "abc1234".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c6in.4xlarge".into(),
-                arch: "x86_64".into(),
-                vcpus: 16,
-                memory_gib: 32.0,
-                network: "Up to 50 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: None,
-            },
-            relays: None,
-            prewarm: None,
-            corpus: CorpusInfo {
-                images: 10,
-                tags: 15,
-            },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         append_record(dir.path(), "ecr", record).unwrap();
 
         let path = dir.path().join("ecr.json");
@@ -1374,7 +1314,7 @@ mod tests {
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].timestamp, "2026-04-18-100000");
+        assert_eq!(records[0].timestamp, "2026-04-15-100000");
     }
 
     #[test]
@@ -1383,31 +1323,18 @@ mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "[]").unwrap();
 
-        let record = RunRecord {
-            timestamp: "2026-04-18-110000".into(),
-            git_ref: "def5678".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "c7g.xlarge".into(),
-                arch: "aarch64".into(),
-                vcpus: 4,
-                memory_gib: 8.0,
-                network: "Up to 12.5 Gigabit".into(),
-                region: "us-east-1".into(),
-                image_id: None,
-            },
-            relays: None,
-            prewarm: None,
-            corpus: CorpusInfo { images: 5, tags: 8 },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         append_record(dir.path(), "ecr", record).unwrap();
 
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].git_ref, "def5678");
+        assert_eq!(records[0].git_ref, "abc1234");
     }
 
     #[test]
@@ -1416,25 +1343,12 @@ mod tests {
         let path = dir.path().join("ecr.json");
         std::fs::write(&path, "not json").unwrap();
 
-        let record = RunRecord {
-            timestamp: "2026-04-18-120000".into(),
-            git_ref: "aaa1111".into(),
-            corpus_locked_at: None,
-            machine: MachineInfo {
-                provider: Some(Provider::Aws),
-                instance_type: "unknown".into(),
-                arch: "unknown".into(),
-                vcpus: 0,
-                memory_gib: 0.0,
-                network: "unknown".into(),
-                region: "unknown".into(),
-                image_id: None,
-            },
-            relays: None,
-            prewarm: None,
-            corpus: CorpusInfo { images: 0, tags: 0 },
-            scenarios: vec![],
-        };
+        let record = RunRecord::of(
+            &sample_report(),
+            "abc1234".into(),
+            Some(Provider::Aws),
+            None,
+        );
         assert!(append_record(dir.path(), "ecr", record).is_err());
     }
 
