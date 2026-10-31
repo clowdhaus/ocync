@@ -122,6 +122,10 @@ pub struct TransferStateCache {
     /// `wait_for(|&v| v)`, never `changed()`, which misses a value sent before
     /// they subscribed. Fresh each run.
     repo_resolved_watches: HashMap<TargetId, HashMap<RepositoryName, watch::Sender<bool>>>,
+    /// Runtime-only: the repo that uploads each blob wanted by two or more
+    /// repos of a target; the others wait for its commit and mount. Set once
+    /// per run, after discovery.
+    blob_owners: HashMap<TargetId, HashMap<Digest, RepositoryName>>,
 }
 
 impl TransferStateCache {
@@ -240,20 +244,45 @@ impl TransferStateCache {
             .map(|(r, _)| r.clone())
             .collect();
 
-        let watches = self
-            .repo_resolved_watches
-            .entry(target.clone())
-            .or_default();
         candidates
             .into_iter()
-            .filter_map(|repo| {
-                let tx = watches
-                    .entry(repo)
-                    .or_insert_with(|| watch::channel(false).0);
-                let rx = tx.subscribe();
-                if *rx.borrow() { None } else { Some(rx) }
-            })
+            .map(|repo| self.repo_watch(target, &repo).subscribe())
+            .filter(|rx| !*rx.borrow())
             .collect()
+    }
+
+    /// Replace the blob owners for this run.
+    pub(crate) fn set_blob_owners(
+        &mut self,
+        owners: HashMap<TargetId, HashMap<Digest, RepositoryName>>,
+    ) {
+        self.blob_owners = owners;
+    }
+
+    /// The repo that uploads `digest` for `target`, if two or more of its
+    /// repos want the blob this run.
+    pub(crate) fn blob_owner(&self, target: &TargetId, digest: &Digest) -> Option<&RepositoryName> {
+        self.blob_owners.get(target)?.get(digest)
+    }
+
+    /// Subscribe to a repo's commit watch, creating it unfired if no one has.
+    /// Unlike [`Self::unresolved_watches_for`], a repo holding no copy of any
+    /// blob yet can be waited on.
+    pub(crate) fn subscribe_repo_resolved(
+        &mut self,
+        target: &TargetId,
+        repo: &RepositoryName,
+    ) -> watch::Receiver<bool> {
+        self.repo_watch(target, repo).subscribe()
+    }
+
+    /// The repo's watch sender, created unfired on first use.
+    fn repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) -> &watch::Sender<bool> {
+        self.repo_resolved_watches
+            .entry(target.clone())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| watch::channel(false).0)
     }
 
     /// Record that a repo's manifest is committed, waking its watchers.
@@ -272,13 +301,7 @@ impl TransferStateCache {
 
     /// Fire the repo's watch, creating it if no follower has subscribed yet.
     fn resolve_repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) {
-        let tx = self
-            .repo_resolved_watches
-            .entry(target.clone())
-            .or_default()
-            .entry(repo.clone())
-            .or_insert_with(|| watch::channel(false).0);
-        tx.send_replace(true);
+        self.repo_watch(target, repo).send_replace(true);
     }
 
     /// Start a run from the blob state a reload from disk would give: every
@@ -289,6 +312,7 @@ impl TransferStateCache {
     /// would push blobs a mount could have saved.
     pub(crate) fn start_run(&mut self) {
         self.repo_resolved_watches.clear();
+        self.blob_owners.clear();
         self.dedup.remember_present();
     }
 
@@ -469,6 +493,7 @@ impl TransferStateCache {
             snapshots,
             committed_repos: HashMap::new(),
             repo_resolved_watches: HashMap::new(),
+            blob_owners: HashMap::new(),
         })
     }
 }
@@ -702,6 +727,32 @@ mod tests {
                 "{name}: a subscriber after the signal finds nothing to wait on"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_owner_lasts_one_run_and_its_repo_can_be_waited_on_before_it_holds_a_blob() {
+        let mut cache = TransferStateCache::new();
+        let owners = HashMap::from([(
+            target_id("reg.io"),
+            HashMap::from([(test_digest(), repo("repo/a"))]),
+        )]);
+        cache.set_blob_owners(owners);
+        assert_eq!(
+            cache.blob_owner(&target_id("reg.io"), &test_digest()),
+            Some(&repo("repo/a"))
+        );
+        assert_eq!(
+            cache.blob_owner(&target_id("other.io"), &test_digest()),
+            None
+        );
+
+        let mut rx = cache.subscribe_repo_resolved(&target_id("reg.io"), &repo("repo/a"));
+        assert!(!*rx.borrow(), "unfired before the owner commits");
+        cache.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
+        assert!(rx.wait_for(|&v| v).await.is_ok());
+
+        cache.start_run();
+        assert_eq!(cache.blob_owner(&target_id("reg.io"), &test_digest()), None);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! mostly disjoint blob sets: every image syncs and the report's blob stats
 //! match the PUT and mount POST counts the target actually received, so a blob
 //! push is never reported as `Skipped` or `Mounted` without a request behind it.
-//! Variants: no shared blobs (no leader), one blob shared by one pair (one
-//! leader, the follower mounts), and that plus a batch checker that reports
+//! Variants: no shared blobs (no owner), one blob shared by one pair (one
+//! owner, the other mounts), and that plus a batch checker that reports
 //! every blob missing.
 
 mod helpers;
@@ -40,7 +40,7 @@ async fn sync_ten_disjoint_mappings_one_shared_blob_with_batch_checker() {
     assert_eq!(checks, [1; 10], "each mapping asks its checker once");
 }
 
-/// Baseline with zero shared blobs: no leader, every image independent.
+/// Baseline with zero shared blobs: no owner, every image independent.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_ten_fully_disjoint_mappings_high_concurrency() {
     let fixture = build_ten_image_fixture(Sharing::Disjoint).await;
@@ -170,7 +170,7 @@ async fn run_engine_default(
     // wanted streams.
     let report = tokio::time::timeout(Duration::from_secs(30), run_sync(mappings))
         .await
-        .expect("engine hung past 30s: leader/follower stall or auth deadlock");
+        .expect("engine hung past 30s: owner wait stall or auth deadlock");
     (report, checkers)
 }
 

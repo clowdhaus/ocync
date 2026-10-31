@@ -206,15 +206,17 @@ This is not a dynamic priority scheduler. It is a circuit breaker with one thres
 
 When source and target share a registry, or when multiple images share base layers on the same target registry, cross-repo blob mounting eliminates redundant data transfer entirely. Instead of re-uploading a blob that already exists in a different repository on the same registry, a mount operation links it in constant time. Zero bytes cross the network.
 
-### Leader-follower election
+### Blob owners
 
-The engine uses a greedy set-cover algorithm (`elect_leaders()`) to elect leader images, selecting those with the most shared blobs across all discovered images. Leaders are ordered to the front of the pending queue so they acquire semaphore permits and begin uploading before followers.
+After discovery, `assign_blob_owners()` names one owner repo for each blob that two or more repos of the same target need. The owner is the task with the smallest total blob bytes (an index counts every child), ties going to discovery order. The smallest image commits soonest, so the other repos wait the least for a repo to mount from. Tasks sharing one source manifest are one image bound to different targets, so ownership is decided per target. A blob needed by one repo has no owner, and two tags of one repo count as one repo.
 
-The greedy set-cover provably covers every shared blob. No "uncovered follower" path exists because all followers' shared blobs are in the leader union. This means there is no code path where a follower needs a blob that was not already uploaded by a leader.
+The owner map lives in the transfer state cache for the run. Before claiming a blob, a task whose repo is not the blob's owner waits for the owner repo's manifest commit (or failure), unless the blob is already at its repo or a mount source exists. It holds no claim while it waits, and the wait runs before the per-image blob semaphore. It then claims the blob and resolves a mount source as below, which finds the committed owner and mounts. If the owner fails or the deadline passes, the task takes the same path and pushes.
+
+Owner tasks are promoted first, ordered by (total bytes, discovery position), then every other task in discovery order. A task waits only on an owner with a strictly smaller key, so waits form no cycle, and each awaited owner holds an image slot before its dependents because the image semaphore is first-in first-out.
 
 ### Progressive promotion
 
-All tasks (leaders and followers) are promoted simultaneously after discovery completes. Leaders start first because they are at the front of the queue and acquire semaphore permits before followers. Upload coordination is per-(target, digest): the first task to arrive holds an explicit `claim` slot in `BlobInfo`, and every other task waits on its `claim_notify` and re-checks after release. That includes a task for the holder's own repo, such as a second tag of the same image, which then finds the blob present and skips it.
+All tasks are promoted simultaneously after discovery completes, owners first (see [Blob owners](#blob-owners)). Upload coordination is per-(target, digest): the first task to arrive holds an explicit `claim` slot in `BlobInfo`, and every other task waits on its `claim_notify` and re-checks after release. That includes a task for the holder's own repo, such as a second tag of the same image, which then finds the blob present and skips it.
 
 ### Bounded-deadline mount-source resolution
 
@@ -222,7 +224,7 @@ Per-(repo) `RepoBlobState` tracks each repo's lifecycle independently (`Verified
 
 An earlier run's repo is offered at once because its commit watch fires only if this run pushes an image to it. A repo whose tag is up to date, or that this run does not sync at all, never commits, so waiting on it would hold every shared blob for the full deadline and then push it. Its manifest most likely already references the blob, so the mount usually succeeds; when the registry refuses it, the fallback below pushes the blob at the cost of one request.
 
-`resolve_mount_source` is a re-check loop bounded by a per-blob deadline (default 60s, configurable via `EngineConfig::mount_source_wait_deadline`). On each iteration, it queries `mount_sources` and returns the first match; if none exist, it subscribes to `unresolved_watches_for` (which filters on watch-not-yet-fired AND state-not-`Failed`) and waits via `futures_util::future::select_all` over the per-repo manifest-commit watches. On wake (any commit or failure fires its watch), it re-queries. The deadline subsumes the leader-leader skip: on expiry, the resolver returns `None` and the caller falls back to push.
+`resolve_mount_source` is a re-check loop bounded by a per-blob deadline (default 60s, configurable via `EngineConfig::mount_source_wait_deadline`). The same deadline, started before the owner wait, bounds both waits for a blob. On each iteration, it queries `mount_sources` and returns the first match; if none exist, it subscribes to `unresolved_watches_for` (which filters on watch-not-yet-fired AND state-not-`Failed`) and waits via `futures_util::future::select_all` over the per-repo manifest-commit watches. On wake (any commit or failure fires its watch), it re-queries. On expiry, the resolver returns `None` and the caller falls back to push.
 
 `mark_blob_repo_stale` provides lazy invalidation: on mount failure (ECR 202 / 4xx / 5xx), the source repo's state transitions to `Failed`, and subsequent `mount_sources` iteration excludes it. The task whose mount was refused pushes; later tasks for the same blob skip that source and take the next one. A refused mount does not skip the existence check, so a blob the repo already holds is not pushed again.
 

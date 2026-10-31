@@ -88,15 +88,15 @@ AIMD discovers a healthy concurrency level via 429 feedback but cannot bound TPS
 
 ## Cross-repo blob mounting
 
-When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through leader-follower election and per-blob synchronization. See [cross-repo blob mounting in the engine doc](/design/engine#cross-repo-blob-mounting) for the full implementation.
+When a blob already exists in another repository on the same target registry, OCI registries can "mount" it -- zero bytes over the wire. `ocync` maximizes mount success through blob owners and per-blob synchronization. See [cross-repo blob mounting in the engine doc](/design/engine#cross-repo-blob-mounting) for the full implementation.
 
-### Leader-follower election
+### Blob owners
 
-Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` uses leader-follower election via a greedy set-cover algorithm (`elect_leaders()`) to ensure shared blobs are uploaded once by leaders and mounted everywhere else by followers. The algorithm provably covers every shared blob -- there is no "uncovered follower" path. See [leader-follower election in the engine doc](/design/engine#leader-follower-election) for the algorithm details.
+Multiple images in a sync run often share base layers. If all images push independently, shared blobs are uploaded N times. `ocync` names the smallest image that needs a shared blob as its owner: the owner uploads it, and every other repo waits for the owner's commit and mounts it. See [blob owners in the engine doc](/design/engine#blob-owners) for the algorithm details.
 
 ### Progressive promotion
 
-Followers cannot mount from a leader until the leader's manifest is committed. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are repos with committed manifests, then repos known to hold the blob only from an earlier run, which are offered without waiting because nothing in this run commits them. See [progressive promotion in the engine doc](/design/engine#progressive-promotion) for details.
+A repo cannot mount from another until that repo's manifest is committed. All tasks are promoted simultaneously after discovery, with blob owners ordered first so they acquire semaphore permits before the repos that wait on them. Tasks that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are repos with committed manifests, then repos known to hold the blob only from an earlier run, which are offered without waiting because nothing in this run commits them. See [progressive promotion in the engine doc](/design/engine#progressive-promotion) for details.
 
 ### ECR BLOB_MOUNTING
 

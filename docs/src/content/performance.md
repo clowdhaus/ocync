@@ -121,7 +121,7 @@ Container images share layers heavily. A sync run touching 40 images may referen
 
 ### Cross-repo blob mounting
 
-When a blob already exists in another repository on the same registry, `ocync` mounts it (a server-side copy) instead of uploading. Images are elected as leaders using a greedy set-cover algorithm; each leader uploads all its blobs and commits its manifest. Followers mount shared blobs from leader repositories once the leader's manifest is committed, and from repositories an earlier sync left the blob in without waiting.
+When a blob already exists in another repository on the same registry, `ocync` mounts it (a server-side copy) instead of uploading. The smallest image that needs a shared blob uploads it and commits its manifest. Other repos mount the blob from it once that manifest is committed, and from repositories an earlier sync left the blob in without waiting.
 
 ### Adaptive rate limiting
 

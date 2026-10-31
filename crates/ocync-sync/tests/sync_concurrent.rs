@@ -574,8 +574,8 @@ async fn sync_failed_own_child_does_not_wait_on_shared_children() {
 /// first repo, not re-upload. If both raced past the cache check they would
 /// both upload in full.
 ///
-/// Order-independent: both targets accept upload and mount, the election
-/// picks the uploader, and the assertion is aggregate (2 transferred, 2 mounted).
+/// Order-independent: both targets accept upload and mount, the owner
+/// assignment picks the uploader, and the assertion is aggregate (2 transferred, 2 mounted).
 #[tokio::test]
 async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     let source_server = MockServer::start().await;
@@ -601,7 +601,7 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     let report = run_sync_with_concurrency(mappings, 10, BlobStage::disabled()).await;
 
     assert_all_synced(&report, 2, "both images should sync");
-    // One image uploads 2 blobs (leader), the other mounts 2 (follower).
+    // One image uploads 2 blobs (the owner), the other mounts 2.
     assert_eq!(report.stats.blobs_transferred, 2);
     assert_eq!(report.stats.blobs_mounted, 2);
     assert!(
@@ -614,9 +614,9 @@ async fn sync_concurrent_shared_blob_mounts_instead_of_double_uploading() {
     );
 }
 
-/// Three images sharing a layer exercise the full leader-follower pipeline:
-/// election picks one leader, wave promotion runs the two followers, and
-/// the shared layer is mounted from the leader's committed repo.
+/// Three images sharing a layer: the first by discovery order owns it, the
+/// other two wait for its commit, and the shared layer is mounted from the
+/// owner's committed repo.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_wave_promotion_three_images_shared_layer() {
     let source_server = MockServer::start().await;
@@ -658,9 +658,9 @@ async fn sync_wave_promotion_three_images_shared_layer() {
     let report = run_sync_with_concurrency(mappings, 10, BlobStage::disabled()).await;
 
     assert_all_synced(&report, 3, "all three images should sync");
-    // 3 unique config blobs transferred + 1 shared layer transferred by leader.
+    // 3 unique config blobs transferred + 1 shared layer transferred by its owner.
     assert_eq!(report.stats.blobs_transferred, 4);
-    // Shared layer mounted by 2 followers.
+    // Shared layer mounted by the 2 other images.
     assert_eq!(report.stats.blobs_mounted, 2);
 }
 
@@ -1121,7 +1121,7 @@ struct DeadlockCase {
     name: &'static str,
     images: &'static [CaseImage],
     timeout: Duration,
-    /// Mounts the run must show. 0 where the second leader may legitimately
+    /// Mounts the run must show. 0 where the second owner may legitimately
     /// fall through to a push when no committed source appears in time.
     min_mounted: u64,
 }
@@ -1129,10 +1129,10 @@ struct DeadlockCase {
 /// Neither case reaches the blob-semaphore deadlock (shared blob count is
 /// below `BLOB_CONCURRENCY`); that is `sync_cross_image_blob_claim_no_deadlock`.
 const DEADLOCK_CASES: &[DeadlockCase] = &[
-    // A and B share two layers (forcing `elect_leaders` to pick two leaders); A
-    // also shares a layer with C and B another, so C is a follower of both.
+    // A and B share two layers; A also shares a layer with C and B another,
+    // so C waits on the owners of both.
     DeadlockCase {
-        name: "three images, two leaders and a follower",
+        name: "three images, two owners and a dependent",
         images: &[
             CaseImage {
                 config: b"config-leader-a-deadlock",
@@ -1179,7 +1179,7 @@ const DEADLOCK_CASES: &[DeadlockCase] = &[
 ];
 
 /// Images whose layers overlap never wait on each other's manifest commit in a
-/// cycle: whichever leader commits first becomes a mount source for the other,
+/// cycle: whichever owner commits first becomes a mount source for the other,
 /// and if none commits in time the deadline trips and the waiter pushes.
 #[tokio::test(flavor = "current_thread")]
 async fn overlapping_shared_blobs_complete_without_deadlock() {
@@ -1599,6 +1599,70 @@ async fn mount_waits_for_committed_source() {
         total_mounts, 1,
         "the shared layer is mounted once, by the follower (committed-source invariant)"
     );
+}
+
+/// A large image holds a small image's layers plus its own slow ones, and is
+/// elected to go first by anything that favours the image covering the most
+/// shared blobs. The small image owns the shared layers: it uploads them, and
+/// the large image waits for its commit and mounts them rather than uploading
+/// them itself and making the small image wait out the large one's own layers.
+#[tokio::test(flavor = "current_thread")]
+async fn smallest_image_uploads_shared_blobs_and_the_large_one_mounts() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let small = ManifestBuilder::new(b"owner-small-cfg")
+        .layer(b"owner-shared-1")
+        .layer(b"owner-shared-2")
+        .build();
+    let large = ManifestBuilder::new(b"owner-large-cfg")
+        .layer(b"owner-shared-1")
+        .layer(b"owner-shared-2")
+        .layer(b"owner-large-only-1")
+        .layer(b"owner-large-only-2")
+        .build();
+    small.mount_source(&source_server, "src-small", "v1").await;
+    large
+        .mount_source_delayed(
+            &source_server,
+            "src-large",
+            "v1",
+            Duration::from_millis(200),
+        )
+        .await;
+
+    let shared = [&small.layer_descs[0].digest, &small.layer_descs[1].digest];
+    let blobs: Vec<Digest> = small.blob_digests().chain(large.blob_digests()).collect();
+    let blob_refs: Vec<&Digest> = blobs.iter().collect();
+    for repo in ["tgt-small", "tgt-large"] {
+        mount_target_fresh(&target_server, repo, "v1", &blob_refs).await;
+    }
+    for digest in shared {
+        mount_blob_mount_accepted(&target_server, "tgt-large", digest).await;
+    }
+
+    let mappings = v1_mappings(
+        &source_server,
+        &target_server,
+        &[("src-small", "tgt-small"), ("src-large", "tgt-large")],
+    );
+    let report = run_sync_with_concurrency(mappings, 10, BlobStage::disabled()).await;
+
+    assert_all_synced(&report, 2, "both images should sync");
+    for digest in shared {
+        assert_eq!(
+            count_blob_uploads(&target_server, PathMatch::Contains("/tgt-small/"), digest).await,
+            1,
+            "the small image uploads the shared layer once"
+        );
+        assert_eq!(
+            count_blob_uploads(&target_server, PathMatch::Contains("/tgt-large/"), digest).await,
+            0,
+            "the large image never uploads a layer the small image owns"
+        );
+    }
+    assert_eq!(report.stats.blobs_mounted, 2, "both shared layers mount");
+    assert_eq!(count_mount_posts(&target_server).await, 2);
 }
 
 /// One `v1` mapping per repo (the same name at source and target), each with

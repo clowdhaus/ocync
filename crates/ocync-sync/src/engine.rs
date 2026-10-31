@@ -468,132 +468,68 @@ enum DiscoveryRoute {
     HeadFirstSkip,
 }
 
-/// Elect leader images for mount optimization via greedy set-cover.
+/// Name one owner repo per blob that two or more repos of a target want, and
+/// promote owners first.
+///
+/// The owner of a (target, digest) is the task with the fewest total blob
+/// bytes among the tasks needing it, ties by discovery position. Every other
+/// repo waits for the owner's commit and mounts (see [`wait_for_blob_owner`]).
+/// A task waits only on an owner with a strictly smaller (bytes, position)
+/// key, so waits are acyclic. Owner tasks move to the front in that key order,
+/// then every other task follows in discovery order, so each awaited owner
+/// takes an image slot before its dependents.
 ///
 /// Tasks sharing a [`PulledManifest`] `Rc` are one source image bound to
-/// different targets. Repeatedly picks the image covering the most shared blob
-/// digests not already covered by earlier leaders, stopping when no candidate
-/// adds coverage. Leader tasks move to the front of the deque; two leaders
-/// sharing a blob are deduplicated by `ClaimAction::Wait` in
-/// `transfer_image_blobs` (the second waits, then mounts).
-///
-/// Returns the number of tasks promoted as leaders (0 if election has no benefit).
-fn elect_leaders(pending: &mut VecDeque<TransferTask>) -> usize {
-    if pending.len() <= 1 {
-        return 0;
-    }
+/// different targets; ownership is per target.
+fn assign_blob_owners(
+    pending: &mut VecDeque<TransferTask>,
+) -> HashMap<TargetId, HashMap<Digest, RepositoryName>> {
+    let bytes: Vec<u64> = pending
+        .iter()
+        .map(|t| {
+            blobs_from_manifest(&t.source_data)
+                .iter()
+                .map(|d| d.size)
+                .sum()
+        })
+        .collect();
+    let mut by_size: Vec<usize> = (0..pending.len()).collect();
+    by_size.sort_by_key(|&i| (bytes[i], i));
 
-    let mut group_ptrs: Vec<usize> = Vec::new();
-    let mut group_blobs: Vec<HashSet<Digest>> = Vec::new();
-    let mut task_group: Vec<usize> = Vec::with_capacity(pending.len());
-
-    for task in pending.iter() {
-        let ptr = Rc::as_ptr(&task.source_data) as usize;
-        let idx = if let Some(pos) = group_ptrs.iter().position(|&p| p == ptr) {
-            pos
-        } else {
-            let blobs: HashSet<Digest> = blobs_from_manifest(&task.source_data)
-                .into_iter()
-                .map(|d| d.digest.clone())
-                .collect();
-            let idx = group_ptrs.len();
-            group_ptrs.push(ptr);
-            group_blobs.push(blobs);
-            idx
-        };
-        task_group.push(idx);
-    }
-
-    let num_groups = group_ptrs.len();
-    if num_groups <= 1 {
-        // All tasks are the same source image; no election needed.
-        return 0;
-    }
-
-    // Each round picks the image with the most marginal shared-blob coverage.
-    // The inverted index `blob_remaining_count` maps each blob to the number
-    // of remaining groups containing it, so a candidate's marginal gain from a
-    // blob outside `leader_blob_union` is `count - 1`. That costs O(n * b_avg)
-    // per round instead of O(n^2 * b) for a pairwise scan. Must stay
-    // sub-cubic; `elect_leaders_scales_subcubically` pins it.
-    let mut leader_set: Vec<usize> = Vec::new();
-    let mut leader_blob_union: HashSet<Digest> = HashSet::new();
-    let mut remaining: Vec<usize> = (0..num_groups).collect();
-
-    let mut blob_remaining_count: HashMap<Digest, usize> = HashMap::new();
-    for &i in &remaining {
-        for d in &group_blobs[i] {
-            *blob_remaining_count.entry(d.clone()).or_insert(0) += 1;
+    // Smallest task first, so the first to name a blob owns it. The flag turns
+    // on when a task bound for another repo wants the same blob.
+    let mut owned: HashMap<(&TargetId, &Digest), (usize, bool)> = HashMap::new();
+    for &i in &by_size {
+        let task = &pending[i];
+        for blob in blobs_from_manifest(&task.source_data) {
+            let (owner, shared) = owned
+                .entry((task.target_entry.id(), &blob.digest))
+                .or_insert((i, false));
+            *shared |= pending[*owner].target.repo != task.target.repo;
         }
     }
 
-    loop {
-        if remaining.len() <= 1 {
-            break;
-        }
-
-        let best = remaining
-            .iter()
-            .map(|&i| {
-                let marginal: usize = group_blobs[i]
-                    .iter()
-                    .filter(|d| !leader_blob_union.contains(*d))
-                    .map(|d| blob_remaining_count.get(d).copied().unwrap_or(0) - 1)
-                    .sum();
-                (i, marginal)
-            })
-            .max_by_key(|&(_, m)| m);
-
-        match best {
-            Some((idx, marginal)) if marginal > 0 => {
-                for d in &group_blobs[idx] {
-                    if let Some(c) = blob_remaining_count.get_mut(d) {
-                        *c -= 1;
-                    }
-                }
-                leader_blob_union.extend(group_blobs[idx].iter().cloned());
-                leader_set.push(idx);
-                remaining.retain(|&i| i != idx);
-            }
-            _ => break,
+    let mut owners: HashMap<TargetId, HashMap<Digest, RepositoryName>> = HashMap::new();
+    let mut is_owner = vec![false; pending.len()];
+    for ((target, digest), (owner, shared)) in owned {
+        if shared {
+            is_owner[owner] = true;
+            owners
+                .entry(target.clone())
+                .or_default()
+                .insert(digest.clone(), pending[owner].target.repo.clone());
         }
     }
 
-    if leader_set.is_empty() {
-        // No shared blobs across any images; concurrent is optimal.
-        return 0;
-    }
-
-    for &leader_idx in &leader_set {
-        if let Some((pos, _)) = task_group
-            .iter()
-            .enumerate()
-            .find(|&(_, &g)| g == leader_idx)
-        {
-            info!(
-                leader = %pending[pos].source,
-                leader_idx = leader_set.iter().position(|&l| l == leader_idx).unwrap() + 1,
-                total_leaders = leader_set.len(),
-                images = num_groups,
-                "elected leader for mount optimization"
-            );
-        }
-    }
-
-    let mut leaders: VecDeque<TransferTask> = VecDeque::new();
-    let mut followers: VecDeque<TransferTask> = VecDeque::new();
-    for (task, &group) in pending.drain(..).zip(task_group.iter()) {
-        if leader_set.contains(&group) {
-            leaders.push_back(task);
-        } else {
-            followers.push_back(task);
-        }
-    }
-
-    let leader_count = leaders.len();
-    pending.extend(leaders);
-    pending.extend(followers);
-    leader_count
+    let order: Vec<usize> = by_size
+        .iter()
+        .copied()
+        .filter(|&i| is_owner[i])
+        .chain((0..is_owner.len()).filter(|&i| !is_owner[i]))
+        .collect();
+    let mut tasks: Vec<Option<TransferTask>> = pending.drain(..).map(Some).collect();
+    pending.extend(order.into_iter().filter_map(|i| tasks[i].take()));
+    owners
 }
 
 /// Blob frequency tracker: blobs shared across many images are transferred
@@ -658,16 +594,17 @@ impl DiscoveryCounters {
 
 /// Pipeline phase, advancing monotonically `Discovering -> Done`.
 ///
-/// Leaders are ordered first by `elect_leaders` so they take semaphore
-/// permits and claim blob uploads before followers. Correctness then rests on
-/// two waits: a follower waits on a leader's per-blob claim
-/// (`ClaimAction::Wait`) before claiming the same blob, and on the leader's
-/// manifest commit before a cross-repo mount (ECR requires a committed
-/// manifest in the source repo for a mount to succeed).
+/// Blob owners are ordered first by `assign_blob_owners` so they take
+/// semaphore permits before their dependents. Correctness then rests on three
+/// waits: a repo waits on a blob's owner repo to commit
+/// (`wait_for_blob_owner`), then on any in-flight upload of the blob
+/// (`ClaimAction::Wait`), and on a source repo's manifest commit before a
+/// cross-repo mount (ECR requires a committed manifest in the source repo for
+/// a mount to succeed).
 enum PromotionPhase {
     /// Discovery futures still in flight; tasks accumulate in `pending`.
     Discovering,
-    /// All tasks promoted, leaders and followers together.
+    /// All tasks promoted, owners first.
     Done,
 }
 
@@ -708,9 +645,9 @@ const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 
 /// Sync engine: orchestrates concurrent image transfers across registries.
 ///
-/// Discovery futures drain first via `tokio::select!`, then leader-follower
-/// election reorders pending tasks so images sharing the most blobs execute
-/// first (enabling cross-repo mounts for followers).
+/// Discovery futures drain first via `tokio::select!`, then blob ownership
+/// reorders pending tasks so the smallest image holding a shared blob executes
+/// first (enabling cross-repo mounts for the other repos).
 #[derive(Debug)]
 pub struct SyncEngine {
     retry: RetryConfig,
@@ -1004,7 +941,8 @@ impl SyncEngine {
                 && matches!(promotion_phase, PromotionPhase::Discovering)
                 && discovery_futures.is_empty()
             {
-                elect_leaders(&mut pending);
+                let owners = assign_blob_owners(&mut pending);
+                cache.borrow_mut().set_blob_owners(owners);
                 promotion_phase = PromotionPhase::Done;
                 write_timing(&mut timing_file, TimingPhase::DiscoveryComplete, &run_start);
                 let ctx = PromoteContext {
@@ -2052,7 +1990,8 @@ struct TransferContext<'a> {
     target_id: &'a TargetId,
     target_repo: &'a RepositoryName,
     batch_checker: Option<&'a Rc<dyn BatchBlobChecker>>,
-    /// Per-blob deadline for mount-source resolution.
+    /// How long one blob may wait for its owner's commit and for a mount
+    /// source, together.
     mount_source_wait_deadline: Duration,
 }
 
@@ -2148,6 +2087,9 @@ async fn transfer_image_blobs(
         let batch = &batch_checked;
         blob_futures.push(async move {
             // Pre-semaphore phase: all external waits run here, with no permit held.
+            // One deadline bounds both the owner wait and the mount-source wait.
+            let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
+            wait_for_blob_owner(ctx, &digest, deadline).await;
             let claim = wait_for_blob_claim(ctx, &digest, cancel).await;
             match claim {
                 BlobClaim::Skipped => return BlobResult::Skipped,
@@ -2155,7 +2097,7 @@ async fn transfer_image_blobs(
                 BlobClaim::Failed(err) => return BlobResult::Failed(crate::Error::Shared(err)),
                 BlobClaim::Claimed => {}
             }
-            let mount_source = resolve_mount_source(ctx, &digest).await;
+            let mount_source = resolve_mount_source(ctx, &digest, deadline).await;
             let staging_claim = resolve_staging(ctx.staging, &digest).await;
 
             // `run_under_semaphore` takes `BlobIoContext`, not `TransferContext`,
@@ -2306,7 +2248,48 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
     }
 }
 
-/// Cross-repo mount-source resolver with bounded deadline.
+/// Wait, claim-free, for the owner repo of a shared blob to commit its
+/// manifest, so the claim that follows finds the owner's copy to mount.
+///
+/// Returns at once when this repo is the owner or has no owner to wait for, the
+/// blob is already at this repo, or a mount source exists. Also returns when
+/// the owner's watch fires (commit or failure) or `deadline` passes; the caller
+/// then takes the ordinary claim, mount and push path.
+///
+/// Runs OUTSIDE the per-image blob semaphore (see [`BlobSink`]).
+async fn wait_for_blob_owner(
+    ctx: &TransferContext<'_>,
+    digest: &Digest,
+    deadline: tokio::time::Instant,
+) {
+    let mut resolved = {
+        let mut c = ctx.cache.borrow_mut();
+        let Some(owner) = c.blob_owner(ctx.target_id, digest).cloned() else {
+            return;
+        };
+        if owner == *ctx.target_repo
+            || c.blob_present_at(ctx.target_id, digest, ctx.target_repo)
+            || c.mount_sources(ctx.target_id, digest, ctx.target_repo)
+                .next()
+                .is_some()
+        {
+            return;
+        }
+        c.subscribe_repo_resolved(ctx.target_id, &owner)
+    };
+    tokio::select! {
+        _ = resolved.wait_for(|&v| v) => {}
+        _ = tokio::time::sleep_until(deadline) => {
+            debug!(
+                %digest,
+                target = %ctx.target_id.alias(),
+                "blob owner wait deadline reached, continuing without its commit"
+            );
+        }
+    }
+}
+
+/// Cross-repo mount-source resolver, bounded by `deadline`.
 ///
 /// Loops until (a) a mount source emerges, (b) all candidate repos resolve
 /// without committing, or (c) the deadline expires. Returns the mount source
@@ -2317,8 +2300,8 @@ async fn resolve_staging<'a>(staging: &'a Rc<BlobStage>, digest: &Digest) -> Sta
 async fn resolve_mount_source(
     ctx: &TransferContext<'_>,
     digest: &Digest,
+    deadline: tokio::time::Instant,
 ) -> Option<RepositoryName> {
-    let deadline = tokio::time::Instant::now() + ctx.mount_source_wait_deadline;
     loop {
         let receivers: Vec<tokio::sync::watch::Receiver<bool>> = {
             let mut c = ctx.cache.borrow_mut();
@@ -3286,7 +3269,7 @@ mod tests {
         assert!(!is_local_io(&registry));
     }
 
-    // elect_leaders
+    // assign_blob_owners
 
     /// Build a `PulledManifest` with the given blob digests (first = config, rest = layers).
     fn test_pulled_manifest(blob_suffixes: &[&str]) -> PulledManifest {
@@ -3332,279 +3315,279 @@ mod tests {
         )
     }
 
-    fn test_task(source_data: Rc<PulledManifest>, tag: &str) -> TransferTask {
+    /// A task syncing `source_data` into `repo` at the target named `alias`.
+    fn test_task(source_data: Rc<PulledManifest>, repo: &str, alias: &str) -> TransferTask {
         let client = test_client();
         TransferTask {
             source_data,
             source_client: Arc::clone(&client),
-            target_entry: Rc::new(TargetEntry::new(
-                RegistryAlias::new("test-target"),
-                client,
-                None,
-            )),
+            target_entry: Rc::new(TargetEntry::new(RegistryAlias::new(alias), client, None)),
             source: ImageRef {
-                repo: RepositoryName::new(format!("source/{tag}")).unwrap(),
-                tag: tag.to_owned(),
+                repo: RepositoryName::new(format!("source/{repo}")).unwrap(),
+                tag: "v1".to_owned(),
             },
             target: ImageRef {
-                repo: RepositoryName::new(format!("target/{tag}")).unwrap(),
-                tag: tag.to_owned(),
+                repo: RepositoryName::new(repo).unwrap(),
+                tag: "v1".to_owned(),
             },
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
             discovery_retries: 0,
         }
     }
 
-    /// Collect blob digests from leader tasks at the front of the deque.
-    fn leader_blob_digests(pending: &VecDeque<TransferTask>, n: usize) -> HashSet<Digest> {
-        pending
+    /// One pending task per `(repo, blobs)` image, all at target `t`.
+    fn pending_at_one_target(images: &[(&str, &[&str])]) -> VecDeque<TransferTask> {
+        images
             .iter()
-            .take(n)
-            .flat_map(|t| {
-                blobs_from_manifest(&t.source_data)
-                    .into_iter()
-                    .map(|d| d.digest.clone())
+            .map(|(repo, blobs)| test_task(Rc::new(test_pulled_manifest(blobs)), repo, "t"))
+            .collect()
+    }
+
+    /// The owners as `(target alias, blob suffix, owner repo)` triples.
+    fn owner_triples(
+        owners: &HashMap<TargetId, HashMap<Digest, RepositoryName>>,
+    ) -> HashSet<(String, Digest, String)> {
+        owners
+            .iter()
+            .flat_map(|(t, m)| {
+                m.iter()
+                    .map(|(d, r)| (t.alias().to_string(), d.clone(), r.to_string()))
             })
             .collect()
     }
 
+    fn triples(want: &[(&str, &str, &str)]) -> HashSet<(String, Digest, String)> {
+        want.iter()
+            .map(|(alias, suffix, repo)| {
+                ((*alias).to_owned(), test_digest(suffix), (*repo).to_owned())
+            })
+            .collect()
+    }
+
+    fn pending_repos(pending: &VecDeque<TransferTask>) -> Vec<&str> {
+        pending.iter().map(|t| t.target.repo.as_str()).collect()
+    }
+
     #[test]
-    fn elect_leaders_returns_zero_without_election_benefit() {
-        let cases: [(&str, Vec<Vec<&str>>); 3] = [
-            ("empty deque", vec![]),
-            ("a single task", vec![vec!["c1", "a1"]]),
+    fn blob_owner_is_the_smallest_image_then_the_earliest() {
+        // Blob suffixes: first is the config. Each layer weighs 1000 bytes,
+        // the config 100.
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, &[(&str, &[&str])], &[(&str, &str, &str)]); 5] = [
             (
-                "three images with disjoint blob sets",
-                vec![vec!["c1", "aa"], vec!["c2", "bb"], vec!["c3", "cc"]],
+                "the smallest image owns its shared blobs, not the first or largest",
+                &[
+                    ("big", &["c1", "a", "b", "e1"]),
+                    ("small", &["c2", "a", "b"]),
+                ],
+                &[("t", "a", "small"), ("t", "b", "small")],
+            ),
+            (
+                "equal sizes go to discovery order",
+                &[("first", &["c1", "a"]), ("second", &["c2", "a"])],
+                &[("t", "a", "first")],
+            ),
+            (
+                "a blob wanted by one repo has no owner",
+                &[("one", &["c1", "a"]), ("two", &["c2", "b"])],
+                &[],
+            ),
+            (
+                "two tags of one repo are not two repos",
+                &[("same", &["c1", "a"]), ("same", &["c2", "a"])],
+                &[],
+            ),
+            (
+                "a smaller tag of the owner's repo does not hide the sharing",
+                &[
+                    ("other", &["c1", "a", "e1"]),
+                    ("same", &["c2", "a"]),
+                    ("same", &["c3", "a", "e2", "e3"]),
+                ],
+                &[("t", "a", "same")],
             ),
         ];
-        for (name, images) in cases {
-            let mut pending: VecDeque<TransferTask> = images
-                .iter()
-                .enumerate()
-                .map(|(i, blobs)| {
-                    test_task(Rc::new(test_pulled_manifest(blobs)), &format!("img{i}"))
-                })
-                .collect();
-            assert_eq!(elect_leaders(&mut pending), 0, "{name}");
+        for (name, images, want) in cases {
+            let mut pending = pending_at_one_target(images);
+            let owners = assign_blob_owners(&mut pending);
+            assert_eq!(owner_triples(&owners), triples(want), "{name}");
         }
     }
 
     #[test]
-    fn elect_leaders_picks_most_shared() {
-        // base:    {c0, a1, a2, a3}, shares 3 with each child
-        // child_a: {c0, a1, a2, d1}, shares 2 with child_b
-        // child_b: {c0, a1, a3, e1}
-        //
-        // Sum of intersections: base 6, children 5 each, so base wins.
-        let data_base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
-        let data_ca = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
-        let data_cb = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
+    fn blob_ownership_is_per_target() {
+        // `base` goes to targets a and b; `small` shares a layer with it at a
+        // only. At b the layer has one repo, so no owner.
+        let base = Rc::new(test_pulled_manifest(&["c1", "a", "e1"]));
+        let small = Rc::new(test_pulled_manifest(&["c2", "a"]));
+        let mut pending = VecDeque::from([
+            test_task(Rc::clone(&base), "base", "ta"),
+            test_task(base, "base", "tb"),
+            test_task(small, "small", "ta"),
+        ]);
 
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&data_base), "base"));
-        pending.push_back(test_task(Rc::clone(&data_ca), "child_a"));
-        pending.push_back(test_task(Rc::clone(&data_cb), "child_b"));
+        let owners = assign_blob_owners(&mut pending);
 
-        let n = elect_leaders(&mut pending);
-
-        assert_eq!(n, 1);
-        assert_eq!(pending[0].source.tag, "base");
-        let leader_blobs = leader_blob_digests(&pending, n);
-        assert_eq!(leader_blobs.len(), 4);
-        assert!(leader_blobs.contains(&test_digest("c0")));
-        assert!(leader_blobs.contains(&test_digest("a3")));
-        // Followers keep their original order.
-        assert_eq!(pending[1].source.tag, "child_a");
-        assert_eq!(pending[2].source.tag, "child_b");
+        assert_eq!(owner_triples(&owners), triples(&[("ta", "a", "small")]));
     }
 
     #[test]
-    fn elect_leaders_multi_target_groups_by_rc() {
-        // Same blob sets as `elect_leaders_picks_most_shared`, but base targets
-        // two registries (two tasks sharing one Rc), so electing it yields n = 2.
-        let base = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "a3"]));
-        let child_a = Rc::new(test_pulled_manifest(&["c0", "a1", "a2", "d1"]));
-        let child_b = Rc::new(test_pulled_manifest(&["c0", "a1", "a3", "e1"]));
+    fn owners_are_promoted_first_ascending_and_before_their_dependents() {
+        // big (5100 bytes) shares 51 with mid (2100) and 52 with small (1100);
+        // loner shares nothing. mid owns 51, small owns 52.
+        let images: &[(&str, &[&str])] = &[
+            ("big", &["cb", "51", "52", "b1", "b2"]),
+            ("mid", &["cc", "51", "a1"]),
+            ("loner", &["cd", "a2"]),
+            ("small", &["ce", "52"]),
+        ];
+        let mut pending = pending_at_one_target(images);
 
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&base), "v1"));
-        pending.push_back(test_task(Rc::clone(&base), "v1"));
-        pending.push_back(test_task(child_a, "child_a"));
-        pending.push_back(test_task(child_b, "child_b"));
-
-        let n = elect_leaders(&mut pending);
-
-        assert_eq!(n, 2);
-        let leader_blobs = leader_blob_digests(&pending, n);
-        assert_eq!(leader_blobs.len(), 4); // {c0, a1, a2, a3}
-        assert_eq!(pending[0].source.tag, "v1");
-        assert_eq!(pending[1].source.tag, "v1");
-        assert_eq!(pending[2].source.tag, "child_a");
-        assert_eq!(pending[3].source.tag, "child_b");
-    }
-
-    #[test]
-    fn elect_leaders_marginal_coverage_across_rounds() {
-        // A spans both clusters via blob c0, so round 1 elects A (score 4 vs
-        // 2, 3, 3). Round 2 must deduct A's blobs: C and D share {c0, d0}, but
-        // c0 is covered, leaving d0 as their only marginal blob (1 each, B 0).
-        //
-        // A: {a0, b0, c0}  B: {a0, b0, e0}  C: {c0, d0, f0}  D: {c0, d0, fa}
-        let data_a = Rc::new(test_pulled_manifest(&["a0", "b0", "c0"]));
-        let data_b = Rc::new(test_pulled_manifest(&["a0", "b0", "e0"]));
-        let data_c = Rc::new(test_pulled_manifest(&["c0", "d0", "f0"]));
-        let data_d = Rc::new(test_pulled_manifest(&["c0", "d0", "fa"]));
-
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
-        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
-        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
-        pending.push_back(test_task(Rc::clone(&data_d), "imgD"));
-
-        let n = elect_leaders(&mut pending);
-
-        // A (round 1) + one of C/D (round 2, marginal on d0).
-        assert_eq!(n, 2);
-        let leader_blobs = leader_blob_digests(&pending, n);
-        assert!(leader_blobs.contains(&test_digest("a0")));
-        assert!(leader_blobs.contains(&test_digest("d0")));
-
-        let leader_tags: Vec<&str> = pending
-            .iter()
-            .take(n)
-            .map(|t| t.source.tag.as_str())
-            .collect();
-
-        assert_eq!(leader_tags[0], "imgA");
-        // Not B: it shares no marginal blobs once A's {a0,b0,c0} are deducted.
-        assert!(
-            leader_tags[1] == "imgC" || leader_tags[1] == "imgD",
-            "second leader should be from cluster 2, got: {leader_tags:?}"
-        );
-    }
-
-    #[test]
-    fn elect_leaders_tie_breaks_deterministically() {
-        // A: {a0, b0}  B: {a0, b0}  C: {a0, c0}. A and B tie, and
-        // max_by_key returns the last maximum, so B (higher index) wins.
-        let data_a = Rc::new(test_pulled_manifest(&["a0", "b0"]));
-        let data_b = Rc::new(test_pulled_manifest(&["a0", "b0"]));
-        let data_c = Rc::new(test_pulled_manifest(&["a0", "c0"]));
-
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&data_a), "imgA"));
-        pending.push_back(test_task(Rc::clone(&data_b), "imgB"));
-        pending.push_back(test_task(Rc::clone(&data_c), "imgC"));
-
-        let n = elect_leaders(&mut pending);
-        assert_eq!(n, 1);
-        assert_eq!(
-            pending[0].source.tag, "imgB",
-            "tie should break deterministically in favor of later candidate"
-        );
-    }
-
-    #[test]
-    fn elect_leaders_minimal_set_covers_all_follower_shared_blobs() {
-        // The greedy election picks the minimal leader set such that every
-        // shared blob of every follower is in the leader union. Two clusters
-        // ({img1, img2, img3} sharing a1..a3, {img4, img5} sharing b4, b5)
-        // need exactly two leaders.
-        let data1 = Rc::new(test_pulled_manifest(&["10", "a1", "a2", "a3", "f1"]));
-        let data2 = Rc::new(test_pulled_manifest(&["20", "a1", "a2", "f2"]));
-        let data3 = Rc::new(test_pulled_manifest(&["30", "a2", "a3", "f3"]));
-        let data4 = Rc::new(test_pulled_manifest(&["40", "b4", "b5", "f4"]));
-        let data5 = Rc::new(test_pulled_manifest(&["50", "b4", "b5", "f5"]));
-
-        let mut pending = VecDeque::new();
-        pending.push_back(test_task(Rc::clone(&data1), "img1"));
-        pending.push_back(test_task(Rc::clone(&data2), "img2"));
-        pending.push_back(test_task(Rc::clone(&data3), "img3"));
-        pending.push_back(test_task(Rc::clone(&data4), "img4"));
-        pending.push_back(test_task(Rc::clone(&data5), "img5"));
-
-        let n = elect_leaders(&mut pending);
+        let owners = assign_blob_owners(&mut pending);
 
         assert_eq!(
-            n, 2,
-            "should elect exactly 2 leaders for 2 disjoint clusters"
+            pending_repos(&pending),
+            ["small", "mid", "big", "loner"],
+            "owners by ascending size, then the rest in discovery order"
         );
-
-        let leader_blobs = leader_blob_digests(&pending, n);
-
-        let all_blob_sets: Vec<HashSet<Digest>> = pending
-            .iter()
-            .map(|t| {
-                blobs_from_manifest(&t.source_data)
-                    .into_iter()
-                    .map(|d| d.digest.clone())
-                    .collect()
-            })
-            .collect();
-
-        for (i, task) in pending.iter().skip(n).enumerate() {
-            let follower_blobs: HashSet<Digest> = blobs_from_manifest(&task.source_data)
-                .into_iter()
-                .map(|d| d.digest.clone())
-                .collect();
-            // Shared means present in at least one other image.
-            for blob in &follower_blobs {
-                let shared_with_others = all_blob_sets
+        for (digest, owner) in owners.values().flatten() {
+            let owner_at = pending
+                .iter()
+                .position(|t| t.target.repo == *owner)
+                .unwrap();
+            for (at, task) in pending.iter().enumerate() {
+                let wants = blobs_from_manifest(&task.source_data)
                     .iter()
-                    .enumerate()
-                    .any(|(j, set)| j != (i + n) && set.contains(blob));
-                if shared_with_others {
-                    assert!(
-                        leader_blobs.contains(blob),
-                        "follower {} has shared blob {} not covered by leaders",
-                        task.source.tag,
-                        blob
-                    );
+                    .any(|d| d.digest == *digest);
+                if wants && task.target.repo != *owner {
+                    assert!(owner_at < at, "{owner} must precede {}", task.target.repo);
                 }
             }
         }
     }
 
     #[test]
-    fn elect_leaders_scales_subcubically() {
-        // With 75 disjoint pairs (n=150 distinct source manifests) the greedy
-        // loop runs one round per pair: an O(n^3) version takes hundreds of
-        // milliseconds, a sub-cubic one under 500ms.
-        let n_pairs: usize = 75;
-        let mut counter: usize = 0;
-        let mut next = || {
-            let s = format!("{counter:x}");
-            counter += 1;
-            s
-        };
+    fn nothing_shared_keeps_discovery_order() {
+        let mut pending =
+            pending_at_one_target(&[("b", &["c1", "e1", "e2"]), ("a", &["c2", "e3"])]);
 
-        let mut pending = VecDeque::new();
-        for pair_idx in 0..n_pairs {
-            let shared = next();
-            let cfg_a = next();
-            let lay_a1 = next();
-            let lay_a2 = next();
-            let data_a = Rc::new(test_pulled_manifest(&[&cfg_a, &shared, &lay_a1, &lay_a2]));
-            pending.push_back(test_task(data_a, &format!("a{pair_idx}")));
+        let owners = assign_blob_owners(&mut pending);
 
-            let cfg_b = next();
-            let lay_b1 = next();
-            let lay_b2 = next();
-            let data_b = Rc::new(test_pulled_manifest(&[&cfg_b, &shared, &lay_b1, &lay_b2]));
-            pending.push_back(test_task(data_b, &format!("b{pair_idx}")));
-        }
+        assert!(owners.is_empty());
+        assert_eq!(pending_repos(&pending), ["b", "a"]);
+    }
 
-        let start = Instant::now();
-        let leader_count = elect_leaders(&mut pending);
-        let elapsed = start.elapsed();
-
-        // Electing one member of a pair drops the other's marginal coverage to 0.
-        assert_eq!(leader_count, n_pairs, "expected one leader per pair");
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "elect_leaders took {elapsed:?} for n=150 (75 pairs); expected sub-500ms on a non-cubic implementation",
+    /// How long `wait_for_blob_owner` takes, on a paused clock, for a repo `mine`, whose blob `51` is
+    /// owned by repo `owner`, after `setup` shaped the cache; `commit_at`
+    /// commits `owner`'s manifest at that offset.
+    async fn owner_wait(
+        setup: fn(&mut TransferStateCache, &TargetId),
+        commit_at: Option<Duration>,
+    ) -> Duration {
+        const DEADLINE: Duration = Duration::from_secs(5);
+        let client = test_client();
+        let target = TargetEntry::new(RegistryAlias::new("t"), Arc::clone(&client), None);
+        let cache = Rc::new(RefCell::new(TransferStateCache::new()));
+        cache.borrow_mut().set_blob_owners(HashMap::from([(
+            target.id().clone(),
+            HashMap::from([(test_digest("51"), RepositoryName::new("owner").unwrap())]),
+        )]));
+        setup(&mut cache.borrow_mut(), target.id());
+        let (shared, staging, retry) = (
+            PerRun::default(),
+            Rc::new(BlobStage::disabled()),
+            RetryConfig::default(),
         );
+        let mine = RepositoryName::new("mine").unwrap();
+        let source = RepositoryName::new("source").unwrap();
+        let ctx = TransferContext {
+            cache: &cache,
+            shared: &shared,
+            staging: &staging,
+            retry: &retry,
+            source_client: &client,
+            source_repo: &source,
+            target_client: &client,
+            target_id: target.id(),
+            target_repo: &mine,
+            batch_checker: None,
+            mount_source_wait_deadline: DEADLINE,
+        };
+        let start = tokio::time::Instant::now();
+        let deadline = start + DEADLINE;
+        let commit = async {
+            if let Some(at) = commit_at {
+                tokio::time::sleep(at).await;
+                let owner = RepositoryName::new("owner").unwrap();
+                cache.borrow_mut().mark_repo_committed(target.id(), &owner);
+            }
+        };
+        let wait = async {
+            wait_for_blob_owner(&ctx, &test_digest("51"), deadline).await;
+            start.elapsed()
+        };
+        tokio::join!(wait, commit).0
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_waits_for_its_owner_only_when_it_has_nothing_better() {
+        let none = Duration::ZERO;
+        let owner_commit = Some(Duration::from_secs(2));
+        // (name, setup, owner commits at, want elapsed)
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, fn(&mut TransferStateCache, &TargetId), _, Duration); 6] = [
+            (
+                "waits for the owner's commit",
+                |_, _| {},
+                owner_commit,
+                Duration::from_secs(2),
+            ),
+            (
+                "gives up at the deadline when the owner never resolves",
+                |_, _| {},
+                None,
+                Duration::from_secs(5),
+            ),
+            (
+                "does not wait once the owner already committed",
+                |c, t| c.mark_repo_committed(t, &RepositoryName::new("owner").unwrap()),
+                owner_commit,
+                none,
+            ),
+            (
+                "does not wait when the blob is already here",
+                |c, t| {
+                    c.set_blob_verified(t, test_digest("51"), RepositoryName::new("mine").unwrap())
+                },
+                owner_commit,
+                none,
+            ),
+            (
+                "does not wait when a mount source exists",
+                |c, t| {
+                    let other = RepositoryName::new("other").unwrap();
+                    c.set_blob_completed(t, test_digest("51"), other.clone());
+                    c.mark_repo_committed(t, &other);
+                },
+                owner_commit,
+                none,
+            ),
+            (
+                "does not wait when it is the owner",
+                |c, t| {
+                    let mine = RepositoryName::new("mine").unwrap();
+                    c.set_blob_owners(HashMap::from([(
+                        t.clone(),
+                        HashMap::from([(test_digest("51"), mine)]),
+                    )]));
+                },
+                owner_commit,
+                none,
+            ),
+        ];
+        for (name, setup, commit_at, want) in cases {
+            assert_eq!(owner_wait(setup, commit_at).await, want, "{name}");
+        }
     }
 
     #[test]
