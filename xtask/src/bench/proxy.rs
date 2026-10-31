@@ -230,7 +230,7 @@ const ACTION_OTHER: &str = "Other";
 /// `Location`, outside `/v2/`.
 const ARTIFACT_REGISTRY_UPLOADS: &str = "/artifacts-uploads/";
 
-/// Classifies a registry request by ECR action from the HTTP method and URL path.
+/// Classifies a registry request by registry action from the HTTP method and URL path.
 ///
 /// Used to break down 429 rate-limit responses by the operation that triggered them.
 fn classify_registry_action(method: &str, url: &str) -> &'static str {
@@ -705,6 +705,13 @@ mod tests {
                 "/artifacts-uploads/namespaces/p/repositories/r/uploads/id?digest=sha256:abc"
             ),
             "BlobUploadComplete"
+        );
+        assert_eq!(
+            classify_registry_action(
+                "PATCH",
+                "/artifacts-uploads/namespaces/p/repositories/r/uploads/id"
+            ),
+            "BlobUploadChunk"
         );
         assert_eq!(
             classify_registry_action("GET", "/v2/repo/tags/list"),

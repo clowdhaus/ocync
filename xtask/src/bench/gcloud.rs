@@ -14,7 +14,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::bench::gar::{ArtifactRegistryTarget, Location, Project, RepositoryId};
-use crate::bench::{Rounds, RunTimestamp};
+use crate::bench::{Rounds, RunTimestamp, captured};
 
 /// What every repository this tool makes is named from. A run removes the
 /// repositories with this prefix that an earlier run left, and touches no
@@ -113,15 +113,14 @@ impl Outputs {
 
     /// Reads the outputs of the applied Terraform stack.
     pub(crate) fn read() -> Result<Self, String> {
-        let json = captured(
-            "terraform".as_ref(),
-            &[
-                "-chdir=".to_owned() + TERRAFORM_DIR,
-                "output".into(),
-                "-json".into(),
-            ],
-        )
-        .map_err(|e| format!("{e}. Did you run `terraform apply` in {TERRAFORM_DIR}?"))?;
+        let json = captured(Command::new("terraform").args([
+            &format!("-chdir={TERRAFORM_DIR}"),
+            "output",
+            "-json",
+        ]))
+        .map_err(|e| {
+            format!("terraform output -json failed: {e}. Did you run `terraform apply` in {TERRAFORM_DIR}?")
+        })?;
         Self::parse(&json)
     }
 }
@@ -163,27 +162,14 @@ impl Gcloud {
     }
 
     fn run(&self, argv: &[String]) -> Result<String, String> {
-        captured(&self.0, argv)
+        captured(Command::new(&self.0).args(argv)).map_err(|e| {
+            format!(
+                "{} {} failed: {e}",
+                self.0.to_string_lossy(),
+                argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ")
+            )
+        })
     }
-}
-
-/// Runs `program` with `argv` and returns its stdout. Its stderr is read only
-/// when it fails, and then goes into the error.
-fn captured(program: &std::ffi::OsStr, argv: &[String]) -> Result<String, String> {
-    let name = program.to_string_lossy();
-    let output = Command::new(program)
-        .args(argv)
-        .output()
-        .map_err(|e| format!("could not run {name}: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{name} {} failed ({}): {}",
-            argv.iter().take(3).cloned().collect::<Vec<_>>().join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| format!("{name} printed non-UTF-8: {e}"))
 }
 
 /// The argv of a `gcloud artifacts repositories` command, with `id` and
@@ -265,9 +251,18 @@ fn leftovers(listed: &str) -> Vec<RepositoryId> {
         .collect()
 }
 
+/// Whether the instance's run is known to have ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunEnd {
+    /// The script's own exit was read, or the run never reached the instance.
+    Settled,
+    /// The connection dropped, so the detached benchmark may still be pushing.
+    Unknown,
+}
+
 /// The repositories one run made, removed when it ends.
 ///
-/// Dropping deletes whatever [`Self::delete`] has not, so a run that fails or
+/// Dropping deletes whatever [`Self::settle`] has not, so a run that fails or
 /// returns early leaves nothing behind. A process that is killed relies on the
 /// next run's sweep of [`REPOSITORY_PREFIX`] instead.
 pub(crate) struct Provisioned {
@@ -317,8 +312,25 @@ impl Provisioned {
         Ok(this)
     }
 
+    /// Deletes the repositories when the run's end is [`RunEnd::Settled`]; when
+    /// it is [`RunEnd::Unknown`], keeps them, since the benchmark may still be
+    /// pushing, and says so.
+    pub(crate) fn settle(&mut self, end: RunEnd) -> Result<(), String> {
+        match end {
+            RunEnd::Settled => self.delete(),
+            RunEnd::Unknown => {
+                let kept = std::mem::take(&mut self.target.repositories);
+                eprintln!(
+                    "bench-remote: kept {} Artifact Registry repositories because the run may                      still be live on the instance; the next `--target artifact-registry` run                      deletes them once the instance is free",
+                    kept.len()
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Deletes every repository this run made.
-    pub(crate) fn delete(&mut self) -> Result<(), String> {
+    fn delete(&mut self) -> Result<(), String> {
         let ids = std::mem::take(&mut self.target.repositories);
         self.delete_ids(&ids)
     }
@@ -533,7 +545,7 @@ mod tests {
 
         let mut provisioned = Provisioned::create(gcloud, outputs, &timestamp, rounds).unwrap();
         assert_eq!(provisioned.target.repositories.len(), 3);
-        let err = provisioned.delete().unwrap_err();
+        let err = provisioned.settle(RunEnd::Settled).unwrap_err();
         assert!(
             err.contains("ocync-bench-run-2026-10-30-120000-r2: ") && err.contains("denied"),
             "{err}"
@@ -572,6 +584,25 @@ mod tests {
             .filter(|l| l.contains("repositories delete ocync-bench-run-2026-10-30-120000-r"))
             .count();
         assert_eq!(deleted, 3, "{calls}");
+    }
+
+    #[test]
+    fn repositories_are_kept_when_the_end_of_the_run_is_unknown() {
+        // Catches: deleting repositories a detached benchmark is still
+        // pushing into, by `settle` or by the drop that follows it.
+        let dir = tempfile::tempdir().unwrap();
+        let (gcloud, log) = stub_gcloud(dir.path(), "never");
+        let outputs = Outputs::parse(OUTPUTS).unwrap();
+        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
+        let mut provisioned =
+            Provisioned::create(gcloud, outputs, &timestamp, "3".parse().unwrap()).unwrap();
+        let before = std::fs::read_to_string(&log).unwrap().lines().count();
+
+        assert_eq!(provisioned.settle(RunEnd::Unknown), Ok(()));
+        drop(provisioned);
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), before, "{calls}");
     }
 
     #[test]

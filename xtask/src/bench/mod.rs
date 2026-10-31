@@ -286,11 +286,29 @@ pub(crate) enum Scenario {
     All,
 }
 
+/// Runs `command` and returns its stdout. A failure is why it could not run,
+/// or what it printed on stderr (its exit status when that is empty).
+pub(crate) fn captured(command: &mut std::process::Command) -> Result<String, String> {
+    let output = command.output().map_err(|e| {
+        format!(
+            "could not run {}: {e}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(match stderr.trim() {
+            "" => output.status.to_string(),
+            stderr => stderr.to_owned(),
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("printed non-UTF-8: {e}"))
+}
+
 /// The trimmed stdout of `command`, or `None` when it cannot be run, exits
 /// non-zero, prints non-UTF-8, or prints nothing.
 pub(crate) fn command_stdout(command: &mut std::process::Command) -> Option<String> {
-    let output = command.output().ok().filter(|o| o.status.success())?;
-    let text = String::from_utf8(output.stdout).ok()?;
+    let text = captured(command).ok()?;
     Some(text.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
@@ -504,6 +522,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &|name| std::env::var(name).ok(),
         args.scenario,
         &args.tool_selection.run_tools(),
+        args.regression,
         args.tool_selection.rounds,
     )?;
 
@@ -2150,6 +2169,21 @@ mod tests {
         assert_eq!(run("printf", &[" \n"]), None, "blank output");
         assert_eq!(run("false", &[]), None, "non-zero exit");
         assert_eq!(run("/nonexistent/program", &[]), None, "cannot spawn");
+    }
+
+    #[test]
+    fn captured_failure_is_stderr_trimmed_or_the_status_or_why_it_did_not_run() {
+        use std::process::Command;
+        let sh = |script: &str| captured(Command::new("sh").args(["-c", script]));
+
+        assert_eq!(sh("printf ' out\\n'").as_deref(), Ok(" out\n"), "untrimmed");
+        assert_eq!(sh("echo ' denied ' >&2; exit 3"), Err("denied".to_owned()));
+        assert_eq!(sh("exit 3"), Err("exit status: 3".to_owned()), "no stderr");
+        let err = captured(&mut Command::new("/nonexistent/program")).unwrap_err();
+        assert!(
+            err.starts_with("could not run /nonexistent/program: "),
+            "{err}"
+        );
     }
 
     #[test]

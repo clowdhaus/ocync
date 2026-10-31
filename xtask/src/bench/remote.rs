@@ -15,11 +15,11 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::gar::{ArtifactRegistryTarget, ENV_CREDENTIALS};
-use super::gcloud::{Gcloud, Outputs, Provisioned, lock_local_run};
+use super::gcloud::{Gcloud, Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
 use super::target::{ENV_REGISTRY, Kind, ensure_artifact_registry_applies};
-use super::{Provider, RunTimestamp, Scenario, ToolSelection, finish_pass, value_name};
+use super::{Provider, RunTimestamp, Scenario, ToolSelection, captured, finish_pass, value_name};
 
 /// Common SSH options for all remote connections.
 ///
@@ -96,6 +96,7 @@ pub(crate) struct BenchRemoteArgs {
     /// older than the change that added `bench --archive` cannot run, because
     /// the instance's `bench` would not know the option, and one older than
     /// `--max-concurrent-transfers` cannot take that option for the same reason.
+    /// An Artifact Registry run needs a ref with `--target`.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -182,7 +183,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
     if args.target == Kind::ArtifactRegistry {
-        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
+        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools(), false)?;
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
@@ -241,7 +242,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         }
     };
 
-    let result = run_on_instance(
+    let (end, result) = run_on_instance(
         &args,
         &config,
         &git_ref,
@@ -249,11 +250,14 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         &timestamp,
         provisioned.as_ref(),
     );
-    let cleanup = provisioned.as_mut().map_or(Ok(()), Provisioned::delete);
+    let cleanup = provisioned
+        .as_mut()
+        .map_or(Ok(()), |provisioned| provisioned.settle(end));
     finish_pass(result, cleanup)
 }
 
-/// Runs the benchmark on the instance and fetches its results.
+/// Runs the benchmark on the instance and fetches its results, and says
+/// whether the run's end is known.
 fn run_on_instance(
     args: &BenchRemoteArgs,
     config: &BenchConfig,
@@ -261,14 +265,17 @@ fn run_on_instance(
     git_sha: &CommitSha,
     timestamp: &RunTimestamp,
     provisioned: Option<&Provisioned>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> (RunEnd, Result<(), Box<dyn std::error::Error>>) {
     // The directory the fetch takes, named by this run's start time. A run
     // that wrote no results leaves nothing at that path, and no earlier run's
     // directory can stand in for it.
     let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
 
-    if let Some(provisioned) = provisioned {
-        copy_credentials(config, &provisioned.credentials_file)?;
+    if let Some(provisioned) = provisioned
+        && let Err(e) = copy_credentials(config, &provisioned.credentials_file)
+    {
+        // Before any run exists on the instance.
+        return (RunEnd::Settled, Err(e));
     }
 
     let bench_args = bench_args(args, timestamp);
@@ -286,16 +293,22 @@ fn run_on_instance(
         config.user, config.host
     );
 
-    let exit_code = match ssh_stream(config, &script)? {
-        RemoteOutcome::Refused => {
-            return Err(LIVE_RUN_REFUSAL.into());
-        }
+    let outcome = match ssh_stream(config, &script) {
+        Ok(outcome) => outcome,
+        Err(e) => return (RunEnd::Unknown, Err(e)),
+    };
+    let end = outcome.end();
+    let exit_code = match outcome {
+        RemoteOutcome::Refused => return (end, Err(LIVE_RUN_REFUSAL.into())),
         RemoteOutcome::FailedBeforeStart(code) => {
-            return Err(format!(
-                "remote script exited with code {code} before the benchmark started; \
-                 not fetching results"
-            )
-            .into());
+            return (
+                end,
+                Err(format!(
+                    "remote script exited with code {code} before the benchmark started; \
+                     not fetching results"
+                )
+                .into()),
+            );
         }
         RemoteOutcome::Ran(code) => code,
     };
@@ -307,7 +320,7 @@ fn run_on_instance(
     }
 
     let results = fetch_run_results(config, &args.output, &results_dir);
-    run_result(exit_code, results)
+    (end, run_result(exit_code, results))
 }
 
 /// What the fetch of a run's results directory found.
@@ -362,13 +375,16 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
         value_name(&ArchiveMode::Defer),
         "--run-timestamp".to_string(),
         timestamp.to_string(),
-        "--target".to_string(),
-        value_name(&args.target),
         "--tools".to_string(),
         join_tools(&args.tool_selection.tools),
         "--rounds".to_string(),
         args.tool_selection.rounds.to_string(),
     ];
+    // Only for Artifact Registry, so an ECR run still works on a `--git-ref`
+    // whose `bench` has no such option.
+    if args.target == Kind::ArtifactRegistry {
+        bench_args.extend(["--target".to_string(), value_name(&args.target)]);
+    }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
     }
@@ -462,6 +478,10 @@ impl Sentinel {
     }
 }
 
+/// The exit code `ssh` itself ends with when it cannot connect or the
+/// connection drops.
+const SSH_FAILED_EXIT: i32 = 255;
+
 /// How the remote script ended.
 #[derive(Debug, PartialEq, Eq)]
 enum RemoteOutcome {
@@ -475,6 +495,21 @@ enum RemoteOutcome {
 }
 
 impl RemoteOutcome {
+    /// Whether the script's own exit was read. `ssh` exits with
+    /// [`SSH_FAILED_EXIT`] when the connection fails or drops, which leaves the
+    /// detached script and benchmark running, and a script is not told apart
+    /// from it by its own code. A refusal is the guard's line, so no run of
+    /// ours exists.
+    fn end(&self) -> RunEnd {
+        match self {
+            Self::Refused => RunEnd::Settled,
+            Self::FailedBeforeStart(code) | Self::Ran(code) if *code == SSH_FAILED_EXIT => {
+                RunEnd::Unknown
+            }
+            Self::FailedBeforeStart(_) | Self::Ran(_) => RunEnd::Settled,
+        }
+    }
+
     /// The outcome of a script whose first sentinel line was `sentinel`.
     /// A refusal is the line, whatever the exit code: `set -e` makes any
     /// failing command exit with any code, the refusal's own `exit 3`
@@ -622,18 +657,13 @@ fn fetch_results(
 
 /// Run a single command on the remote instance and capture its stdout.
 fn ssh_run(config: &BenchConfig, command: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("ssh")
-        .args(ssh_args(config))
-        .arg(format!("{}@{}", config.user, config.host))
-        .arg(command)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ssh command failed: {stderr}").into());
-    }
-
-    Ok(String::from_utf8(output.stdout)?)
+    Ok(captured(
+        Command::new("ssh")
+            .args(ssh_args(config))
+            .arg(format!("{}@{}", config.user, config.host))
+            .arg(command),
+    )
+    .map_err(|e| format!("ssh command failed: {e}"))?)
 }
 
 /// Escapes a string for use inside single quotes in a shell command.
@@ -951,16 +981,9 @@ exit $EXIT
 /// Runs `git` with `args` in `repo` and returns its trimmed output, or an error
 /// carrying git's own message.
 pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git").current_dir(repo).args(args).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    let stdout = captured(Command::new("git").current_dir(repo).args(args))
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    Ok(stdout.trim().to_owned())
 }
 
 /// Runs `git rev-parse` with `args` in `repo`.
@@ -1306,7 +1329,8 @@ mod tests {
     #[test]
     fn the_target_reaches_the_benchmark_on_the_instance() {
         // Catches: `bench-remote` choosing Artifact Registry and the instance
-        // defaulting to ECR, or the reverse.
+        // defaulting to ECR, or an ECR run sending an option that a `--git-ref`
+        // older than the target flag does not know.
         use clap::Parser;
         let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
         let passed = |extra: &[&str]| {
@@ -1316,13 +1340,32 @@ mod tests {
             let args = Cli::try_parse_from(argv).unwrap().args;
             let bench_args = bench_args(&args, &timestamp);
             let argv: Vec<&str> = bench_args.iter().map(String::as_str).collect();
-            crate::bench::parse_bench(&argv).unwrap().target
+            (
+                bench_args.contains(&"--target".to_owned()),
+                crate::bench::parse_bench(&argv).unwrap().target,
+            )
         };
-        assert_eq!(passed(&[]), Kind::Ecr);
+        assert_eq!(passed(&[]), (false, Kind::Ecr));
         assert_eq!(
             passed(&["--target", "artifact-registry"]),
-            Kind::ArtifactRegistry
+            (true, Kind::ArtifactRegistry)
         );
+    }
+
+    #[test]
+    fn only_a_read_exit_settles_the_end_of_a_run() {
+        // Catches: deleting the repositories under a benchmark that goes on
+        // pushing after `ssh` dropped.
+        for (outcome, expected) in [
+            (RemoteOutcome::Refused, RunEnd::Settled),
+            (RemoteOutcome::FailedBeforeStart(3), RunEnd::Settled),
+            (RemoteOutcome::Ran(0), RunEnd::Settled),
+            (RemoteOutcome::Ran(1), RunEnd::Settled),
+            (RemoteOutcome::FailedBeforeStart(255), RunEnd::Unknown),
+            (RemoteOutcome::Ran(255), RunEnd::Unknown),
+        ] {
+            assert_eq!(outcome.end(), expected, "{outcome:?}");
+        }
     }
 
     #[test]

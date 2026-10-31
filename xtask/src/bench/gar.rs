@@ -26,12 +26,13 @@ pub(crate) const ENV_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 const HOST_SUFFIX: &str = "-docker.pkg.dev";
 
 /// Whether `s` is a lowercase letter, then lowercase letters, digits and
-/// hyphens, within `len` characters.
+/// hyphens, ending in a letter or digit, within `len` characters.
 fn is_lowercase_id(s: &str, len: RangeInclusive<usize>) -> bool {
     let mut chars = s.chars();
     len.contains(&s.len())
         && chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.ends_with('-')
 }
 
 /// Declares a string newtype that is parsed against a rule and read back as
@@ -65,19 +66,19 @@ macro_rules! id {
 id!(
     /// An Artifact Registry repository id.
     RepositoryId,
-    "a repository id (a lowercase letter, then lowercase letters, digits or hyphens, at most 63)",
+    "a repository id (a lowercase letter, then lowercase letters, digits or hyphens, ending in a letter or digit, at most 63)",
     1..=63
 );
 id!(
     /// A Google Cloud project id.
     Project,
-    "a project id (a lowercase letter, then lowercase letters, digits or hyphens, 6 to 30)",
+    "a project id (a lowercase letter, then lowercase letters, digits or hyphens, ending in a letter or digit, 6 to 30)",
     6..=30
 );
 id!(
     /// A Google Cloud location, such as a region.
     Location,
-    "a location (a lowercase letter, then lowercase letters, digits or hyphens)",
+    "a location (a lowercase letter, then lowercase letters, digits or hyphens, ending in a letter or digit)",
     1..=63
 );
 
@@ -181,6 +182,25 @@ pub(crate) async fn client(host: &str) -> Result<RegistryClient, String> {
         .map_err(|e| format!("registry client for {host}: {e}"))
 }
 
+/// A tag no image carries, so a signed-in client is answered "absent".
+const SIGN_IN_PROBE_TAG: &str = "ocync-bench-sign-in-probe";
+
+/// Sends one authenticated request, so a broken federation file or a missing
+/// grant fails before the build and the pre-warm rather than after them. The
+/// first repository exists by now, and an absent tag in it answers 404.
+pub(crate) async fn check_sign_in(
+    client: &RegistryClient,
+    target: &ArtifactRegistryTarget,
+) -> Result<(), String> {
+    let repo = target.target_prefix(1, "sign-in-probe");
+    let name = RepositoryName::new(&repo).map_err(|e| format!("{repo}: {e}"))?;
+    client
+        .manifest_head(&name, SIGN_IN_PROBE_TAG)
+        .await
+        .map(drop)
+        .map_err(|e| format!("Google sign-in check against {repo} failed: {e}"))
+}
+
 /// What `repo` holds of the `expected` tags and, for a tag at its locked
 /// digest, of the index children the lock lists. Artifact Registry has no
 /// listing that names untagged images, so each is asked for by digest.
@@ -251,6 +271,7 @@ mod tests {
             ("1abc", false),
             ("Abc", false),
             ("a_b", false),
+            ("run-", false),
             ("", false),
             (long.as_str(), false),
             (&long[..63], true),
@@ -259,6 +280,10 @@ mod tests {
         }
         assert!("example-project".parse::<Project>().is_ok());
         assert!("short".parse::<Project>().is_err(), "under 6 characters");
+        assert!(
+            "example-project-".parse::<Project>().is_err(),
+            "ends in a hyphen"
+        );
         assert_eq!(
             Location::from_host("europe-west9-docker.pkg.dev")
                 .unwrap()
@@ -267,6 +292,56 @@ mod tests {
         );
         assert!(Location::from_host("123.dkr.ecr.us-east-1.amazonaws.com").is_err());
         assert!(Location::from_host("-docker.pkg.dev").is_err());
+    }
+
+    /// Answers one request with `status`, and returns the request line it saw.
+    fn serve_once(status: &str) -> (reqwest::Url, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let status = status.to_owned();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request_line
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn the_sign_in_check_is_one_head_in_the_first_repository_and_a_refusal_fails_it() {
+        // Catches: a broken federation file or a missing grant surfacing only
+        // after the build, and a check that sends nothing or the wrong request.
+        let target = ArtifactRegistryTarget::parse(&env_of(&FULL), rounds("3")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let check = |status: &str| {
+            let (url, seen) = serve_once(status);
+            let client = RegistryClient::builder(url).build().unwrap();
+            let result = runtime.block_on(check_sign_in(&client, &target));
+            (result, seen.join().unwrap())
+        };
+
+        let (result, request) = check("404 Not Found");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            request,
+            "HEAD /v2/example-project/run-r1/sign-in-probe/manifests/ocync-bench-sign-in-probe HTTP/1.1\r\n"
+        );
+        let (result, _) = check("403 Forbidden");
+        assert!(result.unwrap_err().contains("sign-in check"), "refused");
     }
 
     #[test]

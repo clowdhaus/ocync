@@ -50,11 +50,19 @@ pub(crate) enum Target {
 
 /// Fails unless a run of `scenario` with `tools` can sync into Artifact
 /// Registry. Shared by the instance and by `bench-remote`, which refuses
-/// before it creates anything.
+/// before it creates anything. `regression` is whether the run compares with
+/// the stored baseline, which `bench-remote` never asks for.
 pub(crate) fn ensure_artifact_registry_applies(
     scenario: Scenario,
     tools: &[Tool],
+    regression: bool,
 ) -> Result<(), String> {
+    if regression {
+        return Err(
+            "--regression cannot run against Artifact Registry: the one stored baseline is ECR's"
+                .to_owned(),
+        );
+    }
     if !matches!(scenario, Scenario::Sync) {
         return Err(format!(
             "the {} scenario cannot sync into Artifact Registry yet; only sync can",
@@ -87,12 +95,13 @@ impl Target {
         env: &dyn Fn(&str) -> Option<String>,
         scenario: Scenario,
         tools: &[Tool],
+        regression: bool,
         rounds: Rounds,
     ) -> Result<Self, String> {
         match kind {
             Kind::Ecr => Ok(Self::Ecr),
             Kind::ArtifactRegistry => {
-                ensure_artifact_registry_applies(scenario, tools)?;
+                ensure_artifact_registry_applies(scenario, tools, regression)?;
                 gar::require(env, ENV_CREDENTIALS)?;
                 ArtifactRegistryTarget::parse(env, rounds).map(Self::ArtifactRegistry)
             }
@@ -132,9 +141,11 @@ impl Store {
                 ecr::validate_credentials(&client).await?;
                 Ok(Self::Ecr(client))
             }
-            Target::ArtifactRegistry(target) => gar::client(&target.location.host())
-                .await
-                .map(|client| Self::ArtifactRegistry(Box::new(client))),
+            Target::ArtifactRegistry(target) => {
+                let client = gar::client(&target.location.host()).await?;
+                gar::check_sign_in(&client, target).await?;
+                Ok(Self::ArtifactRegistry(Box::new(client)))
+            }
         }
     }
 }
@@ -452,7 +463,7 @@ mod tests {
         tools: &[Tool],
         asked: &str,
     ) -> Result<Target, String> {
-        Target::from_env(kind, &env_of(pairs), scenario, tools, rounds(asked))
+        Target::from_env(kind, &env_of(pairs), scenario, tools, false, rounds(asked))
     }
 
     #[test]
@@ -542,6 +553,27 @@ mod tests {
             ),
             Ok(Target::ArtifactRegistry(_))
         ));
+    }
+
+    #[test]
+    fn regression_is_refused_with_artifact_registry_and_still_allowed_with_ecr() {
+        // Catches: a Google run compared with, or saved as, ECR's one baseline.
+        let from_env = |kind, regression| {
+            Target::from_env(
+                kind,
+                &env_of(&GAR_ENV),
+                Scenario::Sync,
+                &[Tool::Ocync],
+                regression,
+                rounds("3"),
+            )
+        };
+        let err = from_env(Kind::ArtifactRegistry, true).unwrap_err();
+        assert!(
+            err.starts_with("--regression cannot run against Artifact Registry"),
+            "{err}"
+        );
+        assert_eq!(from_env(Kind::Ecr, true), Ok(Target::Ecr));
     }
 
     #[test]
