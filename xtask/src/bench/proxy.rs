@@ -226,10 +226,15 @@ const ACTION_BLOB_UPLOAD_COMPLETE: &str = "BlobUploadComplete";
 const ACTION_TAG_LIST: &str = "TagList";
 const ACTION_OTHER: &str = "Other";
 
+/// Path prefix of the upload session URL Artifact Registry hands back in
+/// `Location`, outside `/v2/`.
+const ARTIFACT_REGISTRY_UPLOADS: &str = "/artifacts-uploads/";
+
 /// Classifies a registry request by ECR action from the HTTP method and URL path.
 ///
 /// Used to break down 429 rate-limit responses by the operation that triggered them.
 fn classify_registry_action(method: &str, url: &str) -> &'static str {
+    let upload_session = url.starts_with(ARTIFACT_REGISTRY_UPLOADS);
     match method {
         "HEAD" if url.contains("/manifests/") => ACTION_MANIFEST_HEAD,
         "GET" if url.contains("/manifests/") => ACTION_MANIFEST_READ,
@@ -237,8 +242,8 @@ fn classify_registry_action(method: &str, url: &str) -> &'static str {
         "HEAD" if url.contains("/blobs/sha256:") => ACTION_BLOB_HEAD,
         "GET" if url.contains("/blobs/sha256:") => ACTION_BLOB_READ,
         "POST" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_INIT,
-        "PATCH" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_CHUNK,
-        "PUT" if url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_COMPLETE,
+        "PATCH" if upload_session || url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_CHUNK,
+        "PUT" if upload_session || url.contains("/blobs/uploads/") => ACTION_BLOB_UPLOAD_COMPLETE,
         "GET" if url.contains("/tags/list") => ACTION_TAG_LIST,
         _ => ACTION_OTHER,
     }
@@ -692,6 +697,13 @@ mod tests {
         );
         assert_eq!(
             classify_registry_action("PUT", "/v2/repo/blobs/uploads/uuid-123?digest=sha256:abc"),
+            "BlobUploadComplete"
+        );
+        assert_eq!(
+            classify_registry_action(
+                "PUT",
+                "/artifacts-uploads/namespaces/p/repositories/r/uploads/id?digest=sha256:abc"
+            ),
             "BlobUploadComplete"
         );
         assert_eq!(
