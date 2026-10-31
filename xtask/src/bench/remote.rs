@@ -63,6 +63,7 @@ pub(crate) struct BenchRemoteArgs {
             "tools",
             "baseline_ref",
             "rounds",
+            "max_concurrent_transfers",
             "scenario",
             "limit",
             "skip_registries",
@@ -79,7 +80,8 @@ pub(crate) struct BenchRemoteArgs {
 
     /// Git ref to checkout on the instance (default: current branch). A ref
     /// older than the change that added `bench --archive` cannot run, because
-    /// the instance's `bench` would not know the option.
+    /// the instance's `bench` would not know the option, and one older than
+    /// `--max-concurrent-transfers` cannot take that option for the same reason.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -164,6 +166,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // anything leaves this machine.
     let registry_env = registry_env(args.provider)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    args.tool_selection.ensure_cap_applies()?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
@@ -297,6 +300,9 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     ];
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
+    }
+    if let Some(cap) = args.tool_selection.max_concurrent_transfers {
+        bench_args.extend(["--max-concurrent-transfers".to_string(), cap.to_string()]);
     }
     if let Some(limit) = args.limit {
         bench_args.extend(["--limit".to_string(), limit.to_string()]);
@@ -1052,6 +1058,7 @@ mod tests {
             &["--git-ref", "main"][..],
             &["--tools", "ocync"][..],
             &["--rounds", "3"][..],
+            &["--max-concurrent-transfers", "20"][..],
             &["--baseline-ref", &head][..],
             &["--scenario", "sync"][..],
             &["--limit", "3"][..],
@@ -1306,6 +1313,37 @@ mod tests {
             crate::bench::parse_bench(&["sync"]).unwrap().archive,
             ArchiveMode::Write,
             "a local run keeps writing the tracked files"
+        );
+    }
+
+    #[test]
+    fn the_transfer_cap_reaches_the_benchmark_on_the_instance_only_when_set() {
+        // Catches: `bench-remote` accepting the option and dropping it, so a
+        // run labelled with a cap measures ocync's default.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            bench_args(&args, &timestamp)
+        };
+
+        let capped = passed(&["--max-concurrent-transfers", "20"]);
+        let argv: Vec<&str> = capped.iter().map(String::as_str).collect();
+        assert_eq!(
+            crate::bench::parse_bench(&argv)
+                .unwrap()
+                .tool_selection
+                .max_concurrent_transfers,
+            std::num::NonZeroUsize::new(20)
+        );
+
+        assert!(
+            !passed(&[])
+                .iter()
+                .any(|a| a == "--max-concurrent-transfers")
         );
     }
 

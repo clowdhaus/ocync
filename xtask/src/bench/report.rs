@@ -1,10 +1,12 @@
 //! Markdown and JSON report generation from benchmark results.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::lock::LockedAt;
@@ -67,12 +69,32 @@ pub(crate) struct RunRecord {
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
+    /// The cap on concurrent image transfers the current ocync ran with, the
+    /// default's value when none was given. Runs under different caps are
+    /// different series; absent when no ocync ran and from records written
+    /// before the cap was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
+    /// The cap the baseline build ran with; absent without a baseline build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline_max_concurrent_transfers: Option<BaselineCap>,
     /// How many rounds were asked for and finished; absent for a run with no
     /// repeated scenario and for records written before rounds existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rounds: Option<RoundCount>,
     /// Per-scenario results, one per round of a repeated scenario.
     pub(crate) scenarios: Vec<ScenarioRecord>,
+}
+
+/// The cap the baseline build ran with. Its default is unknown: the build is an
+/// older commit, whose own default may differ from the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BaselineCap {
+    /// The cap the run gave it.
+    Given(NonZeroUsize),
+    /// None was given, so it ran at its own default.
+    OwnDefault,
 }
 
 /// How many rounds of the repeated scenarios a run was asked for and finished.
@@ -114,6 +136,8 @@ impl RunRecord {
                 images: report.corpus_size,
                 tags: report.total_tags,
             },
+            max_concurrent_transfers: report.ocync_transfer_cap(),
+            baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
             rounds: report.round_count(),
             scenarios: report
                 .scenarios
@@ -530,6 +554,9 @@ pub(crate) struct BenchReport {
     pub(crate) prewarm: Option<Prewarm>,
     /// The commit the baseline build was made from; `None` without one.
     pub(crate) baseline: Option<CommitSha>,
+    /// The cap on concurrent image transfers the run gave ocync, the current
+    /// build and the baseline alike; `None` when it kept their defaults.
+    pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
     /// The rounds the run was asked for, of which a stopped run finished fewer.
     pub(crate) rounds: Rounds,
     /// The scenarios the run planned to repeat, so that one which finished no
@@ -548,7 +575,28 @@ pub(crate) fn tool_label(tool: Tool, baseline: Option<&CommitSha>) -> String {
     }
 }
 
+/// The cap the current ocync runs with: the one `given`, else the engine's
+/// default.
+pub(crate) fn effective_transfer_cap(given: Option<NonZeroUsize>) -> NonZeroUsize {
+    given.unwrap_or(DEFAULT_MAX_CONCURRENT_TRANSFERS)
+}
+
 impl BenchReport {
+    /// The cap the current ocync ran with. `None` when no ocync ran.
+    pub(crate) fn ocync_transfer_cap(&self) -> Option<NonZeroUsize> {
+        self.tool_versions
+            .contains_key(&Tool::Ocync)
+            .then(|| effective_transfer_cap(self.max_concurrent_transfers))
+    }
+
+    /// The cap the baseline build ran with. `None` without a baseline build.
+    fn baseline_transfer_cap(&self) -> Option<BaselineCap> {
+        self.baseline.as_ref().map(|_| {
+            self.max_concurrent_transfers
+                .map_or(BaselineCap::OwnDefault, BaselineCap::Given)
+        })
+    }
+
     /// A tool's name in the reports.
     fn label(&self, tool: Tool) -> String {
         tool_label(tool, self.baseline.as_ref())
@@ -686,6 +734,13 @@ fn summary_markdown(report: &BenchReport) -> String {
         "Corpus: {} images, {} total tags\n\n",
         report.corpus_size, report.total_tags
     ));
+    if let Some(cap) = report.ocync_transfer_cap() {
+        out.push_str(&format!("ocync ran with `max_concurrent_transfers: {cap}`"));
+        if report.baseline_transfer_cap() == Some(BaselineCap::OwnDefault) {
+            out.push_str("; the baseline build ran at its own default, which may differ");
+        }
+        out.push_str("\n\n");
+    }
     if let Some(note) = report.prewarm.as_ref().and_then(Prewarm::note) {
         out.push_str(&format!("{note}\n\n"));
     }
@@ -1192,8 +1247,14 @@ pub(crate) struct PageBlocks {
 }
 
 impl PageBlocks {
-    /// The blocks `report` produces.
+    /// The blocks `report` produces. A run whose transfer cap is not ocync's
+    /// default produces none: the page shows ocync as it runs out of the box.
     pub(crate) fn of(report: &BenchReport) -> Self {
+        if effective_transfer_cap(report.max_concurrent_transfers)
+            != DEFAULT_MAX_CONCURRENT_TRANSFERS
+        {
+            return Self::default();
+        }
         let block = |kind, description| {
             let rounds = rounds_of(&report.scenarios, kind);
             (!rounds.is_empty()).then(|| scenario_markdown(report, &rounds, description))
@@ -1388,6 +1449,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
@@ -1523,6 +1585,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
@@ -1611,6 +1674,65 @@ pub(crate) mod tests {
         );
         let reread: RunRecord = serde_json::from_str(&with).unwrap();
         assert_eq!(reread.corpus_locked_at, record.corpus_locked_at);
+    }
+
+    #[test]
+    fn the_cap_ocync_ran_with_is_recorded_and_a_capped_run_writes_no_page_blocks() {
+        // Catches: a run at ocync's default recorded as uncapped, so a later
+        // default sits in the same series as the old one; a capped run
+        // published on the page as ocync's out-of-the-box result; the baseline
+        // build's default taken to be the current one's.
+        let default = DEFAULT_MAX_CONCURRENT_TRANSFERS;
+        let mut report = five_rounds(1);
+        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, Some(default));
+        assert_eq!(
+            record.baseline_max_concurrent_transfers,
+            Some(BaselineCap::OwnDefault)
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains(r#""baseline_max_concurrent_transfers":"own_default""#),
+            "{json}"
+        );
+        assert!(summary_markdown(&report).contains(&format!(
+            "ocync ran with `max_concurrent_transfers: {default}`; the baseline build ran at \
+             its own default, which may differ\n"
+        )));
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.max_concurrent_transfers = Some(default);
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.max_concurrent_transfers = NonZeroUsize::new(20);
+        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert_eq!(
+            record.baseline_max_concurrent_transfers,
+            NonZeroUsize::new(20).map(BaselineCap::Given)
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(r#""max_concurrent_transfers":20"#), "{json}");
+        assert!(
+            json.contains(r#""baseline_max_concurrent_transfers":{"given":20}"#),
+            "{json}"
+        );
+        let reread: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reread.baseline_max_concurrent_transfers,
+            record.baseline_max_concurrent_transfers
+        );
+        assert!(
+            summary_markdown(&report).contains("ocync ran with `max_concurrent_transfers: 20`\n")
+        );
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+
+        let mut no_ocync = sample_report();
+        no_ocync.tool_versions.remove(&Tool::Ocync);
+        let record = RunRecord::of(&no_ocync, "abc1234".into(), None, None);
+        assert_eq!(record.max_concurrent_transfers, None);
+        assert_eq!(record.baseline_max_concurrent_transfers, None);
+        assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
     }
 
     #[test]
@@ -1808,6 +1930,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
@@ -1854,6 +1977,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
@@ -1935,6 +2059,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
@@ -2030,6 +2155,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
@@ -2089,6 +2215,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
@@ -2171,6 +2298,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
@@ -2228,6 +2356,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
@@ -2262,6 +2391,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
@@ -2319,6 +2449,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
@@ -2353,6 +2484,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
@@ -2393,6 +2525,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: Some(CommitSha::fixture()),
             rounds: Rounds::DEFAULT,
+            max_concurrent_transfers: None,
             repeated: vec![ScenarioKind::Cold],
             timestamp: "2026-10-30-100000".into(),
             instance: test_instance(),

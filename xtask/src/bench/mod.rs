@@ -15,6 +15,7 @@ pub(crate) mod stats;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::rc::Rc;
@@ -104,6 +105,12 @@ pub(crate) struct ToolSelection {
     /// multiply the run time.
     #[arg(long, default_value_t = Rounds::DEFAULT)]
     pub(crate) rounds: Rounds,
+
+    /// Cap on the images ocync transfers at once, written to the generated
+    /// config as `global.max_concurrent_transfers` for `ocync` and the
+    /// `--baseline-ref` build alike. Unset leaves ocync's own default.
+    #[arg(long)]
+    pub(crate) max_concurrent_transfers: Option<NonZeroUsize>,
 }
 
 impl ToolSelection {
@@ -133,6 +140,19 @@ impl ToolSelection {
     /// A tool's name where a person reads it.
     fn label(&self, tool: Tool) -> String {
         report::tool_label(tool, self.baseline_ref.as_ref())
+    }
+
+    /// Refuses a transfer cap when no ocync build runs to take it. Called
+    /// beside [`Self::ensure_baseline_applies`], for the same two commands.
+    pub(crate) fn ensure_cap_applies(&self) -> Result<(), String> {
+        if self.max_concurrent_transfers.is_some() && !self.run_tools().contains(&Tool::Ocync) {
+            return Err(
+                "--max-concurrent-transfers applies to ocync, and this run builds none: \
+                 add ocync to --tools or give --baseline-ref"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 
     /// Refuses a baseline for a scenario that has no rounds to put it in. Clap
@@ -478,6 +498,7 @@ fn git_ref() -> String {
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    args.tool_selection.ensure_cap_applies()?;
 
     // The prepare scenario is exempt because it stages nothing: `--dry-run`
     // resolves mappings and stops, so there is no blob to write anywhere.
@@ -520,6 +541,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
     let corpus_locked_at = lock.as_ref().map(|lock| lock.locked_at.clone());
+    ensure_baseline_comparable(
+        &args,
+        &transfers,
+        &corpus,
+        corpus_locked_at.as_ref(),
+        &baseline_path(),
+    )?;
     let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
     let refs: BTreeSet<_> = transfers
@@ -573,8 +601,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         runner::build_baseline(commit).await?;
         let config_dir = tempfile::tempdir()?;
         let config = config_dir.path().join("baseline-check.yaml");
-        std::fs::write(&config, config_gen::ocync_config(&corpus))
-            .map_err(|e| format!("write config {}: {e}", config.display()))?;
+        std::fs::write(
+            &config,
+            config_gen::ocync_config(&corpus, args.tool_selection.max_concurrent_transfers),
+        )
+        .map_err(|e| format!("write config {}: {e}", config.display()))?;
         runner::check_baseline(commit, &config)?;
     }
 
@@ -654,6 +685,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         relay_versions,
         prewarm,
         baseline: args.tool_selection.baseline_ref.clone(),
+        max_concurrent_transfers: args.tool_selection.max_concurrent_transfers,
         rounds: args.tool_selection.rounds,
         repeated,
         scenarios: Vec::new(),
@@ -988,6 +1020,7 @@ fn cold_ocync_runs(scenarios: &[ScenarioResult]) -> Vec<&ToolRun> {
 fn cold_ocync_median(
     scenarios: &[ScenarioResult],
     corpus: report::CorpusInfo,
+    max_concurrent_transfers: Option<NonZeroUsize>,
     corpus_locked_at: Option<&lock::LockedAt>,
 ) -> Option<Baseline> {
     let runs = cold_ocync_runs(scenarios);
@@ -1007,8 +1040,53 @@ fn cold_ocync_median(
             as u64,
         corpus_locked_at: corpus_locked_at.cloned(),
         corpus,
+        max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
     })
+}
+
+/// Refuses a `--regression` whose stored baseline the run could not be compared
+/// with, before any round runs rather than after the last. The comparison is
+/// made over the cold sync rounds of ocync and needs the proxy's metrics, so a
+/// run without any of them is left alone, as the comparison skips it.
+fn ensure_baseline_comparable(
+    args: &BenchArgs,
+    transfers: &[Transfer],
+    corpus: &Corpus,
+    corpus_locked_at: Option<&lock::LockedAt>,
+    baseline_path: &Path,
+) -> Result<(), String> {
+    let cold_rounds = transfers
+        .iter()
+        .filter(|transfer| matches!(transfer, Transfer::Sync { .. }))
+        .count();
+    if !args.regression
+        || args.no_proxy
+        || cold_rounds == 0
+        || !args.tool_selection.run_tools().contains(&Tool::Ocync)
+    {
+        return Ok(());
+    }
+    let key = Baseline {
+        wall_clock_secs: 0.0,
+        requests: 0,
+        total_bytes: 0,
+        corpus_locked_at: corpus_locked_at.cloned(),
+        corpus: report::CorpusInfo {
+            images: corpus.images.len(),
+            tags: corpus.total_tags(),
+        },
+        max_concurrent_transfers: Some(report::effective_transfer_cap(
+            args.tool_selection.max_concurrent_transfers,
+        )),
+        rounds: u32::try_from(cold_rounds).expect("a run has fewer than 2^32 rounds"),
+    };
+    regression::ensure_baseline_comparable(baseline_path, &key)
+}
+
+/// Where the stored baseline of `--regression` lives.
+fn baseline_path() -> PathBuf {
+    PathBuf::from("bench/results/baseline.json")
 }
 
 /// Compare the current ocync run against a stored baseline.
@@ -1019,13 +1097,18 @@ fn check_regression(
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = PathBuf::from("bench/results/baseline.json");
+    let baseline_path = baseline_path();
 
     let corpus = report::CorpusInfo {
         images: report.corpus_size,
         tags: report.total_tags,
     };
-    if let Some(current) = cold_ocync_median(&report.scenarios, corpus, corpus_locked_at) {
+    if let Some(current) = cold_ocync_median(
+        &report.scenarios,
+        corpus,
+        report.ocync_transfer_cap(),
+        corpus_locked_at,
+    ) {
         if baseline_path.exists() {
             let baseline = regression::load_baseline(&baseline_path)?;
             let result = regression::compare(&current, &baseline, threshold, &baseline_path)?;
@@ -1095,7 +1178,9 @@ async fn run_single_tool(
     dry_run: bool,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
     let config_content = match tool {
-        Tool::Ocync | Tool::OcyncBaseline => config_gen::ocync_config(corpus),
+        Tool::Ocync | Tool::OcyncBaseline => {
+            config_gen::ocync_config(corpus, args.tool_selection.max_concurrent_transfers)
+        }
         Tool::Dregsy => config_gen::dregsy_config(corpus),
         Tool::Regsync => config_gen::regsync_config(corpus),
     };
@@ -2273,6 +2358,128 @@ mod tests {
     }
 
     #[test]
+    fn a_transfer_cap_is_refused_when_no_ocync_build_runs() {
+        // Catches: a cap accepted by a run that has no ocync to apply it to,
+        // which then labels dregsy's numbers with a setting it never had.
+        let head =
+            command_stdout(std::process::Command::new("git").args(["rev-parse", "HEAD"])).unwrap();
+        let refusal = "--max-concurrent-transfers applies to ocync, and this run builds none: \
+                       add ocync to --tools or give --baseline-ref";
+        let cap = ["--max-concurrent-transfers", "20"];
+        for (argv, refused) in [
+            (vec!["--tools", "dregsy", "sync"], None),
+            (
+                [&["--tools", "dregsy"][..], &cap, &["sync"]].concat(),
+                Some(refusal),
+            ),
+            (
+                [&["--tools", "ocync,dregsy"][..], &cap, &["sync"]].concat(),
+                None,
+            ),
+            (
+                [
+                    &["--tools", "dregsy", "--baseline-ref", &head][..],
+                    &cap,
+                    &["sync"],
+                ]
+                .concat(),
+                None,
+            ),
+        ] {
+            let selection = parse_bench(&argv).unwrap().tool_selection;
+            assert_eq!(
+                selection.ensure_cap_applies(),
+                refused.map_or(Ok(()), |text| Err(text.to_owned())),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_regression_run_is_refused_before_its_rounds_only_when_its_comparison_would_be() {
+        // Catches: the refusal coming after the rounds, and a refusal for a run
+        // whose comparison is skipped (proxy off, no ocync, no cold sync).
+        let corpus = two_image_corpus();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        let cold = |rounds: usize| -> Vec<Transfer> {
+            (1..=rounds).map(|round| Transfer::Sync { round }).collect()
+        };
+        let saved = Baseline {
+            wall_clock_secs: 1.0,
+            requests: 1,
+            total_bytes: 1,
+            corpus_locked_at: None,
+            corpus: report::CorpusInfo {
+                images: corpus.images.len(),
+                tags: corpus.total_tags(),
+            },
+            max_concurrent_transfers: NonZeroUsize::new(20),
+            rounds: 3,
+        };
+        regression::save_baseline(&path, &saved).unwrap();
+        let shown = path.display();
+        let other_cap = format!(
+            "{shown} was recorded with a transfer cap of 20, this run with a transfer cap of \
+             30; record a new baseline by deleting {shown} and rerunning"
+        );
+        let other_rounds = format!(
+            "{shown} was recorded over 3 rounds, this run over 4; record a new baseline by \
+             deleting {shown} and rerunning"
+        );
+        for (argv, transfers, refused) in [
+            (
+                vec!["--regression", "--max-concurrent-transfers", "20", "sync"],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "30", "sync"],
+                cold(3),
+                Some(&other_cap),
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "20", "sync"],
+                cold(4),
+                Some(&other_rounds),
+            ),
+            (
+                vec![
+                    "--regression",
+                    "--max-concurrent-transfers",
+                    "30",
+                    "--no-proxy",
+                    "sync",
+                ],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--tools", "dregsy", "sync"],
+                cold(3),
+                None,
+            ),
+            (
+                vec!["--regression", "--max-concurrent-transfers", "30", "sync"],
+                Vec::new(),
+                None,
+            ),
+            (
+                vec!["--max-concurrent-transfers", "30", "sync"],
+                cold(3),
+                None,
+            ),
+        ] {
+            let args = parse_bench(&argv).unwrap();
+            assert_eq!(
+                ensure_baseline_comparable(&args, &transfers, &corpus, None, &path),
+                refused.map_or(Ok(()), |text| Err(text.clone())),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rounds_repeat_sync_and_partial_and_leave_scale_and_prepare_at_one_pass() {
         // Catches: scale repeating, which multiplies its four corpus sizes, and
         // a sync with fewer rounds than asked for.
@@ -2355,13 +2562,14 @@ mod tests {
         ];
         let corpus = || report::CorpusInfo { images: 2, tags: 2 };
 
-        let median = cold_ocync_median(&scenarios, corpus(), None).unwrap();
+        let median = cold_ocync_median(&scenarios, corpus(), NonZeroUsize::new(20), None).unwrap();
 
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
         assert_eq!(median.total_bytes, 300_000);
         assert_eq!(median.rounds, 3);
-        assert!(cold_ocync_median(&[], corpus(), None).is_none());
+        assert_eq!(median.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
     }
 
     #[test]
@@ -2374,7 +2582,7 @@ mod tests {
         };
         let corpus = report::CorpusInfo { images: 2, tags: 2 };
 
-        assert!(cold_ocync_median(&[scenario], corpus, None).is_none());
+        assert!(cold_ocync_median(&[scenario], corpus, None, None).is_none());
     }
 
     /// What a fake pass returns for one run of `tool`.

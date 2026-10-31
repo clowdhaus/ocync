@@ -35,13 +35,14 @@ A run already in progress on the instance, including one still checking out or b
 | `--tools` | string | `ocync` | Tools to benchmark |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios (see [Rounds](#rounds-and-the-baseline-build)) |
 | `--baseline-ref` | commit | | Also run the ocync built from this commit (see [Rounds](#rounds-and-the-baseline-build)) |
+| `--max-concurrent-transfers` | integer, at least 1 | ocync default | Cap on images ocync transfers at once (passed through to `bench`). Refused when no ocync build runs |
 | `--limit` | integer | all | Use first N corpus images only |
 | `--skip-registries` | string | | Comma-separated source registries to skip |
 | `--skip-prewarm` | flag | | Skip CDN pre-warming (it otherwise runs for at most 8 minutes, then waits 6 for the CDN after any miss) |
 | `--no-proxy` | flag | | Run without bench-proxy on the instance |
 | `--fetch` | flag | | Copy the newest results on the instance without running (a live run's partial results once its benchmark has started); conflicts with every run option |
 | `--force` | flag | | Kill a running benchmark and start fresh; without it a live run is refused |
-| `--git-ref` | string | current branch | Git ref to checkout on the instance; a ref older than `bench --archive` cannot run |
+| `--git-ref` | string | current branch | Git ref to checkout on the instance; a ref older than `bench --archive` cannot run, nor can one older than `--max-concurrent-transfers` take that option |
 | `--output` | path | `bench/results` | Local directory to save fetched results |
 
 ### `cargo xtask bench-lock`
@@ -73,6 +74,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | `--tools` | comma-separated | `ocync` | Tools to benchmark: `ocync`, `dregsy`, `regsync`. The baseline build is added by `--baseline-ref`, never named here |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios, each running every tool once in a fresh random order |
 | `--baseline-ref` | hex commit id | | Also run the ocync built from this commit in every round, and compare it with the current one. Refused for `scale` and `prepare` |
+| `--max-concurrent-transfers` | integer, at least 1 | ocync default | Write `global.max_concurrent_transfers` to the ocync config, the baseline build's too. The run record and `summary.md` state the cap ocync ran with, its default's value when none is given; a capped run writes no performance-page blocks. `--regression` refuses, before any round runs, a baseline taken under another cap. Refused when no ocync build runs |
 | `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML |
 | `--partial-overrides` | path | `bench/corpus-partial-overrides.yaml` | Partial sync tag overrides |
 | `--limit` | integer | all | Use first N corpus images only |
