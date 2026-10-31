@@ -68,6 +68,9 @@ enum Loaded {
 #[derive(Default)]
 pub struct SharedGoogleToken {
     loaded: OnceCell<Result<Loaded, Arc<google::Error>>>,
+    /// The metadata server's token, for the registries the user named when
+    /// there are no credentials: kept once per run, as a found source's is.
+    metadata: OnceCell<Result<Arc<CachedGoogleToken>, Arc<google::Error>>>,
     /// Whether the anonymous read has been announced, once per run.
     announced: AtomicBool,
 }
@@ -108,10 +111,16 @@ impl SharedGoogleToken {
                 }
                 Ok(None)
             }
-            (Ok(Loaded::Absent), Selection::Configured) => {
-                let source = AdcTokenSource::metadata(host).map_err(Arc::new)?;
-                Ok(Some(Arc::new(CachedGoogleToken::new(source))))
-            }
+            (Ok(Loaded::Absent), Selection::Configured) => self
+                .metadata
+                .get_or_init(|| async {
+                    AdcTokenSource::metadata(host)
+                        .map(|source| Arc::new(CachedGoogleToken::new(source)))
+                        .map_err(Arc::new)
+                })
+                .await
+                .clone()
+                .map(Some),
         }
     }
 }
@@ -1097,10 +1106,6 @@ mod tests {
         auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
     }
 
-    /// Where Linux reports the machine's product name, which is `Google
-    /// Compute Engine` on Compute Engine and GKE.
-    const DMI_PRODUCT_NAME: &str = "/sys/class/dmi/id/product_name";
-
     /// A request with no `Authorization` header, as an anonymous read sends.
     fn without_credentials(request: &wiremock::Request) -> bool {
         !request.headers.contains_key("authorization")
@@ -1121,7 +1126,7 @@ mod tests {
     /// Breaks if a missing source is an error, the exchange sends
     /// credentials, or a source is built that could be contacted.
     #[tokio::test]
-    async fn no_source_off_google_cloud_reads_anonymously() {
+    async fn a_detected_registry_with_no_source_reads_anonymously() {
         let server = MockServer::start().await;
         testing::challenge(&server, "us-docker.pkg.dev")
             .mount(&server)
@@ -1207,7 +1212,7 @@ mod tests {
                 "GCE_METADATA_HOST",
                 metadata.uri().trim_start_matches("http://"),
             )],
-            &[(DMI_PRODUCT_NAME, b"Google Compute Engine\n".to_vec())],
+            &[],
         );
         let auth = GcpAuth::on_host(
             &registry.uri().parse().unwrap(),
@@ -1232,6 +1237,54 @@ mod tests {
             !error.to_string().contains("no Google credentials"),
             "{error}"
         );
+    }
+
+    /// Registries the user named share one metadata server token when there
+    /// are no credentials, as they share a found source's: one token request
+    /// however many registries. Breaks if each registry loads its own.
+    #[tokio::test]
+    async fn configured_registries_with_no_source_share_one_metadata_token() {
+        let metadata = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.mds", "token_type": "Bearer", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&metadata)
+            .await;
+        let registry = MockServer::start().await;
+        testing::challenge(&registry, "us-docker.pkg.dev")
+            .mount(&registry)
+            .await;
+        testing::token("registry").mount(&registry).await;
+        // The run found no source, which a host cannot say while it also
+        // names the mock as its metadata server, so the outcome is set and
+        // the named host only points the metadata token source at the mock.
+        let host = google::tests::host(
+            crate::aws::Platform::Unix,
+            &[(
+                "GCE_METADATA_HOST",
+                metadata.uri().trim_start_matches("http://"),
+            )],
+            &[],
+        );
+        let shared = SharedGoogleToken::default();
+        shared.loaded.set(Ok(Loaded::Absent)).ok().unwrap();
+        let mut auths = Vec::new();
+        for scope in ["a", "b", "c"] {
+            let auth = GcpAuth::on_host(
+                &registry.uri().parse().unwrap(),
+                crate::test_http_client(),
+                &host,
+                &AwsCredentialProviders::default(),
+                &shared,
+                Selection::Configured,
+            )
+            .await
+            .unwrap();
+            auth.get_token(&[Scope::pull(scope)]).await.unwrap();
+            auths.push(auth);
+        }
     }
 
     /// An anonymous read the token endpoint refuses fails naming the missing

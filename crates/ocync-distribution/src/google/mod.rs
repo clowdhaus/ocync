@@ -630,7 +630,9 @@ enum Kind {
 
 impl Credentials {
     /// The Application Default Credentials of `host`, asking for the
-    /// registry scope, decided once from its files and environment. An
+    /// registry scope, decided once from its files, its environment, its
+    /// DMI product name and, when those find nothing, one probe of the
+    /// metadata IP. An
     /// external account with an AWS subject token takes its AWS credentials
     /// from `aws_credentials`.
     pub(crate) async fn load(

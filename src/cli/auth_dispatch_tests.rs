@@ -22,32 +22,53 @@ async fn build(cfg: &RegistryConfig) -> Result<RegistryClient, CliError> {
     build_registry_client(Registry::Configured(cfg), &RunCredentials::default()).await
 }
 
-/// Sets `DOCKER_CONFIG` and restores its prior value on drop, holding the
-/// shared environment lock meanwhile.
+/// Sets environment variables and restores their prior values on drop,
+/// holding the shared environment lock meanwhile.
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
-    prior: Option<OsString>,
+    prior: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl EnvGuard {
-    fn set_docker_config(value: &std::path::Path) -> Self {
+    fn set(vars: &[(&'static str, &std::ffi::OsStr)]) -> Self {
         let lock = lock_env();
-        let prior = std::env::var_os("DOCKER_CONFIG");
-        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
-        unsafe {
-            std::env::set_var("DOCKER_CONFIG", value);
+        let mut prior = Vec::new();
+        for (name, value) in vars {
+            prior.push((*name, std::env::var_os(name)));
+            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
+            unsafe {
+                std::env::set_var(name, value);
+            }
         }
         Self { _lock: lock, prior }
+    }
+
+    fn set_docker_config(value: &std::path::Path) -> Self {
+        Self::set(&[("DOCKER_CONFIG", value.as_os_str())])
+    }
+
+    /// `DOCKER_CONFIG` as [`Self::set_docker_config`], and a Google metadata
+    /// server at a closed port. A host naming one is on Google Cloud, so a
+    /// Google provider is built without reading the machine's DMI name or
+    /// probing the metadata IP: the distribution crate's test-only probe
+    /// address is not in effect in this crate, and nothing is contacted.
+    fn set_docker_config_and_offline_google(value: &std::path::Path) -> Self {
+        Self::set(&[
+            ("DOCKER_CONFIG", value.as_os_str()),
+            ("GCE_METADATA_HOST", "127.0.0.1:9".as_ref()),
+        ])
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: tests that set or remove variables are serialized by `lock_env`.
-        unsafe {
-            match &self.prior {
-                Some(v) => std::env::set_var("DOCKER_CONFIG", v),
-                None => std::env::remove_var("DOCKER_CONFIG"),
+        for (name, prior) in &self.prior {
+            // SAFETY: tests that set or remove variables are serialized by `lock_env`.
+            unsafe {
+                match prior {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
             }
         }
     }
@@ -108,7 +129,7 @@ async fn assert_dispatch(cases: Vec<(&str, RegistryConfig, &str)>) {
 #[tokio::test]
 async fn dispatches_without_a_docker_config() {
     let dir = tempdir_without_config();
-    let _g = EnvGuard::set_docker_config(dir.path());
+    let _g = EnvGuard::set_docker_config_and_offline_google(dir.path());
     // `token` is a serde alias for `static_token`; the docs promise both spellings.
     let token_alias: AuthType = serde_yaml::from_str("token").expect("alias parses");
     assert_eq!(token_alias, AuthType::StaticToken);

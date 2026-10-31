@@ -49,9 +49,11 @@ const PROBE_URL: &str = "http://169.254.169.254/";
 /// Cloud.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A test host's probe address, in place of [`PROBE_URL`]. A test host
-/// without it is not probed, so no test reaches the network. Read only in
-/// tests.
+/// A test host's probe address, in place of [`PROBE_URL`]. A host without it
+/// is not probed, so no test reaches the network. Read only when this
+/// crate's own tests run (`cfg!(test)` is false in a crate that depends on
+/// this one), so another crate's tests that build a Google provider set
+/// `GCE_METADATA_HOST` instead, which skips the probe.
 pub(super) const PROBE_OVERRIDE: &str = "OCYNC_TEST_GOOGLE_PROBE";
 
 /// Whether `host` is on Google Cloud, as Google's Go library
@@ -63,24 +65,22 @@ pub(super) const PROBE_OVERRIDE: &str = "OCYNC_TEST_GOOGLE_PROBE";
 /// DMI but do have a metadata server, so one probe asks the metadata IP
 /// whether it is there (see [`probe`]). Go races that request against a DNS
 /// lookup of `metadata.google.internal` and takes the first answer; this
-/// asks the IP alone. Windows, where this does not read the registry, is
-/// taken to be on it so the metadata server is asked, as upstream does.
+/// asks the IP alone. Go probes on every platform and reads the system
+/// information (the Windows registry there) only to decide how long to
+/// wait for it, so a host whose name is not read, as on Windows here, is
+/// probed like any whose name is not Google's.
 pub(super) async fn is_on_google_cloud(host: &Host) -> bool {
     if host.env.get(HOST_VARIABLE).is_some() {
         return true;
     }
-    match host.platform {
-        Platform::Windows => true,
-        Platform::Unix => {
-            let named = host
-                .fs
-                .read(std::path::Path::new(PRODUCT_NAME_FILE))
-                .is_ok_and(|name| {
-                    matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")
-                });
-            named || probe(probe_url(host), PROBE_TIMEOUT).await
-        }
-    }
+    let named = match host.platform {
+        Platform::Windows => false,
+        Platform::Unix => host
+            .fs
+            .read(std::path::Path::new(PRODUCT_NAME_FILE))
+            .is_ok_and(|name| matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")),
+    };
+    named || probe(probe_url(host), PROBE_TIMEOUT).await
 }
 
 /// The address to probe, or `None` for no probe.
@@ -268,7 +268,9 @@ mod tests {
         assert!(!on(&[], Some(b"Dell Inc.")).await);
         assert!(!on(&[], Some(b"Google Compute Engine Plus")).await);
         assert!(!on(&[], Some(b"")).await);
-        assert!(is_on_google_cloud(&crate::google::tests::host(Platform::Windows, &[], &[])).await);
+        // Windows has no product name read here, so it is probed.
+        let windows = crate::google::tests::host(Platform::Windows, &[], &[]);
+        assert!(!is_on_google_cloud(&windows).await);
     }
 
     /// A machine whose DMI is not Google's is on Google Cloud when the
