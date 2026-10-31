@@ -2192,6 +2192,53 @@ mod tests {
     }
 
     #[test]
+    fn a_google_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+        use crate::bench::gar::ArtifactRegistryTarget;
+        use crate::bench::report::tests::sample_report;
+
+        let google = BenchTarget::ArtifactRegistry(ArtifactRegistryTarget {
+            location: "europe-west9".parse().unwrap(),
+            project: "example-project".parse().unwrap(),
+            repositories: vec!["run-r1".parse().unwrap(), "run-r2".parse().unwrap()],
+        });
+        let report = sample_report();
+        let output = |target: &BenchTarget, host: &str| {
+            let deferred = deferred_output(target, host, &report, "abc1234".into(), None);
+            let text = serde_json::to_string(&deferred).unwrap();
+            (
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                text,
+            )
+        };
+
+        let (gar, text) = output(&google, "europe-west9-docker.pkg.dev");
+        // Catches: the target registry's cloud written as the machine's.
+        assert_eq!(gar["record"]["machine"]["provider"], "aws");
+        assert_eq!(gar["archive_key"], "gcr");
+        // Catches: a Google run rewriting the ECR comparison page.
+        assert_eq!(gar["page"], serde_json::json!({"cold": null, "warm": null}));
+        // Catches: the project, the repositories or the host reaching a file
+        // that is tracked in git.
+        for name in [
+            "example-project",
+            "run-r1",
+            "run-r2",
+            "europe-west9",
+            "pkg.dev",
+        ] {
+            assert!(!text.contains(name), "{name} in {text}");
+        }
+
+        let (ecr, _) = output(
+            &BenchTarget::Ecr,
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com",
+        );
+        assert_eq!(ecr["record"]["machine"]["provider"], "aws");
+        assert_eq!(ecr["archive_key"], "ecr");
+        assert!(ecr["page"]["cold"].is_string(), "{ecr}");
+    }
+
+    #[test]
     fn bench_args_parse_closed_sets_and_refuse_anything_else() {
         use clap::error::ErrorKind;
 

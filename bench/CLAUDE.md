@@ -35,9 +35,20 @@ cargo xtask bench-remote --provider aws --scenario all
 # (the newest results on the instance; a live run's partial ones once its benchmark has started)
 cargo xtask bench-remote --provider aws --fetch
 
+# Sync into Google Artifact Registry instead of ECR (see below)
+cargo xtask bench-remote --provider aws --target artifact-registry --scenario sync --tools ocync
+
 # Replace a run that is still going
 cargo xtask bench-remote --provider aws --force --scenario sync
 ```
+
+**`--target artifact-registry` syncs from the AWS instance into Google Artifact Registry.** Artifact Registry keeps a blob after the image that held it is deleted, so a used repository is no longer cold; every round therefore syncs into a repository of its own, made fresh. The bench service account can write to a repository but not create one, and the instance has no Google access to the repository API, so `bench-remote` makes and deletes the repositories on this machine with your `gcloud` sign-in:
+
+- It needs `bench/terraform/gcp` applied (its `repository`, `service_account` and `credentials_file` outputs name the project, location, service account and federation file) and `gcloud` signed in with rights to create repositories and set their IAM policy.
+- Before the push it refuses anything but `--provider aws`, `--scenario sync` and ocync alone (no `--baseline-ref`, which adds a second build): regsync and dregsy configs hardcode ECR credentials, partial and scale are not built for it, and two builds would share one repository.
+- After the push it deletes every repository whose id starts with `ocync-bench-run-` (an earlier run that was killed), creates `ocync-bench-run-<run timestamp>-r<round>` for each round, grants the service account `roles/artifactregistry.writer` on each, and copies the federation file to the instance (mode 0600). It then deletes them all when the run ends, on success and on failure. A process killed outright leaves them for the next run's sweep. A second `bench-remote` refused for a live run still sweeps first, and so deletes that run's repositories: do not start one while an Artifact Registry run is going.
+- The instance reads `BENCH_TARGET_REGISTRY`, `BENCH_GAR_PROJECT`, `BENCH_GAR_REPOSITORIES` and `GOOGLE_APPLICATION_CREDENTIALS`, creates and deletes nothing, writes the ocync registry as `auth_type: gar`, syncs round N into `<project>/<repository N>/bench/...`, and checks each pass with manifest HEADs (the tag's digest, then each locked index child) through ocync's own Google sign-in, outside the proxy window.
+- Its records go to `bench/results/gcr.json` and carry the machine's cloud (`aws`), never the project, repositories or host. It writes no block to `docs/src/content/performance.md`, which is the ECR comparison.
 
 **A run in progress is refused unless `--force`.** A run lock on the instance (`bench/.bench-run.lock`) is held from the start of checkout until the benchmark and every tool it spawned have exited, so a second `bench-remote` cannot delete `target/` under a build. The remote script, the build and the benchmark runner share one process group, recorded in `bench/.bench-run.pgid` and never removed (the lock, not the file, says whether a run is live). `--force` kills that group, then takes the lock. Git runs with the lock's fd closed so a daemonized git cannot hold it from outside the group. Only `flock` exit 75 means held; any other `flock` failure aborts without the refusal. `--fetch` conflicts with every option that shapes a run, since it starts nothing. A run fetches results only after the script prints `benchmark started`; a failure before that (lock held after the wait, `flock` failed, build failed) returns an error and leaves local results alone. The instance writes results only into the run's own directory, which `bench-remote` names locally and fetches exactly (`bench --archive defer`); the run record and performance-page blocks are written locally after the fetch, idempotently (the run's one start time, `--run-timestamp`, names the directory and stamps the record), and the script still restores the two tracked files before checkout to discard edits from runs on older code, and a missing directory means the run wrote no results. `--fetch` copies the newest directory. A script that exits nonzero, or exits 0 with no results, makes `bench-remote` exit nonzero after any fetch.
 
@@ -194,7 +205,7 @@ jq '[.response_bytes] | add' <tool>-<pass>-proxy.jsonl
 
 Each benchmark run appends a compact record to `bench/results/{registry}.json` (e.g. `ecr.json`). These files are tracked in git for longitudinal comparison across machines, cloud providers, and code versions.
 
-Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud provider of the target registry, omitted when the registry is none of ECR, GCR or ACR), corpus size, the pre-warm outcome, and the per-tool metrics per scenario, one record per round for sync and partial.
+Each record includes: timestamp, git ref, machine metadata (instance type, arch, vCPUs, memory, network, region, and the cloud the machine runs in, `aws` when EC2's metadata answered, whichever cloud the target registry is in), corpus size, the pre-warm outcome, and the per-tool metrics per scenario, one record per round for sync and partial.
 
 ## Competitor config gotchas
 

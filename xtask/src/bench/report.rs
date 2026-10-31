@@ -1797,6 +1797,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_machines_cloud_is_aws_only_when_ec2_answered() {
+        let mut instance = test_instance();
+        assert_eq!(instance.provider(), Some(Provider::Aws));
+        instance.instance_type = "unknown".into();
+        assert_eq!(instance.provider(), None);
+    }
+
+    #[test]
     fn a_run_record_carries_the_pre_warm_and_no_relay_as_an_empty_map() {
         // Catches: a record written with the pre-warm or the relays dropped,
         // which reads as "not recorded" instead of the run's own answer.
