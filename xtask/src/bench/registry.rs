@@ -50,6 +50,14 @@ pub(crate) struct Repository<'a> {
     pub(crate) path: &'a str,
 }
 
+impl Repository<'_> {
+    /// The URL of `rest` under the repository's `/v2/` path, e.g.
+    /// `blobs/sha256:..` or `manifests/latest`.
+    pub(crate) fn url(&self, rest: &str) -> String {
+        format!("https://{}/v2/{}/{rest}", self.host.api_host(), self.path)
+    }
+}
+
 impl std::fmt::Display for Repository<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.host.api_host(), self.path)

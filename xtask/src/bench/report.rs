@@ -43,12 +43,12 @@ pub(crate) struct RunRecord {
     /// dregsy transfers nothing itself, so skopeo's version moves dregsy's
     /// numbers. Recorded here rather than only in the per-run summary, which
     /// is not tracked in git and dies with the instance. Empty for a run that
-    /// used no relay; `None` for a record written before the field existed.
+    /// used no relay; `None` when the record does not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) relays: Option<BTreeMap<String, String>>,
     /// How the CDN pre-warm went. A source that was not warmed changes what the
-    /// numbers mean. `None` when no pre-warm was decided, as in a record
-    /// written before the field existed.
+    /// numbers mean. `None` when no pre-warm was decided or the record does
+    /// not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
@@ -133,7 +133,7 @@ pub(crate) enum Prewarm {
 impl Prewarm {
     /// The line the summary carries, when the pre-warm was skipped or left a
     /// registry unwarmed.
-    fn note(&self) -> Option<String> {
+    pub(crate) fn note(&self) -> Option<String> {
         match self {
             Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
             Self::Done { unwarmed } if unwarmed.is_empty() => None,
@@ -168,8 +168,8 @@ pub(crate) struct MachineInfo {
     /// Cloud region (e.g. `us-east-1`).
     pub(crate) region: String,
     /// Machine image the instance booted (e.g. `ami-0742fcde83639b335`), or
-    /// `"unknown"` when a live run could not read it. Absent from records
-    /// written before the field existed.
+    /// `"unknown"` when a live run could not read it. Absent when the
+    /// record does not carry it.
     ///
     /// The image carries the kernel, glibc and NIC driver, so two runs on
     /// different images are not directly comparable however identical the rest

@@ -173,16 +173,7 @@ impl Lock {
                 "failed to read corpus lock {shown}: {e}; create it with `cargo xtask bench-lock`"
             )
         })?;
-        Self::parse(&raw).map_err(|e| {
-            // Only a lock from before blobs were recorded needs writing again;
-            // re-locking also moves floating tags and starts a new series.
-            let hint = if e.contains("missing field `blobs`") {
-                "; it predates recorded blobs, so re-create it with `cargo xtask bench-lock`"
-            } else {
-                ""
-            };
-            format!("corpus lock {shown}: {e}{hint}")
-        })
+        Self::parse(&raw).map_err(|e| format!("corpus lock {shown}: {e}"))
     }
 
     /// Parse the text of a lock file.
@@ -191,7 +182,13 @@ impl Lock {
             clippy::disallowed_methods,
             reason = "a lock file the bench wrote, holding digests and tags"
         )]
-        serde_json::from_str(raw).map_err(|e| e.to_string())
+        let lock: Self = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        // Every image has a config, so an empty list is a malformed entry and
+        // not a ref with nothing to warm.
+        if let Some(image) = lock.images.iter().find(|(_, e)| e.blobs.is_empty()) {
+            return Err(format!("{} lists no blobs", image.0));
+        }
+        Ok(lock)
     }
 
     /// The lock as the text written to disk.
@@ -509,11 +506,7 @@ impl Access<'_> {
         repo: &Repository<'_>,
         reference: &str,
     ) -> Result<reqwest::Response, FetchError> {
-        let url = format!(
-            "https://{}/v2/{}/manifests/{reference}",
-            repo.host.api_host(),
-            repo.path
-        );
+        let url = repo.url(&format!("manifests/{reference}"));
         let response = self
             .send(repo, &format!("{repo}:{reference}"), |client| {
                 client
@@ -561,10 +554,10 @@ impl Access<'_> {
     async fn get_manifest<T>(
         &self,
         repo: &Repository<'_>,
-        tag: &str,
+        reference: &str,
         read: impl FnOnce(Digest, &[u8]) -> Result<T, String>,
     ) -> Result<T, FetchError> {
-        let response = self.request_manifest(Method::GET, repo, tag).await?;
+        let response = self.request_manifest(Method::GET, repo, reference).await?;
         let header = content_digest(&response);
         let body = response
             .bytes()
@@ -936,44 +929,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_lock_from_before_blobs_is_told_to_be_re_created() {
-        // Catches: a typo in the lock, or a mangled digest, sending the
-        // operator to re-lock, which moves floating tags and starts a new
-        // series.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corpus.lock.json");
-        let lock = |blobs: &str, locked_at: &str| {
-            format!(
-                r#"{{"locked_at":"{locked_at}","images":{{"s/a:1":{{"digest":"{}","children":[]{blobs}}}}}}}"#,
-                d('1')
-            )
-        };
-        let cases = [
-            (lock("", "2026-10-30-120000"), true),
-            (lock(r#","blobs":[]"#, "yesterday"), false),
-            (
-                lock(r#","blobs":["sha256:xyz"]"#, "2026-10-30-120000"),
-                false,
-            ),
-        ];
-        for (text, hinted) in cases {
-            std::fs::write(&path, &text).unwrap();
-            let error = Lock::load(&path).unwrap_err();
-            assert_eq!(error.contains("cargo xtask bench-lock"), hinted, "{error}");
-        }
-    }
-
-    #[test]
     fn lock_round_trips_with_sorted_keys_and_refuses_unknown_fields() {
+        let with_blobs = |entry: Entry| Entry {
+            blobs: vec![d('5')],
+            ..entry
+        };
         let lock = lock_of(&[
-            ("quay.io/b:latest", entry('1', &['2', '3'])),
-            (
-                "docker.io/a:1",
-                Entry {
-                    blobs: vec![d('5')],
-                    ..entry('4', &[])
-                },
-            ),
+            ("quay.io/b:latest", with_blobs(entry('1', &['2', '3']))),
+            ("docker.io/a:1", with_blobs(entry('4', &[]))),
         ]);
         let text = lock.render().unwrap();
         assert!(
@@ -990,6 +953,11 @@ mod tests {
         assert!(Lock::parse(&bad_key).is_err(), "key with no tag");
         let bad_time = text.replacen("2026-10-30-120000", "yesterday", 1);
         assert!(Lock::parse(&bad_time).is_err(), "malformed locked_at");
+        // Catches: an entry with no blobs loading, warming nothing and being
+        // reported warm.
+        let no_blobs = lock_of(&[("quay.io/b:latest", entry('1', &[]))]);
+        let error = Lock::parse(&no_blobs.render().unwrap()).unwrap_err();
+        assert!(error.contains("quay.io/b:latest lists no blobs"), "{error}");
     }
 
     #[test]

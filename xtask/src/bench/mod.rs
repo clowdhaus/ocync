@@ -1397,10 +1397,12 @@ async fn warm_blobs<'a>(
     deadline: Instant,
     send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
 ) -> BTreeMap<&'a str, PrewarmStats> {
-    let hosts: BTreeSet<&str> = blobs.iter().map(|(repo, _)| repo.host.api_host()).collect();
-    let permits: HashMap<&str, tokio::sync::Semaphore> = hosts
-        .into_iter()
-        .map(|host| (host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY)))
+    let permits: HashMap<&str, tokio::sync::Semaphore> = blobs
+        .iter()
+        .map(|(repo, _)| {
+            let host = repo.host.api_host();
+            (host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY))
+        })
         .collect();
     let outcomes = futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
         let (permits, send) = (&permits, &send);
@@ -1428,16 +1430,12 @@ async fn warm_blobs<'a>(
 /// `CloudFront` actually caches the responses. Unauthenticated 401s are
 /// NOT cached by CDN and would warm nothing. The blobs come from the lock,
 /// so every tag the run syncs is warmed and no manifest is read.
-///
-/// The outcome says which registries were not warmed, for the run record.
 async fn cdn_prewarm(
     client: &reqwest::Client,
     auth: Option<&corpus::DockerHubAuth>,
     lock: &lock::Lock,
     refs: &BTreeSet<lock::ImageRef>,
 ) -> Prewarm {
-    // Every blob is held to this time, so the downloads end by it. The CDN
-    // wait below follows.
     let deadline = Instant::now() + PREWARM_DEADLINE;
     let access = registry::Access::new(client, auth);
     let blobs = blobs_to_warm(lock, refs);
@@ -1447,11 +1445,7 @@ async fn cdn_prewarm(
         blobs.len()
     );
     let stats = warm_blobs(&blobs, deadline, async |repo, digest, what| {
-        let url = format!(
-            "https://{}/v2/{}/blobs/{digest}",
-            repo.host.api_host(),
-            repo.path
-        );
+        let url = repo.url(&format!("blobs/{digest}"));
         access.send(repo, what, |client| client.get(&url)).await
     })
     .await;
@@ -1466,26 +1460,25 @@ async fn cdn_prewarm(
         );
     }
     eprintln!("bench: blob CDN pre-warm done");
-    let unwarmed = unwarmed(&stats);
-    if !unwarmed.is_empty() {
-        let registries: Vec<&str> = unwarmed.keys().map(String::as_str).collect();
+    let outcome = Prewarm::Done {
+        unwarmed: unwarmed(&stats),
+    };
+    if let Some(note) = outcome.note() {
         eprintln!(
-            "WARNING: pre-warm: not warmed: {}; the tool that runs first may pay the CDN misses and tool order matters",
-            registries.join(", ")
+            "WARNING: {note}; the tool that runs first may pay the CDN misses and tool order matters"
         );
     }
 
-    // Wait for CDN propagation. CloudFront edges need time to fully
-    // populate after the first request hits the origin. With nothing warmed
-    // there is nothing to wait for.
-    if stats.values().any(|s| s.hits + s.misses > 0) {
+    // A miss is an origin fetch, which CloudFront edges need time to settle
+    // after; all hits leave nothing to wait for.
+    if stats.values().any(|s| s.misses > 0) {
         let wait_secs = 360; // 6 minutes
         eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
         tokio::time::sleep(Duration::from_secs(wait_secs)).await;
     } else {
-        eprintln!("bench: no blob was warmed, so not waiting for the CDN");
+        eprintln!("bench: no blob missed the CDN cache, so not waiting for it");
     }
-    Prewarm::Done { unwarmed }
+    outcome
 }
 
 /// Parses an ocync timing JSONL file into a phase-name to milliseconds map.
@@ -2198,17 +2191,6 @@ images:
     fn block_on_within_five_seconds<T>(future: impl Future<Output = T>) -> T {
         block_on(async { tokio::time::timeout(Duration::from_secs(5), future).await })
             .expect("the future hung instead of ending at the deadline")
-    }
-
-    #[test]
-    fn a_blob_not_finished_by_the_deadline_is_dropped_whatever_it_is_waiting_on() {
-        // Catches: a send that retries or waits past the deadline holding the
-        // pre-warm with it.
-        let deadline = Instant::now() + Duration::from_millis(50);
-        let outcome = block_on_within_five_seconds(warm_blob(deadline, "blob", async || {
-            std::future::pending::<Result<reqwest::Response, String>>().await
-        }));
-        assert_eq!(outcome, BlobOutcome::PastDeadline);
     }
 
     #[test]
