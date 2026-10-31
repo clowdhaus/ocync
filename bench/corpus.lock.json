@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-10-30-233653",
+  "locked_at": "2026-10-31-031753",
   "images": {
     "cgr.dev/chainguard/busybox:latest": {
       "digest": "sha256:9cf938251dfb3cc081ef9847e79c203b5de90ecc20855e40bef8a7cc191bb218",
@@ -566,7 +566,7 @@
         "sha256:dbe8dc8ef95930238aa47854da520254840038464d040bdebccd9d756d4c4fe2"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:11": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:11.0.33": {
       "digest": "sha256:5c047ea4b1b63952dc2d8c43b99096d3b238137d2b5e60556ed771fe573da269",
       "children": [
         "sha256:55419cd94faa27ff97e424ecb9a454a73e6b420a5b981415a11e65dc86ac1446",
@@ -581,7 +581,7 @@
         "sha256:a1a6125542a8ac07b830fe4e5f494cda45ca9d99d22c9dd5a738665d686e1cbd"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:17": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:17.0.21": {
       "digest": "sha256:52bfe5bfef9204b5da96ea5d8b2c5e9cafd2af1d1f8a771078929fde9cac827c",
       "children": [
         "sha256:17a0d086599c3334618b5430b4a8eb61195f576db7d8b4008b73e3afbc273a3c",
@@ -596,7 +596,7 @@
         "sha256:e67c378b0333a8c5099313ab4ed451f1835beca72ebb11bb855f5a71d4a68e17"
       ]
     },
-    "public.ecr.aws/amazoncorretto/amazoncorretto:21": {
+    "public.ecr.aws/amazoncorretto/amazoncorretto:21.0.13": {
       "digest": "sha256:a9589d4842ace85a42dfb131b0c1d20ddeb259570d859d3bbd114423fd574318",
       "children": [
         "sha256:15419cd08f1469f3c02a125016a6604f9d214ab45080447167e6f8e72bc054f1",
@@ -611,20 +611,20 @@
         "sha256:fd6fd6d463d2ef82c116e5016b315b123de454e8b4fbc69b2d194a528948a13f"
       ]
     },
-    "public.ecr.aws/amazonlinux/amazonlinux:2": {
-      "digest": "sha256:b2817552413197681024bb55621800d1721ad38c22b7866936dd475416f6959b",
+    "public.ecr.aws/amazonlinux/amazonlinux:2.0.20261102.0": {
+      "digest": "sha256:957ff255a4ca9c60138ea636b8ae09e29ba146ea7bc95d0dae3923a5faeeb122",
       "children": [
-        "sha256:b0d0fac27471a430d3736a7bc0315c233dc502f9b4f8b21f9af7ba45cd4ddef7",
-        "sha256:a173876315d3ee8b354addd78b76db38669d39452b9c22c8bde92f2f3e6e5f78"
+        "sha256:eda2ad19d8d9a98e9a63373a15cdb41a62f7a6370e795764c54ba685c09a387e",
+        "sha256:380c8604ee9f9a80a2eac78c5ef4a60909b5631a88aff460242c42671c232ed6"
       ],
       "blobs": [
-        "sha256:5f1e675cad19c3c31d97033c48b91a3435f74ffc82153473d08315659af851e8",
-        "sha256:6fc2c821269c7bbccee2f980c1c02dbe8a9f14b20a2e312616c65fb958bceda2",
-        "sha256:80449b74fa1af9a562e73dc141adc8ea3abac3ce8190b8588ed712d72d1fdff0",
-        "sha256:a10bb3d82497ad67608b17a4c415bc0d95b91881e90c34a1a09d4f457a1dfffd"
+        "sha256:0495c25dad2c432d2725b987a8e120fbea60c2f52ab965d1194495d66bd54a79",
+        "sha256:18bcf19ccc0bc115d104bcbdad9e27ba75e193b1a6fdcd865bd8c0c501f82605",
+        "sha256:7446ad3822bebb9d3cea78f7987fe85a39d207cf1c4201cfbf764c198d6e450d",
+        "sha256:ec84068a79e503a31a893b9fd91255e63276a7d88c803d10789070f5f0d1907a"
       ]
     },
-    "public.ecr.aws/amazonlinux/amazonlinux:2023": {
+    "public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261102.0": {
       "digest": "sha256:381352c430f36d8aa6b8b670de06e7e4e5642fe0cb9dbd463bb8d1e79aefc0c7",
       "children": [
         "sha256:3bbae8a3ad757535c4a031e6dbc67b18e6e6cb120436c3f067841da262993455",
@@ -844,7 +844,7 @@
         "sha256:f89dc04d14086cefb9b07b9f81f656de51a0c107670c4e5368310b6c2ae1be65"
       ]
     },
-    "public.ecr.aws/docker/library/golang:1.21": {
+    "public.ecr.aws/docker/library/golang:1.21.13": {
       "digest": "sha256:4746d26432a9117a5f58e95cb9f954ddf0de128e9d5816886514199316e4a2fb",
       "children": [
         "sha256:e6ba96dde4af9f4e06caba475fa65e94e4c54fe4aa3e9f4f504c02178eb8934e",
@@ -965,7 +965,7 @@
         "sha256:fe645af3342e465899318dc4be86189d8911f07a9c14ca6893cead0ef762992f"
       ]
     },
-    "public.ecr.aws/docker/library/golang:1.22": {
+    "public.ecr.aws/docker/library/golang:1.22.12": {
       "digest": "sha256:1cf6c45ba39db9fd6db16922041d074a63c935556a05c5ccb62d181034df7f02",
       "children": [
         "sha256:1f298b0c9fecdf504389a0329236f948cc04a566a2bb32337207cbaaa2f8177c",
@@ -1101,7 +1101,7 @@
         "sha256:ff303475ed1f572c926ff74379056def666d7a2df1be19913476e1e30c5f2681"
       ]
     },
-    "public.ecr.aws/docker/library/nginx:1.26": {
+    "public.ecr.aws/docker/library/nginx:1.26.3": {
       "digest": "sha256:41b194461e4bae16f9b25d68b0976ed4735b89ca625c89aad88e1c1c3b7e8860",
       "children": [
         "sha256:c8042489f41ddaf05b7dfbe1e32d5227f94f1b002aca8e3b7b9c9d0cee6b0fed",
@@ -1211,7 +1211,7 @@
         "sha256:f8b2e5dba997a5bb85649169a512bcdd9250c0d229745b54479bf0ce005923e1"
       ]
     },
-    "public.ecr.aws/docker/library/nginx:1.27": {
+    "public.ecr.aws/docker/library/nginx:1.27.5": {
       "digest": "sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d",
       "children": [
         "sha256:fafd5f55296511cd0f1c991efa0cb85f323449bf643f3b6d760c6542f020d6e5",
@@ -1321,7 +1321,7 @@
         "sha256:ff490355ee7c902ef816a5ff4875be7641c21b17cf3aba419bd18f61b59f1fec"
       ]
     },
-    "public.ecr.aws/docker/library/postgres:15": {
+    "public.ecr.aws/docker/library/postgres:15.19": {
       "digest": "sha256:64b99032e218b66b1d1a6334995056e1aa57f50a0c522cc856e72dff0e4b0d63",
       "children": [
         "sha256:7da5d534f1ffcdb2f69efa6e466a7a29ff89eefd611c7b50c4d69aa77fd4a822",
@@ -1488,7 +1488,7 @@
         "sha256:f9917c3ac06743ceb3dabd99aaad10dc9f451711dc58061ff9240a024c2a0a76"
       ]
     },
-    "public.ecr.aws/docker/library/postgres:16": {
+    "public.ecr.aws/docker/library/postgres:16.15": {
       "digest": "sha256:1beaa3084eee2676f20a9cd9928f0bf2c5bf674f8e49f81017912183d377c61c",
       "children": [
         "sha256:b95b87e93ceb7594715d5c71fb6e09f6fc878851ab537735d617325eb9ba8b1b",
@@ -1655,7 +1655,7 @@
         "sha256:fc5640635fea5540cb65da4902982d805090721e063ee328382766664d8d98bf"
       ]
     },
-    "public.ecr.aws/docker/library/redis:6": {
+    "public.ecr.aws/docker/library/redis:6.2.24": {
       "digest": "sha256:71075871d0c318a0a835648a954e32d2b88d7b2a75c89a034ad0aa404e0319c9",
       "children": [
         "sha256:13d6d1e01c742fa698d8de5e8b2b8f9942499da0e222332ae6622704b4e5454c",
@@ -1723,7 +1723,7 @@
         "sha256:f7923e4daec1052f2e738a239e3682d01f04c43f9e476c6334425e18f0403ad9"
       ]
     },
-    "public.ecr.aws/docker/library/redis:7": {
+    "public.ecr.aws/docker/library/redis:7.4.12": {
       "digest": "sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5",
       "children": [
         "sha256:a7aad82554197a54c653388bfded882a59d6b4a02468484bc31bae6772dcc42c",
@@ -1791,7 +1791,7 @@
         "sha256:f8a5b91eb3c714608db691f319b8c60d622538d6ec6d309e9c751fe78d2bdb13"
       ]
     },
-    "public.ecr.aws/lambda/nodejs:18": {
+    "public.ecr.aws/lambda/nodejs:18.2026.04.30.01": {
       "digest": "sha256:daf6a5c0a2b36153b94c91f3563e8ef89b3b19e4129963c6ccb07b8c5251f7ef",
       "children": [
         "sha256:c3fe6ff9c75a5d6b0c8ba4c1224ef0c3a3a869c94487e1c786503d8e872b5e2e",
@@ -1814,7 +1814,7 @@
         "sha256:e725a81c56a0c8a899b7067df3675a4d57232d83b213483b22f5721844c03a1e"
       ]
     },
-    "public.ecr.aws/lambda/nodejs:20": {
+    "public.ecr.aws/lambda/nodejs:20.2026.04.12.14": {
       "digest": "sha256:a4440274d6f0fb4e6cb92cd5f2a97254efe6612f631d9974b197ecbd4a61fcab",
       "children": [
         "sha256:2c2357d244ca4b8c599b7fb080bd5fdc2b655a572b344978ce8fde5bd8005d6b",
@@ -1837,73 +1837,73 @@
         "sha256:fee28591ce9e55d7dfd06f1ef542367d4d2822a8d9d056df3b66f1fb4cfb6dc2"
       ]
     },
-    "public.ecr.aws/lambda/python:3.10": {
-      "digest": "sha256:6e574c3e6a09794c5177f24ecb7a94ba0c7179f3a3669f53d6ac7d25d0eea5ed",
+    "public.ecr.aws/lambda/python:3.10.2026.10.31.02": {
+      "digest": "sha256:d4f9e61faf4a525c275d9f5601f095cc6372b78227d702bb7c71ae17ded0c9e9",
       "children": [
-        "sha256:75eead7948a02058efd297ca9666efac3f6bf435badd3431c7785b60229d0cb1",
-        "sha256:3032118cf3b1c3e38ef8277eec462632912d45732e4a165370fb6a80b355e054"
+        "sha256:cfc8f68d5198af683e6ab2f3ab1f10aaccde48f6ea3cd8ca8ef479a00a337d50",
+        "sha256:a363df93ca38cb0dab83d638092e74248ab727847db4984b7e12b15939e1deb8"
       ],
       "blobs": [
-        "sha256:05b3f5ab15eccf27b530825cf557dc7c253327595340cb63b7178294eb8cb015",
-        "sha256:1e0be815d2e949315ceacf9c5a62642877de7677491020b0315a31ec442d1c15",
-        "sha256:1ef17d7121f0ed55d0ab1975daa2fb99d2f2935c8fd89b74e400bd1fa0f717d5",
         "sha256:218e2d223b055630f0149ceac46fabe3fd9e7cbd9621d2d4b3ae9fe3bde03746",
-        "sha256:303a95e641439cdaa2c42ee356a8984e50ce2a54236f23dd21803a2d5c11bb16",
-        "sha256:3bf2b9b8e2d69b3c5d0e645a0ee18bfe05bacea8fa86e1ecf3cd9ce4e0155495",
-        "sha256:400c082a2df4d8736e15fa233d96f80530c114687f66ed0e92c1bb427e54635d",
-        "sha256:593e4d413fade02534a377d0bf69bfdf9f8b1d948f13a498be054f95a0f89236",
-        "sha256:77ea4f9f34cfdae198c03a5901ede66602d7b201233fc2c381262715669cef6d",
-        "sha256:7bbfe3ad655c2a865df9a5f87c6ed3758d0f10d9d1156572c93af580777829f2",
+        "sha256:6131b571523e03877b6857eca464cc499e80c2398a685daa14f516d13cd06a54",
+        "sha256:65963c40d3a346e869c6c61d10de4e710fe1e7738380694d0ab487d762a78581",
         "sha256:7e4421823f6362efa0d9a66cfaa937fe993b904fe6ac3df47c30a6f8551c94a9",
-        "sha256:89ac7aefafacd68cdfc751b290b027533f1d5165b8167b734d2303a66cf18945",
-        "sha256:d8ce4a9abd606e96fe6a269d9d55229ee68e29f633f77e7f8d15de13ee3039e0",
-        "sha256:ea84f766bdcd68ed39aaad6e6c04d534f35c158abd63fdc3f18ebfca59410e44"
+        "sha256:933a334012251d66dcf34ac21698610c70e3ee00596868fffbde4f42047196df",
+        "sha256:a82a9a97206d342297a69b92ff4018e2997085c522112f2b6e24cb2adacb52d1",
+        "sha256:a8be1a69cca52fb12db8ed2380b0b380ba04ff8a34b9b3f1c7c822565446ab38",
+        "sha256:b53e6ba061950f6d1657dc2d693c331327e47926659c7af1ec54c1d6106b172f",
+        "sha256:c5e998838d7ea6a3f428aa918809fef3262bdd61e8f5e1c34339d35a76a84de9",
+        "sha256:d375d94fa22c963f9646d5ed16b81a4ad52908999493b44c55dc3247659bd9a8",
+        "sha256:da73ce81b15931d01c4d5462a5c7a61fdf360349cc6294813779139939c83eca",
+        "sha256:e8f90876153c0ef3fb8f82055cc7f5926e1fc6b5e8ee5a832925eae8db93d760",
+        "sha256:f00c4bd6957e1ceabdd4eb49021291cc25a4ad684d08ea76e95689682c51e0e0",
+        "sha256:faa709820ff7692266a2dd3a29b412c501aec1dd72bf69888a12f47c3dadf644"
       ]
     },
-    "public.ecr.aws/lambda/python:3.11": {
-      "digest": "sha256:148e32d687b1492accc8990af5f4b82a89203438fe0ef072dd72628fb1bcc4c9",
+    "public.ecr.aws/lambda/python:3.11.2026.10.31.02": {
+      "digest": "sha256:005594dbdcc42b7093f5da95082599eeda2f21f430240b874cf85639371e91fd",
       "children": [
-        "sha256:20efb8868dd579c5f7a8f4acaad952d670a43d469c3351fe71ede38b27c11c2f",
-        "sha256:0568d42610a39f1aa642ad903f4aa1cc1ce58d1e8923faf43ff14e2df4841d83"
+        "sha256:ce7bf562b078f7c2e13fe834e58c6501e7feb660de5c996e2ac164d3d3684fa1",
+        "sha256:28d15d8227a0b2b0f422bb2cd8d3ecd170a2c4ae9f2e5270c42f2e2a7530a206"
       ],
       "blobs": [
-        "sha256:08976cff57106447835dd1f6bf19cf4fbb02d0edb631996eaed81699d701dc80",
-        "sha256:0b1a7d4c731a9aad6e9aa8a2c2cd87d8a54a7e3dde93011ff0c9357251811022",
-        "sha256:1281f26b8128bd120fcf7f670f5720a42849c63b257d35df3f996bfa585d2e38",
+        "sha256:0b67088b7e1d9af919d936cc20b32231609bb2fe1b4f1ed2f5f4cc6bb01a8f7d",
         "sha256:218e2d223b055630f0149ceac46fabe3fd9e7cbd9621d2d4b3ae9fe3bde03746",
-        "sha256:4d372fa889b453747a76cb70fe4d6fcaecd1455f2001550324e4494e1b3f930e",
-        "sha256:4d52222be4d42095dfdaa5ad9351fa20c3a297463e5b8d0c3fabb90fbd0376a1",
-        "sha256:574b4a224291134bef82fc57c3cecb9a506f7cf40a1e83eec057cadd61d7273c",
-        "sha256:617ef7242e1890f9831f5b1d4e0a95cbd2625c0c73303180d3596dcb35b4ba33",
-        "sha256:731bafaa905fb62fe6ba78d8eb88439ebb196184ae20244b294a370f0ad88c86",
+        "sha256:307d8462a7de9d15963333a2f2f094f2da96a0ba127878c93453e3d760fcd5cb",
+        "sha256:40160810448f1487693c15a1556a95689a6315711b5198627970506d26652137",
+        "sha256:40e019ce1b5930e4c0a8fd83a725483c39438123bc9eaf08d265a7e71e71db17",
+        "sha256:6557811466fc8bf9991c95c6983f626f838ae464b9d1eb5d582fd5a51d043534",
         "sha256:7e4421823f6362efa0d9a66cfaa937fe993b904fe6ac3df47c30a6f8551c94a9",
-        "sha256:96291296b7d4bc865035a4d18098a031fb097614e4afedd037adfce513956753",
-        "sha256:b353c993e754de6fe38185a29b5d6d96a11e5fc1ae5ca0fdfbccd6a700e731b5",
-        "sha256:c53cf65e058d94fdc8224fac6b2f4e62e834f8012c7ff19bca99f5efef3dc8a1",
-        "sha256:cc6ed9ade9d8f3163e2fcc98335bd76c4b72b7fe54810ffa2507a7b754d80743"
+        "sha256:81591919217ede12dfd95a5d805880c625532036603d0239a6434402e1d4e9ea",
+        "sha256:95cb74040dd2f449b82a6f8c0b6210452e42aeb1b8eca43706e1014b8754a602",
+        "sha256:aff82d4c93424f8dd721fb268c1c8624b45ea6609825b407d9256fafe538b514",
+        "sha256:c9dfd60c70e60d5d93d89d8c95219edfe169ba823ae21cf2c5950917048d4044",
+        "sha256:cf5d5636e5164998be762c73b01539cbfd05e798e27d48a9f4660d5d99aafedd",
+        "sha256:d1ed6886fe4cf61ef01ffd0544a1f74221ba16f6f0bcdb90f3358991b0ca1831",
+        "sha256:f4e9e7da474f6bb2cea186ac80dd14aa78e0db0399f521d7d1878af8f997f57a"
       ]
     },
-    "public.ecr.aws/lambda/python:3.12": {
-      "digest": "sha256:d82c9eee479c78dd43ce5c4d0c80feedc581b2015bd105e52364b8aca589644d",
+    "public.ecr.aws/lambda/python:3.12.2026.10.31.02": {
+      "digest": "sha256:4f9132fef5abe6f09ffdf865b7ae8a644bf65b81a77b39f40e5012b06609ba0d",
       "children": [
-        "sha256:7372b6c2f91067eb14c245da88f95ccee1a1fa4f7780c44a36ae285f31802d2a",
-        "sha256:2e5f4048d2c1388345767fcc985db6e351050142deaee050a3d17e76157fe9ff"
+        "sha256:d69eb7e5a313444d1e2054a3a64ec94d72232e6ba4e1ede8518f2d9cad37bf5f",
+        "sha256:768445f0de1ab04c262c9fa33601c4036cedb8af19ae5e93371cdc79d33a7021"
       ],
       "blobs": [
-        "sha256:0b8b4f7b7ace458019eccc935cd1c72d5f874241e5265042d38af71b2f97a881",
-        "sha256:1297b034fecdab205fefe0982e5951ef7a8522c89b083fa9331fb035eca1bcf4",
-        "sha256:2ce13ac2e8baa4fb46f975a7cab9572c9fe76bdb752234b5d23e8ec03454c639",
-        "sha256:2dae97e47969ec294e3a0e425d66680ac8da7c899bc079494f2ba80d66dfc1f3",
+        "sha256:1c098c273e97747bcbda4434d988f3e9178559900fbc18305a7570f68452c56f",
+        "sha256:23e8498693a152ede205fb9173ee791204ae2ef911e0894c7aa66b36de2d86b3",
+        "sha256:25f5866e7cb43db0cea5908f384cb931bcb080059bae332fae90a5a74db1bbc5",
         "sha256:3ca82a91183dfeba3f4de3c8f842d6ac2328f6b8bcf4d78f9ca307e455abd358",
-        "sha256:7308d5e3aab90d1e6deb1e584c6999d83fe80d3507a3615c8e0750aaa70410ee",
-        "sha256:84a448ba430f749af9110b464372228ccd187390eefaec1a8458b538b18b4021",
-        "sha256:8bdf39eaa338eeefc9c97c7b25a10b58751ec39cd96cec79f7cfe6cad5a4fffe",
-        "sha256:958cbef37e46d2657a26a86f1012afa71e12a93719c62ca458907e121bf6529c",
-        "sha256:a092fdbff67930f0e56072a9914ba159c9ad6f5266e188f75f4a5794c6ccf761",
-        "sha256:b8a785046b54293cb33ca50b36ed0c84c547671bab5d4a878ad8b708312bd560",
+        "sha256:3e6e5aee8cb512028664dd322f28d8f956442e9d12d01695d952813feb1668d5",
+        "sha256:44d4fa6c59775728f00bb84044951d92243ae817ac2f1f67d15d8691f3cd5249",
+        "sha256:647a46b7e6cbc359b63e9cf20acf1b13da2607501a521169e840c2bfe4e5f224",
+        "sha256:8878b2a06fc3869bc97939c09b404bf1b6f2c2a5ed34bb9103721ce1d48c09f4",
+        "sha256:96eb82c692115990e2e4fbcbfdf3b38369f153543b1adc4d26a0c7835062a002",
+        "sha256:9b223770a8f6287e3fd8ce278c61b3508565390d64d0af5c1ee2ee53e9565f86",
+        "sha256:a25c01cdc9375fd95a5939ddcf823faee58aaf77b33cdf56b3c12f494cd84278",
+        "sha256:b90efcae6038b8cf543a2f0750fa4c276cec0db0ad425d10e85c044979f5526a",
         "sha256:bd0433009a1345ffe60d6c7f79d66c710199e3fb9392034b671e734ff0518754",
-        "sha256:c28cb9b08a77c17da06879f5e3b67c4e008e6adabea505dc0160a34e2fd69e79",
-        "sha256:ec5cb98c687cc4c8f622e1ce446774f61da1c70b2cc7197e72708944e07c40d2"
+        "sha256:d50e89f4ff057b2d0b63b8221e3305e6136940d2ae60313f1bf2f655a4cd4f3f"
       ]
     },
     "public.ecr.aws/soci-workshop-examples/ffmpeg:latest": {
