@@ -1491,6 +1491,15 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
     );
 }
 
+/// Index in `report.images` of the image synced into `target_repo`.
+fn image_index(report: &SyncReport, target_repo: &str) -> usize {
+    report
+        .images
+        .iter()
+        .position(|i| i.target.contains(target_repo))
+        .unwrap_or_else(|| panic!("{target_repo} is reported"))
+}
+
 /// A blob failure ends the image's other blobs' waits. Image B's shared layer
 /// waits on image A, and B's own layer fails to pull. B is reported failed at
 /// once instead of after A's delay, and never pushes the shared layer. The
@@ -1573,31 +1582,28 @@ async fn sync_blob_failure_ends_the_images_other_blob_waits() {
         .await
         .expect("a blob failure must not leave the run waiting");
 
-        let image_b = report
-            .images
-            .iter()
-            .find(|i| i.target.contains("tgt-b"))
-            .expect("image B is reported");
-        let failing_digest = parts_b.layer_descs[1].digest.to_string();
+        let b = image_index(&report, "tgt-b");
+        assert_status!(
+            report,
+            b,
+            ImageStatus::Failed {
+                kind: ErrorKind::BlobTransfer,
+                status_code: Some(404),
+                ..
+            },
+            "{slow:?}"
+        );
         assert!(
-            matches!(
-                &image_b.status,
-                ImageStatus::Failed {
-                    kind: ErrorKind::BlobTransfer,
-                    error,
-                    status_code: Some(404),
-                    ..
-                } if error.contains(&failing_digest)
-            ),
-            "{slow:?}: {:?}",
-            image_b.status
+            format!("{:?}", report.images[b].status)
+                .contains(&parts_b.layer_descs[1].digest.to_string()),
+            "{slow:?}: B failed on another blob"
         );
         // The negative assertion: B ends at its own failure, not when A's
         // slow step lets the waiting layer through.
         assert!(
-            image_b.duration < DELAY / 2,
+            report.images[b].duration < DELAY / 2,
             "{slow:?}: B failed after {:?}, its shared layer kept waiting on A",
-            image_b.duration
+            report.images[b].duration
         );
         assert_eq!(
             count_blob_uploads(
@@ -1696,32 +1702,25 @@ async fn sync_blob_failure_releases_the_claim_of_a_blob_queued_for_a_permit() {
     ];
     let report = tokio::time::timeout(
         SLOW_PULL * 3,
-        SyncEngine::new(fast_retry(), concurrency(10)).run(
+        run_engine(
             mappings,
+            fast_retry(),
+            10,
             empty_cache(),
             BlobStage::disabled(),
-            &NullProgress,
             None,
         ),
     )
     .await
     .expect("a cancelled blob must not keep its claim");
 
-    let image_c = report
-        .images
-        .iter()
-        .find(|i| i.target.contains("tgt-c"))
-        .expect("image C is reported");
-    assert!(
-        matches!(image_c.status, ImageStatus::Synced),
-        "{:?}",
-        image_c.status
-    );
+    let c = image_index(&report, "tgt-c");
+    assert_status!(report, c, ImageStatus::Synced);
     // The negative assertion: C ends before B's slow pulls do, not after.
     assert!(
-        image_c.duration < SLOW_PULL / 2,
+        report.images[c].duration < SLOW_PULL / 2,
         "C finished after {:?}, held up by B's claim of the shared layer",
-        image_c.duration
+        report.images[c].duration
     );
 }
 
@@ -1783,42 +1782,138 @@ async fn sync_blob_failure_ends_a_staging_wait_and_releases_the_claim() {
     let staging_dir = tempfile::tempdir().unwrap();
     let report = tokio::time::timeout(
         SLOW_PULL * 3,
-        SyncEngine::new(fast_retry(), concurrency(10)).run(
+        run_engine(
             mappings,
+            fast_retry(),
+            10,
             empty_cache(),
             BlobStage::new(staging_dir.path().to_path_buf()),
-            &NullProgress,
             None,
         ),
     )
     .await
     .expect("a cancelled blob must not keep its claim");
 
-    let image = |repo: &str| {
-        report
-            .images
-            .iter()
-            .find(|i| i.target.contains(repo))
-            .unwrap_or_else(|| panic!("{repo} is reported"))
-    };
-    let failing_digest = parts_b.layer_descs[0].digest.to_string();
+    let b = image_index(&report, "tgt-b");
+    assert_status!(
+        report,
+        b,
+        ImageStatus::Failed {
+            kind: ErrorKind::BlobTransfer,
+            status_code: Some(404),
+            ..
+        }
+    );
     assert!(
-        matches!(
-            &image("tgt-b").status,
-            ImageStatus::Failed { error, status_code: Some(404), .. }
-                if error.contains(&failing_digest)
-        ),
-        "{:?}",
-        image("tgt-b").status
+        format!("{:?}", report.images[b].status)
+            .contains(&parts_b.layer_descs[0].digest.to_string()),
+        "B failed on another blob"
     );
     // The negative assertion: B ends at its own failure, not when A's pull
     // lets the waiting layer through.
     assert!(
-        image("tgt-b").duration < SLOW_PULL / 2,
+        report.images[b].duration < SLOW_PULL / 2,
         "B failed after {:?}, its staging wait kept going",
-        image("tgt-b").duration
+        report.images[b].duration
     );
-    assert!(matches!(image("tgt-c").status, ImageStatus::Synced));
+    assert_status!(report, image_index(&report, "tgt-c"), ImageStatus::Synced);
+}
+
+/// A repo's followers stop waiting on its manifest commit at its first blob
+/// failure, not after its other uploads drain. Image B uploads the layer image
+/// C wants, then has one blob fail fast and another still pulling slowly. C
+/// waits to mount from B's repo, and gives up and pushes as soon as B fails.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_blob_failure_releases_followers_waiting_on_the_repo() {
+    const SLOW_PULL: Duration = Duration::from_secs(6);
+    const FAILURE_DELAY: Duration = Duration::from_secs(1);
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let shared = b"repo-failed-shared";
+    let parts_b = ManifestBuilder::new(b"repo-failed-config-b")
+        .layer(b"repo-failed-unpullable")
+        .layer(b"repo-failed-slow")
+        .layer(shared)
+        .build();
+    let parts_c = ManifestBuilder::new(b"repo-failed-config-c")
+        .layer(shared)
+        .build();
+    mount_source_manifest(&source_server, "src-b", "v1", &parts_b.bytes).await;
+    let [unpullable, slow, shared_desc] = &parts_b.layer_descs[..] else {
+        unreachable!("B has three layers");
+    };
+    mount_blob_pull(
+        &source_server,
+        "src-b",
+        &parts_b.config_desc.digest,
+        &parts_b.config_data,
+    )
+    .await;
+    mount_blob_pull(
+        &source_server,
+        "src-b",
+        &shared_desc.digest,
+        &parts_b.layers_data[2],
+    )
+    .await;
+    mount_blob_pull_delayed(
+        &source_server,
+        "src-b",
+        &slow.digest,
+        &parts_b.layers_data[1],
+        SLOW_PULL,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src-b/blobs/{}", unpullable.digest)))
+        .respond_with(ResponseTemplate::new(404).set_delay(FAILURE_DELAY))
+        .mount(&source_server)
+        .await;
+    parts_c.mount_source(&source_server, "src-c", "v1").await;
+    parts_b.mount_target(&target_server, "tgt-b", "v1").await;
+    parts_c.mount_target(&target_server, "tgt-c", "v1").await;
+
+    // Leader election breaks a tie in favor of the later image, so listing C
+    // first makes B upload the shared layer and C wait to mount it.
+    let mappings = ["c", "b"]
+        .map(|id| {
+            mapping_with_distinct_repos(
+                &source_server,
+                &target_server,
+                &format!("src-{id}"),
+                &format!("tgt-{id}"),
+                same_tags(&["v1"]),
+            )
+        })
+        .into();
+    let report = tokio::time::timeout(
+        SLOW_PULL * 3,
+        run_engine(
+            mappings,
+            fast_retry(),
+            10,
+            empty_cache(),
+            BlobStage::disabled(),
+            None,
+        ),
+    )
+    .await
+    .expect("a failed repo must not leave its followers waiting");
+
+    let c = image_index(&report, "tgt-c");
+    assert_status!(report, c, ImageStatus::Synced);
+    assert_status!(
+        report,
+        image_index(&report, "tgt-b"),
+        ImageStatus::Failed { .. }
+    );
+    // The negative assertion: C ends before B's slow pull does, not after.
+    assert!(
+        report.images[c].duration < SLOW_PULL / 2,
+        "C finished after {:?}, held up by B's slow upload",
+        report.images[c].duration
+    );
 }
 
 /// Two images share a blob and run concurrently; the blob already exists at

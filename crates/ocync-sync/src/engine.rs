@@ -1643,11 +1643,6 @@ async fn execute_item(
 
     if let Some(err) = outcome.error.take() {
         warn!(target_name = %item.target_entry.id().alias(), error = %err, "blob transfer failed");
-        // Unblock followers waiting on this repo's manifest commit; they
-        // fall through to HEAD+push.
-        cache
-            .borrow_mut()
-            .notify_repo_failed(item.target_entry.id(), &item.target.repo);
         let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
@@ -2222,6 +2217,12 @@ async fn transfer_image_blobs(
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
                 cancel.trigger();
+                // Followers waiting to mount from this repo stop now, not
+                // after the in-flight uploads drain; they fall through to
+                // HEAD+push.
+                ctx.cache
+                    .borrow_mut()
+                    .notify_repo_failed(ctx.target_id, ctx.target_repo);
                 outcome.error = Some(err);
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
