@@ -10,10 +10,12 @@
 //!   | docker login -u oauth2accesstoken --password-stdin us-docker.pkg.dev
 //! ```
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::OnceCell;
@@ -23,7 +25,7 @@ use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Scope, Token, registry_origin, scopes_cache_key};
 use crate::aws::{AwsCredentialProviders, Clock};
 use crate::credential_cache::{CredentialCache, remaining};
-use crate::error::{Error, error_chain};
+use crate::error::{CredentialFailure, Error, error_chain};
 use crate::google::{self, AccessToken, Expiry};
 
 /// The HTTP Basic username GAR and GCR take with an `OAuth2` access token as
@@ -73,11 +75,24 @@ impl SharedGoogleToken {
     }
 }
 
+/// Who a registry token exchange is made as.
+#[derive(Clone, PartialEq, Eq)]
+enum Identity {
+    /// A Google account, by its access token.
+    Google(google::Secret),
+    /// No one: there are no Google credentials anywhere to use, so the
+    /// registry is read as a public one.
+    Anonymous,
+}
+
 /// A token source and the token it last returned, kept until it is about
 /// to expire or a registry's token exchange refuses it with 401.
 struct CachedGoogleToken {
     source: Box<dyn GcpTokenSource>,
     token: CredentialCache<AccessToken, Arc<google::Error>>,
+    /// Set once the source reports there is no credential source at all,
+    /// so the run asks it once and every host after reads anonymously.
+    no_source: AtomicBool,
 }
 
 impl fmt::Debug for CachedGoogleToken {
@@ -93,12 +108,34 @@ impl CachedGoogleToken {
         Self {
             source: Box::new(source),
             token: CredentialCache::new(),
+            no_source: AtomicBool::new(false),
         }
     }
 
-    /// The kept token, or a new one. Providers waiting on a fetch that
-    /// failed get its error rather than each asking again.
-    async fn get(&self) -> Result<AccessToken, Arc<google::Error>> {
+    /// The kept token, or a new one, as the identity to exchange as.
+    /// Providers waiting on a fetch that failed get its error rather than
+    /// each asking again. Only a source that does not exist at all is
+    /// anonymous: one that fails to load, fetch or is refused is an error.
+    async fn get(&self) -> Result<Identity, Arc<google::Error>> {
+        if self.no_source.load(Ordering::Acquire) {
+            return Ok(Identity::Anonymous);
+        }
+        match self.fetch().await {
+            Ok(token) => Ok(Identity::Google(token.token)),
+            Err(e) if e.is_no_source() => {
+                if !self.no_source.swap(true, Ordering::AcqRel) {
+                    tracing::info!(
+                        "no Google credentials found, reading Google registries anonymously"
+                    );
+                }
+                Ok(Identity::Anonymous)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The kept token, or a new one.
+    async fn fetch(&self) -> Result<AccessToken, Arc<google::Error>> {
         self.token
             .get_or_refresh_sharing_failure(async {
                 tracing::debug!("GCP OAuth2 token expired or missing, refreshing");
@@ -209,7 +246,19 @@ pub struct GcpAuth {
     /// Shared by the run's GAR and GCR providers.
     cached_token: Arc<CachedGoogleToken>,
     tokens: TokenCache,
-    recovery: Recovery<google::Secret>,
+    recovery: Recovery<Identity>,
+    anonymous: Mutex<AnonymousReads>,
+}
+
+/// What anonymous reads of one registry have handed out and had refused.
+#[derive(Default)]
+struct AnonymousReads {
+    /// The registry token each scope was last given.
+    issued: HashMap<String, Token>,
+    /// The scopes whose anonymous token the registry refused, so a
+    /// repository that needs Google credentials fails at once the next time
+    /// while a public one on the same host is unaffected.
+    refused: HashSet<String>,
 }
 
 impl fmt::Debug for GcpAuth {
@@ -273,7 +322,14 @@ impl GcpAuth {
             cached_token,
             tokens: TokenCache::new(),
             recovery: Recovery::default(),
+            anonymous: Mutex::default(),
         }
+    }
+
+    fn anonymous(&self) -> std::sync::MutexGuard<'_, AnonymousReads> {
+        self.anonymous
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Create a GCP auth provider with an injected token source.
@@ -290,30 +346,73 @@ impl GcpAuth {
         )
     }
 
-    /// The registry token for `scopes`, exchanged with `google_token`.
+    /// The registry token for the scopes `key` names, exchanged as `identity`.
     async fn exchange(
         &self,
         scopes: &[Scope],
-        google_token: &google::Secret,
+        key: &str,
+        identity: &Identity,
     ) -> Result<Token, Error> {
-        let credentials = Credentials::Basic {
-            username: GCP_USERNAME.to_owned(),
-            password: google_token.expose().to_owned(),
+        let (credentials, anonymous) = match identity {
+            Identity::Google(google_token) => (
+                Some(Credentials::Basic {
+                    username: GCP_USERNAME.to_owned(),
+                    password: google_token.expose().to_owned(),
+                }),
+                false,
+            ),
+            Identity::Anonymous => (None, true),
         };
-        self.tokens
+        let exchanged = self
+            .tokens
             .challenge()
-            .exchange(&self.http, &self.base_url, scopes, Some(&credentials))
-            .await
+            .exchange(&self.http, &self.base_url, scopes, credentials.as_ref())
+            .await;
+        if !anonymous {
+            return exchanged;
+        }
+        let token = exchanged.map_err(|e| self.anonymous_failure(e))?;
+        self.anonymous()
+            .issued
+            .insert(key.to_owned(), token.clone());
+        Ok(token)
     }
 
-    /// The current Google token.
-    async fn google_token(&self) -> Result<google::Secret, Error> {
-        let token = self
-            .cached_token
+    /// `error`, an anonymous read's failure, as the missing credentials when
+    /// the registry refused the read.
+    fn anonymous_failure(&self, error: Error) -> Error {
+        match &error {
+            Error::TokenEndpoint { status, .. } | Error::RegistryPing { status, .. }
+                if matches!(
+                    *status,
+                    http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+                ) =>
+            {
+                self.credentials_needed(*status)
+            }
+            _ => error,
+        }
+    }
+
+    /// The error for an anonymous read that the registry refused with
+    /// `status`.
+    fn credentials_needed(&self, status: http::StatusCode) -> Error {
+        Error::cloud_credentials(
+            &self.hostname,
+            CredentialFailure::Refused,
+            format_args!(
+                "no Google credentials were found, so the registry was read anonymously and \
+                 refused it with {status}; this image needs Google credentials"
+            ),
+        )
+    }
+
+    /// The identity to exchange as now.
+    async fn identity(&self) -> Result<Identity, Error> {
+        self.cached_token
             .get()
             .await
-            .map_err(|e| credentials_failed(&self.hostname, Stage::TokenRequest, &e))?;
-        Ok(token.token)
+            .map_err(|e| credentials_failed(&self.hostname, Stage::TokenRequest, &e))
     }
 }
 
@@ -332,14 +431,21 @@ impl AuthProvider for GcpAuth {
             self.tokens
                 .get_or_fetch(key.clone(), || async {
                     tracing::debug!(base_url = %self.base_url, scope = %key, "token cache miss, exchanging");
-                    let scopes = &scopes;
+                    if self.anonymous().refused.contains(&key) {
+                        return Err(self.credentials_needed(http::StatusCode::UNAUTHORIZED));
+                    }
+                    let (scopes, key) = (&scopes, &key);
                     let exchanged = self
                         .recovery
                         .exchange(
-                            || self.google_token(),
-                            |google_token| async move { self.exchange(scopes, &google_token).await },
+                            || self.identity(),
+                            |identity| async move { self.exchange(scopes, key, &identity).await },
                             judge_token_endpoint,
-                            |refused| self.cached_token.refuse(refused),
+                            |refused| {
+                                if let Identity::Google(refused) = refused {
+                                    self.cached_token.refuse(refused);
+                                }
+                            },
                         )
                         .await;
                     let token = exchanged.inspect_err(|e| {
@@ -356,7 +462,18 @@ impl AuthProvider for GcpAuth {
             // The Google token stays: a refusal here is of the registry's
             // token, and the kept Google token exchanges for a new one
             // without a request to Google. An exchange that refuses the
-            // Google token drops it.
+            // Google token drops it. An anonymous token the registry
+            // refused means its scope needs Google credentials.
+            {
+                let mut anonymous = self.anonymous();
+                let scopes: Vec<String> = anonymous
+                    .issued
+                    .iter()
+                    .filter(|(_, issued)| issued.sends_same_header(&refused))
+                    .map(|(scope, _)| scope.clone())
+                    .collect();
+                anonymous.refused.extend(scopes);
+            }
             self.tokens.refuse(&self.base_url, &refused).await;
         })
     }
@@ -369,7 +486,7 @@ mod tests {
 
     use tokio::sync::Mutex;
     use wiremock::MockServer;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     use super::*;
@@ -524,7 +641,10 @@ mod tests {
 
     /// The password of the credentials `auth` holds now.
     async fn password(auth: &GcpAuth) -> String {
-        auth.google_token().await.unwrap().expose().to_owned()
+        match auth.identity().await.unwrap() {
+            Identity::Google(token) => token.expose().to_owned(),
+            Identity::Anonymous => panic!("anonymous, not a Google account"),
+        }
     }
 
     #[tokio::test]
@@ -984,6 +1104,171 @@ mod tests {
         );
         auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
         auth.get_token(&[Scope::pull("repo-b")]).await.unwrap();
+    }
+
+    /// A token source that finds no credential source at all, counted.
+    #[derive(Debug)]
+    struct NoCredentials(Arc<AtomicUsize>);
+
+    impl GcpTokenSource for NoCredentials {
+        fn access_token(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<AccessToken, google::Error>> + Send + '_>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(google::Error::NoSource(Box::new(google::Error::NoType)))
+            })
+        }
+    }
+
+    /// A request with no `Authorization` header, as an anonymous read sends.
+    fn without_credentials(request: &wiremock::Request) -> bool {
+        !request.headers.contains_key("authorization")
+    }
+
+    /// With no credential source at all, the registry is read as a public
+    /// one: the token exchange carries no credentials, no Google token is
+    /// ever fetched, and the source is asked once for the whole run however
+    /// many scopes. Breaks if a missing source is an error, the exchange
+    /// sends credentials, or each scope asks the source again.
+    #[tokio::test]
+    async fn no_credential_source_reads_anonymously() {
+        let server = MockServer::start().await;
+        testing::challenge(&server, "us-docker.pkg.dev")
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(without_credentials)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "public", "expires_in": 300})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            NoCredentials(Arc::clone(&probes)),
+        );
+
+        let token = auth.get_token(&[Scope::pull("a")]).await.unwrap();
+        auth.get_token(&[Scope::pull("b")]).await.unwrap();
+
+        assert_eq!(token.value(), "public");
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+    }
+
+    /// A credential source that exists but fails is an error, never an
+    /// anonymous read: the registry is not asked for anything. Breaks if a
+    /// broken key silently becomes anonymous.
+    #[tokio::test]
+    async fn a_failing_credential_source_is_not_read_anonymously() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            MockGcpTokenSource::with_tokens(vec![]),
+        );
+
+        let error = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("mock: no more tokens"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("no Google credentials"),
+            "{error}"
+        );
+    }
+
+    /// An anonymous read the token endpoint refuses fails naming the missing
+    /// credentials, as an authentication failure. Breaks if the error is the
+    /// bare status or is not an authentication failure.
+    #[tokio::test]
+    async fn an_anonymous_read_refused_by_the_token_endpoint_names_the_cause() {
+        let server = MockServer::start().await;
+        testing::challenge(&server, "us-docker.pkg.dev")
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            NoCredentials(Arc::default()),
+        );
+
+        let error = auth.get_token(&[Scope::pull("repo")]).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no Google credentials were found"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("403"), "{error}");
+        assert!(error.is_auth_error(), "{error}");
+    }
+
+    /// A registry that refuses the anonymous token it handed out (401 on the
+    /// request itself) fails the retry naming the missing credentials,
+    /// without exchanging again, while another repository on the host is
+    /// still read. Breaks if the refusal is retried with another anonymous
+    /// token or poisons the host.
+    #[tokio::test]
+    async fn an_anonymous_token_the_registry_refuses_names_the_cause() {
+        let server = MockServer::start().await;
+        testing::challenge(&server, "us-docker.pkg.dev")
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token": "anon", "expires_in": 300})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let auth = GcpAuth::with_api(
+            server.uri(),
+            crate::test_http_client(),
+            NoCredentials(Arc::default()),
+        );
+        let private = [Scope::pull("private")];
+
+        let refused = auth.get_token(&private).await.unwrap();
+        auth.refuse(refused).await;
+        let error = auth.get_token(&private).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no Google credentials were found"),
+            "{error}"
+        );
+        assert!(error.is_auth_error(), "{error}");
+        auth.get_token(&[Scope::pull("public")]).await.unwrap();
     }
 
     #[tokio::test]

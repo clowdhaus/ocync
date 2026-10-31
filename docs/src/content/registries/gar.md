@@ -6,7 +6,7 @@ order: 3
 
 ## Auth
 
-ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io` except `mirror.gcr.io`, such as `us.gcr.io`, which Artifact Registry [serves](https://docs.cloud.google.com/artifact-registry/docs/transition/gcr-repositories)) and uses Google Application Default Credentials (ADC):
+ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any `*.gcr.io`, such as `us.gcr.io`, which Artifact Registry [serves](https://docs.cloud.google.com/artifact-registry/docs/transition/gcr-repositories)) and uses Google Application Default Credentials (ADC):
 
 - `GOOGLE_APPLICATION_CREDENTIALS` pointing at a credentials file: a service account key, an authorized user, a Workload Identity Federation (`external_account`) configuration or an impersonated service account
 - `gcloud auth application-default login` (developer machines)
@@ -15,7 +15,7 @@ ocync auto-detects GAR (`*-docker.pkg.dev`) and GCR hostnames (`gcr.io` and any 
 
 Workload Identity Federation takes its subject token from a file (such as a projected Kubernetes service account token), a URL, or AWS. On EKS, the AWS source signs with the pod's AWS credentials (IRSA or Pod Identity), so `ocync` reaches Artifact Registry with no service account key. The executable source is not supported. See the [security design](/design/security#owned-google-authentication) for how this matches Google's own library.
 
-`mirror.gcr.io`, Google's public cache of Docker Hub, is read anonymously and uses no Google credentials.
+With no Google credentials at all, ocync reads public Google registries anonymously, including `mirror.gcr.io`, `gcr.io/distroless` and `k8s.gcr.io`. Credentials that exist but fail to load or are refused are an error, never a silent anonymous read. When the registry refuses an anonymous read, the error says no Google credentials were found.
 
 See the [GCP ADC docs](https://cloud.google.com/docs/authentication/application-default-credentials) for the full precedence chain.
 

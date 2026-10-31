@@ -14,8 +14,7 @@ pub enum ProviderKind {
     Ecr,
     /// AWS ECR Public Gallery.
     EcrPublic,
-    /// Google Container Registry (`gcr.io` and its regional hosts, but not
-    /// the anonymous Docker Hub mirror `mirror.gcr.io`).
+    /// Google Container Registry (gcr.io and regional mirrors).
     Gcr,
     /// Google Artifact Registry (*-docker.pkg.dev).
     Gar,
@@ -97,12 +96,6 @@ impl AzureCloud {
 /// The ECR Public registry hostname.
 pub(crate) const ECR_PUBLIC_HOST: &str = "public.ecr.aws";
 
-/// Google's public, anonymous cache of Docker Hub. It sits under `gcr.io` but
-/// needs no Google credentials, so it is detected as no provider.
-///
-/// Source: <https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images>
-const GCR_DOCKER_HUB_MIRROR_HOST: &str = "mirror.gcr.io";
-
 /// A hostname with its case, port and trailing dot removed, the form every
 /// host comparison is made against.
 fn normalize_host(hostname: &str) -> String {
@@ -122,7 +115,6 @@ pub fn detect_provider_kind(hostname: &str) -> Option<ProviderKind> {
         "ghcr.io" => Some(ProviderKind::Ghcr),
         "cgr.dev" => Some(ProviderKind::Chainguard),
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some(ProviderKind::DockerHub),
-        GCR_DOCKER_HUB_MIRROR_HOST => None,
         _ if hostname == "gcr.io" || hostname.ends_with(".gcr.io") => Some(ProviderKind::Gcr),
         _ if ECR_RE.is_match(hostname) => Some(ProviderKind::Ecr),
         _ if GAR_RE.is_match(hostname) => Some(ProviderKind::Gar),
@@ -190,9 +182,7 @@ mod tests {
             ("us.gcr.io", Some(ProviderKind::Gcr)),
             ("eu.gcr.io", Some(ProviderKind::Gcr)),
             ("asia.gcr.io", Some(ProviderKind::Gcr)),
-            ("mirror.gcr.io", None),
-            ("Mirror.GCR.io.", None),
-            ("mirror.gcr.io:443", None),
+            ("mirror.gcr.io", Some(ProviderKind::Gcr)),
             ("k8s.gcr.io", Some(ProviderKind::Gcr)),
             ("us-central1-docker.pkg.dev", Some(ProviderKind::Gar)),
             ("europe-docker.pkg.dev", Some(ProviderKind::Gar)),

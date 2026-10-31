@@ -38,6 +38,11 @@ pub(super) struct Server {
     /// The token URL, with the comma-joined scopes as its query unless the
     /// server's default is wanted.
     token_url: Url,
+    /// Whether the address is the default one rather than one
+    /// [`HOST_VARIABLE`] names. Only a default address that never connects
+    /// means there is no metadata server; a named one that does not is a
+    /// source that failed.
+    ambient: bool,
 }
 
 /// The token endpoint's answer.
@@ -55,6 +60,7 @@ impl Server {
     /// `host[:port]`, such as one with a path or user info, is an error.
     pub(super) fn new(env: &Env, scopes: Scopes) -> Result<Self, Error> {
         let host = env.get(HOST_VARIABLE);
+        let ambient = host.is_none();
         let mut token_url = Url::parse(&format!(
             "http://{}",
             host.as_deref().unwrap_or(DEFAULT_HOST)
@@ -74,10 +80,12 @@ impl Server {
                 .query_pairs_mut()
                 .append_pair("scopes", &scopes.joined(","));
         }
-        Ok(Self { token_url })
+        Ok(Self { token_url, ambient })
     }
 
-    /// The default service account's token.
+    /// The default service account's token. A default address that never
+    /// connects, after the retries every metadata call gets, is
+    /// [`Error::NoSource`]: nothing here is a source to fail.
     pub(super) async fn access_token(
         &self,
         clients: &Clients,
@@ -88,7 +96,14 @@ impl Server {
                 .get(self.token_url.clone())
                 .header(FLAVOR.0, FLAVOR.1)
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            if self.ambient && e.is_connect_failure() {
+                Error::NoSource(Box::new(e))
+            } else {
+                e
+            }
+        })?;
         expiring(response.access_token, clock.now(), response.expires_in)
     }
 }
@@ -150,6 +165,53 @@ mod tests {
                 "{not_a_host}: {error}"
             );
         }
+    }
+
+    /// A default address that never connects is no credential source, but a
+    /// named one that does not connect is a source that failed. Breaks if a
+    /// broken source silently becomes anonymous, or an absent one stays an
+    /// error.
+    #[tokio::test(start_paused = true)]
+    async fn only_an_unreachable_default_address_is_no_source() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut server = Server::new(&host_env(&closed.to_string()), Scopes::Registry).unwrap();
+        let clients = Clients::new().unwrap();
+        async fn fetch(server: &Server, clients: &Clients) -> Error {
+            server
+                .access_token(clients, Clock::Fixed(now()))
+                .await
+                .unwrap_err()
+        }
+
+        let named = fetch(&server, &clients).await;
+        assert!(matches!(named, Error::Transport { .. }), "{named}");
+
+        server.ambient = true;
+        let default = fetch(&server, &clients).await;
+        assert!(default.is_no_source(), "{default}");
+    }
+
+    /// A server that answers with an error is a source that failed, even at
+    /// the default address. Breaks if any answer counts as no source.
+    #[tokio::test]
+    async fn an_answering_server_is_a_source() {
+        let answering = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&answering)
+            .await;
+        let mut server = Server::new(&server_env(&answering), Scopes::Registry).unwrap();
+        server.ambient = true;
+
+        let error = server
+            .access_token(&Clients::new().unwrap(), Clock::Fixed(now()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Status { .. }), "{error:?}");
     }
 
     /// Upstream `token_provider_full` and `headers_success_with_quota_project`:

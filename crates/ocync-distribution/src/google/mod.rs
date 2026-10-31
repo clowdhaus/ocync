@@ -389,6 +389,12 @@ pub(crate) enum Error {
     /// An answer was longer than any token response.
     #[error("{call}, answer over {MAX_SMALL_ANSWER} bytes")]
     BodyTooLarge { call: Call },
+    /// There is no credential source at all: no file is named, gcloud has
+    /// none, and no metadata server answers at its default address. This is
+    /// the only failure that is not an error to a caller that can read
+    /// anonymously. A source that exists but fails is never this.
+    #[error("no Google credentials were found, and no metadata server answered")]
+    NoSource(#[source] Box<Error>),
 }
 
 impl Error {
@@ -415,6 +421,17 @@ impl Error {
             }
             _ => false,
         }
+    }
+
+    /// Whether there is no credential source at all, as opposed to one that
+    /// failed.
+    pub(crate) fn is_no_source(&self) -> bool {
+        matches!(self, Self::NoSource(_))
+    }
+
+    /// Whether this is a request that never connected.
+    fn is_connect_failure(&self) -> bool {
+        matches!(self, Self::Transport { source, .. } if source.is_connect())
     }
 
     /// Whether Google refused the identity, the call may pass if sent

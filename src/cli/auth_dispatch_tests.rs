@@ -207,12 +207,6 @@ async fn dispatches_to_docker_config_when_one_exists() {
             config("ghcr.io", None),
             "docker-config",
         ),
-        // Google's anonymous Docker Hub cache is under gcr.io but takes the default path.
-        (
-            "autodetect mirror.gcr.io",
-            config("mirror.gcr.io", None),
-            "docker-config",
-        ),
         // Docker Hub shares the docker-config-then-anonymous path and is the most common.
         (
             "autodetect docker.io",
@@ -241,8 +235,6 @@ async fn autodetect_falls_back_to_anonymous_without_a_docker_config() {
             "anonymous",
         ),
         ("docker.io", config("docker.io", None), "anonymous"),
-        // Not "gcp": reading mirror.gcr.io needs no Google credentials.
-        ("mirror.gcr.io", config("mirror.gcr.io", None), "anonymous"),
     ])
     .await;
 }
