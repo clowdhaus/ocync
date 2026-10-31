@@ -249,7 +249,26 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         "remote script started the benchmark without reporting the newest results directory; \
          not fetching results",
     )?;
-    fetch_results(&config, &args.output, Some(&results_before))
+    let fetched = fetch_results(&config, &args.output, Some(&results_before));
+    run_result(exit_code, fetched)
+}
+
+/// The result of a run whose script exited with `exit_code` and whose fetch
+/// ended as `fetched`. A nonzero exit is an error whatever the fetch did, so a
+/// refused or failed run is never a success to the caller; a failed fetch is
+/// named alongside it.
+fn run_result(
+    exit_code: i32,
+    fetched: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (exit_code, fetched) {
+        (0, fetched) => fetched,
+        (code, Ok(())) => Err(format!("remote script exited with code {code}").into()),
+        (code, Err(e)) => Err(format!(
+            "remote script exited with code {code}; fetching results failed: {e}"
+        )
+        .into()),
+    }
 }
 
 /// The shell that points the benchmark at `provider`'s registry on the
@@ -1294,6 +1313,27 @@ mod tests {
             .find(|l| l.starts_with("RESULTS_BEFORE="))
             .unwrap();
         assert!(line.ends_with("|| true)"), "{line}");
+    }
+
+    #[test]
+    fn a_nonzero_remote_exit_is_an_error_after_the_fetch() {
+        assert!(run_result(0, Ok(())).is_ok());
+        assert_eq!(
+            run_result(0, Err("scp failed".into()))
+                .unwrap_err()
+                .to_string(),
+            "scp failed"
+        );
+        assert_eq!(
+            run_result(3, Ok(())).unwrap_err().to_string(),
+            "remote script exited with code 3"
+        );
+        assert_eq!(
+            run_result(1, Err("scp failed".into()))
+                .unwrap_err()
+                .to_string(),
+            "remote script exited with code 1; fetching results failed: scp failed"
+        );
     }
 
     #[test]
