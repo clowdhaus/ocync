@@ -209,6 +209,46 @@ async fn finds_the_credentials_in_order() {
     }
 }
 
+/// A host with no file and a DMI name that is not Google's has a metadata
+/// server when the metadata IP answers as Google's does, as on Cloud Run,
+/// and none when it answers as the EC2 instance metadata service does.
+/// Breaks if the probe's answer is not what decides, so Cloud Run reads
+/// anonymously or EC2 is given a metadata server.
+#[tokio::test]
+async fn the_metadata_ip_decides_a_host_with_no_other_source() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (answer, found) in [
+        (
+            ResponseTemplate::new(200).insert_header("Metadata-Flavor", "Google"),
+            true,
+        ),
+        (
+            ResponseTemplate::new(200).insert_header("Server", "EC2ws"),
+            false,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("metadata-flavor", "Google"))
+            .respond_with(answer)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = host(
+            Platform::Unix,
+            &[(metadata::PROBE_OVERRIDE, &server.uri())],
+            &[(metadata::PRODUCT_NAME_FILE, b"Dell Inc.".to_vec())],
+        );
+        let located = load(&host).await.unwrap();
+        match located {
+            Located::Found(c) => assert!(found && matches!(c.0, Kind::Metadata(_)), "{c:?}"),
+            Located::Absent => assert!(!found),
+        }
+    }
+}
+
 /// Upstream `create_access_token_credentials_malformed_adc_is_error` and
 /// `_adc_unimplemented_credential_type`, and the missing and non-string
 /// `type` cases: each is an error naming the problem. Breaks if one is

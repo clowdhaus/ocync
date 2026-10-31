@@ -5,9 +5,12 @@
 //! names, else from gcloud's well-known file, else from the metadata server
 //! of the GCE or GKE host. With no file, no `GCE_METADATA_HOST` and a host
 //! that is not on Google Cloud there is no source at all, which loading
-//! reports as [`Located::Absent`] without contacting any address. A file holds a service account key, an authorized
-//! user's refresh token, an external account (Workload Identity Federation)
-//! or a service account impersonated with any of those.
+//! reports as [`Located::Absent`]. Whether a host is on Google Cloud is
+//! judged by its DMI product name, then by one short probe of the metadata
+//! IP, which is the only address contacted to find out. A file holds a
+//! service account key, an authorized user's refresh token, an external
+//! account (Workload Identity Federation) or a service account
+//! impersonated with any of those.
 
 mod aws_source;
 mod external_account;
@@ -611,7 +614,7 @@ pub(crate) enum Located {
     /// A source exists. Failing to use it is an error.
     Found(Box<Credentials>),
     /// No source exists: no file, no `GCE_METADATA_HOST`, and a host that is
-    /// not on Google Cloud. Nothing was contacted to find out.
+    /// not on Google Cloud.
     Absent,
 }
 
@@ -641,7 +644,7 @@ impl Credentials {
             aws_credentials,
         };
         match find_file(host)? {
-            None if metadata::is_on_google_cloud(host) => {
+            None if metadata::is_on_google_cloud(host).await => {
                 Self::metadata(host).map(|c| Located::Found(Box::new(c)))
             }
             None => Ok(Located::Absent),

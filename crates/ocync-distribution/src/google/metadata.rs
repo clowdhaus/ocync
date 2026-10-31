@@ -35,27 +35,96 @@ pub(super) const TIMEOUTS: Timeouts = Timeouts {
 /// The file where Linux reports the machine's product name.
 pub(super) const PRODUCT_NAME_FILE: &str = "/sys/class/dmi/id/product_name";
 
-/// Whether `host` is on Google Cloud, judged without a network request, as
-/// Google's Go library `cloud.google.com/go/compute/metadata` does in
-/// `OnGCE`: `GCE_METADATA_HOST` set means the user said so, and otherwise
-/// the DMI product name, `Google` or `Google Compute Engine` (every Compute
-/// Engine and GKE node), suggests it. Go goes on to probe the network when
-/// the name does not, which would make every run off Google Cloud wait, so
-/// this does not: a machine whose name is not Google's is off Google Cloud.
-/// Go reads no `K_SERVICE` or `FUNCTION_TARGET` either. Windows, where this
-/// does not read the registry, is taken to be on it so the metadata server
-/// is asked, as upstream does.
-pub(super) fn is_on_google_cloud(host: &Host) -> bool {
+/// The address Google's Go library `cloud.google.com/go/compute/metadata`
+/// probes to tell whether a machine is on Google Cloud: the metadata server
+/// by IP, which needs no DNS.
+const PROBE_URL: &str = "http://169.254.169.254/";
+
+/// The most a probe of [`PROBE_URL`] may take, connecting included. It is
+/// the 2 second dial timeout of Go's default metadata client, which Go's
+/// `testOnGCE` names as the bound on a machine off Google Cloud ("worst case
+/// this should return when the ... Dial.Timeout fires (in two seconds)").
+/// Go's client allows 5 seconds in all, but a metadata server answers
+/// within the connection, so a longer wait only delays machines off Google
+/// Cloud.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A test host's probe address, in place of [`PROBE_URL`]. A test host
+/// without it is not probed, so no test reaches the network. Read only in
+/// tests.
+pub(super) const PROBE_OVERRIDE: &str = "OCYNC_TEST_GOOGLE_PROBE";
+
+/// Whether `host` is on Google Cloud, as Google's Go library
+/// `cloud.google.com/go/compute/metadata` decides in `OnGCE` and
+/// `testOnGCE`: `GCE_METADATA_HOST` set means the user said so, and the DMI
+/// product name `Google` or `Google Compute Engine` (every Compute Engine
+/// and GKE node) means it is. A name that says otherwise is not final,
+/// because Cloud Run's first generation and Cloud Functions have no Google
+/// DMI but do have a metadata server, so one probe asks the metadata IP
+/// whether it is there (see [`probe`]). Go races that request against a DNS
+/// lookup of `metadata.google.internal` and takes the first answer; this
+/// asks the IP alone. Windows, where this does not read the registry, is
+/// taken to be on it so the metadata server is asked, as upstream does.
+pub(super) async fn is_on_google_cloud(host: &Host) -> bool {
     if host.env.get(HOST_VARIABLE).is_some() {
         return true;
     }
     match host.platform {
         Platform::Windows => true,
-        Platform::Unix => host
-            .fs
-            .read(std::path::Path::new(PRODUCT_NAME_FILE))
-            .is_ok_and(|name| matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")),
+        Platform::Unix => {
+            let named = host
+                .fs
+                .read(std::path::Path::new(PRODUCT_NAME_FILE))
+                .is_ok_and(|name| {
+                    matches!(name.trim_ascii(), b"Google" | b"Google Compute Engine")
+                });
+            named || probe(probe_url(host), PROBE_TIMEOUT).await
+        }
     }
+}
+
+/// The address to probe, or `None` for no probe.
+fn probe_url(host: &Host) -> Option<Url> {
+    let default = Url::parse(PROBE_URL).expect("PROBE_URL is a URL");
+    if cfg!(test) {
+        host.env
+            .get(PROBE_OVERRIDE)
+            .map(|url| Url::parse(&url).expect("a probe URL"))
+    } else {
+        Some(default)
+    }
+}
+
+/// Whether a metadata server answers `url` within `timeout`: one request,
+/// not sent again, whose answer carries `Metadata-Flavor: Google`, as Go's
+/// `metadataRequestStrategy` requires. The EC2 instance metadata service
+/// answers on the same IP without that header, so on EC2 this is `false`, as
+/// it is for a timeout, a refusal or any other answer. No proxy and no
+/// redirect, so nothing leaves for another host.
+async fn probe(url: Option<Url>, timeout: Duration) -> bool {
+    let Some(url) = url else {
+        return false;
+    };
+    crate::install_crypto_provider();
+    let Ok(client) = crate::aws::credential_endpoint_client(Timeouts {
+        connect: timeout,
+        read: timeout,
+    })
+    .timeout(timeout)
+    .build() else {
+        return false;
+    };
+    client
+        .get(url)
+        .header(FLAVOR.0, FLAVOR.1)
+        .send()
+        .await
+        .is_ok_and(|response| {
+            response
+                .headers()
+                .get(FLAVOR.0)
+                .is_some_and(|flavor| flavor == FLAVOR.1)
+        })
 }
 
 /// The metadata server's token endpoint.
@@ -180,29 +249,87 @@ mod tests {
 
     /// A host is on Google Cloud when `GCE_METADATA_HOST` is set or its DMI
     /// product name is Google's, and off it otherwise, whatever else the
-    /// name says. Breaks if a rule is dropped, a near name matches, or the
-    /// name is read from the real file system.
-    #[test]
-    fn residency_follows_googles_rule() {
+    /// name says, when nothing answers a probe. Breaks if a rule is dropped,
+    /// a near name matches, or the name is read from the real file system.
+    #[tokio::test]
+    async fn residency_follows_googles_rule() {
         let on = |vars: &[(&str, &str)], name: Option<&[u8]>| {
             let files: Vec<(&str, Vec<u8>)> = name
                 .map(|name| (PRODUCT_NAME_FILE, name.to_vec()))
                 .into_iter()
                 .collect();
-            is_on_google_cloud(&crate::google::tests::host(Platform::Unix, vars, &files))
+            let host = crate::google::tests::host(Platform::Unix, vars, &files);
+            async move { is_on_google_cloud(&host).await }
         };
-        assert!(on(&[(HOST_VARIABLE, "10.0.0.1")], None));
-        assert!(on(&[], Some(b"Google Compute Engine\n")));
-        assert!(on(&[], Some(b"Google")));
-        assert!(!on(&[], None));
-        assert!(!on(&[], Some(b"Dell Inc.")));
-        assert!(!on(&[], Some(b"Google Compute Engine Plus")));
-        assert!(!on(&[], Some(b"")));
-        assert!(is_on_google_cloud(&crate::google::tests::host(
-            Platform::Windows,
-            &[],
-            &[]
-        )));
+        assert!(on(&[(HOST_VARIABLE, "10.0.0.1")], None).await);
+        assert!(on(&[], Some(b"Google Compute Engine\n")).await);
+        assert!(on(&[], Some(b"Google")).await);
+        assert!(!on(&[], None).await);
+        assert!(!on(&[], Some(b"Dell Inc.")).await);
+        assert!(!on(&[], Some(b"Google Compute Engine Plus")).await);
+        assert!(!on(&[], Some(b"")).await);
+        assert!(is_on_google_cloud(&crate::google::tests::host(Platform::Windows, &[], &[])).await);
+    }
+
+    /// A machine whose DMI is not Google's is on Google Cloud when the
+    /// metadata IP answers with `Metadata-Flavor: Google`, as Cloud Run and
+    /// Cloud Functions do, and not when it answers without it, as the EC2
+    /// instance metadata service does, or answers nothing in time or at all.
+    /// Breaks if any answer counts, the header is not required, the
+    /// request is sent again, or the wait outlasts the timeout.
+    #[tokio::test]
+    async fn a_probe_needs_the_google_flavor_header() {
+        let probed = |server: &MockServer| {
+            let url = server.uri();
+            let host = crate::google::tests::host(Platform::Unix, &[(PROBE_OVERRIDE, &url)], &[]);
+            async move { is_on_google_cloud(&host).await }
+        };
+
+        let google = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .and(header("metadata-flavor", "Google"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Metadata-Flavor", "Google"))
+            .expect(1)
+            .mount(&google)
+            .await;
+        assert!(probed(&google).await);
+
+        let ec2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Server", "EC2ws"))
+            .expect(1)
+            .mount(&ec2)
+            .await;
+        assert!(!probed(&ec2).await);
+
+        let wrong = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("Metadata-Flavor", "Other"))
+            .expect(1)
+            .mount(&wrong)
+            .await;
+        assert!(!probed(&wrong).await);
+
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Metadata-Flavor", "Google")
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .expect(1)
+            .mount(&slow)
+            .await;
+        let started = std::time::Instant::now();
+        assert!(!probe(Url::parse(&slow.uri()).ok(), Duration::from_millis(200)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}/", listener.local_addr().unwrap())
+        };
+        assert!(!probe(Url::parse(&closed).ok(), PROBE_TIMEOUT).await);
     }
 
     /// Upstream `token_provider_full` and `headers_success_with_quota_project`:
