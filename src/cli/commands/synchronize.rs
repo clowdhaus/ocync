@@ -1060,16 +1060,7 @@ pub(crate) async fn build_clients(
         }
         // Token minting is a round trip; track it so a wedged provider is named.
         let _item = tracker.track(name);
-        let built = build_registry_client(Registry::Configured(reg), credentials)
-            .await
-            .and_then(|client| {
-                // Every use of the client keys the cache by its address.
-                client
-                    .registry_authority()
-                    .map_err(|e| CliError::Input(format!("registry '{name}': {e}")))?;
-                Ok(client)
-            });
-        let entry = match built {
+        let entry = match build_registry_client(Registry::Configured(reg), credentials).await {
             Ok(client) => Ok(Arc::new(client)),
             Err(err) => {
                 tracing::error!(
@@ -1425,18 +1416,12 @@ fn build_targets(
     let mut worst_err: Option<CliError> = None;
     let mut codes = Vec::new();
     for name in target_names {
-        let entry = client_for(clients, &name, from, RegistryRole::Target).and_then(|client| {
-            // `build_clients` already rejected a client without an address, once
-            // per registry; this only guards a client map built elsewhere.
-            TargetEntry::new(
+        match client_for(clients, &name, from, RegistryRole::Target) {
+            Ok(client) => targets.push(TargetEntry::new(
                 RegistryAlias::new(&name),
                 client,
                 batch_checkers.get(&name).cloned(),
-            )
-            .map_err(|e| CliError::Input(format!("target '{name}' of mapping '{from}': {e}")))
-        });
-        match entry {
-            Ok(entry) => targets.push(entry),
+            )),
             Err(err) => {
                 dropped.push(DroppedTarget {
                     from: from.to_owned(),
@@ -1616,9 +1601,7 @@ async fn resolve_mapping_inner(
         })
         .transpose()?;
 
-    let source_authority = source_client
-        .registry_authority()
-        .map_err(|e| CliError::Input(format!("mapping '{}': {e}", mapping.from)))?;
+    let source_authority = source_client.registry_authority().clone();
 
     let head_first = config
         .registries
@@ -1638,7 +1621,7 @@ async fn resolve_mapping_inner(
         // its own AIMD window. Clients are cloned out so the listings do not
         // borrow `targets`, which is mutated below.
         let target_clients: Vec<Arc<RegistryClient>> =
-            targets.iter().map(|e| Arc::clone(&e.client)).collect();
+            targets.iter().map(|e| Arc::clone(e.client())).collect();
         let listings: Vec<Result<Vec<String>, ocync_distribution::Error>> =
             futures_util::stream::iter(
                 target_clients

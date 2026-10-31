@@ -119,7 +119,7 @@ pub fn snap_key(repo: &str, tag: &str) -> SnapshotKey {
 
 /// A [`TargetEntry`] without a batch checker.
 pub fn target_entry(name: &str, client: Arc<ocync_distribution::RegistryClient>) -> TargetEntry {
-    TargetEntry::new(RegistryAlias::new(name), client, None).unwrap()
+    TargetEntry::new(RegistryAlias::new(name), client, None)
 }
 
 /// A `ResolvedMapping` with no platform filter or immutable glob and the

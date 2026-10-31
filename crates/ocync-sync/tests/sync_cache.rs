@@ -458,10 +458,13 @@ async fn sync_cache_does_not_carry_blobs_to_a_new_target_address() {
 }
 
 /// Two config entries for one host keep separate cache state: an earlier run
-/// left both believing the registry holds the blobs, it holds none, and both
-/// first manifest PUTs are refused. Each image repairs for itself. Were the
-/// entries to share state, the second would find the first's repair already
-/// recorded as lost and fail instead of uploading its own blobs.
+/// left both believing the registry holds the blobs, it holds none, and each
+/// entry's image has its first manifest PUT refused. Each image repairs for
+/// itself. Were the entries to share state, one image's repair would leave the
+/// other nothing recorded as lost, and it would fail instead of uploading.
+///
+/// The entries sync different tags, so each refusal mock matches one image's
+/// manifest path and the test does not depend on request order.
 #[tokio::test]
 async fn sync_two_aliases_at_one_address_each_repair_a_refused_manifest() {
     let source_server = MockServer::start().await;
@@ -471,39 +474,26 @@ async fn sync_two_aliases_at_one_address_each_repair_a_refused_manifest() {
         .layer(b"twin-layer")
         .build();
     parts.mount_source(&source_server, "repo", "v1").await;
-    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    mount_source_manifest(&source_server, "repo", "v2", &parts.bytes).await;
     parts.mount_target_blob_misses(&target_server, "repo").await;
-
-    // Each entry uploads both blobs. The slow PUT keeps both first manifest
-    // PUTs ahead of any repair, so both are refused.
-    let session = "/v2/repo/blobs/uploads/upload-id";
-    Mock::given(method("POST"))
-        .and(path("/v2/repo/blobs/uploads/"))
-        .respond_with(ResponseTemplate::new(202).insert_header("location", session))
-        .expect(4)
-        .named("blob upload POST")
-        .mount(&target_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path(session))
-        .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_millis(200)))
-        .expect(4)
-        .named("blob upload PUT")
-        .mount(&target_server)
-        .await;
-    Mock::given(method("PUT"))
-        .and(path("/v2/repo/manifests/v1"))
-        .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
-        .up_to_n_times(2)
-        .expect(2)
-        .named("refused manifest PUT")
-        .mount(&target_server)
-        .await;
-    manifest_push_mock("repo", "v1")
-        .expect(2)
-        .named("repaired manifest PUT")
-        .mount(&target_server)
-        .await;
+    // Each entry uploads both blobs.
+    mount_blob_push_expecting(&target_server, "repo", 4, "twin entries").await;
+    for tag in ["v1", "v2"] {
+        mount_manifest_head_not_found(&target_server, "repo", tag).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/v2/repo/manifests/{tag}")))
+            .respond_with(ResponseTemplate::new(400).set_body_string(MANIFEST_BLOB_UNKNOWN))
+            .up_to_n_times(1)
+            .expect(1)
+            .named(format!("refused manifest PUT {tag}"))
+            .mount(&target_server)
+            .await;
+        manifest_push_mock("repo", tag)
+            .expect(1)
+            .named(format!("repaired manifest PUT {tag}"))
+            .mount(&target_server)
+            .await;
+    }
 
     let cache = empty_cache();
     for alias in ["first", "second"] {
@@ -514,17 +504,17 @@ async fn sync_two_aliases_at_one_address_each_repair_a_refused_manifest() {
                 .set_blob_completed(&id, digest.clone(), repo("repo"));
         }
     }
-    let mapping = resolved_mapping(
-        mock_client(&source_server),
-        "repo",
-        "repo",
-        vec![
-            target_entry("first", mock_client(&target_server)),
-            target_entry("second", mock_client(&target_server)),
-        ],
-        vec![TagPair::same("v1")],
-    );
-    let report = run_sync_with_cache(vec![mapping], cache).await;
+    let mapping = |alias: &str, tag: &str| {
+        resolved_mapping(
+            mock_client(&source_server),
+            "repo",
+            "repo",
+            vec![target_entry(alias, mock_client(&target_server))],
+            vec![TagPair::same(tag)],
+        )
+    };
+    let report =
+        run_sync_with_cache(vec![mapping("first", "v1"), mapping("second", "v2")], cache).await;
 
     assert_eq!(report.images.len(), 2);
     assert_status!(report, 0, ImageStatus::Synced);

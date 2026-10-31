@@ -39,13 +39,13 @@ use ocync_distribution::spec::{
     Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, PlatformFilter,
     RegistryAuthority, RepositoryName,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferStateCache};
 use crate::error::ManifestRefusal;
+pub use crate::plan::{RegistryAlias, TargetId};
 use crate::progress::RunProgress;
 use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
 use crate::shared::{
@@ -107,67 +107,6 @@ struct ImageRef {
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.repo, self.tag)
-    }
-}
-
-/// A registry identifier used as the in-run copy and failure key.
-///
-/// The config-defined name (e.g. `us-ecr`) or the bare hostname for ad-hoc
-/// commands. Must be unique per mapping. Within one run an alias has one
-/// address; the transfer state cache, which outlives a config edit, keys by
-/// [`TargetId`] instead.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RegistryAlias(String);
-
-impl RegistryAlias {
-    /// Create a new registry alias.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-}
-
-impl std::ops::Deref for RegistryAlias {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for RegistryAlias {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Key of a target in the transfer state cache: the config entry and the
-/// address it served when the state was recorded.
-///
-/// The address makes a changed `url` under a kept alias a new key, so the cache
-/// never credits the new registry with the old one's blobs. The alias keeps two
-/// entries for one host apart, as their clients (and so credentials and
-/// outcomes) are.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TargetId {
-    /// Config entry name.
-    alias: RegistryAlias,
-    /// Address the entry's client talks to.
-    authority: RegistryAuthority,
-}
-
-impl TargetId {
-    /// Key for the entry `alias` served at `authority`.
-    pub fn new(alias: RegistryAlias, authority: RegistryAuthority) -> Self {
-        Self { alias, authority }
-    }
-
-    /// The config entry name.
-    pub fn alias(&self) -> &RegistryAlias {
-        &self.alias
-    }
-
-    /// The registry address.
-    pub fn authority(&self) -> &RegistryAuthority {
-        &self.authority
     }
 }
 
@@ -274,8 +213,9 @@ pub struct TargetEntry {
     /// Registry identifier (unique per [`ResolvedMapping`]) and the address
     /// `client` serves. Private so the two cannot be set apart from the client.
     id: TargetId,
-    /// Client for this target registry.
-    pub client: Arc<RegistryClient>,
+    /// Client for this target registry. Private with `id`, whose address it
+    /// serves.
+    client: Arc<RegistryClient>,
     /// Optional batch blob checker for this target (ECR batch API). When
     /// present, one batch call pre-populates the cache instead of per-blob HEADs.
     pub batch_checker: Option<Rc<dyn BatchBlobChecker>>,
@@ -290,32 +230,16 @@ pub struct TargetEntry {
 
 impl TargetEntry {
     /// An entry for the registry `name` reached through `client`, with no
-    /// existing tags.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the client's URL has no host to key the cache by.
+    /// existing tags. The cache key pairs `name` with the client's address.
     pub fn new(
         name: RegistryAlias,
         client: Arc<RegistryClient>,
         batch_checker: Option<Rc<dyn BatchBlobChecker>>,
-    ) -> Result<Self, ocync_distribution::Error> {
-        let id = TargetId::new(name, client.registry_authority()?);
-        Ok(Self {
-            id,
+    ) -> Self {
+        Self {
+            id: TargetId::new(name, client.registry_authority().clone()),
             client,
             batch_checker,
-            existing_tags: HashSet::new(),
-        })
-    }
-
-    /// A copy that carries no existing tags, for a caller that only needs the
-    /// registry.
-    fn without_existing_tags(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            client: Arc::clone(&self.client),
-            batch_checker: self.batch_checker.clone(),
             existing_tags: HashSet::new(),
         }
     }
@@ -329,13 +253,20 @@ impl TargetEntry {
     pub fn id(&self) -> &TargetId {
         &self.id
     }
+
+    /// The client for this target registry.
+    pub fn client(&self) -> &Arc<RegistryClient> {
+        &self.client
+    }
 }
 
 impl Clone for TargetEntry {
     fn clone(&self) -> Self {
         Self {
+            id: self.id.clone(),
+            client: Arc::clone(&self.client),
+            batch_checker: self.batch_checker.clone(),
             existing_tags: self.existing_tags.clone(),
-            ..self.without_existing_tags()
         }
     }
 }
@@ -492,17 +423,14 @@ struct TransferTask {
     source_data: Rc<PulledManifest>,
     /// Source client for pulling blobs.
     source_client: Arc<RegistryClient>,
-    /// Target registry name and address: the alias keys in-run state and
-    /// labels logs, the pair keys the transfer state cache.
-    target_id: TargetId,
-    /// Target client for pushing.
-    target_client: Arc<RegistryClient>,
+    /// The target registry: its alias keys in-run state and labels logs, its
+    /// id keys the transfer state cache, and it carries the client to push
+    /// with and the optional batch checker.
+    target_entry: Rc<TargetEntry>,
     /// Source image reference (repo + tag, for display/logging and blob pulls).
     source: ImageRef,
     /// Target image reference (repo + tag, for pushing manifests and blobs).
     target: ImageRef,
-    /// Optional batch blob checker for pre-populating the cache.
-    batch_checker: Option<Rc<dyn BatchBlobChecker>>,
     /// Artifact sync configuration (Rc-shared with mapping).
     artifacts_config: Rc<ResolvedArtifacts>,
     /// Retries made discovering this image, counted into its total.
@@ -945,6 +873,8 @@ impl SyncEngine {
         let mut next_heartbeat = tokio::time::Instant::now() + self.heartbeat_interval;
 
         for mapping in &mappings {
+            let targets: Vec<Rc<TargetEntry>> =
+                mapping.targets.iter().cloned().map(Rc::new).collect();
             for tag_pair in &mapping.tags {
                 // Tier 1: immutable tag skip (0 API calls).
                 if mapping.should_skip_immutable(&tag_pair.target) {
@@ -987,7 +917,7 @@ impl SyncEngine {
                         repo: mapping.target_repo.clone(),
                         tag: tag_pair.target.clone(),
                     },
-                    targets: mapping.targets.clone(),
+                    targets: targets.clone(),
                     retry: self.retry.clone(),
                     platforms: mapping.platforms.clone(),
                     cache: Rc::clone(&cache),
@@ -1179,15 +1109,11 @@ impl SyncEngine {
                             if let Some(remaining) = client.rate_limit_remaining() {
                                 if remaining < threshold {
                                     discovery_paused = true;
-                                    let registry = client
-                                        .registry_authority()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|_| "unknown".into());
                                     warn!(
                                         rate_limit_remaining = remaining,
                                         remaining_discovery,
                                         threshold,
-                                        %registry,
+                                        registry = client.registry_authority().as_str(),
                                         "rate-limit budget low, pausing discovery"
                                     );
                                     break;
@@ -1269,7 +1195,7 @@ struct DiscoveryParams {
     source_authority: RegistryAuthority,
     source: ImageRef,
     target: ImageRef,
-    targets: Vec<TargetEntry>,
+    targets: Vec<Rc<TargetEntry>>,
     retry: RetryConfig,
     platforms: Option<Vec<PlatformFilter>>,
     cache: Rc<RefCell<TransferStateCache>>,
@@ -1460,7 +1386,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
 /// Parameters for [`check_targets_against_digest`].
 struct TargetCheckParams<'a> {
-    targets: &'a [TargetEntry],
+    targets: &'a [Rc<TargetEntry>],
     source: &'a ImageRef,
     target: &'a ImageRef,
     compare_digest: &'a Digest,
@@ -1473,7 +1399,7 @@ struct TargetCheckResult {
     /// Targets whose HEAD matched the compare digest.
     skipped: Vec<ImageResult>,
     /// Targets whose HEAD did not match or failed (need sync).
-    mismatched: Vec<TargetEntry>,
+    mismatched: Vec<Rc<TargetEntry>>,
 }
 
 /// HEAD-check all targets concurrently against a known digest: the cached
@@ -1490,7 +1416,10 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
     let mut head_checks = FuturesUnordered::new();
     for entry in targets {
         head_checks.push(async move {
-            let result = entry.client.manifest_head(&target.repo, &target.tag).await;
+            let result = entry
+                .client()
+                .manifest_head(&target.repo, &target.tag)
+                .await;
             (entry, result)
         });
     }
@@ -1525,7 +1454,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                         "target manifest HEAD failed during {label}, proceeding with sync"
                     );
                 }
-                mismatched.push(entry.without_existing_tags());
+                mismatched.push(Rc::clone(entry));
             }
         }
     }
@@ -1542,7 +1471,7 @@ struct FullPullParams<'a> {
     shared: &'a PerRun,
     source: &'a ImageRef,
     target: &'a ImageRef,
-    targets: &'a [TargetEntry],
+    targets: &'a [Rc<TargetEntry>],
     skipped_results: Vec<ImageResult>,
     retry: &'a RetryConfig,
     platforms: Option<&'a [PlatformFilter]>,
@@ -1618,7 +1547,10 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
     let mut head_checks = FuturesUnordered::new();
     for entry in targets {
         head_checks.push(async move {
-            let result = entry.client.manifest_head(&target.repo, &target.tag).await;
+            let result = entry
+                .client()
+                .manifest_head(&target.repo, &target.tag)
+                .await;
             (entry, result)
         });
     }
@@ -1655,11 +1587,9 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                 active_items.push(TransferTask {
                     source_data: Rc::clone(&source_data),
                     source_client: Arc::clone(source_client),
-                    target_id: entry.id().clone(),
-                    target_client: Arc::clone(&entry.client),
+                    target_entry: Rc::clone(entry),
                     source: source.clone(),
                     target: target.clone(),
-                    batch_checker: entry.batch_checker.clone(),
                     artifacts_config: Rc::clone(artifacts_config),
                     discovery_retries: retries_made(),
                 });
@@ -1696,22 +1626,22 @@ async fn execute_item(
         shared,
         source_client: &item.source_client,
         source_repo: &item.source.repo,
-        target_client: &item.target_client,
-        target_id: &item.target_id,
+        target_client: item.target_entry.client(),
+        target_id: item.target_entry.id(),
         target_repo: &item.target.repo,
-        batch_checker: item.batch_checker.as_ref(),
+        batch_checker: item.target_entry.batch_checker.as_ref(),
         mount_source_wait_deadline,
     };
     let mut outcome =
         transfer_image_blobs(&ctx, blobs_from_manifest(&item.source_data), freq_counts).await;
 
     if let Some(err) = outcome.error.take() {
-        warn!(target_name = %item.target_id.alias(), error = %err, "blob transfer failed");
+        warn!(target_name = %item.target_entry.id().alias(), error = %err, "blob transfer failed");
         // Unblock followers waiting on this repo's manifest commit; they
         // fall through to HEAD+push.
         cache
             .borrow_mut()
-            .notify_repo_failed(&item.target_id, &item.target.repo);
+            .notify_repo_failed(item.target_entry.id(), &item.target.repo);
         let status = failed_status(ErrorKind::BlobTransfer, &err);
         return outcome.into_result(&item.source, &item.target, status, start);
     }
@@ -1725,7 +1655,7 @@ async fn execute_item(
             // cross-repo mount source.
             cache
                 .borrow_mut()
-                .mark_repo_committed(&item.target_id, &item.target.repo);
+                .mark_repo_committed(item.target_entry.id(), &item.target.repo);
 
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
@@ -1776,7 +1706,7 @@ async fn execute_item(
             // Unblock followers waiting on this repo's manifest commit.
             cache
                 .borrow_mut()
-                .notify_repo_failed(&item.target_id, &item.target.repo);
+                .notify_repo_failed(item.target_entry.id(), &item.target.repo);
 
             if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
@@ -1790,7 +1720,7 @@ async fn execute_item(
                 };
                 outcome.into_result(&item.source, &item.target, status, start)
             } else {
-                warn!(target_name = %item.target_id.alias(), error = %err, "manifest push failed");
+                warn!(target_name = %item.target_entry.id().alias(), error = %err, "manifest push failed");
                 // A refused manifest's repair can fail copying a blob.
                 let kind = if err.is_blob_transfer() {
                     ErrorKind::BlobTransfer
@@ -2639,8 +2569,9 @@ async fn push_manifests(
     let (retry, shared) = (ctx.retry, ctx.shared);
     let target_repo = &item.target.repo;
     let source_data = &item.source_data;
-    let child_key =
-        |child: &ManifestPull| target_key(item.target_id.alias(), target_repo, &child.digest);
+    let child_key = |child: &ManifestPull| {
+        target_key(item.target_entry.id().alias(), target_repo, &child.digest)
+    };
 
     // Claim before waiting on blob availability, so tasks sharing an index
     // split its children instead of each waiting on all of them.
@@ -2709,7 +2640,7 @@ async fn push_manifests(
 /// non-zero. ECR's manifest validator can lag blob PUT-201s; on timeout the
 /// push goes ahead and `with_retry` catches any residual `BLOB_UPLOAD_UNKNOWN`.
 async fn wait_for_commit(item: &TransferTask, retry: &RetryConfig, digests: &[Digest]) {
-    let Some(checker) = item.batch_checker.as_deref() else {
+    let Some(checker) = item.target_entry.batch_checker.as_deref() else {
         return;
     };
     if retry.manifest_commit_wait.is_zero() || digests.is_empty() {
@@ -2906,7 +2837,7 @@ async fn discover_and_sync_artifacts(
         let push_key = copy_key(
             &item.source_client,
             &item.source.repo,
-            item.target_id.alias(),
+            item.target_entry.id().alias(),
             &item.target.repo,
             &desc.digest,
         );
@@ -3406,11 +3337,11 @@ mod tests {
         TransferTask {
             source_data,
             source_client: Arc::clone(&client),
-            target_id: TargetId::new(
+            target_entry: Rc::new(TargetEntry::new(
                 RegistryAlias::new("test-target"),
-                client.registry_authority().unwrap(),
-            ),
-            target_client: client,
+                client,
+                None,
+            )),
             source: ImageRef {
                 repo: RepositoryName::new(format!("source/{tag}")).unwrap(),
                 tag: tag.to_owned(),
@@ -3419,7 +3350,6 @@ mod tests {
                 repo: RepositoryName::new(format!("target/{tag}")).unwrap(),
                 tag: tag.to_owned(),
             },
-            batch_checker: None,
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
             discovery_retries: 0,
         }

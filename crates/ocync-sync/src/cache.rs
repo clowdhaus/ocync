@@ -25,8 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::engine::TargetId;
-use crate::plan::{BlobDedupMap, ClaimAction, RepoBlobState, get_or_default, get_or_insert_with};
+use crate::plan::{BlobDedupMap, ClaimAction, RepoBlobState, TargetId};
 
 /// Cache file format version. Bump when the layout or the meaning of a key
 /// changes; a mismatched file is discarded and rebuilt.
@@ -241,7 +240,10 @@ impl TransferStateCache {
             .map(|(r, _)| r.clone())
             .collect();
 
-        let watches = get_or_default(&mut self.repo_resolved_watches, target);
+        let watches = self
+            .repo_resolved_watches
+            .entry(target.clone())
+            .or_default();
         candidates
             .into_iter()
             .filter_map(|repo| {
@@ -256,10 +258,10 @@ impl TransferStateCache {
 
     /// Record that a repo's manifest is committed, waking its watchers.
     pub fn mark_repo_committed(&mut self, target: &TargetId, repo: &RepositoryName) {
-        let committed = get_or_default(&mut self.committed_repos, target);
-        if !committed.contains(repo) {
-            committed.insert(repo.clone());
-        }
+        self.committed_repos
+            .entry(target.clone())
+            .or_default()
+            .insert(repo.clone());
         self.resolve_repo_watch(target, repo);
     }
 
@@ -270,8 +272,13 @@ impl TransferStateCache {
 
     /// Fire the repo's watch, creating it if no follower has subscribed yet.
     fn resolve_repo_watch(&mut self, target: &TargetId, repo: &RepositoryName) {
-        let watches = get_or_default(&mut self.repo_resolved_watches, target);
-        get_or_insert_with(watches, repo, || watch::channel(false).0).send_replace(true);
+        let tx = self
+            .repo_resolved_watches
+            .entry(target.clone())
+            .or_default()
+            .entry(repo.clone())
+            .or_insert_with(|| watch::channel(false).0);
+        tx.send_replace(true);
     }
 
     /// Start a run from the blob state a reload from disk would give: every
@@ -328,10 +335,14 @@ impl TransferStateCache {
         self.snapshots.retain(|k, _| live_keys.contains(k));
     }
 
-    /// Remove dedup entries for targets not in `live_targets`. Call after each
-    /// sync cycle so targets dropped from config do not grow the cache without
-    /// bound.
+    /// Remove blob state, committed repos and commit watches for targets not in
+    /// `live_targets`. Call after each sync cycle so targets dropped from
+    /// config do not grow the cache without bound.
     pub fn prune_dedup(&mut self, live_targets: &HashSet<TargetId>) {
+        self.committed_repos
+            .retain(|target, _| live_targets.contains(target));
+        self.repo_resolved_watches
+            .retain(|target, _| live_targets.contains(target));
         let removed = self.dedup.retain_targets(live_targets);
         if removed > 0 {
             tracing::debug!(removed, "pruned stale dedup entries for removed targets");
@@ -413,7 +424,7 @@ impl TransferStateCache {
             })?;
 
         if header.version != CACHE_VERSION {
-            info!(
+            warn!(
                 path = %path.display(),
                 version = header.version,
                 expected = CACHE_VERSION,
@@ -642,6 +653,27 @@ mod tests {
             cache.mark_repo_committed(&target_id("reg.io"), &repo(left));
             assert!(*receivers[0].borrow(), "{name}: the watch left is {left}'s");
         }
+    }
+
+    /// Pruning drops every per-target map for a target no longer in the
+    /// config, not only its blob state, and leaves the live target alone.
+    #[test]
+    fn prune_dedup_drops_committed_repos_and_watches_of_removed_targets() {
+        let (live, gone) = (target_id("live.io"), target_id("gone.io"));
+        let mut cache = TransferStateCache::new();
+        for t in [&live, &gone] {
+            cache.set_blob_completed(t, test_digest(), repo("repo/a"));
+            cache.mark_repo_committed(t, &repo("repo/a"));
+        }
+
+        cache.prune_dedup(&HashSet::from([live.clone()]));
+
+        assert!(cache.blob_present_at(&live, &test_digest(), &repo("repo/a")));
+        assert!(cache.committed_repos.contains_key(&live));
+        assert!(cache.repo_resolved_watches.contains_key(&live));
+        assert!(!cache.blob_present_at(&gone, &test_digest(), &repo("repo/a")));
+        assert!(!cache.committed_repos.contains_key(&gone));
+        assert!(!cache.repo_resolved_watches.contains_key(&gone));
     }
 
     #[tokio::test(flavor = "current_thread")]

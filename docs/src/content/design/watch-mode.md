@@ -87,7 +87,7 @@ When platform filtering is active but no source platforms match the filter (e.g.
 
 > **Status: Planned.** SIGHUP handling is designed but not yet implemented. The tag digest cache and discovery optimization described in this document are implemented.
 
-On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP since blob existence is independent of config.
+On SIGHUP config reload, the tag digest cache is cleared to force full source re-verification. Platform filter changes are detected by the platform_filter_key, but other config changes (source registry URL, repository mappings) could make cached entries stale. The blob dedup map is preserved across SIGHUP, except for a registry entry whose `url` changed: that entry's blobs are keyed by its address and start cold.
 
 End-of-cycle pruning evicts entries for tags no longer present in the resolved mapping, preventing unbounded cache growth when source tags are deleted or tag filters change.
 

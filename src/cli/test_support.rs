@@ -55,7 +55,7 @@ pub(crate) fn mapping_with_tags_and_report(
         source_client: client.clone(),
         source_repo: RepositoryName::new("repo").unwrap(),
         target_repo: RepositoryName::new("repo").unwrap(),
-        targets: vec![TargetEntry::new(RegistryAlias::new("target"), client, None).unwrap()],
+        targets: vec![TargetEntry::new(RegistryAlias::new("target"), client, None)],
         tags,
         platforms: None,
         head_first: false,

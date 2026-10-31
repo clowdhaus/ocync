@@ -1,14 +1,74 @@
 //! Per-(repo) blob state and upload-claim coordination for mount support.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
 use ocync_distribution::Digest;
-use ocync_distribution::spec::RepositoryName;
+use ocync_distribution::spec::{RegistryAuthority, RepositoryName};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
-use crate::engine::TargetId;
+/// A registry identifier used as the in-run copy and failure key.
+///
+/// The config-defined name (e.g. `us-ecr`) or the bare hostname for ad-hoc
+/// commands. Must be unique per mapping. Within one run an alias has one
+/// address; the transfer state cache, which outlives a config edit, keys by
+/// [`TargetId`] instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RegistryAlias(String);
+
+impl RegistryAlias {
+    /// Create a new registry alias.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+}
+
+impl std::ops::Deref for RegistryAlias {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RegistryAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Key of a target in the transfer state cache: the config entry and the
+/// address it served when the state was recorded.
+///
+/// The address makes a changed `url` under a kept alias a new key, so the cache
+/// never credits the new registry with the old one's blobs. The alias keeps two
+/// entries for one host apart, as their clients (and so credentials and
+/// outcomes) are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TargetId {
+    /// Config entry name.
+    alias: RegistryAlias,
+    /// Address the entry's client talks to.
+    authority: RegistryAuthority,
+}
+
+impl TargetId {
+    /// Key for the entry `alias` served at `authority`.
+    pub fn new(alias: RegistryAlias, authority: RegistryAuthority) -> Self {
+        Self { alias, authority }
+    }
+
+    /// The config entry name.
+    pub fn alias(&self) -> &RegistryAlias {
+        &self.alias
+    }
+
+    /// The registry address.
+    pub fn authority(&self) -> &RegistryAuthority {
+        &self.authority
+    }
+}
 
 /// State of a blob at a single (target, repo) pair.
 ///
@@ -77,31 +137,6 @@ pub(crate) struct BlobInfo {
     pub(crate) claim_notify: Option<Rc<Notify>>,
 }
 
-/// The value at `key`, inserted as its default on a miss. Unlike
-/// `entry(key.clone())`, an existing key is not cloned.
-pub(crate) fn get_or_insert_with<'m, K, V>(
-    map: &'m mut HashMap<K, V>,
-    key: &K,
-    make: impl FnOnce() -> V,
-) -> &'m mut V
-where
-    K: Clone + Eq + std::hash::Hash,
-{
-    if !map.contains_key(key) {
-        map.insert(key.clone(), make());
-    }
-    map.get_mut(key).expect("present: inserted above")
-}
-
-/// [`get_or_insert_with`] with the value's default.
-pub(crate) fn get_or_default<'m, K, V>(map: &'m mut HashMap<K, V>, key: &K) -> &'m mut V
-where
-    K: Clone + Eq + std::hash::Hash,
-    V: Default,
-{
-    get_or_insert_with(map, key, V::default)
-}
-
 /// Per-registry index of tracked blobs.
 type BlobIndex = HashMap<Digest, BlobInfo>;
 
@@ -113,7 +148,11 @@ pub(crate) struct BlobDedupMap {
 
 impl BlobDedupMap {
     fn entry_mut(&mut self, target: &TargetId, digest: &Digest) -> &mut BlobInfo {
-        get_or_default(get_or_default(&mut self.inner, target), digest)
+        self.inner
+            .entry(target.clone())
+            .or_default()
+            .entry(digest.clone())
+            .or_default()
     }
 
     /// The recorded state of a blob at one (target, repo), if any.
