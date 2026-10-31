@@ -1725,6 +1725,102 @@ async fn sync_blob_failure_releases_the_claim_of_a_blob_queued_for_a_permit() {
     );
 }
 
+/// A blob waiting on another task's source pull (staging dedup) ends its wait
+/// when another blob of its image fails, and gives up its claim. Image A pulls
+/// the shared layer slowly. Image B waits for that pull, and B's own layer
+/// fails to pull. B is reported failed at once. Image C, at B's target, waits
+/// on B's claim of the shared layer, and finishes once A's pull has staged it.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_blob_failure_ends_a_staging_wait_and_releases_the_claim() {
+    const SLOW_PULL: Duration = Duration::from_secs(6);
+    const FAILURE_DELAY: Duration = Duration::from_secs(1);
+    let source_server = MockServer::start().await;
+    // A has its own target: claims are per target, so B reaches the staging
+    // wait instead of waiting on A's claim.
+    let target_a = MockServer::start().await;
+    let target_bc = MockServer::start().await;
+
+    let shared = b"staging-cancel-shared";
+    let parts_a = ManifestBuilder::new(b"staging-cancel-config-a")
+        .layer(shared)
+        .build();
+    let parts_b = ManifestBuilder::new(b"staging-cancel-config-b")
+        .layer(b"staging-cancel-unpullable")
+        .layer(shared)
+        .build();
+    let parts_c = ManifestBuilder::new(b"staging-cancel-config-c")
+        .layer(shared)
+        .build();
+    parts_a
+        .mount_source_delayed(&source_server, "src-a", "v1", SLOW_PULL)
+        .await;
+    parts_b.mount_source(&source_server, "src-b", "v1").await;
+    parts_c.mount_source(&source_server, "src-c", "v1").await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v2/src-b/blobs/{}",
+            parts_b.layer_descs[0].digest
+        )))
+        .respond_with(ResponseTemplate::new(404).set_delay(FAILURE_DELAY))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+    parts_a.mount_target(&target_a, "tgt-a", "v1").await;
+    parts_b.mount_target(&target_bc, "tgt-b", "v1").await;
+    parts_c.mount_target(&target_bc, "tgt-c", "v1").await;
+
+    // Leader election breaks a tie in favor of the last image and the rest
+    // follow in order, so A pulls first, then B claims the layer, then C.
+    let mappings = [
+        ("src-b", "tgt-b", &target_bc),
+        ("src-c", "tgt-c", &target_bc),
+        ("src-a", "tgt-a", &target_a),
+    ]
+    .map(|(src, tgt, target)| {
+        mapping_with_distinct_repos(&source_server, target, src, tgt, same_tags(&["v1"]))
+    })
+    .into();
+    let staging_dir = tempfile::tempdir().unwrap();
+    let report = tokio::time::timeout(
+        SLOW_PULL * 3,
+        SyncEngine::new(fast_retry(), concurrency(10)).run(
+            mappings,
+            empty_cache(),
+            BlobStage::new(staging_dir.path().to_path_buf()),
+            &NullProgress,
+            None,
+        ),
+    )
+    .await
+    .expect("a cancelled blob must not keep its claim");
+
+    let image = |repo: &str| {
+        report
+            .images
+            .iter()
+            .find(|i| i.target.contains(repo))
+            .unwrap_or_else(|| panic!("{repo} is reported"))
+    };
+    let failing_digest = parts_b.layer_descs[0].digest.to_string();
+    assert!(
+        matches!(
+            &image("tgt-b").status,
+            ImageStatus::Failed { error, status_code: Some(404), .. }
+                if error.contains(&failing_digest)
+        ),
+        "{:?}",
+        image("tgt-b").status
+    );
+    // The negative assertion: B ends at its own failure, not when A's pull
+    // lets the waiting layer through.
+    assert!(
+        image("tgt-b").duration < SLOW_PULL / 2,
+        "B failed after {:?}, its staging wait kept going",
+        image("tgt-b").duration
+    );
+    assert!(matches!(image("tgt-c").status, ImageStatus::Synced));
+}
+
 /// Two images share a blob and run concurrently; the blob already exists at
 /// one of their target repos. Both sync without deadlocking on the shared
 /// blob's upload claim, and the repo that has the blob never has it pushed.
