@@ -451,22 +451,40 @@ pub(crate) fn baseline_dir(commit: &CommitSha) -> PathBuf {
 fn ensure_checkout(repo: &Path, commit: &CommitSha) -> Result<(), String> {
     let err = |e: Box<dyn std::error::Error>| e.to_string();
     let dir = repo.join(baseline_dir(commit));
-    let others = std::fs::read_dir(repo.join(BASELINE_ROOT))
+    let io = |path: &Path, e: std::io::Error| format!("cannot remove {}: {e}", path.display());
+    // A checkout deleted behind git's back stays registered and would make
+    // the add refuse, and would be listed below as one to remove.
+    git(repo, &["worktree", "prune"]).map_err(err)?;
+    let registered: Vec<PathBuf> = git(repo, &["worktree", "list", "--porcelain"])
+        .map_err(err)?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter_map(|path| Path::new(path).canonicalize().ok())
+        .collect();
+    let entries = std::fs::read_dir(repo.join(BASELINE_ROOT))
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| *path != dir);
-    for other in others {
-        git(
-            repo,
-            &["worktree", "remove", "--force", &other.to_string_lossy()],
-        )
-        .map_err(err)?;
+    for other in entries {
+        // Git's own removal for a worktree, which also drops its registration;
+        // anything else in the directory is not git's to remove.
+        let is_worktree = other
+            .canonicalize()
+            .is_ok_and(|path| registered.contains(&path));
+        if is_worktree {
+            git(
+                repo,
+                &["worktree", "remove", "--force", &other.to_string_lossy()],
+            )
+            .map_err(err)?;
+        } else if other.is_dir() && !other.is_symlink() {
+            std::fs::remove_dir_all(&other).map_err(|e| io(&other, e))?;
+        } else {
+            std::fs::remove_file(&other).map_err(|e| io(&other, e))?;
+        }
     }
-    // A checkout deleted behind git's back stays registered and would make
-    // the add refuse.
-    git(repo, &["worktree", "prune"]).map_err(err)?;
 
     if !dir.join(".git").exists() {
         git(
@@ -1191,6 +1209,18 @@ mod tests {
         assert_eq!(ensure(&second), Ok(()));
         assert!(dir(&second).join(".git").exists());
         assert!(!dir(&first).exists(), "the other checkout was kept");
+
+        // Catches: a stray file or an unregistered directory in the checkout
+        // directory failing the build instead of being cleared.
+        let root = repo.join(BASELINE_ROOT);
+        std::fs::write(root.join("stray"), "x").unwrap();
+        std::fs::create_dir_all(root.join("leftover").join("nested")).unwrap();
+        assert_eq!(ensure(&second), Ok(()));
+        assert!(!root.join("stray").exists() && !root.join("leftover").exists());
+        assert!(
+            dir(&second).join(".git").exists(),
+            "the wanted one was cleared"
+        );
     }
 
     #[test]

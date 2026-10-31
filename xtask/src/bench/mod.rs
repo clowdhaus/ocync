@@ -33,15 +33,18 @@ use runner::Tool;
 /// How many rounds the sync and partial scenarios run, each round running
 /// every tool once in a fresh order.
 ///
-/// At least [`Rounds::MIN`]: the per-round ratios hold the true median with a
-/// confidence of `1 - 2 * 0.5^n`, which is 50% at 2 rounds and useless at 1.
+/// At least [`Rounds::MIN`], the fewest for which a range of per-round ratios
+/// is stated at all. It holds the true median with a confidence of
+/// `1 - 2 * 0.5^n`, and a verdict between tools needs
+/// [`stats::VERDICT_ROUNDS`].
 /// Scale and prepare run ocync alone, so they have no ratio to take and run
 /// one pass whatever this is, which is why no type for a single round exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rounds(usize);
 
 impl Rounds {
-    /// The fewest rounds that can be claimed on.
+    /// The fewest rounds a range is stated for; fewer say nothing of the
+    /// median, and fewer than [`stats::VERDICT_ROUNDS`] give no verdict.
     const MIN: usize = 3;
     /// Rounds when none are asked for.
     pub(crate) const DEFAULT: Self = Self(5);
@@ -61,9 +64,10 @@ impl std::str::FromStr for Rounds {
             .map_err(|_| format!("`{s}` is not a whole number of rounds"))?;
         if rounds < Self::MIN {
             return Err(format!(
-                "{rounds} rounds cannot separate a difference between tools from noise; \
-                 the fewest is {}",
-                Self::MIN
+                "{rounds} rounds are too few to state a range; the fewest is {}, and a \
+                 verdict between tools needs {}",
+                Self::MIN,
+                stats::VERDICT_ROUNDS
             ));
         }
         Ok(Self(rounds))
@@ -617,6 +621,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         None
     };
 
+    let mut repeated = Vec::new();
+    for transfer in &transfers {
+        let kind = match transfer {
+            Transfer::Sync { .. } => ScenarioKind::Cold,
+            Transfer::Partial { .. } => ScenarioKind::Partial,
+            Transfer::Scale => continue,
+        };
+        if !repeated.contains(&kind) {
+            repeated.push(kind);
+        }
+    }
     let mut report = BenchReport {
         timestamp,
         instance,
@@ -627,6 +642,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         prewarm,
         baseline: args.tool_selection.baseline_ref.clone(),
         rounds: args.tool_selection.rounds,
+        repeated,
         scenarios: Vec::new(),
     };
 
@@ -2043,7 +2059,10 @@ mod tests {
             }
         }
         let message = "2".parse::<Rounds>().unwrap_err();
-        assert!(message.ends_with("the fewest is 3"), "{message}");
+        assert!(
+            message.ends_with("the fewest is 3, and a verdict between tools needs 5"),
+            "{message}"
+        );
     }
 
     #[test]

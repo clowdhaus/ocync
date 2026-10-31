@@ -520,6 +520,9 @@ pub(crate) struct BenchReport {
     pub(crate) baseline: Option<CommitSha>,
     /// The rounds the run was asked for, of which a stopped run finished fewer.
     pub(crate) rounds: Rounds,
+    /// The scenarios the run planned to repeat, so that one which finished no
+    /// round still counts as zero rounds, not as absent.
+    pub(crate) repeated: Vec<ScenarioKind>,
     /// Per-scenario results, one per round of a repeated scenario.
     pub(crate) scenarios: Vec<ScenarioResult>,
 }
@@ -550,15 +553,13 @@ impl BenchReport {
         }
     }
 
-    /// The rounds asked for and the fewest any repeated scenario finished;
-    /// `None` when no scenario was repeated.
+    /// The rounds asked for and the fewest any planned repeated scenario
+    /// finished; `None` when no scenario was repeated.
     fn round_count(&self) -> Option<RoundCount> {
-        let finished = kinds(&self.scenarios)
-            .into_iter()
-            .filter_map(|kind| {
-                let rounds = rounds_of(&self.scenarios, kind);
-                rounds[0].round.map(|_| rounds.len())
-            })
+        let finished = self
+            .repeated
+            .iter()
+            .map(|&kind| rounds_of(&self.scenarios, kind).len())
             .min()?;
         let count = |n: usize| u32::try_from(n).expect("a run has fewer than 2^32 rounds");
         Some(RoundCount {
@@ -1289,6 +1290,7 @@ mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1423,6 +1425,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1616,6 +1619,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1661,6 +1665,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus_size: 28,
@@ -1741,6 +1746,7 @@ mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1835,6 +1841,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1893,6 +1900,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus_size: 42,
@@ -1974,6 +1982,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus_size: 39,
@@ -2030,6 +2039,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus_size: 39,
@@ -2063,6 +2073,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2119,6 +2130,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2152,6 +2164,7 @@ mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2191,6 +2204,7 @@ mod tests {
         BenchReport {
             baseline: Some(CommitSha::fixture()),
             rounds: Rounds::DEFAULT,
+            repeated: vec![ScenarioKind::Cold],
             timestamp: "2026-10-30-100000".into(),
             instance: test_instance(),
             corpus_size: 28,
@@ -2486,6 +2500,22 @@ mod tests {
             Some(RoundCount {
                 requested: 5,
                 finished: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_repeated_scenario_that_finished_no_round_is_counted_as_zero() {
+        // Catches: the count taken from the results alone, so a partial
+        // scenario that failed in round 1 left the run recorded as complete.
+        let mut report = five_rounds(5);
+        report.repeated = vec![ScenarioKind::Cold, ScenarioKind::Partial];
+        let record = RunRecord::of(&report, "abc1234".into(), None, None);
+        assert_eq!(
+            record.rounds,
+            Some(RoundCount {
+                requested: 5,
+                finished: 0
             })
         );
     }

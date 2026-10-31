@@ -738,9 +738,16 @@ fn git_rev_parse(repo: &Path, args: &[&str]) -> Result<String, Box<dyn std::erro
 /// instance fetches from origin, so a commit only this machine has cannot be
 /// built there.
 fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::error::Error>> {
-    git(repo, &["fetch", "origin"])?;
+    // Pruning drops the tracking ref of a branch deleted on origin, and the
+    // pattern leaves out the branches of any other remote.
+    git(repo, &["fetch", "--prune", "origin"])?;
     let sha = commit.to_string();
-    if git(repo, &["branch", "-r", "--contains", &sha])?.is_empty() {
+    if git(
+        repo,
+        &["branch", "-r", "--contains", &sha, "--list", "origin/*"],
+    )?
+    .is_empty()
+    {
         return Err(format!(
             "the baseline commit {sha} is not on origin, where the instance fetches from; \
              push it first"
@@ -915,16 +922,40 @@ mod tests {
         // Catches: a baseline only this machine has, which the instance could
         // not fetch, failing after the push and the build.
         assert!(ensure_on_origin(work.path(), &pushed).is_ok());
-        let err = ensure_on_origin(work.path(), &local)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
+        let pushed_ref = &pushed.to_string();
+        let refused = |commit: &CommitSha| {
+            ensure_on_origin(work.path(), commit)
+                .unwrap_err()
+                .to_string()
+        };
+        let not_on_origin = |commit: &CommitSha| {
             format!(
-                "the baseline commit {local} is not on origin, where the instance fetches \
+                "the baseline commit {commit} is not on origin, where the instance fetches \
                  from; push it first"
             )
+        };
+        assert_eq!(refused(&local), not_on_origin(&local));
+
+        // Catches: a commit only another remote has, and one on a branch since
+        // deleted on origin, both of which the instance cannot fetch.
+        let fork = tempfile::tempdir().unwrap();
+        git_in(fork.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "fork", fork.path().to_str().unwrap()],
         );
+        git_in(work.path(), &["push", "-q", "fork", "main"]);
+        assert_eq!(refused(&local), not_on_origin(&local));
+
+        git_in(work.path(), &["push", "-q", "origin", "main:gone"]);
+        assert!(ensure_on_origin(work.path(), &local).is_ok());
+        // Deleted at origin itself, so only a pruning fetch drops the tracking ref.
+        git_in(origin.path(), &["branch", "-q", "-D", "gone"]);
+        git_in(
+            origin.path(),
+            &["update-ref", "refs/heads/main", pushed_ref],
+        );
+        assert_eq!(refused(&local), not_on_origin(&local));
     }
 
     #[test]
