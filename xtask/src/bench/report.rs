@@ -928,25 +928,41 @@ struct Cell {
     /// How many runs the spread is over.
     runs: usize,
     /// The median, followed by the lowest and highest in brackets when there
-    /// is more than one run. For an `a/b` row the range is of `a`.
+    /// is more than one run. For an `a/b` row the brackets hold both ranges,
+    /// `(a_low..a_high / b_low..b_high)`.
     text: String,
 }
 
-/// A tool's cell in a row, `None` when a run has no value for it.
+/// A tool's cell in a row, `None` when a run has no value for it. A run with
+/// no value for the row is left out of the spread, and of the count the
+/// brackets and the bold rule depend on.
 fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
-    let spread = spread_of(runs.iter().filter_map(|r| (row.rank)(r)))?;
+    let values: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| (row.rank)(r))
+        .map(|v| v as f64)
+        .collect();
+    let spread = stats::spread(&values)?;
     let shown = |value: f64| (row.format)(value.round() as u64);
+    let range = |s: &stats::Spread| format!("{}..{}", shown(s.min), shown(s.max));
+    let denominator = match row.of {
+        Some(of) => Some(spread_of(runs.iter().filter_map(|r| of(r)))?),
+        None => None,
+    };
     let mut text = shown(spread.median);
-    if let Some(of) = row.of {
-        let denominator = spread_of(runs.iter().filter_map(|r| of(r)))?;
-        text = format!("{text}/{}", shown(denominator.median));
+    if let Some(d) = &denominator {
+        text = format!("{text}/{}", shown(d.median));
     }
-    if runs.len() > 1 {
-        text = format!("{text} ({}..{})", shown(spread.min), shown(spread.max));
+    if values.len() > 1 {
+        let ranges = match &denominator {
+            Some(d) => format!("{} / {}", range(&spread), range(d)),
+            None => range(&spread),
+        };
+        text = format!("{text} ({ranges})");
     }
     Some(Cell {
         spread,
-        runs: runs.len(),
+        runs: values.len(),
         text,
     })
 }
@@ -1159,7 +1175,8 @@ fn scenario_markdown(
         round_note = if rounds[0].round.is_some() {
             format!(
                 " {}, the tool order shuffled in each. A cell is the median over \
-                 the rounds, with the lowest and highest in brackets.",
+                 the rounds, with the lowest and highest in brackets; a paired cell (a/b) brackets \
+                 the range of each value, in the order shown.",
                 report.rounds_note(rounds.len())
             )
         } else {
@@ -1385,14 +1402,22 @@ impl Deferred {
     }
 }
 
+/// The part of an archived record the duplicate check reads.
+#[derive(Deserialize)]
+struct Stamped {
+    timestamp: String,
+}
+
 /// Appends a compact run record to the per-registry JSON archive.
 ///
 /// The file at `results_dir/{registry_key}.json` is a JSON array of
 /// `RunRecord` values. If the file does not exist, it is created with
 /// `[record]`. If it exists, the record is appended, unless the file already
 /// has a record with its timestamp: a run is recorded once, however many
-/// times its record is applied. If the file contains invalid JSON, an error is
-/// returned (never silently overwrite corrupt data).
+/// times its record is applied. Earlier records are never parsed into
+/// `RunRecord` and written back, so their bytes stay as written whatever
+/// fields `RunRecord` has gained or lost since. If the file contains invalid
+/// JSON, an error is returned (never silently overwrite corrupt data).
 #[expect(
     clippy::disallowed_methods,
     reason = "reads a record file the bench wrote"
@@ -1406,22 +1431,24 @@ pub(crate) fn append_record(
         .map_err(|e| format!("create results dir {}: {e}", results_dir.display()))?;
 
     let path = results_dir.join(format!("{registry_key}.json"));
-
-    let mut records: Vec<RunRecord> = if path.exists() {
-        let contents =
-            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        serde_json::from_str(&contents).map_err(|e| format!("parse {}: {e}", path.display()))?
+    let contents = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?
     } else {
-        Vec::new()
+        "[]".to_owned()
     };
-
-    if records.iter().any(|r| r.timestamp == record.timestamp) {
+    let archived: Vec<Stamped> =
+        serde_json::from_str(&contents).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if archived.iter().any(|r| r.timestamp == record.timestamp) {
         return Ok(());
     }
-    records.push(record);
 
-    let json = serde_json::to_string_pretty(&records)
-        .map_err(|e| format!("serialize run records: {e}"))?;
+    let item = serde_json::to_string_pretty(&record)
+        .map_err(|e| format!("serialize run record: {e}"))?
+        .replace('\n', "\n  ");
+    // The array parsed, so its last non-space character is the closing `]`.
+    let body = contents.trim_end().trim_end_matches(']').trim_end();
+    let separator = if archived.is_empty() { "" } else { "," };
+    let json = format!("{body}{separator}\n  {item}\n]");
     std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
 
     Ok(())
@@ -1861,6 +1888,56 @@ pub(crate) mod tests {
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn appending_leaves_an_old_records_floats_as_written() {
+        // Catches: a float that does not round-trip through `f64` parsing
+        // being rewritten (`2.5753332589999998` as `2.575333259`).
+        let dir = tempfile::tempdir().unwrap();
+        let old = serde_json::to_string_pretty(&[sample_record()])
+            .unwrap()
+            .replacen(
+                "\"wall_clock_secs\": 47.0",
+                "\"wall_clock_secs\": 2.5753332589999998",
+                1,
+            );
+        assert!(old.contains("2.5753332589999998"), "{old}");
+        std::fs::write(dir.path().join("ecr.json"), &old).unwrap();
+
+        let mut later = sample_record();
+        later.timestamp = "2026-04-16-100000".into();
+        append_record(dir.path(), "ecr", later).unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("ecr.json")).unwrap();
+        assert!(after.contains("2.5753332589999998"), "{after}");
+    }
+
+    #[test]
+    fn appending_keeps_the_archive_format_and_leaves_old_records_as_written() {
+        // Catches: an old record re-serialized with a field it never had, and
+        // an appended record indented differently from the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ecr.json");
+        let first = sample_record();
+        let mut second = sample_record();
+        second.timestamp = "2026-04-16-100000".into();
+        let pretty = |records: &[&RunRecord]| serde_json::to_string_pretty(records).unwrap();
+        let both = pretty(&[&first, &second]);
+        let one = pretty(&[&first]);
+
+        // An archive written before `referrer_calls` existed.
+        let old = one.replace(",\n            \"referrer_calls\": 0", "");
+        assert_ne!(old, one, "the field was not found to remove");
+        std::fs::write(&path, &old).unwrap();
+        append_record(dir.path(), "ecr", second).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let kept = old.strip_suffix("\n]").unwrap();
+        assert!(after.starts_with(kept), "{after}");
+        // The new record is indented as the archive writes it.
+        let tail = both.strip_prefix(one.strip_suffix("\n]").unwrap()).unwrap();
+        assert_eq!(&after[kept.len()..], tail, "{after}");
     }
 
     #[test]
@@ -2667,6 +2744,51 @@ pub(crate) mod tests {
             md.contains("Referrers calls -- ocync: 0, ocync@0123456: 105,"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_paired_cell_shows_the_range_of_both_values() {
+        // A paired cell brackets the range of each of its values, so a second
+        // value that varies shows even when the first does not.
+        let mut report = five_rounds(3);
+        let paired = [
+            (1003, 69, 320, 300),
+            (1072, 0, 355, 300),
+            (1072, 0, 356, 300),
+        ];
+        for (scenario, (hits, misses, attempts, successes)) in
+            report.scenarios.iter_mut().zip(paired)
+        {
+            let metrics = scenario.runs[0].proxy_metrics.as_mut().unwrap();
+            metrics.cdn_hits = hits;
+            metrics.cdn_misses = misses;
+            metrics.mount_attempts = attempts;
+            metrics.mount_successes = successes;
+        }
+        let md = summary_markdown(&report);
+
+        assert!(
+            md.contains("| CDN hits/misses | **1072/0 (1003..1072 / 0..69)** |"),
+            "{md}"
+        );
+        // Only the second value varies in the successes/attempts row.
+        assert!(
+            md.contains("| Mounts (success/attempt) | **300/355 (300..300 / 320..356)** |"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn a_cell_of_one_measured_value_is_plain_and_bold_when_it_wins() {
+        // Rounds with no value for a row are not rounds of its cell.
+        let mut report = five_rounds(3);
+        for (round, scenario) in report.scenarios.iter_mut().enumerate() {
+            scenario.runs[0].peak_rss_kb = (round == 0).then_some(1000);
+            scenario.runs[3].peak_rss_kb = Some(2_000_000 + round as u64);
+        }
+        let md = summary_markdown(&report);
+
+        assert!(md.contains("| Peak RSS | **1.0 MB** | -- | -- | "), "{md}");
     }
 
     #[test]
