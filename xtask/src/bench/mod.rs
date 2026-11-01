@@ -625,8 +625,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 &corpus,
                 args.target,
                 args.tool_selection.max_concurrent_transfers,
-                lock.as_ref(),
-            )?,
+                lock.as_ref()
+                    .map_or(config_gen::Mode::Prepare, config_gen::Mode::Sync),
+            ),
         )
         .map_err(|e| format!("write config {}: {e}", config.display()))?;
         runner::check_baseline(commit, &config)?;
@@ -725,7 +726,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             tools,
             fresh_seed,
             |tool| args.tool_selection.label(tool),
-            async |_position, transfer, order| {
+            async |transfer, order| {
                 let target = Destination {
                     store: &store,
                     lock,
@@ -760,7 +761,14 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     })
                 }
                 .await;
-                outcome.map_err(|error| error.to_string())
+                match outcome {
+                    Ok(finished) => Ok(finished),
+                    Err(error) => {
+                        let refs = scenario_refs(transfer, &corpus);
+                        let recheck = lock::ensure_served(&http, lock, &refs, auth).await;
+                        Err(lock::explain(error.to_string(), recheck))
+                    }
+                }
             },
         )
         .await;
@@ -880,17 +888,17 @@ type Finished = Vec<(ScenarioKind, Vec<ToolRun>)>;
 ///
 /// Every round gets its own tool order, drawn from `next_seed` as the round
 /// starts, so no tool is systematically first or last, and each result records
-/// the round, seed and order it ran with. `pass` is given its position and the
+/// the round, seed and order it ran with. `pass` is given the transfer and the
 /// order, and returns the reason to stop when it fails.
 async fn run_passes(
     transfers: &[Transfer],
     tools: &[Tool],
     mut next_seed: impl FnMut() -> u64,
     label: impl Fn(Tool) -> String,
-    mut pass: impl AsyncFnMut(usize, &Transfer, &[Tool]) -> Result<Finished, String>,
+    mut pass: impl AsyncFnMut(&Transfer, &[Tool]) -> Result<Finished, String>,
 ) -> (Vec<ScenarioResult>, Option<String>) {
     let mut done = Vec::new();
-    for (position, transfer) in transfers.iter().enumerate() {
+    for transfer in transfers {
         let mut order = tools.to_vec();
         let mut seed = 0;
         if transfer.round().is_some() && tools.len() > 1 {
@@ -902,7 +910,7 @@ async fn run_passes(
                 names.join(", ")
             );
         }
-        match pass(position, transfer, &order).await {
+        match pass(transfer, &order).await {
             Ok(finished) => {
                 done.extend(
                     finished
@@ -1062,6 +1070,7 @@ fn cold_ocync_median(
         total_bytes: median(|r| r.proxy_metrics.as_ref().map(|m| m.response_bytes as f64))?.round()
             as u64,
         corpus_locked_at: corpus_locked_at.cloned(),
+        sync_from: lock::SyncFrom::of(corpus_locked_at),
         corpus,
         max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
@@ -1095,6 +1104,7 @@ fn ensure_baseline_comparable(
         requests: 0,
         total_bytes: 0,
         corpus_locked_at: corpus_locked_at.cloned(),
+        sync_from: lock::SyncFrom::of(corpus_locked_at),
         corpus: report::CorpusInfo {
             images: corpus.images.len(),
             tags: corpus.total_tags(),
@@ -1198,18 +1208,18 @@ async fn run_single_tool(
     config_dir: &Path,
     output_dir: &Path,
     pass: Pass,
-    lock: Option<&lock::Lock>,
+    mode: config_gen::Mode<'_>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    let config_content = match (tool, lock) {
-        (Tool::Ocync | Tool::OcyncBaseline, lock) => config_gen::ocync_config(
+    let config_content = match (tool, mode) {
+        (Tool::Ocync | Tool::OcyncBaseline, mode) => config_gen::ocync_config(
             corpus,
             args.target,
             args.tool_selection.max_concurrent_transfers,
-            lock,
-        )?,
-        (Tool::Dregsy, Some(lock)) => config_gen::dregsy_config(corpus, lock)?,
-        (Tool::Regsync, Some(lock)) => config_gen::regsync_config(corpus, lock)?,
-        (Tool::Dregsy | Tool::Regsync, None) => {
+            mode,
+        ),
+        (Tool::Dregsy, config_gen::Mode::Sync(lock)) => config_gen::dregsy_config(corpus, lock),
+        (Tool::Regsync, config_gen::Mode::Sync(lock)) => config_gen::regsync_config(corpus, lock),
+        (Tool::Dregsy | Tool::Regsync, config_gen::Mode::Prepare) => {
             return Err(
                 format!("{tool} syncs from the corpus lock and has no prepare mode").into(),
             );
@@ -1253,7 +1263,7 @@ async fn run_single_tool(
         proxy_url.as_deref(),
         &args.tool_selection.root(tool),
         // Prepare resolves mappings and stops, so it is the only dry run.
-        matches!(pass, Pass::Measured(ScenarioKind::Prepare)),
+        matches!(mode, config_gen::Mode::Prepare),
     )
     .await?;
 
@@ -1400,7 +1410,7 @@ async fn run_sync(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Cold),
-                Some(target.lock),
+                config_gen::Mode::Sync(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1419,7 +1429,7 @@ async fn run_sync(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Warm),
-                Some(target.lock),
+                config_gen::Mode::Sync(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1474,7 +1484,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 Pass::Prime,
-                Some(target.lock),
+                config_gen::Mode::Sync(target.lock),
             )
             .await?;
             progress(&format!("  partial: {label} measuring"));
@@ -1486,7 +1496,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Partial),
-                Some(target.lock),
+                config_gen::Mode::Sync(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1550,7 +1560,7 @@ async fn run_scale(
                     config_dir.path(),
                     output_dir,
                     Pass::Measured(ScenarioKind::Scale { images: size }),
-                    Some(target.lock),
+                    config_gen::Mode::Sync(target.lock),
                 )
                 .await?;
                 runs.push(run);
@@ -1610,7 +1620,7 @@ async fn run_prepare(
         config_dir.path(),
         output_dir,
         Pass::Measured(ScenarioKind::Prepare),
-        None,
+        config_gen::Mode::Prepare,
     )
     .await?;
 
@@ -2473,6 +2483,7 @@ mod tests {
             requests: 1,
             total_bytes: 1,
             corpus_locked_at: None,
+            sync_from: None,
             corpus: report::CorpusInfo {
                 images: corpus.images.len(),
                 tags: corpus.total_tags(),
@@ -2540,6 +2551,45 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_baseline_recorded_from_source_tags_is_refused_under_the_same_lock() {
+        // Catches: a run that syncs locked digests being compared with a
+        // baseline recorded when tools followed the tags, which the same
+        // `locked_at` does not tell apart.
+        let corpus = two_image_corpus();
+        let at = lock::fixtures::locked_at("2026-10-30-214340");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        let args = parse_bench(&["--regression", "sync"]).unwrap();
+        let cold: Vec<Transfer> = (1..=5).map(|round| Transfer::Sync { round }).collect();
+        let saved = |sync_from| Baseline {
+            wall_clock_secs: 1.0,
+            requests: 1,
+            total_bytes: 1,
+            corpus_locked_at: Some(at.clone()),
+            sync_from,
+            corpus: report::CorpusInfo {
+                images: corpus.images.len(),
+                tags: corpus.total_tags(),
+            },
+            max_concurrent_transfers: Some(report::effective_transfer_cap(None)),
+            rounds: 5,
+        };
+        let check = || ensure_baseline_comparable(&args, &cold, &corpus, Some(&at), &path);
+
+        regression::save_baseline(&path, &saved(None)).unwrap();
+        let shown = path.display();
+        assert_eq!(
+            check(),
+            Err(format!(
+                "{shown} was recorded syncing from source tags, this run syncing from locked \
+                 digests; record a new baseline by deleting {shown} and rerunning"
+            ))
+        );
+        regression::save_baseline(&path, &saved(Some(lock::SyncFrom::Digest))).unwrap();
+        assert_eq!(check(), Ok(()));
     }
 
     #[test]
@@ -2674,7 +2724,7 @@ mod tests {
             &TOOLS,
             || seeds.next().unwrap(),
             |tool| tool.to_string(),
-            async |_, transfer, order| {
+            async |transfer, order| {
                 let Transfer::Sync { .. } = transfer else {
                     unreachable!()
                 };
@@ -2727,9 +2777,9 @@ mod tests {
             &TOOLS,
             || 1,
             |tool| tool.to_string(),
-            async |position, _, order| {
-                asked.push(position);
-                if position == 2 {
+            async |transfer, order| {
+                asked.push(transfer.round());
+                if transfer.round() == Some(3) {
                     return Err("round 3 failed".to_owned());
                 }
                 Ok(finished(ScenarioKind::Cold, order))
@@ -2741,7 +2791,11 @@ mod tests {
             done.iter().map(|r| r.round).collect::<Vec<_>>(),
             [Some(1), Some(2)]
         );
-        assert_eq!(asked, [0, 1, 2], "the run went on past the failure");
+        assert_eq!(
+            asked,
+            [Some(1), Some(2), Some(3)],
+            "the run went on past the failure"
+        );
     }
 
     #[test]
@@ -2752,7 +2806,7 @@ mod tests {
             &TOOLS,
             || 5,
             |tool| tool.to_string(),
-            async |_, transfer, order| {
+            async |transfer, order| {
                 let kind = match transfer {
                     Transfer::Scale => ScenarioKind::Scale { images: 10 },
                     _ => ScenarioKind::Cold,

@@ -7,20 +7,26 @@ use ocync_distribution::Digest;
 
 use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
-use crate::bench::lock::{ImageRef, Lock};
+use crate::bench::lock::Lock;
 use crate::bench::target::Kind;
 
-/// The digest `lock` pins `tag` of `source` to. A tag the lock lacks is an
-/// error, so no config names a source tag the run was not locked to.
-fn locked_digest<'a>(lock: &'a Lock, source: &str, tag: &str) -> Result<&'a Digest, String> {
-    let image = ImageRef {
-        source: source.to_owned(),
-        tag: tag.to_owned(),
-    };
-    lock.images
-        .get(&image)
-        .map(|entry| &entry.digest)
-        .ok_or_else(|| format!("{image} is not in the corpus lock"))
+/// What a generated config syncs.
+#[derive(Clone, Copy)]
+pub(crate) enum Mode<'a> {
+    /// Each corpus tag from the digest `lock` pins it to, so a source tag that
+    /// has moved cannot change what is copied.
+    Sync(&'a Lock),
+    /// Resolve wildcard tags and transfer nothing, which no lock describes.
+    Prepare,
+}
+
+/// The digest `lock` pins `tag` of `source` to. `ensure_served` refuses a ref
+/// the lock lacks before any config is written, as `blobs_to_warm` relies on.
+fn locked_digest<'a>(lock: &'a Lock, source: &str, tag: &str) -> &'a Digest {
+    &lock
+        .entry(source, tag)
+        .expect("ensure_served refuses a ref the lock lacks")
+        .digest
 }
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
@@ -93,10 +99,8 @@ fn registry_key(hostname: &str) -> String {
 /// Produces a `registries:` section with unique source registries (anonymous auth)
 /// and the target registry (signed in to as `target` says), followed by a `mappings:` section.
 /// Each mapping uses `source:` and `targets:` to reference registries by name,
-/// and `tags:`. With a `lock`, `tags:` pins each tag to its locked digest, so a
-/// source tag that has moved cannot change what is copied; without one (the prepare
-/// scenario, which resolves wildcards and transfers nothing) it is a `glob:` of the
-/// corpus tags.
+/// and `tags:`. For [`Mode::Sync`], `tags:` pins each tag to its locked digest; for
+/// [`Mode::Prepare`] it is a `glob:` of the corpus tags.
 ///
 /// A `max_concurrent_transfers` writes a leading `global:` block carrying it;
 /// without one the config has no `global:` block and ocync keeps its default.
@@ -104,8 +108,8 @@ pub(crate) fn ocync_config(
     corpus: &Corpus,
     target: Kind,
     max_concurrent_transfers: Option<NonZeroUsize>,
-    lock: Option<&Lock>,
-) -> Result<String, String> {
+    mode: Mode<'_>,
+) -> String {
     let mut out = String::new();
 
     if let Some(cap) = max_concurrent_transfers {
@@ -152,15 +156,15 @@ pub(crate) fn ocync_config(
         out.push_str(&format!("    source: {src_key}\n"));
         out.push_str(&format!("    targets: [{target_key}]\n"));
         out.push_str("    tags:\n");
-        match lock {
-            Some(lock) => {
+        match mode {
+            Mode::Sync(lock) => {
                 for tag in &img.tags {
-                    let digest = locked_digest(lock, &img.source, tag)?;
+                    let digest = locked_digest(lock, &img.source, tag);
                     out.push_str(&format!("      - name: \"{tag}\"\n"));
                     out.push_str(&format!("        digest: \"{digest}\"\n"));
                 }
             }
-            None => {
+            Mode::Prepare => {
                 out.push_str("      glob:\n");
                 for tag in &img.tags {
                     out.push_str(&format!("        - \"{tag}\"\n"));
@@ -169,7 +173,7 @@ pub(crate) fn ocync_config(
         }
     }
 
-    Ok(out)
+    out
 }
 
 /// Generate a dregsy YAML config from a corpus.
@@ -182,7 +186,7 @@ pub(crate) fn ocync_config(
 /// The ECR target gets `auth-refresh: 12h` so dregsy uses its internal AWS SDK refresher
 /// (via `GetAuthorizationToken`) instead of falling through to skopeo's Docker credential
 /// resolution. 12h matches the ECR token lifetime to minimize refresh overhead.
-pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> Result<String, String> {
+pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> String {
     // Group images by source registry. BTreeMap gives deterministic iteration order.
     let mut by_registry: BTreeMap<&str, Vec<&ImageEntry>> = BTreeMap::new();
     for img in &corpus.images {
@@ -227,13 +231,13 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> Result<String, Stri
             out.push_str("        platform: all\n");
             out.push_str("        tags:\n");
             for tag in &img.tags {
-                let digest = locked_digest(lock, &img.source, tag)?;
+                let digest = locked_digest(lock, &img.source, tag);
                 out.push_str(&format!("          - \"{tag}@{digest}\"\n"));
             }
         }
     }
 
-    Ok(out)
+    out
 }
 
 /// Generate a regsync YAML config from a corpus.
@@ -244,7 +248,7 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> Result<String, Stri
 /// for the ECR target, followed by a flat `sync:` list. Each entry copies the source at its
 /// locked digest from `lock` to the corpus tag, so a moved source tag cannot change what is
 /// copied.
-pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> Result<String, String> {
+pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()
@@ -290,7 +294,7 @@ pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> Result<String, Str
     // specifies v2) and skips the image entirely.
     for img in &corpus.images {
         for tag in &img.tags {
-            let digest = locked_digest(lock, &img.source, tag)?;
+            let digest = locked_digest(lock, &img.source, tag);
             let source_ref = format!("{}@{digest}", img.source);
             let target_ref = format!("{}:{}", corpus.target_ref(&img.source), tag);
             out.push_str(&format!("  - source: \"{source_ref}\"\n"));
@@ -304,7 +308,7 @@ pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> Result<String, Str
         }
     }
 
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -343,7 +347,7 @@ images:
         // and the measurement is of the wrong cap), and a `global:` block
         // written when none was asked for.
         let (corpus, lock) = (test_corpus(), test_lock());
-        let config = |cap| ocync_config(&corpus, Kind::Ecr, cap, Some(&lock)).unwrap();
+        let config = |cap| ocync_config(&corpus, Kind::Ecr, cap, Mode::Sync(&lock));
         assert_eq!(
             config(NonZeroUsize::new(20)),
             format!(
@@ -352,21 +356,6 @@ images:
             )
         );
         assert!(!config(None).contains("global:"));
-    }
-
-    #[test]
-    fn a_tag_the_lock_lacks_is_refused_by_every_generator() {
-        // Catches: a config naming a source tag the run was not locked to, which
-        // would copy whatever that tag points at on the day.
-        let corpus = test_corpus();
-        let lock = lock_of(&[("cgr.dev/chainguard/static:latest", entry('1', &[]))]);
-        let want = "docker.io/library/alpine:3.20 is not in the corpus lock";
-        assert_eq!(
-            ocync_config(&corpus, Kind::Ecr, None, Some(&lock)).unwrap_err(),
-            want
-        );
-        assert_eq!(dregsy_config(&corpus, &lock).unwrap_err(), want);
-        assert_eq!(regsync_config(&corpus, &lock).unwrap_err(), want);
     }
 
     #[test]
@@ -388,7 +377,7 @@ images:
         for (name, config, expected) in [
             (
                 "ocync_config_artifact_registry",
-                ocync_config(&gar, Kind::ArtifactRegistry, None, Some(&lock)).unwrap(),
+                ocync_config(&gar, Kind::ArtifactRegistry, None, Mode::Sync(&lock)),
                 "\
 registries:
   cgr-dev:
@@ -420,7 +409,7 @@ mappings:
             ),
             (
                 "ocync_config_exact_output",
-                ocync_config(&plain, Kind::Ecr, None, Some(&lock)).unwrap(),
+                ocync_config(&plain, Kind::Ecr, None, Mode::Sync(&lock)),
                 "\
 registries:
   cgr-dev:
@@ -454,7 +443,7 @@ mappings:
                 // The prepare scenario transfers nothing and resolves wildcards, so
                 // it has no lock and keeps the tag globs.
                 "ocync_config_without_lock",
-                ocync_config(&plain, Kind::Ecr, None, None).unwrap(),
+                ocync_config(&plain, Kind::Ecr, None, Mode::Prepare),
                 "\
 registries:
   cgr-dev:
@@ -485,7 +474,7 @@ mappings:
             ),
             (
                 "dregsy_config_exact_output",
-                dregsy_config(&plain, &lock).unwrap(),
+                dregsy_config(&plain, &lock),
                 "\
 relay: skopeo
 
@@ -519,7 +508,7 @@ tasks:
             ),
             (
                 "regsync_config_exact_output",
-                regsync_config(&plain, &lock).unwrap(),
+                regsync_config(&plain, &lock),
                 "\
 version: 1
 
@@ -560,7 +549,7 @@ sync:
             ),
             (
                 "ocync_config_with_dockerhub_auth",
-                ocync_config(&with_auth, Kind::Ecr, None, Some(&lock)).unwrap(),
+                ocync_config(&with_auth, Kind::Ecr, None, Mode::Sync(&lock)),
                 "\
 registries:
   cgr-dev:
@@ -596,7 +585,7 @@ mappings:
             ),
             (
                 "dregsy_config_with_dockerhub_auth",
-                dregsy_config(&with_auth, &lock).unwrap(),
+                dregsy_config(&with_auth, &lock),
                 "\
 relay: skopeo
 
@@ -631,7 +620,7 @@ tasks:
             ),
             (
                 "regsync_config_with_dockerhub_auth",
-                regsync_config(&with_auth, &lock).unwrap(),
+                regsync_config(&with_auth, &lock),
                 "\
 version: 1
 

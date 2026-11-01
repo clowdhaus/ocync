@@ -11,7 +11,7 @@ use ocync_distribution::{Digest, RegistryClient};
 
 use crate::bench::corpus::Corpus;
 use crate::bench::gar::{self, ArtifactRegistryTarget, ENV_CREDENTIALS};
-use crate::bench::lock::{Entry, ImageRef, Lock};
+use crate::bench::lock::{Entry, Lock};
 use crate::bench::report::ScenarioKind;
 use crate::bench::runner::Tool;
 use crate::bench::{Rounds, Scenario, ecr, value_name};
@@ -306,13 +306,9 @@ pub(crate) async fn verify_sync(
 
         let mut expected: Vec<(&str, &Entry)> = Vec::new();
         for tag in &img.tags {
-            let key = ImageRef {
-                source: img.source.clone(),
-                tag: tag.clone(),
-            };
-            match target.lock.images.get(&key) {
-                Some(entry) => expected.push((tag, entry)),
-                None => problems.push(format!("{key}: not in the lock")),
+            match target.lock.entry(&img.source, tag) {
+                Ok(entry) => expected.push((tag, entry)),
+                Err(problem) => problems.push(problem),
             }
         }
 
