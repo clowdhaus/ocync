@@ -165,7 +165,7 @@ async fn run_engine_default(
         })
         .collect();
 
-    // Above the engine default of 10 on purpose: it oversubscribes the
+    // Above the engine default of 20 on purpose: it oversubscribes the
     // per-target upload semaphore (cap 64) with 50 * BLOB_CONCURRENCY(6) = 300
     // wanted streams.
     let report = tokio::time::timeout(Duration::from_secs(30), run_sync(mappings))

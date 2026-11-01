@@ -124,12 +124,10 @@ pub(crate) struct Config {
 /// Global engine settings that apply across all sync operations.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub(crate) struct GlobalConfig {
-    /// Maximum concurrent image syncs (default: 10).
+    /// Maximum concurrent image syncs.
     ///
-    /// Default derived as `blob_upload_concurrency / BLOB_CONCURRENCY = 64
-    /// / 6`, sized so the per-target HTTP/2 stream budget is not exhausted
-    /// (typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` is 100-128
-    /// across major container registries).
+    /// HTTP/2 upload streams per target are bounded separately, at 64,
+    /// whatever this cap.
     #[serde(
         default = "default_max_concurrent_transfers",
         deserialize_with = "transfers_at_least_one"
@@ -1389,7 +1387,7 @@ mappings:
     fn deserialize_global_all_fields() {
         let yaml = r#"
 global:
-  max_concurrent_transfers: 20
+  max_concurrent_transfers: 30
   cache_dir: /tmp/ocync-cache
   cache_ttl: 6h
   staging_size_limit: 1GB
@@ -1400,7 +1398,7 @@ mappings:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let global = config.global.as_ref().unwrap();
-        assert_eq!(global.max_concurrent_transfers.get(), 20);
+        assert_eq!(global.max_concurrent_transfers.get(), 30);
         assert_eq!(global.cache_dir.as_deref(), Some("/tmp/ocync-cache"));
         assert_eq!(
             global.cache_ttl.map(CacheTtl::get),

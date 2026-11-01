@@ -684,12 +684,12 @@ struct PromoteContext<'a> {
 
 /// Default cap for concurrent image transfers (the global image semaphore).
 ///
-/// Higher caps are measured only against ECR, where 50 ran without a stall
-/// and, with the mount wait, kept every mount; other registries are
-/// unmeasured there. The cap does not bound HTTP/2 upload streams: the
-/// per-target `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution` does,
-/// whatever the image cap.
-pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
+/// Chosen by measurement against ECR and Artifact Registry (the engine design
+/// page, level 1); other registries are unmeasured at this cap. The cap does
+/// not bound HTTP/2 upload streams: the per-target
+/// `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution` does, whatever
+/// the image cap.
+pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 
 /// Maximum concurrent blob transfers within a single image (skopeo's default).
 /// Each `RegistryClient` separately caps uploads and downloads across images.
