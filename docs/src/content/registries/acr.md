@@ -10,7 +10,7 @@ ocync auto-detects ACR (`*.azurecr.io`, `*.azurecr.cn`, `*.azurecr.us`) and auth
 
 1. Client secret (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`)
 2. Workload Identity (`AZURE_FEDERATED_TOKEN_FILE`; AKS Workload Identity or any OIDC federation)
-3. Managed Identity (`IDENTITY_ENDPOINT` / `IDENTITY_HEADER`; AKS pod-managed identity, App Service, Functions)
+3. Managed Identity (asks the instance metadata service at `169.254.169.254` directly, never through a proxy; Azure VMs, AKS node or pod-managed identity)
 4. Azure CLI (`az login`; developer machines)
 
 See the [Azure DefaultAzureCredential docs](https://learn.microsoft.com/en-us/dotnet/azure/sdk/authentication/credential-chains) for credential precedence.
