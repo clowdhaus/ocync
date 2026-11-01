@@ -255,7 +255,7 @@
           ]
         },
         "max_concurrent_transfers": {
-          "description": "Maximum concurrent image syncs (default: 20).\n\nHTTP/2 upload streams per target are bounded separately, by the\nregistry client's blob upload concurrency, whatever this cap.",
+          "description": "Maximum concurrent image syncs.\n\nHTTP/2 upload streams per target are bounded separately, by the\nregistry client's blob upload concurrency, whatever this cap.",
           "type": "integer",
           "format": "uint",
           "default": 20,

@@ -684,10 +684,9 @@ struct PromoteContext<'a> {
 
 /// Default cap for concurrent image transfers (the global image semaphore).
 ///
-/// Measured on 2026-10-31 syncing the bench corpus cold into ECR and into
-/// Artifact Registry: 20 was 13 to 14% faster than 10 with the same bytes,
-/// mounts and requests and no 429s, and on ECR caps above 20 were no faster.
-/// The cap does not bound HTTP/2 upload streams: the per-target
+/// Chosen by measurement against ECR and Artifact Registry (the engine design
+/// page, level 1); other registries are unmeasured at this cap. The cap does
+/// not bound HTTP/2 upload streams: the per-target
 /// `DEFAULT_BLOB_UPLOAD_CONCURRENCY` in `ocync-distribution` does, whatever
 /// the image cap.
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: NonZeroUsize = NonZeroUsize::new(20).unwrap();

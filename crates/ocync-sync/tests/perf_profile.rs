@@ -30,7 +30,7 @@
 //! - `OCYNC_PROFILE_BYTES`         bytes per layer (default: 16384). About 5 MB
 //!   gives a real layer's SHA-256 cost.
 //! - `OCYNC_PROFILE_WORKERS`       `max_concurrent_transfers` (default: 50, over
-//!   the engine default of 10 to stress h2 stream budgeting).
+//!   the engine default of 20 to stress h2 stream budgeting).
 //! - `OCYNC_PROFILE_HTTP1=1`       refuse HTTP/2 via ALPN for metadata and
 //!   uploads (blob downloads are always HTTP/1.1), to isolate HTTP/2
 //!   multiplexing stalls.
