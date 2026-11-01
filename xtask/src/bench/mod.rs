@@ -12,6 +12,7 @@ pub(crate) mod regression;
 pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
+pub(crate) mod skopeo_shim;
 pub(crate) mod stats;
 pub(crate) mod target;
 
@@ -1220,7 +1221,10 @@ async fn run_single_tool(
             args.tool_selection.max_concurrent_transfers,
             mode,
         ),
-        (Tool::Dregsy, config_gen::Mode::Sync(lock)) => config_gen::dregsy_config(corpus, lock),
+        (Tool::Dregsy, config_gen::Mode::Sync(lock)) => {
+            let skopeo = skopeo_shim::write_script(config_dir)?;
+            config_gen::dregsy_config(corpus, lock, &skopeo)
+        }
         (Tool::Regsync, config_gen::Mode::Sync(lock)) => config_gen::regsync_config(corpus, lock),
         (Tool::Dregsy | Tool::Regsync, config_gen::Mode::Prepare) => {
             return Err(

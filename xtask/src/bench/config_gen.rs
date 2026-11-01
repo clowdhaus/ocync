@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
 
 use ocync_distribution::Digest;
 
@@ -181,12 +182,13 @@ pub(crate) fn ocync_config(
 /// Produces `relay: skopeo` followed by `tasks:` grouped by source registry in deterministic
 /// order. Each task contains source/target registry fields and a flat mappings list.
 /// Each tag is written `<tag>@<digest>` from `lock`: dregsy pulls the digest and creates
-/// `<tag>` at the target, so a moved source tag cannot change what is copied.
+/// `<tag>` at the target, so a moved source tag cannot change what is copied. `skopeo` is
+/// the binary dregsy runs as skopeo.
 ///
 /// The ECR target gets `auth-refresh: 12h` so dregsy uses its internal AWS SDK refresher
 /// (via `GetAuthorizationToken`) instead of falling through to skopeo's Docker credential
 /// resolution. 12h matches the ECR token lifetime to minimize refresh overhead.
-pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> String {
+pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> String {
     // Group images by source registry. BTreeMap gives deterministic iteration order.
     let mut by_registry: BTreeMap<&str, Vec<&ImageEntry>> = BTreeMap::new();
     for img in &corpus.images {
@@ -196,6 +198,8 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock) -> String {
 
     let mut out = String::new();
     out.push_str("relay: skopeo\n");
+    out.push('\n');
+    out.push_str(&format!("skopeo:\n  binary: \"{}\"\n", skopeo.display()));
     out.push('\n');
     out.push_str("tasks:\n");
 
@@ -474,9 +478,12 @@ mappings:
             ),
             (
                 "dregsy_config_exact_output",
-                dregsy_config(&plain, &lock),
+                dregsy_config(&plain, &lock, Path::new("/run/dir/skopeo")),
                 "\
 relay: skopeo
+
+skopeo:
+  binary: \"/run/dir/skopeo\"
 
 tasks:
   - name: sync-cgr-dev
@@ -585,9 +592,12 @@ mappings:
             ),
             (
                 "dregsy_config_with_dockerhub_auth",
-                dregsy_config(&with_auth, &lock),
+                dregsy_config(&with_auth, &lock, Path::new("/run/dir/skopeo")),
                 "\
 relay: skopeo
+
+skopeo:
+  binary: \"/run/dir/skopeo\"
 
 tasks:
   - name: sync-cgr-dev
