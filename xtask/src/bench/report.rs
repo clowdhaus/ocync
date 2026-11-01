@@ -181,15 +181,25 @@ pub(crate) enum Prewarm {
     Skipped,
     /// Ran.
     Done {
-        /// For each registry with a blob that failed, was not finished by the
-        /// deadline (started or not) or was not requested though the registry
-        /// has a cache, how many; empty when every blob was warmed.
+        /// For each registry with a blob that failed or was not finished by
+        /// the deadline, started or not, how many; empty when every blob was
+        /// warmed.
         unwarmed: BTreeMap<String, u64>,
-        /// Registries judged to have no blob cache: not warmed, and not
-        /// counted as unwarmed.
+        /// Registries on the no-cache list whose probe carried no cache
+        /// header: only that blob was requested, and they are not counted as
+        /// unwarmed.
         #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
         no_cache: BTreeSet<String>,
     },
+}
+
+/// The registries left unwarmed and how many blobs of each, as a phrase.
+pub(crate) fn not_warmed(unwarmed: &BTreeMap<String, u64>) -> String {
+    let counts: Vec<String> = unwarmed
+        .iter()
+        .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
+        .collect();
+    format!("not warmed for {}", counts.join(", "))
 }
 
 impl Prewarm {
@@ -201,11 +211,7 @@ impl Prewarm {
             Self::Done { unwarmed, no_cache } => {
                 let mut parts = Vec::new();
                 if !unwarmed.is_empty() {
-                    let counts: Vec<String> = unwarmed
-                        .iter()
-                        .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
-                        .collect();
-                    parts.push(format!("not warmed for {}", counts.join(", ")));
+                    parts.push(not_warmed(unwarmed));
                 }
                 if !no_cache.is_empty() {
                     let hosts: Vec<&str> = no_cache.iter().map(String::as_str).collect();
