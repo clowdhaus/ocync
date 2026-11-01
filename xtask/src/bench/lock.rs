@@ -1,6 +1,8 @@
 //! The corpus lock: every (source, tag) the benchmark syncs, pinned to the
 //! manifest digest it resolved to, so runs on different dates sync the same
-//! content and a moved source is refused rather than benchmarked.
+//! content. Tools copy each tag from its locked digest, so a source tag that
+//! moves after the lock changes nothing; only a digest the source stops serving
+//! stops a run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -222,163 +224,86 @@ fn unresolved(failed: &[(ImageRef, FetchError)]) -> String {
     )
 }
 
-/// A way a resolved ref differs from the lock.
-#[derive(Debug, PartialEq, Eq)]
-enum Difference {
-    /// The ref is not in the lock.
-    Missing { image: ImageRef },
-    /// The tag now names a different manifest.
-    Moved {
-        image: ImageRef,
-        expected: Digest,
-        actual: Digest,
-    },
-    /// The registry answers 404, 403, or 401 after a new token, as it does for a
-    /// deleted repository.
-    Gone { image: ImageRef },
-}
-
-impl fmt::Display for Difference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Missing { image } => write!(f, "{image}: not in the lock"),
-            Self::Moved {
-                image,
-                expected,
-                actual,
-            } => write!(f, "{image}: expected {expected}, now {actual}"),
-            Self::Gone { image } => write!(
-                f,
-                "{image}: no longer at the source (404, 403, or 401 after a new token)"
-            ),
-        }
-    }
-}
-
-/// Why a check against the lock did not pass.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RecheckError {
-    /// A source differs from the lock.
-    Moved(String),
-    /// Nothing differs among the refs that resolved, but some could not be
-    /// resolved after retries, so the check is incomplete.
-    Lookup(String),
-}
-
-impl fmt::Display for RecheckError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Moved(text) | Self::Lookup(text) => f.write_str(text),
-        }
-    }
-}
-
-impl std::error::Error for RecheckError {}
-
-/// Judge the refs that resolved against `lock`. Equal digests mean identical
-/// manifest bytes, children included. A tag answered 404, 403, or 401 after a new
-/// token, has moved; any other failure only leaves the check incomplete.
-fn check_unmoved(
-    lock: &Lock,
-    resolved: &BTreeMap<ImageRef, Digest>,
-    failed: &[(ImageRef, FetchError)],
-) -> Result<(), RecheckError> {
-    let mut differences = Vec::new();
-    for (image, actual) in resolved {
-        match lock.images.get(image) {
-            None => differences.push(Difference::Missing {
-                image: image.clone(),
-            }),
-            Some(expected) if expected.digest != *actual => differences.push(Difference::Moved {
-                image: image.clone(),
-                expected: expected.digest.clone(),
-                actual: actual.clone(),
-            }),
-            Some(_) => {}
-        }
-    }
+/// Judge the refs that could not be served. A digest answered 404, 403, or 401
+/// after a new token is no longer served, as for a deleted repository; any other
+/// failure only leaves the check incomplete. `missing` are refs the lock lacks.
+fn judge_served(missing: &[ImageRef], failed: &[(ImageRef, FetchError)]) -> Result<(), String> {
     let (gone, unreachable): (Vec<_>, Vec<_>) = failed.iter().cloned().partition(|(_, e)| {
         matches!(
             e.status,
             Some(StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
         )
     });
-    differences.extend(
-        gone.into_iter()
-            .map(|(image, _)| Difference::Gone { image }),
-    );
-    let incomplete = (!unreachable.is_empty()).then(|| unresolved(&unreachable));
-    if differences.is_empty() {
-        return incomplete.map_or(Ok(()), |text| Err(RecheckError::Lookup(text)));
+    let incomplete = (!unreachable.is_empty()).then(|| {
+        format!(
+            "{}\nUse --skip-registries <host> to leave a registry out, or retry later.",
+            unresolved(&unreachable)
+        )
+    });
+    let lines: Vec<String> =
+        missing
+            .iter()
+            .map(|image| format!("  {image}: not in the lock"))
+            .chain(gone.iter().map(|(image, e)| {
+                format!("  {image}: {} (no longer served by the source)", e.reason)
+            }))
+            .collect();
+    if lines.is_empty() {
+        return incomplete.map_or(Ok(()), Err);
     }
-    let listed: Vec<String> = differences.iter().map(|d| format!("  {d}")).collect();
     let mut text = format!(
-        "{} source ref(s) differ from the corpus lock, so this run would not sync the corpus \
+        "{} locked source ref(s) cannot be copied, so this run would not sync the corpus \
          it was locked to:\n{}\nRun `cargo xtask bench-lock` to lock the current content. A new \
          lock starts a new comparison series: do not read its runs against runs under the old one.",
-        differences.len(),
-        listed.join("\n")
+        lines.len(),
+        lines.join("\n")
     );
     if let Some(incomplete) = incomplete {
         text.push_str("\nAlso, ");
         text.push_str(&incomplete);
     }
-    Err(RecheckError::Moved(text))
+    Err(text)
 }
 
-/// Resolve every ref in `refs` again and refuse if any differs from `lock`.
-///
-/// Probes with HEAD, which costs no body, and falls back to a GET only for a
-/// registry that sends no digest header.
-pub(crate) async fn ensure_unmoved(
+/// Check that the source still serves the locked manifest digest of every ref
+/// in `refs`, each by a HEAD of that digest and never of its tag. A tag that
+/// has moved is not a difference: the run copies the locked digest.
+pub(crate) async fn ensure_served(
     client: &reqwest::Client,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
     auth: Option<&DockerHubAuth>,
-) -> Result<(), RecheckError> {
+) -> Result<(), String> {
     eprintln!(
-        "bench: checking {} source refs against the lock...",
+        "bench: checking {} locked source digests are still served...",
         refs.len()
     );
     let access = Access::new(client, auth);
-    let (resolved, failed) = access.resolve(refs, Access::fetch_digest).await;
-    check_unmoved(lock, &resolved, &failed)
+    check_served(&access, lock, refs, async |repo, digest| {
+        access.head_digest(repo, digest).await
+    })
+    .await
 }
 
-/// What a run does after the check between scenarios.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Next {
-    /// Run the next scenario; the check could not finish, which is warned of.
-    Proceed { warning: Option<String> },
-    /// Do not run the remaining scenarios, for this reason.
-    Stop(String),
-}
-
-/// Decide from the between-scenarios check. Only an actual difference stops
-/// the run: a lookup that failed after retries leaves the post-pass digest
-/// check to guard the content.
-pub(crate) fn between_scenarios(check: Result<(), RecheckError>) -> Next {
-    match check {
-        Ok(()) => Next::Proceed { warning: None },
-        Err(RecheckError::Lookup(text)) => Next::Proceed {
-            warning: Some(format!(
-                "could not re-check the sources before the next scenario, continuing; \
-                 the post-pass digest check still guards the content:\n{text}"
-            )),
-        },
-        Err(RecheckError::Moved(text)) => Next::Stop(text),
-    }
-}
-
-/// The reason a scenario failed, led by the sources having moved when
-/// re-resolving its refs shows they did: that is not the tool's fault.
-pub(crate) fn explain(error: String, recheck: Result<(), RecheckError>) -> String {
-    match recheck {
-        Err(RecheckError::Moved(text)) => {
-            format!("the source moved during the scenario: {text}\n{error}")
-        }
-        _ => error,
-    }
+/// [`ensure_served`] with the request `head` makes for one locked digest.
+async fn check_served(
+    access: &Access<'_>,
+    lock: &Lock,
+    refs: &BTreeSet<ImageRef>,
+    head: impl AsyncFn(&Repository<'_>, &Digest) -> Result<(), FetchError>,
+) -> Result<(), String> {
+    let known: BTreeSet<ImageRef> = refs
+        .iter()
+        .filter(|image| lock.images.contains_key(*image))
+        .cloned()
+        .collect();
+    let missing: Vec<ImageRef> = refs.difference(&known).cloned().collect();
+    let (_, failed) = access
+        .resolve(&known, async |_, repo, image| {
+            head(repo, &lock.images[image].digest).await
+        })
+        .await;
+    judge_served(&missing, &failed)
 }
 
 /// The digest of a manifest body. A registry that also reports a digest must
@@ -394,23 +319,6 @@ fn body_digest(header: Option<&str>, body: &[u8]) -> Result<Digest, String> {
         }
     }
     Ok(actual)
-}
-
-/// What a HEAD answer settles.
-#[derive(Debug, PartialEq, Eq)]
-enum Probe {
-    /// The registry named the digest.
-    Header(Digest),
-    /// It sent none, so the body must be fetched and hashed.
-    NeedBody,
-}
-
-/// Read the `Docker-Content-Digest` of a HEAD answer.
-fn probe(header: Option<&str>) -> Result<Probe, String> {
-    match header {
-        Some(value) => parse_digest(value).map(Probe::Header),
-        None => Ok(Probe::NeedBody),
-    }
 }
 
 /// A descriptor: one entry of an index's `manifests`, or a config or layer.
@@ -522,13 +430,13 @@ impl Access<'_> {
     async fn resolve<T>(
         &self,
         refs: &BTreeSet<ImageRef>,
-        fetch: impl AsyncFn(&Self, &Repository<'_>, &str) -> Result<T, FetchError>,
+        fetch: impl AsyncFn(&Self, &Repository<'_>, &ImageRef) -> Result<T, FetchError>,
     ) -> (BTreeMap<ImageRef, T>, Vec<(ImageRef, FetchError)>) {
         let mut resolved = BTreeMap::new();
         let mut failed = Vec::new();
         for image in refs {
             let outcome = match registry::split_source(&image.source) {
-                Some(repo) => fetch(self, &repo, &image.tag).await,
+                Some(repo) => fetch(self, &repo, image).await,
                 None => Err("source names no registry".to_owned().into()),
             };
             match outcome {
@@ -557,14 +465,15 @@ impl Access<'_> {
         Ok(read(body_digest(header.as_deref(), &body)?, &body)?)
     }
 
-    /// The digest a tag names: HEAD, then a GET to hash the body when the
-    /// registry sends no digest header.
-    async fn fetch_digest(&self, repo: &Repository<'_>, tag: &str) -> Result<Digest, FetchError> {
-        let head = self.request_manifest(Method::HEAD, repo, tag).await?;
-        match probe(content_digest(&head).as_deref())? {
-            Probe::Header(digest) => Ok(digest),
-            Probe::NeedBody => self.get_manifest(repo, tag, |digest, _| Ok(digest)).await,
-        }
+    /// HEAD the manifest `digest`, which succeeds when the repository serves it.
+    async fn head_digest(&self, repo: &Repository<'_>, digest: &Digest) -> Result<(), FetchError> {
+        self.request_manifest(Method::HEAD, repo, &digest.to_string())
+            .await
+            .map(drop)
+            .map_err(|e| FetchError {
+                reason: format!("digest {digest}: {}", e.reason),
+                ..e
+            })
     }
 
     /// The digest, children and blobs of a tag, from a GET of its exact bytes
@@ -658,7 +567,11 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
     eprintln!("bench-lock: resolving {} source refs...", refs.len());
     let client = registry::http_client()?;
     let access = Access::new(&client, auth.as_ref());
-    let (images, failed) = access.resolve(&refs, Access::fetch_entry).await;
+    let (images, failed) = access
+        .resolve(&refs, async |access, repo, image| {
+            access.fetch_entry(repo, &image.tag).await
+        })
+        .await;
     if !failed.is_empty() {
         return Err(unresolved(&failed).into());
     }
@@ -738,21 +651,6 @@ mod tests {
         ImageRef::parse(raw).unwrap()
     }
 
-    fn resolved_of(images: &[(&str, char)]) -> BTreeMap<ImageRef, Digest> {
-        images.iter().map(|(k, c)| (image(k), d(*c))).collect()
-    }
-
-    fn failure(raw: &str, status: Option<u16>) -> (ImageRef, FetchError) {
-        let status = status.map(|s| StatusCode::from_u16(s).unwrap());
-        (
-            image(raw),
-            FetchError {
-                status,
-                reason: format!("manifest request status {status:?}"),
-            },
-        )
-    }
-
     const ABC_SHA256: &str =
         "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
@@ -776,9 +674,13 @@ mod tests {
 
     #[test]
     fn body_digest_hashes_the_body_and_refuses_a_header_that_disagrees() {
-        let cases: [(Option<&str>, Option<&str>); 3] = [
+        let cases: [(Option<&str>, Option<&str>); 4] = [
             (None, Some(ABC_SHA256)),
             (Some(ABC_SHA256), Some(ABC_SHA256)),
+            (
+                Some(" sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"),
+                Some(ABC_SHA256),
+            ),
             (
                 Some("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
                 None,
@@ -788,25 +690,6 @@ mod tests {
             let got = body_digest(header, b"abc").ok().map(|d| d.to_string());
             assert_eq!(got.as_deref(), want, "header {header:?}");
         }
-    }
-
-    #[test]
-    fn a_head_answer_with_a_digest_is_used_and_one_without_sends_for_the_body() {
-        // Catches: fetching a body for every ref on every re-check, and
-        // trusting nothing when the registry did name the digest.
-        let abc = parse_digest(ABC_SHA256).unwrap();
-        let cases: [(Option<&str>, Option<Probe>); 3] = [
-            (Some(ABC_SHA256), Some(Probe::Header(abc.clone()))),
-            (
-                Some(" sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"),
-                Some(Probe::Header(abc)),
-            ),
-            (None, Some(Probe::NeedBody)),
-        ];
-        for (header, want) in cases {
-            assert_eq!(probe(header).ok(), want, "header {header:?}");
-        }
-        assert!(probe(Some("not a digest")).is_err());
     }
 
     #[test]
@@ -951,87 +834,94 @@ mod tests {
         assert!(error.contains("quay.io/b:latest lists no blobs"), "{error}");
     }
 
+    /// Run [`check_served`] with a source that serves exactly the digests in
+    /// `served` and answers `status` for any other. Returns the verdict and the
+    /// references the source was asked for, in order.
+    fn check(
+        lock: &Lock,
+        refs: &[&str],
+        served: &[char],
+        status: StatusCode,
+    ) -> (Result<(), String>, Vec<String>) {
+        let served: Vec<Digest> = served.iter().map(|c| d(*c)).collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let client = registry::http_client().unwrap();
+        let access = Access::new(&client, None);
+        let refs: BTreeSet<ImageRef> = refs.iter().map(|r| image(r)).collect();
+        let verdict = futures_util::FutureExt::now_or_never(check_served(
+            &access,
+            lock,
+            &refs,
+            async |_, digest| {
+                asked.borrow_mut().push(digest.to_string());
+                if served.contains(digest) {
+                    Ok(())
+                } else {
+                    Err(FetchError {
+                        status: Some(status),
+                        reason: format!("digest {digest}: manifest request returned {status}"),
+                    })
+                }
+            },
+        ))
+        .expect("nothing here waits");
+        (verdict, asked.into_inner())
+    }
+
     #[test]
-    fn a_moved_or_gone_source_is_refused_and_a_failed_lookup_is_not_called_a_move() {
-        let lock = lock_of(&[
-            ("s/a:1", entry('1', &[])),
-            ("s/b:1", entry('2', &[])),
-            ("s/gone:1", entry('3', &[])),
-        ]);
-        let outage = failure("s/b:1", Some(503));
+    fn the_run_needs_each_locked_digest_served_and_nothing_else() {
+        // The source is asked for digests only, so a tag that has since moved
+        // (s/a:1 now names another manifest, which the source also serves) is
+        // not a difference. Catches: refusing a run, or syncing other content,
+        // because a floating tag moved after the lock.
+        let lock = lock_of(&[("s/a:1", entry('1', &[])), ("s/b:1", entry('2', &[]))]);
+        let both = ["s/a:1", "s/b:1"];
+        let (verdict, asked) = check(&lock, &both, &['1', '2', '9'], StatusCode::NOT_FOUND);
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(asked, [d('1').to_string(), d('2').to_string()]);
 
-        assert_eq!(
-            check_unmoved(&lock, &resolved_of(&[("s/a:1", '1')]), &[]),
-            Ok(()),
-            "an unmoved source passes"
+        // Catches: a digest the source dropped being waved through because its
+        // tag still resolves, which would fail later in a tool, mid-run.
+        let (verdict, _) = check(&lock, &both, &['1', '9'], StatusCode::NOT_FOUND);
+        let text = verdict.unwrap_err();
+        assert!(
+            text.contains(&format!("s/b:1: digest {}", d('2'))),
+            "{text}"
         );
+        assert!(!text.contains("s/a:1"), "{text}");
+        assert!(text.contains("no longer served") && text.contains("cargo xtask bench-lock"));
+        assert!(text.contains("new comparison series"));
+    }
 
-        let Err(RecheckError::Moved(text)) = check_unmoved(
-            &lock,
-            &resolved_of(&[("s/a:1", '9'), ("s/c:1", '3')]),
-            &[outage],
-        ) else {
-            panic!("a moved source must not pass, even beside a failed lookup");
-        };
-        assert!(text.contains(&format!("s/a:1: expected {}, now {}", d('1'), d('9'))));
-        assert!(text.contains("s/c:1: not in the lock"));
-        assert!(text.contains("cargo xtask bench-lock") && text.contains("new comparison series"));
-        assert!(text.contains("could not resolve 1 source ref(s)"));
+    #[test]
+    fn a_ref_the_lock_lacks_stops_the_run_and_is_not_requested() {
+        // Catches: a ref with no locked digest being run from its tag.
+        let lock = lock_of(&[("s/a:1", entry('1', &[]))]);
+        let (verdict, asked) = check(&lock, &["s/a:1", "s/c:1"], &['1'], StatusCode::NOT_FOUND);
+        assert!(verdict.unwrap_err().contains("s/c:1: not in the lock"));
+        assert_eq!(asked, [d('1').to_string()]);
+    }
 
-        // Catches: a tag or repository deleted at the source (Docker Hub and
-        // quay answer 401) being waved through as an outage.
+    #[test]
+    fn a_digest_answered_as_a_deleted_one_stops_and_an_outage_only_leaves_the_check_incomplete() {
+        // Catches: a deleted repository (Docker Hub and quay answer 401) being
+        // waved through as an outage, and an outage called a missing digest.
+        let lock = lock_of(&[("s/a:1", entry('1', &[]))]);
         for status in [404, 403, 401] {
-            let Err(RecheckError::Moved(text)) = check_unmoved(
-                &lock,
-                &resolved_of(&[("s/a:1", '1')]),
-                &[failure("s/gone:1", Some(status))],
-            ) else {
-                panic!("a {status} for a locked ref is a moved source");
-            };
-            assert!(text.contains("s/gone:1: no longer at the source"));
+            let status = StatusCode::from_u16(status).unwrap();
+            let (verdict, _) = check(&lock, &["s/a:1"], &[], status);
+            let text = verdict.unwrap_err();
+            assert!(text.contains("no longer served"), "{status}: {text}");
+            assert!(!text.contains("--skip-registries"), "{status}: {text}");
         }
-
-        for status in [Some(503), Some(429), None] {
-            let check = check_unmoved(&lock, &resolved_of(&[]), &[failure("s/b:1", status)]);
-            assert!(
-                matches!(check, Err(RecheckError::Lookup(_))),
-                "{status:?} leaves the check incomplete, not failed"
-            );
+        for status in [503, 429] {
+            let status = StatusCode::from_u16(status).unwrap();
+            let (verdict, _) = check(&lock, &["s/a:1"], &[], status);
+            let text = verdict.unwrap_err();
+            assert!(text.contains("could not resolve 1 source ref(s)"), "{text}");
+            assert!(text.contains("--skip-registries"), "{text}");
+            assert!(!text.contains("no longer served"), "{text}");
         }
-    }
-
-    #[test]
-    fn between_scenarios_only_a_difference_stops_the_run() {
-        // Catches: stopping a long run, and discarding its finished scenarios,
-        // because a registry was briefly unreachable.
-        let moved = RecheckError::Moved("s/a:1 moved".into());
-        let lookup = RecheckError::Lookup("s/a:1 unreachable".into());
-        assert_eq!(between_scenarios(Ok(())), Next::Proceed { warning: None });
-        assert_eq!(
-            between_scenarios(Err(moved)),
-            Next::Stop("s/a:1 moved".into())
-        );
-        let Next::Proceed { warning: Some(w) } = between_scenarios(Err(lookup)) else {
-            panic!("a failed lookup proceeds with a warning");
-        };
-        assert!(w.contains("s/a:1 unreachable") && w.contains("post-pass digest check"));
-    }
-
-    #[test]
-    fn a_failed_scenario_is_blamed_on_the_source_only_when_it_moved() {
-        // Catches: reporting a source that changed mid-scenario as a tool defect.
-        let error = "ocync cold verification failed".to_owned();
-        let moved = explain(
-            error.clone(),
-            Err(RecheckError::Moved("s/a:1 moved".into())),
-        );
-        assert!(moved.starts_with("the source moved during the scenario"));
-        assert!(moved.contains("s/a:1 moved") && moved.contains(&error));
-        assert_eq!(explain(error.clone(), Ok(())), error);
-        assert_eq!(
-            explain(error.clone(), Err(RecheckError::Lookup("down".into()))),
-            error
-        );
     }
 
     #[test]

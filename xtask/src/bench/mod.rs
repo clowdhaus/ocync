@@ -581,16 +581,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         .flat_map(|transfer| scenario_refs(transfer, &corpus))
         .collect();
     if let Some(lock) = &lock {
-        // Before the build and the CDN pre-warm, so a moved source costs
-        // seconds rather than a wasted run.
-        lock::ensure_unmoved(&http, lock, &refs, auth)
-            .await
-            .map_err(|e| match e {
-                lock::RecheckError::Lookup(text) => format!(
-                    "{text}\nUse --skip-registries <host> to leave a registry out, or retry later."
-                ),
-                lock::RecheckError::Moved(text) => text,
-            })?;
+        // Before the build and the CDN pre-warm, so a digest the source no
+        // longer serves costs seconds rather than a wasted run.
+        lock::ensure_served(&http, lock, &refs, auth).await?;
     }
 
     let tools = args.tool_selection.run_tools();
@@ -632,7 +625,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 &corpus,
                 args.target,
                 args.tool_selection.max_concurrent_transfers,
-            ),
+                lock.as_ref(),
+            )?,
         )
         .map_err(|e| format!("write config {}: {e}", config.display()))?;
         runner::check_baseline(commit, &config)?;
@@ -720,11 +714,10 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         scenarios: Vec::new(),
     };
 
-    // A round or scenario after the first re-checks the sources, so a move
-    // during a long run cannot put different content under later numbers. The
-    // first was checked before the build. Any failure stops the passes still to
-    // run; the finished ones are still reported and recorded, and the run then
-    // returns the reason.
+    // Every tool copies the locked digests, so a source tag that moves during a
+    // long run cannot put different content under later numbers. Any failure
+    // stops the passes still to run; the finished ones are still reported and
+    // recorded, and the run then returns the reason.
     let mut stopped: Option<String> = None;
     if let Some(lock) = &lock {
         let (finished, stop) = run_passes(
@@ -732,20 +725,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             tools,
             fresh_seed,
             |tool| args.tool_selection.label(tool),
-            async |position, transfer, order| {
-                let refs = scenario_refs(transfer, &corpus);
-                if position > 0 {
-                    let check = lock::ensure_unmoved(&http, lock, &refs, auth).await;
-                    match lock::between_scenarios(check) {
-                        lock::Next::Proceed { warning } => {
-                            if let Some(warning) = warning {
-                                eprintln!("WARNING: {warning}");
-                            }
-                        }
-                        lock::Next::Stop(reason) => return Err(reason),
-                    }
-                }
-
+            async |_position, transfer, order| {
                 let target = Destination {
                     store: &store,
                     lock,
@@ -780,14 +760,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     })
                 }
                 .await;
-                // A source that moved mid-scenario is not the tool's fault.
-                match outcome {
-                    Ok(finished) => Ok(finished),
-                    Err(error) => {
-                        let recheck = lock::ensure_unmoved(&http, lock, &refs, auth).await;
-                        Err(lock::explain(error.to_string(), recheck))
-                    }
-                }
+                outcome.map_err(|error| error.to_string())
             },
         )
         .await;
@@ -1225,16 +1198,22 @@ async fn run_single_tool(
     config_dir: &Path,
     output_dir: &Path,
     pass: Pass,
-    dry_run: bool,
+    lock: Option<&lock::Lock>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    let config_content = match tool {
-        Tool::Ocync | Tool::OcyncBaseline => config_gen::ocync_config(
+    let config_content = match (tool, lock) {
+        (Tool::Ocync | Tool::OcyncBaseline, lock) => config_gen::ocync_config(
             corpus,
             args.target,
             args.tool_selection.max_concurrent_transfers,
-        ),
-        Tool::Dregsy => config_gen::dregsy_config(corpus),
-        Tool::Regsync => config_gen::regsync_config(corpus),
+            lock,
+        )?,
+        (Tool::Dregsy, Some(lock)) => config_gen::dregsy_config(corpus, lock)?,
+        (Tool::Regsync, Some(lock)) => config_gen::regsync_config(corpus, lock)?,
+        (Tool::Dregsy | Tool::Regsync, None) => {
+            return Err(
+                format!("{tool} syncs from the corpus lock and has no prepare mode").into(),
+            );
+        }
     };
 
     let config_path = config_dir.join(format!("{}.yaml", tool));
@@ -1273,7 +1252,8 @@ async fn run_single_tool(
         &config_path,
         proxy_url.as_deref(),
         &args.tool_selection.root(tool),
-        dry_run,
+        // Prepare resolves mappings and stops, so it is the only dry run.
+        matches!(pass, Pass::Measured(ScenarioKind::Prepare)),
     )
     .await?;
 
@@ -1420,7 +1400,7 @@ async fn run_sync(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Cold),
-                false,
+                Some(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1439,7 +1419,7 @@ async fn run_sync(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Warm),
-                false,
+                Some(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1494,7 +1474,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 Pass::Prime,
-                false,
+                Some(target.lock),
             )
             .await?;
             progress(&format!("  partial: {label} measuring"));
@@ -1506,7 +1486,7 @@ async fn run_partial(
                 config_dir.path(),
                 output_dir,
                 Pass::Measured(ScenarioKind::Partial),
-                false,
+                Some(target.lock),
             )
             .await?;
             progress(&format!(
@@ -1570,7 +1550,7 @@ async fn run_scale(
                     config_dir.path(),
                     output_dir,
                     Pass::Measured(ScenarioKind::Scale { images: size }),
-                    false,
+                    Some(target.lock),
                 )
                 .await?;
                 runs.push(run);
@@ -1630,7 +1610,7 @@ async fn run_prepare(
         config_dir.path(),
         output_dir,
         Pass::Measured(ScenarioKind::Prepare),
-        true,
+        None,
     )
     .await?;
 
@@ -1764,11 +1744,11 @@ fn blobs_to_warm<'a>(
     let mut blobs = Vec::new();
     for image in refs {
         let repo = registry::split_source(&image.source)
-            .expect("ensure_unmoved refuses a source with no registry");
+            .expect("ensure_served refuses a source with no registry");
         let entry = lock
             .images
             .get(image)
-            .expect("ensure_unmoved refuses a ref the lock lacks");
+            .expect("ensure_served refuses a ref the lock lacks");
         blobs.extend(entry.blobs.iter().map(|blob| (repo, blob)));
     }
     blobs.sort_by_cached_key(|(repo, blob)| (repo.to_string(), blob.to_string()));

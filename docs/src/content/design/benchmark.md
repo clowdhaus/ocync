@@ -34,7 +34,7 @@ The harness is to enforce each rule. A rule marked Planned is not built yet. A r
 
 ### A fixed corpus
 
-Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Before the run and again before every later round and scenario, the harness resolves every source tag again and stops if any digest has changed. A floating tag such as `latest` is allowed in the corpus only through the lock, so two runs on different dates sync the same content or do not run.
+Every image in the corpus resolves to a manifest digest once and is recorded in `bench/corpus.lock.json` (`cargo xtask bench-lock`). Every tool syncs each corpus tag from its locked digest and writes it under the corpus tag, so a source tag that moves after the lock, such as `latest`, changes nothing: two runs on different dates sync the same content, and no round is refused because a tag moved. Before the build, the harness checks that the source still serves every locked digest the run needs, and stops, naming the digest, if one is gone. A new lock, made with `cargo xtask bench-lock`, starts a new comparison series.
 
 ### Content verified, not only tags
 
