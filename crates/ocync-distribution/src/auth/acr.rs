@@ -23,7 +23,7 @@ use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
-use crate::credential_cache::CredentialCache;
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -42,31 +42,22 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
         .map_err(|e| acr_failed(format_args!("JWT payload is not valid JSON: {e}")))
 }
 
-/// Extract the `exp` claim from a JWT as a Unix timestamp.
-fn extract_jwt_exp(token: &str) -> Result<i64, Error> {
+/// The `exp` claim of a JWT as a time. One before the epoch reads as the
+/// epoch, so it has passed all the same.
+fn extract_jwt_exp(token: &str) -> Result<SystemTime, Error> {
     let json = decode_jwt_payload(token)?;
-    json.get("exp")
+    let exp = json
+        .get("exp")
         .and_then(|v| v.as_i64())
-        .ok_or_else(|| acr_failed("JWT missing 'exp' claim"))
+        .ok_or_else(|| acr_failed("JWT missing 'exp' claim"))?;
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(exp.max(0) as u64))
+        .ok_or_else(|| acr_failed("JWT 'exp' claim is out of range"))
 }
 
 /// An ACR token that does not read: [`CredentialFailure::Failed`].
 fn acr_failed(reason: impl fmt::Display) -> Error {
     Error::cloud_credentials("ACR", CredentialFailure::Failed, reason)
-}
-
-/// Compute remaining TTL from a Unix epoch timestamp.
-fn ttl_from_unix_exp(exp: i64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_secs() as i64;
-    let remaining = exp - now;
-    if remaining > 0 {
-        Duration::from_secs(remaining as u64)
-    } else {
-        Duration::ZERO
-    }
 }
 
 impl AzureCloud {
@@ -733,7 +724,7 @@ impl AcrAuth {
                 })?;
                 let ttl = extract_jwt_exp(&refresh_token)
                     .ok()
-                    .map(ttl_from_unix_exp)
+                    .map(remaining)
                     .unwrap_or(ACR_REFRESH_TOKEN_DEFAULT_TTL);
                 tracing::debug!(service = %self.service, ttl_secs = ttl.as_secs(), "ACR refresh token acquired");
                 Ok((refresh_token, ttl))
@@ -791,7 +782,7 @@ impl AuthProvider for AcrAuth {
                     let access_token = self.access_token_for(&scope_str).await?;
                     let ttl = extract_jwt_exp(&access_token)
                         .ok()
-                        .map(ttl_from_unix_exp)
+                        .map(remaining)
                         .unwrap_or(ACR_ACCESS_TOKEN_DEFAULT_TTL);
                     Ok(Token::with_ttl(access_token, ttl))
                 })
@@ -896,7 +887,23 @@ mod tests {
     fn extract_exp_from_acr_token() {
         let token = fake_jwt(r#"{"exp":1700000000,"iss":"Azure Container Registry"}"#);
         let exp = extract_jwt_exp(&token).unwrap();
-        assert_eq!(exp, 1700000000);
+        assert_eq!(
+            exp,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+    }
+
+    /// A token already past, or with a negative `exp`, has no time left
+    /// rather than falling back to the default lifetime.
+    #[test]
+    fn expired_acr_token_has_no_time_left() {
+        for (name, payload) in [
+            ("past", r#"{"exp":1700000000}"#),
+            ("negative", r#"{"exp":-5}"#),
+        ] {
+            let exp = extract_jwt_exp(&fake_jwt(payload)).unwrap();
+            assert_eq!(remaining(exp), Duration::ZERO, "{name}");
+        }
     }
 
     #[test]

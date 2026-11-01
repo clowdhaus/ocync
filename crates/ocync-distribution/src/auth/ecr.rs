@@ -12,8 +12,9 @@ use crate::auth::{AuthProvider, AuthScheme, Presents, Scope, Token};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
 
-/// ECR token lifetime when the answer carries no `expiresAt`.
-const ECR_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Token lifetime, in ECR and ECR Public, when the answer carries no
+/// `expiresAt`.
+pub(super) const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Response from an ECR `GetAuthorizationToken` call.
 #[derive(Clone)]
@@ -42,6 +43,24 @@ pub(super) struct AuthorizationData {
     /// When the token expires.
     #[serde(default, deserialize_with = "epoch_seconds")]
     pub(super) expires_at: Option<SystemTime>,
+}
+
+impl AuthorizationData {
+    /// The token and the time left on it, or [`CredentialFailure::Failed`]
+    /// naming `registry` with `missing_token` when the answer holds no token.
+    pub(super) fn into_response(
+        self,
+        registry: &str,
+        missing_token: &str,
+    ) -> Result<EcrTokenResponse, Error> {
+        let encoded_token = self.authorization_token.ok_or_else(|| {
+            Error::cloud_credentials(registry, CredentialFailure::Failed, missing_token)
+        })?;
+        Ok(EcrTokenResponse {
+            encoded_token,
+            expires_in: self.expires_at.map(remaining),
+        })
+    }
 }
 
 /// Read an expiry sent as seconds since the UNIX epoch. One before the
@@ -105,20 +124,7 @@ impl EcrApi for AwsEcrApi {
                     )
                 })?;
 
-            let encoded_token = auth_data.authorization_token.ok_or_else(|| {
-                Error::cloud_credentials(
-                    &self.registry,
-                    CredentialFailure::Failed,
-                    "ECR authorization data missing token",
-                )
-            })?;
-
-            let expires_in = auth_data.expires_at.map(remaining);
-
-            Ok(EcrTokenResponse {
-                encoded_token,
-                expires_in,
-            })
+            auth_data.into_response(&self.registry, "ECR authorization data missing token")
         })
     }
 }
@@ -239,7 +245,7 @@ impl EcrAuth {
                     e
                 })?;
                 let token = AuthorizationToken::parse(response.encoded_token, &self.hostname)?;
-                let ttl = response.expires_in.unwrap_or(ECR_DEFAULT_TOKEN_TTL);
+                let ttl = response.expires_in.unwrap_or(DEFAULT_TOKEN_TTL);
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
                 // The encoded token is already ECR's `Basic` credential.
                 let token = Token::with_ttl(token.into_encoded(), ttl).with_scheme(AuthScheme::Basic);

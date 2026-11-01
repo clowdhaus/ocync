@@ -20,18 +20,17 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
-use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
+use super::ecr::{
+    AuthorizationData, AuthorizationToken, DEFAULT_TOKEN_TTL, EcrApi, EcrTokenResponse,
+};
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Presents, Scope, Token, scopes_cache_key};
-use crate::credential_cache::{CredentialCache, remaining};
+use crate::credential_cache::CredentialCache;
 use crate::error::{CredentialFailure, Error};
 
 /// The only region ECR Public's API serves.
 const ECR_PUBLIC_REGION: &str = "us-east-1";
-
-/// Default ECR Public token lifetime (12 hours).
-const ECR_PUBLIC_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Default [`EcrApi`], calling ECR Public through [`crate::aws::Client`].
 #[derive(Debug)]
@@ -76,20 +75,10 @@ impl EcrApi for AwsEcrPublicApi {
                 )
             })?;
 
-            let encoded_token = auth_data.authorization_token.ok_or_else(|| {
-                Error::cloud_credentials(
-                    ECR_PUBLIC_HOST,
-                    CredentialFailure::Failed,
-                    "ECR Public authorization data missing token",
-                )
-            })?;
-
-            let expires_in = auth_data.expires_at.map(remaining);
-
-            Ok(EcrTokenResponse {
-                encoded_token,
-                expires_in,
-            })
+            auth_data.into_response(
+                ECR_PUBLIC_HOST,
+                "ECR Public authorization data missing token",
+            )
         })
     }
 }
@@ -107,7 +96,7 @@ fn decode_ecr_credentials(
             username: "AWS".to_owned(),
             password,
         },
-        ttl.unwrap_or(ECR_PUBLIC_DEFAULT_TOKEN_TTL),
+        ttl.unwrap_or(DEFAULT_TOKEN_TTL),
     ))
 }
 
@@ -388,6 +377,13 @@ mod tests {
                 assert_eq!(password, "my-secret-password");
             }
         }
+    }
+
+    #[test]
+    fn credentials_last_twelve_hours_when_the_answer_has_no_expiry() {
+        let encoded = BASE64.encode("AWS:my-secret-password");
+        let (_, ttl) = decode_ecr_credentials(encoded, None).unwrap();
+        assert_eq!(ttl, Duration::from_secs(43_200));
     }
 
     #[test]
