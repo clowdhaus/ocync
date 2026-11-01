@@ -1647,8 +1647,12 @@ fn prepare_clean_slate() {
 enum BlobOutcome {
     /// Served from the CDN cache.
     Hit,
-    /// Served from the origin, which warms the cache.
+    /// A cache header reported a miss: served from the origin, which warms
+    /// the cache.
     Miss,
+    /// Downloaded, but no cache header reported a hit or a miss. Nothing
+    /// says the cache needs time to settle, so this never causes the wait.
+    Unreported,
     /// Refused, unreachable or still failing after the attempts.
     Failed,
     /// Not warmed by the deadline: not sent, or not finished.
@@ -1657,15 +1661,18 @@ enum BlobOutcome {
 
 /// Classify the final response to a blob request. A hit is what `CloudFront`
 /// (`X-Cache`) or Cloudflare (`CF-Cache-Status`: `HIT`, `REVALIDATED`,
-/// `UPDATING` or `STALE`, each served from its cache) says it is; any other
-/// success is a miss. A status that is not 2xx, an unfollowed redirect
-/// included, warmed nothing.
+/// `UPDATING` or `STALE`, each served from its cache) says it is. A miss is an
+/// `X-Cache` that says miss or any other `CF-Cache-Status`. A success whose
+/// headers say neither, an object store's or a CDN's direct answer, is
+/// unreported. A status that is not 2xx, an unfollowed redirect included,
+/// warmed nothing.
 fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> BlobOutcome {
     if !status.is_success() {
         return BlobOutcome::Failed;
     }
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    let hit = header("x-cache").is_some_and(|v| v.to_ascii_lowercase().contains("hit"))
+    let x_cache = header("x-cache").map(str::to_ascii_lowercase);
+    let hit = x_cache.as_ref().is_some_and(|v| v.contains("hit"))
         || header("cf-cache-status").is_some_and(|v| {
             ["HIT", "REVALIDATED", "UPDATING", "STALE"]
                 .iter()
@@ -1673,8 +1680,10 @@ fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap)
         });
     if hit {
         BlobOutcome::Hit
-    } else {
+    } else if x_cache.is_some_and(|v| v.contains("miss")) || header("cf-cache-status").is_some() {
         BlobOutcome::Miss
+    } else {
+        BlobOutcome::Unreported
     }
 }
 
@@ -1731,10 +1740,17 @@ async fn warm_blob(
 struct PrewarmStats {
     hits: u64,
     misses: u64,
+    /// Blobs downloaded with no cache header saying hit or miss.
+    unreported: u64,
     /// Blobs that could not be warmed.
     failed: u64,
     /// Blobs not finished because the deadline came first.
     past_deadline: u64,
+    /// The registry is on [`NO_BLOB_CACHE_HOSTS`] and its probe confirmed it:
+    /// one blob was checked and the others were not requested.
+    no_cache: bool,
+    /// Blobs not requested because the registry has no blob cache.
+    not_requested: u64,
 }
 
 impl PrewarmStats {
@@ -1743,10 +1759,30 @@ impl PrewarmStats {
         let count = match outcome {
             BlobOutcome::Hit => &mut self.hits,
             BlobOutcome::Miss => &mut self.misses,
+            BlobOutcome::Unreported => &mut self.unreported,
             BlobOutcome::Failed => &mut self.failed,
             BlobOutcome::PastDeadline => &mut self.past_deadline,
         };
         *count += 1;
+    }
+
+    /// The registry's line in the pre-warm summary.
+    fn summary(&self) -> String {
+        if self.no_cache {
+            return format!(
+                "no blob cache, not warmed ({} checked, {} not requested)",
+                self.unreported, self.not_requested
+            );
+        }
+        format!(
+            "{} blobs warmed ({} hits, {} misses, {} without a cache header), {} failed, {} past the deadline",
+            self.hits + self.misses + self.unreported,
+            self.hits,
+            self.misses,
+            self.unreported,
+            self.failed,
+            self.past_deadline
+        )
     }
 }
 
@@ -1793,22 +1829,134 @@ const PREWARM_PER_REGISTRY: usize = 8;
 /// Attempts at one blob whose body fails mid-read.
 const PREWARM_MAX_ATTEMPTS: u32 = 2;
 
+/// Registries measured to serve blobs through no cache, so that warming one
+/// costs its bytes for nothing. quay.io redirects blobs to `cdn01.quay.io`
+/// (S3) and cgr.dev to Cloudflare R2; neither answers with `X-Cache` or
+/// `CF-Cache-Status` (measured 2026-10-31 and in run `2026-11-01-154015` for
+/// quay.io, 2026-10-30 for cgr.dev). Each is probed with one blob, so one that
+/// gains a cache is warmed after all and reported.
+const NO_BLOB_CACHE_HOSTS: [&str; 2] = ["quay.io", "cgr.dev"];
+
+/// What a probe of a host on [`NO_BLOB_CACHE_HOSTS`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// A success with neither `X-Cache` nor `CF-Cache-Status`.
+    NoCache,
+    /// A success carrying one of them: the host has a cache now.
+    Cached,
+    /// Refused, unreachable or past the deadline: nothing learned, so the
+    /// host is warmed as any other.
+    Unknown,
+}
+
+/// Request one blob and read its headers only, dropping the body unread.
+/// `what` names it in notices.
+async fn probe(
+    deadline: Instant,
+    what: &str,
+    send: impl AsyncFn() -> Result<reqwest::Response, String>,
+) -> Probe {
+    let answered = async {
+        match send().await {
+            Ok(response) if !response.status().is_success() => {
+                eprintln!("  {what}: {}", response.status());
+                Probe::Unknown
+            }
+            Ok(response) => {
+                let headers = response.headers();
+                if headers.contains_key("x-cache") || headers.contains_key("cf-cache-status") {
+                    Probe::Cached
+                } else {
+                    Probe::NoCache
+                }
+            }
+            Err(e) => {
+                eprintln!("  {what}: {e}");
+                Probe::Unknown
+            }
+        }
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answered)
+        .await
+        .unwrap_or(Probe::Unknown)
+}
+
+/// What [`warm_blobs`] found.
+struct Warmed<'a> {
+    /// The outcomes of each registry's blobs.
+    stats: BTreeMap<&'a str, PrewarmStats>,
+    /// Registries on the no-cache list whose probe carried a cache header.
+    cache_gained: BTreeSet<&'a str>,
+}
+
 /// Warm every blob, at most [`PREWARM_PER_REGISTRY`] at a time per registry,
-/// each by `deadline`, and count the outcomes by registry. `send` requests one
-/// blob, `what` naming it in notices.
+/// each by `deadline`, and count the outcomes by registry. First, each
+/// registry in `no_cache_hosts` is probed with its first blob; one that
+/// answers with no cache header has its other blobs left unrequested, and one
+/// that answers with a cache header is warmed like any other and named in
+/// [`Warmed::cache_gained`]. `send` requests one blob, `what` naming it in
+/// notices.
 async fn warm_blobs<'a>(
     blobs: &[(registry::Repository<'a>, &'a Digest)],
     deadline: Instant,
+    no_cache_hosts: &[&str],
     send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
-) -> BTreeMap<&'a str, PrewarmStats> {
-    let permits: HashMap<&str, tokio::sync::Semaphore> = blobs
+) -> Warmed<'a> {
+    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
+    let mut cache_gained = BTreeSet::new();
+
+    let mut firsts = BTreeMap::new();
+    for blob in blobs {
+        let host = blob.0.host.api_host();
+        if no_cache_hosts.contains(&host) {
+            firsts.entry(host).or_insert(blob);
+        }
+    }
+    let probes = futures_util::future::join_all(firsts.values().map(|(repo, digest)| {
+        let send = &send;
+        async move {
+            let what = format!("blob probe {repo}@{digest}");
+            let found = probe(deadline, &what, async || send(repo, digest, &what).await).await;
+            (repo.host.api_host(), found)
+        }
+    }))
+    .await;
+    for (host, found) in probes {
+        match found {
+            Probe::NoCache => {
+                let blobs_of_host = blobs
+                    .iter()
+                    .filter(|(repo, _)| repo.host.api_host() == host)
+                    .count();
+                stats.insert(
+                    host,
+                    PrewarmStats {
+                        unreported: 1,
+                        no_cache: true,
+                        not_requested: blobs_of_host as u64 - 1,
+                        ..PrewarmStats::default()
+                    },
+                );
+            }
+            Probe::Cached => {
+                cache_gained.insert(host);
+            }
+            Probe::Unknown => {}
+        }
+    }
+
+    let to_warm: Vec<_> = blobs
+        .iter()
+        .filter(|(repo, _)| !stats.contains_key(repo.host.api_host()))
+        .collect();
+    let permits: HashMap<&str, tokio::sync::Semaphore> = to_warm
         .iter()
         .map(|(repo, _)| {
             let host = repo.host.api_host();
             (host, tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY))
         })
         .collect();
-    let outcomes = futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
+    let outcomes = futures_util::future::join_all(to_warm.iter().map(|(repo, digest)| {
         let (permits, send) = (&permits, &send);
         async move {
             let host = repo.host.api_host();
@@ -1820,11 +1968,13 @@ async fn warm_blobs<'a>(
         }
     }))
     .await;
-    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
     for (host, outcome) in outcomes {
         stats.entry(host).or_default().record(outcome);
     }
-    stats
+    Warmed {
+        stats,
+        cache_gained,
+    }
 }
 
 /// Pull every unique source blob once to warm CDN edge caches.
@@ -1848,28 +1998,45 @@ async fn cdn_prewarm(
         "bench: warming {} unique blobs ({PREWARM_PER_REGISTRY} at a time per registry)...",
         blobs.len()
     );
-    let stats = warm_blobs(&blobs, deadline, async |repo, digest, what| {
-        let url = repo.url(&format!("blobs/{digest}"));
-        access.send(repo, what, |client| client.get(&url)).await
-    })
+    let Warmed {
+        stats,
+        cache_gained,
+    } = warm_blobs(
+        &blobs,
+        deadline,
+        &NO_BLOB_CACHE_HOSTS,
+        async |repo, digest, what| {
+            let url = repo.url(&format!("blobs/{digest}"));
+            access.send(repo, what, |client| client.get(&url)).await
+        },
+    )
     .await;
-    for (registry, s) in &stats {
+    for host in &cache_gained {
         eprintln!(
-            "  pre-warm: {registry}: {} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline",
-            s.hits + s.misses,
-            s.hits,
-            s.misses,
-            s.failed,
-            s.past_deadline
+            "WARNING: {host} is on NO_BLOB_CACHE_HOSTS but its blob answered with a cache header, so it was warmed; remove it from the list"
         );
+    }
+    for (registry, s) in &stats {
+        eprintln!("  pre-warm: {registry}: {}", s.summary());
     }
     eprintln!("bench: blob CDN pre-warm done");
     let outcome = Prewarm::Done {
         unwarmed: unwarmed(&stats),
+        no_cache: stats
+            .iter()
+            .filter(|(_, s)| s.no_cache)
+            .map(|(host, _)| (*host).to_owned())
+            .collect(),
     };
-    if let Some(note) = outcome.note() {
+    // Only what is not warmed is a warning: a registry with no cache has
+    // nothing a later tool could pay for, so it is in the summary and the
+    // record alone.
+    if let Prewarm::Done { unwarmed, .. } = &outcome
+        && !unwarmed.is_empty()
+    {
         eprintln!(
-            "WARNING: {note}; the tool that runs first may pay the CDN misses and tool order matters"
+            "WARNING: Pre-warm: {}; the tool that runs first may pay the CDN misses and tool order matters",
+            report::not_warmed(unwarmed)
         );
     }
 
@@ -2969,6 +3136,17 @@ images:
             s.record(BlobOutcome::Failed);
             s
         });
+        // Catches: a registry with no blob cache named as one that failed to
+        // warm.
+        stats.insert(
+            "nocache.example",
+            PrewarmStats {
+                unreported: 1,
+                no_cache: true,
+                not_requested: 5,
+                ..PrewarmStats::default()
+            },
+        );
         stats.insert("late.example", {
             let mut s = PrewarmStats::default();
             s.record(BlobOutcome::PastDeadline);
@@ -3164,7 +3342,7 @@ images:
         // Catches: an error page or an unfollowed redirect counted as a warmed
         // blob, and a hit read off the wrong header.
         type Headers<'a> = &'a [(&'a str, &'a str)];
-        let cases: [(u16, Headers<'_>, BlobOutcome); 16] = [
+        let cases: [(u16, Headers<'_>, BlobOutcome); 18] = [
             (200, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
             (
                 200,
@@ -3183,7 +3361,13 @@ images:
                 BlobOutcome::Miss,
             ),
             (200, &[("cf-cache-status", "MISS")], BlobOutcome::Miss),
-            (200, &[], BlobOutcome::Miss),
+            (200, &[], BlobOutcome::Unreported),
+            (200, &[("server", "AmazonS3")], BlobOutcome::Unreported),
+            (
+                200,
+                &[("x-cache", "Error from cloudfront")],
+                BlobOutcome::Unreported,
+            ),
             (206, &[("x-cache", "Hit from cloudfront")], BlobOutcome::Hit),
             (
                 302,
@@ -3277,16 +3461,136 @@ images:
             .map(|(host, path)| (Repository { host, path }, &digest))
             .collect();
         let deadline = Instant::now() + Duration::from_millis(100);
-        let stats = block_on_within_five_seconds(warm_blobs(
-            &blobs,
-            deadline,
-            async |repo, _, _| match repo.host {
-                Host::Other("hung.example") => std::future::pending().await,
-                _ => served("Hit from cloudfront"),
-            },
-        ));
+        let stats =
+            block_on_within_five_seconds(warm_blobs(&blobs, deadline, &[], async |repo, _, _| {
+                match repo.host {
+                    Host::Other("hung.example") => std::future::pending().await,
+                    _ => served("Hit from cloudfront"),
+                }
+            }))
+            .stats;
         assert_eq!(stats["fine.example"].hits, fine_paths.len() as u64);
         assert_eq!(stats["hung.example"].past_deadline, hung_paths.len() as u64);
+    }
+
+    /// How a host answers every blob request: with this status and, if any,
+    /// this `X-Cache`.
+    type Answer = (u16, Option<&'static str>);
+
+    /// Warm `blobs_each` blobs of each of `hosts`, which answer as given and
+    /// of which `listed` are on the no-cache list. Returns what was found
+    /// and how many requests each host received.
+    fn warm_hosts(
+        listed: &[&str],
+        hosts: &[(&'static str, Answer)],
+        blobs_each: usize,
+    ) -> (Warmed<'static>, BTreeMap<String, usize>) {
+        use registry::{Host, Repository};
+        let digest: &'static Digest = Box::leak(Box::new(lock::fixtures::digest('1')));
+        let paths: Vec<&'static str> = (0..blobs_each)
+            .map(|i| &*Box::leak(format!("p{i}").into_boxed_str()))
+            .collect();
+        let blobs: Vec<_> = hosts
+            .iter()
+            .flat_map(|(host, _)| {
+                paths.iter().map(move |path| Repository {
+                    host: Host::Other(host),
+                    path,
+                })
+            })
+            .map(|repo| (repo, digest))
+            .collect();
+        let requests = std::cell::RefCell::new(BTreeMap::new());
+        let warmed = block_on_within_five_seconds(warm_blobs(
+            &blobs,
+            Instant::now() + Duration::from_secs(10),
+            listed,
+            async |repo, _, _| {
+                let host = repo.host.api_host();
+                *requests.borrow_mut().entry(host.to_owned()).or_default() += 1;
+                let (_, (status, x_cache)) = hosts.iter().find(|(h, _)| *h == host).unwrap();
+                let mut response = http::Response::builder().status(*status);
+                if let Some(x_cache) = x_cache {
+                    response = response.header("x-cache", *x_cache);
+                }
+                Ok(reqwest::Response::from(
+                    response.body("blob bytes").unwrap(),
+                ))
+            },
+        ));
+        (warmed, requests.into_inner())
+    }
+
+    const HIT: Answer = (200, Some("Hit from cloudfront"));
+    const MISS: Answer = (200, Some("Miss from cloudfront"));
+    const NO_HEADER: Answer = (200, None);
+
+    #[test]
+    fn a_listed_host_with_no_cache_header_is_probed_once_and_the_rest_left_alone() {
+        // Catches: the whole corpus of a registry with no cache downloaded to
+        // warm nothing, a host off the list probed, and the probe's result
+        // spilling over to another host.
+        let (warmed, requests) = warm_hosts(
+            &["bare.example"],
+            &[("bare.example", NO_HEADER), ("cdn.example", HIT)],
+            20,
+        );
+        assert_eq!(requests["bare.example"], 1);
+        let bare = &warmed.stats["bare.example"];
+        assert!(bare.no_cache);
+        assert_eq!((bare.unreported, bare.not_requested), (1, 19));
+        assert_eq!(
+            bare.summary(),
+            "no blob cache, not warmed (1 checked, 19 not requested)"
+        );
+        assert!(warmed.cache_gained.is_empty());
+        assert_eq!(requests["cdn.example"], 20);
+        assert_eq!(warmed.stats["cdn.example"].hits, 20);
+        assert!(!warmed.stats["cdn.example"].no_cache);
+    }
+
+    #[test]
+    fn a_listed_host_that_gained_a_cache_is_warmed_in_full_and_named() {
+        // Catches: a host left unwarmed because it is on the list, and a host
+        // that gained a cache going unreported.
+        let (warmed, requests) = warm_hosts(&["now-cdn.example"], &[("now-cdn.example", MISS)], 20);
+        // The probe, then every blob.
+        assert_eq!(requests["now-cdn.example"], 21);
+        let stats = &warmed.stats["now-cdn.example"];
+        assert_eq!((stats.misses, stats.no_cache), (20, false));
+        assert_eq!(warmed.cache_gained, BTreeSet::from(["now-cdn.example"]));
+    }
+
+    #[test]
+    fn a_listed_host_whose_probe_fails_is_warmed_like_any_other() {
+        // Catches: a refused probe taken for a host with no cache, which
+        // would leave it unwarmed without saying so.
+        let (warmed, requests) = warm_hosts(&["down.example"], &[("down.example", (503, None))], 5);
+        assert_eq!(requests["down.example"], 6);
+        let stats = &warmed.stats["down.example"];
+        assert_eq!((stats.failed, stats.no_cache), (5, false));
+        assert!(warmed.cache_gained.is_empty());
+    }
+
+    #[test]
+    fn only_a_reported_miss_counts_toward_the_wait() {
+        // Catches: a registry's direct answers, with no cache header, counted
+        // as misses and holding the run for the CDN wait, and a reported miss
+        // not counted.
+        let (warmed, requests) = warm_hosts(
+            &[],
+            &[("direct.example", NO_HEADER), ("edge.example", MISS)],
+            10,
+        );
+        // Every blob is downloaded either way.
+        assert_eq!(requests["direct.example"], 10);
+        let direct = &warmed.stats["direct.example"];
+        assert_eq!((direct.unreported, direct.misses), (10, 0));
+        assert_eq!(warmed.stats["edge.example"].misses, 10);
+        assert_eq!(
+            direct.summary(),
+            "10 blobs warmed (0 hits, 0 misses, 10 without a cache header), 0 failed, 0 past the deadline"
+        );
     }
 
     #[test]
