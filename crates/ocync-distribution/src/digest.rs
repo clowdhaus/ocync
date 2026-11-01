@@ -31,6 +31,17 @@ impl Digest {
         }
     }
 
+    /// The full `algorithm:hex` string.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Whether this is a SHA-256 digest, the only algorithm the client can
+    /// compute over received bytes.
+    pub fn is_sha256(&self) -> bool {
+        self.algorithm() == SHA256_ALGO
+    }
+
     /// The algorithm portion (e.g. `sha256`).
     pub fn algorithm(&self) -> &str {
         &self.raw[..self.algo_len]

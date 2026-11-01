@@ -81,7 +81,7 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
     )?;
 
     let Some(report) = m.filter_report.as_ref() else {
-        // Exact-tag fast path: source tags were never enumerated.
+        // Exact-tag and pinned-digest paths: source tags were never enumerated.
         return write_simple_tag_list(w, &m.tags);
     };
 
@@ -104,7 +104,8 @@ fn write_mapping<W: Write>(w: &mut W, m: &ResolvedMapping, verbose: bool) -> io:
     Ok(())
 }
 
-/// A flat tag list for the exact-tag fast path, which has no `FilterReport`.
+/// A flat tag list for the exact-tag and pinned-digest paths, which have no
+/// `FilterReport`.
 fn write_simple_tag_list<W: Write>(w: &mut W, tags: &[TagPair]) -> io::Result<()> {
     writeln!(w, "  tags ({}):", tags.len())?;
     write_tag_pairs(w, tags)

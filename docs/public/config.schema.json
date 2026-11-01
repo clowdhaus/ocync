@@ -310,10 +310,10 @@
           "default": null
         },
         "tags": {
-          "description": "Tag filter rules for this mapping, overriding `defaults.tags`.",
+          "description": "Tag filter rules for this mapping, overriding `defaults.tags`, or a\nlist of tags pinned to source digests.",
           "anyOf": [
             {
-              "$ref": "#/$defs/TagsConfig"
+              "$ref": "#/$defs/MappingTags"
             },
             {
               "type": "null"
@@ -345,6 +345,46 @@
       "required": [
         "from"
       ]
+    },
+    "MappingTags": {
+      "description": "A mapping's `tags:` value: filter rules, or a list of pinned tags.",
+      "anyOf": [
+        {
+          "description": "Filter rules applied to the source's tag list.",
+          "$ref": "#/$defs/TagsConfig"
+        },
+        {
+          "description": "Tags copied from exact source digests; the source is never listed.",
+          "$ref": "#/$defs/PinnedTags"
+        }
+      ]
+    },
+    "PinnedTag": {
+      "description": "A target tag and the source manifest digest it is copied from.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Source manifest digest to copy (`sha256:` followed by 64 hex digits).",
+          "type": "string"
+        },
+        "name": {
+          "description": "Tag written at the target.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "digest"
+      ]
+    },
+    "PinnedTags": {
+      "description": "A non-empty list of pinned tags with no name repeated.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PinnedTag"
+      },
+      "minItems": 1
     },
     "RegistryConfig": {
       "description": "Per-registry settings: URL, auth method, concurrency, and credentials.",

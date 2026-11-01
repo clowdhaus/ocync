@@ -145,7 +145,7 @@ pub use manifest::ManifestPull;
 pub use reference::Reference;
 pub use spec::{
     Descriptor, ImageIndex, ImageManifest, ManifestKind, MediaType, Platform, PlatformFilter,
-    RegistryAuthority, RepositoryName,
+    RegistryAuthority, RepositoryName, Tag,
 };
 
 #[cfg(all(test, not(feature = "fips")))]

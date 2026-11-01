@@ -186,5 +186,6 @@ Discovery counters are reported in the sync summary and `--json` output:
 - **discovery_cache_misses**: tags where a full source manifest pull was attempted (cold cache, source changed, config changed, HEAD failed, or target stale despite source cache match)
 - **discovery_head_failures**: subset of misses caused by infrastructure issues (network errors, HTTP errors, timeouts, missing digest headers)
 - **discovery_target_stale**: subset of misses where the source cache matched but target HEAD returned a mismatch
+- **discovery_pin_skips**: pinned tags skipped because every target already held the pinned digest, with no source request
 
 The sum of cache_hits and cache_misses always equals the total tag count. Operators can distinguish "source changed" (healthy) from "HEAD broken" (unhealthy) and from "target stale" (check ECR lifecycle policies or GC schedules).

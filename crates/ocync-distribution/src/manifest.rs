@@ -87,6 +87,10 @@ impl RegistryClient {
 
     /// Pull a manifest, accepting every supported media type, with its digest
     /// computed from the raw bytes.
+    ///
+    /// When `reference` is a SHA-256 digest, bytes that hash to another digest
+    /// fail with [`Error::DigestMismatch`]. Other algorithms are not checked:
+    /// the client computes only SHA-256.
     pub async fn manifest_pull(
         &self,
         repository: &RepositoryName,
@@ -114,6 +118,16 @@ impl RegistryClient {
 
         let hash = Sha256::digest(&raw_bytes);
         let digest = Digest::from_sha256(hash);
+
+        if let Ok(expected) = reference.parse::<Digest>()
+            && expected.is_sha256()
+            && expected != digest
+        {
+            return Err(Error::DigestMismatch {
+                expected,
+                actual: digest,
+            });
+        }
 
         let manifest = ManifestKind::from_json(&media_type, &raw_bytes)?;
 
@@ -243,6 +257,48 @@ mod tests {
             referrers_path(&digest),
             "referrers/sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// A manifest pulled by digest must hash to it; a tag is not checked.
+    /// Breaks if the check is dropped, fires for a tag, or compares the wrong
+    /// digests.
+    #[tokio::test]
+    async fn a_manifest_pulled_by_digest_must_hash_to_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1},"layers":[]}"#;
+        let actual = Digest::from_sha256(Sha256::digest(body));
+        let other: Digest = format!("sha256:{}", "b".repeat(64)).parse().unwrap();
+
+        let server = MockServer::start().await;
+        for reference in [actual.to_string(), other.to_string(), "latest".to_string()] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/repo/manifests/{reference}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(body.to_vec(), MediaType::OciManifest.as_str()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client =
+            crate::client::RegistryClientBuilder::new(url::Url::parse(&server.uri()).unwrap())
+                .build()
+                .unwrap();
+        let repo = RepositoryName::new("repo").unwrap();
+
+        let pulled = client.manifest_pull(&repo, actual.as_str()).await.unwrap();
+        assert_eq!(pulled.digest, actual);
+        client.manifest_pull(&repo, "latest").await.unwrap();
+        match client.manifest_pull(&repo, other.as_str()).await {
+            Err(Error::DigestMismatch {
+                expected,
+                actual: got,
+            }) => assert_eq!((expected, got), (other, actual)),
+            got => panic!("expected a digest mismatch, got {got:?}"),
+        }
     }
 
     #[test]

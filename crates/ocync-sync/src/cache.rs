@@ -66,7 +66,8 @@ pub struct SnapshotKey {
     authority: RegistryAuthority,
     /// Repository path (e.g. `chainguard/nginx`).
     repo: RepositoryName,
-    /// Tag name (e.g. `latest`).
+    /// Tag or digest the source was pulled by (e.g. `latest`, `sha256:...`).
+    /// Named `tag` because the field is persisted.
     tag: String,
 }
 

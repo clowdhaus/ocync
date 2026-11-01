@@ -22,6 +22,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// A tag name broke the OCI tag rule.
+    #[error("invalid tag '{tag}': {reason}")]
+    InvalidTag {
+        /// The tag that was refused.
+        tag: String,
+        /// Why the tag is invalid.
+        reason: String,
+    },
+
     /// The digest string could not be parsed.
     #[error("invalid digest '{digest}': {reason}")]
     InvalidDigest {
@@ -186,7 +195,8 @@ pub enum Error {
         reason: String,
     },
 
-    /// The computed digest does not match the expected digest during blob upload.
+    /// The computed digest does not match the expected digest: a blob upload,
+    /// or a manifest pulled by digest whose bytes hash to another.
     #[error("digest mismatch: expected {expected}, got {actual}")]
     DigestMismatch {
         /// The digest that was expected.
@@ -580,7 +590,7 @@ mod tests {
     /// the header or path. Breaks if a message drops a field it names.
     #[test]
     fn errors_show_their_fields() {
-        let cases: [(Error, &[&str]); 11] = [
+        let cases: [(Error, &[&str]); 12] = [
             // invalid reference
             (
                 Error::InvalidReference {
@@ -588,6 +598,13 @@ mod tests {
                     reason: "bad chars".into(),
                 },
                 &["!!!", "bad chars"],
+            ),
+            (
+                Error::InvalidTag {
+                    tag: "a b".into(),
+                    reason: "bad chars".into(),
+                },
+                &["a b", "bad chars"],
             ),
             // invalid digest
             (
@@ -692,6 +709,10 @@ mod tests {
         let variants: Vec<Error> = vec![
             Error::InvalidReference {
                 input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidTag {
+                tag: "bad".into(),
                 reason: "reason".into(),
             },
             Error::InvalidDigest {
@@ -900,6 +921,10 @@ mod tests {
         let variants: Vec<Error> = vec![
             Error::InvalidReference {
                 input: "bad".into(),
+                reason: "reason".into(),
+            },
+            Error::InvalidTag {
+                tag: "bad".into(),
                 reason: "reason".into(),
             },
             Error::InvalidDigest {

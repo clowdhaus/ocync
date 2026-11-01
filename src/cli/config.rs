@@ -5,6 +5,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::time::Duration;
 
+use ocync_distribution::{Digest, Tag};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +28,12 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let has_default_tags = config.defaults.as_ref().is_some_and(|d| d.tags.is_some());
     for mapping in &config.mappings {
         validate_mapping(mapping, has_default_tags)?;
-        if let Some(ref tags) = mapping.tags {
-            validate_tags(&format!("mapping '{}'", mapping.from), tags)?;
+        match &mapping.tags {
+            Some(MappingTags::Filter(tags)) => {
+                validate_tags(&format!("mapping '{}'", mapping.from), tags)?;
+            }
+            Some(MappingTags::Pinned(_)) => validate_pinned(mapping)?,
+            None => {}
         }
     }
     if let Some(ref defaults) = config.defaults {
@@ -341,9 +346,10 @@ pub(crate) struct MappingConfig {
     #[serde(default)]
     pub targets: Option<TargetsValue>,
 
-    /// Tag filter rules for this mapping, overriding `defaults.tags`.
+    /// Tag filter rules for this mapping, overriding `defaults.tags`, or a
+    /// list of tags pinned to source digests.
     #[serde(default)]
-    pub tags: Option<TagsConfig>,
+    pub tags: Option<MappingTags>,
 
     /// Platform filter for this mapping, overriding any value in `defaults`.
     ///
@@ -447,6 +453,104 @@ pub(crate) struct TagsConfig {
     /// conventionally immutable; this avoids redundant HEAD checks.
     #[serde(default)]
     pub immutable_tags: Option<String>,
+}
+
+/// A mapping's `tags:` value: filter rules, or a list of pinned tags.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum MappingTags {
+    /// Filter rules applied to the source's tag list.
+    Filter(TagsConfig),
+    /// Tags copied from exact source digests; the source is never listed.
+    Pinned(PinnedTags),
+}
+
+/// A non-empty list of pinned tags with no name repeated.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(try_from = "Vec<PinnedTag>")]
+#[schemars(extend("minItems" = 1))]
+pub(crate) struct PinnedTags(Vec<PinnedTag>);
+
+impl PinnedTags {
+    /// The pinned entries in config order.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, PinnedTag> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<PinnedTag>> for PinnedTags {
+    type Error = String;
+
+    fn try_from(pins: Vec<PinnedTag>) -> Result<Self, Self::Error> {
+        if pins.is_empty() {
+            return Err("tags list must not be empty".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for pin in &pins {
+            if !seen.insert(&pin.name) {
+                return Err(format!("tag '{}' is pinned more than once", pin.name));
+            }
+        }
+        Ok(Self(pins))
+    }
+}
+
+/// A target tag and the source manifest digest it is copied from.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinnedTag {
+    /// Tag written at the target.
+    #[schemars(with = "String")]
+    pub name: Tag,
+
+    /// Source manifest digest to copy (`sha256:` followed by 64 hex digits).
+    #[serde(deserialize_with = "deserialize_pinned_digest")]
+    #[schemars(with = "String")]
+    pub digest: Digest,
+}
+
+/// Parses `digest:`, naming the field in the error and accepting only SHA-256,
+/// the algorithm the pulled manifest bytes are hashed with.
+fn deserialize_pinned_digest<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Digest, D::Error> {
+    use serde::de::Error as _;
+    let digest =
+        Digest::deserialize(deserializer).map_err(|e| D::Error::custom(format!("digest: {e}")))?;
+    if !digest.is_sha256() {
+        return Err(D::Error::custom(format!(
+            "digest: '{digest}' is not sha256, the only supported algorithm"
+        )));
+    }
+    Ok(digest)
+}
+
+impl<'de> Deserialize<'de> for MappingTags {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(MappingTagsVisitor)
+    }
+}
+
+/// Dispatches on map versus sequence so each form reports its own errors,
+/// which `#[serde(untagged)]` would replace with "did not match any variant".
+struct MappingTagsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for MappingTagsVisitor {
+    type Value = MappingTags;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a tag filter map or a list of pinned {name, digest} entries")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<MappingTags, A::Error> {
+        TagsConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(MappingTags::Filter)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<MappingTags, A::Error> {
+        PinnedTags::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            .map(MappingTags::Pinned)
+    }
 }
 
 impl TagsConfig {
@@ -811,6 +915,20 @@ fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// A pinned mapping must set no `platforms:` of its own: a pinned tag copies
+/// the exact digest, which a filtered index would change. (`defaults.platforms`
+/// is ignored, like `defaults.tags`.)
+fn validate_pinned(mapping: &MappingConfig) -> Result<(), ConfigError> {
+    if mapping.platforms.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "mapping '{}': pinned tags copy the whole index and cannot be platform-filtered \
+             (remove platforms)",
+            mapping.from
+        )));
+    }
+    Ok(())
+}
+
 /// A mapping must have its own `tags` block or inherit `defaults.tags`.
 /// Its platform strings are validated too.
 fn validate_mapping(mapping: &MappingConfig, has_default_tags: bool) -> Result<(), ConfigError> {
@@ -924,6 +1042,16 @@ mod tests {
     use super::*;
     use crate::cli::test_support::{lock_env, write_temp_config};
 
+    impl MappingConfig {
+        /// The mapping's filter rules; panics on a pinned list or no tags.
+        fn filter(&self) -> &TagsConfig {
+            match &self.tags {
+                Some(MappingTags::Filter(tags)) => tags,
+                other => panic!("expected filter rules, got {other:?}"),
+            }
+        }
+    }
+
     const SCHEMA_JSON_PATH: &str = "docs/public/config.schema.json";
 
     fn generate_schema_json() -> String {
@@ -987,7 +1115,7 @@ mappings:
       latest: 5
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let tags = config.mappings[0].tags.as_ref().unwrap();
+        let tags = config.mappings[0].filter();
         assert!(matches!(tags.sort, Some(SortOrder::Semver)));
         assert_eq!(tags.latest, Some(5));
         assert!(matches!(&tags.include, Some(GlobOrList::Single(s)) if s == "*-rc*"));
@@ -1037,12 +1165,12 @@ mappings:
 "#;
         let cfg = serde_yaml::from_str::<Config>(yaml).expect("config parses");
         let mapping = &cfg.mappings[0];
-        let include = mapping.tags.as_ref().unwrap().include.as_ref().unwrap();
+        let include = mapping.filter().include.as_ref().unwrap();
         let list = match include {
             GlobOrList::List(l) => l,
             GlobOrList::Single(s) => panic!("expected list, got single: {}", s),
         };
-        assert_eq!(list, &vec!["latest".to_string(), "latest-dev".to_string()]);
+        assert_eq!(*list, vec!["latest".to_string(), "latest-dev".to_string()]);
     }
 
     #[test]
@@ -1059,7 +1187,7 @@ mappings:
         - "*.beta*"
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let tags = config.mappings[0].tags.as_ref().unwrap();
+        let tags = config.mappings[0].filter();
         match tags.glob.as_ref().unwrap() {
             GlobOrList::List(v) => assert_eq!(v.len(), 2),
             _ => panic!("expected list"),
@@ -1152,13 +1280,7 @@ mappings:
             global.staging_size_limit,
             Some(StagingLimit::Bytes(NonZeroU64::new(1_000_000_000).unwrap()))
         );
-        let semver = roundtripped.mappings[0]
-            .tags
-            .as_ref()
-            .unwrap()
-            .semver
-            .as_ref()
-            .unwrap();
+        let semver = roundtripped.mappings[0].filter().semver.as_ref().unwrap();
         assert_eq!(semver.to_string(), ">=1.0, <2.0");
     }
 
@@ -1287,10 +1409,10 @@ mappings:
             to: None,
             source: None,
             targets: None,
-            tags: Some(TagsConfig {
+            tags: Some(MappingTags::Filter(TagsConfig {
                 glob: Some(GlobOrList::Single("*".to_string())),
                 ..Default::default()
-            }),
+            })),
             platforms: Some(vec!["linux-amd64".to_string()]),
             artifacts: None,
         };
@@ -1314,10 +1436,10 @@ mappings:
                 to: None,
                 source: None,
                 targets: None,
-                tags: Some(TagsConfig {
+                tags: Some(MappingTags::Filter(TagsConfig {
                     glob: Some(GlobOrList::Single("*".to_string())),
                     ..Default::default()
-                }),
+                })),
                 platforms: Some(vec![platform.to_string()]),
                 artifacts: None,
             };
@@ -1463,7 +1585,7 @@ mappings:
             format!("mappings:\n  - from: nginx\n    tags:\n      semver: \"{range}\"\n")
         };
         let config: Config = serde_yaml::from_str(&yaml(">=1.0, <2.0")).unwrap();
-        let tags = config.mappings[0].tags.as_ref().unwrap();
+        let tags = config.mappings[0].filter();
         assert_eq!(tags.semver.as_ref().unwrap().to_string(), ">=1.0, <2.0");
 
         let err = serde_yaml::from_str::<Config>(&yaml("not_valid"))
@@ -1845,6 +1967,133 @@ mappings:
                 assert!(msg.contains("linux-amd64"), "{msg}");
             }
             other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// A config whose only mapping has the given `tags:` YAML (indented under
+    /// the mapping), with no `defaults.tags`.
+    fn pinned_config(tags_yaml: &str) -> String {
+        format!("mappings:\n  - from: library/postgres\n    tags:{tags_yaml}\n")
+    }
+
+    /// A pinned list loads as `Pinned` with no `defaults.tags`, which a
+    /// mapping without its own tags block would need. Breaks if a list is
+    /// read as filter rules or `validate_mapping` does not count it present.
+    #[test]
+    fn a_pinned_list_loads() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let file = write_temp_config(&pinned_config(&format!(
+            "\n      - name: \"15.19\"\n        digest: \"{digest}\"\n      - name: stable\n        digest: \"{digest}\""
+        )));
+        let config = load_config(file.path()).unwrap();
+        let Some(MappingTags::Pinned(pins)) = &config.mappings[0].tags else {
+            panic!("expected a pinned list, got {:?}", config.mappings[0].tags);
+        };
+        let got: Vec<(&str, String)> = pins
+            .iter()
+            .map(|p| (p.name.as_str(), p.digest.to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            [("15.19", digest.clone()), ("stable", digest)],
+            "pinned entries"
+        );
+    }
+
+    /// Each bad pinned list names its problem. Breaks if validation is
+    /// skipped for a pinned list or an error loses the field it names.
+    #[test]
+    fn invalid_pinned_lists_rejected() {
+        let good = format!("sha256:{}", "a".repeat(64));
+        let entry = |name: &str, digest: &str| {
+            format!("\n      - name: \"{name}\"\n        digest: \"{digest}\"")
+        };
+        let cases = [
+            (
+                "empty list",
+                " []".to_string(),
+                "tags list must not be empty",
+            ),
+            (
+                "neither map nor list",
+                " oops".to_string(),
+                "a tag filter map or a list of pinned",
+            ),
+            (
+                "duplicate name",
+                entry("15.19", &good) + &entry("15.19", &good),
+                "tag '15.19' is pinned more than once",
+            ),
+            (
+                "short digest",
+                entry("15.19", "sha256:abc"),
+                "digest: invalid digest 'sha256:abc'",
+            ),
+            (
+                "non-sha256 digest",
+                entry("15.19", &format!("sha512:{}", "a".repeat(128))),
+                "is not sha256",
+            ),
+            (
+                "unknown entry field",
+                format!("{}\n        platform: linux/amd64", entry("15.19", &good)),
+                "unknown field `platform`",
+            ),
+            (
+                "missing digest",
+                "\n      - name: \"15.19\"".to_string(),
+                "missing field `digest`",
+            ),
+        ];
+        for (name, tags_yaml, want) in cases {
+            let file = write_temp_config(&pinned_config(&tags_yaml));
+            let err = load_config(file.path()).unwrap_err().to_string();
+            assert!(err.contains(want), "{name}: expected '{want}' in: {err}");
+        }
+    }
+
+    /// A pinned mapping with its own platform filter is refused, since a
+    /// filtered index is not the pinned digest; `defaults.platforms` is
+    /// ignored for it, like `defaults.tags`. Breaks if its own platforms are
+    /// not checked, or `defaults.platforms` or no platforms are refused.
+    #[test]
+    fn a_pinned_mapping_cannot_be_platform_filtered() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned = format!("    tags:\n      - name: \"15.19\"\n        digest: \"{digest}\"\n");
+        let cases = [
+            (
+                "mapping platforms",
+                format!(
+                    "mappings:\n  - from: library/postgres\n    platforms: [linux/amd64]\n{pinned}"
+                ),
+                Some("cannot be platform-filtered (remove platforms)"),
+            ),
+            (
+                "defaults platforms",
+                format!(
+                    "defaults:\n  platforms: [linux/amd64]\nmappings:\n  - from: library/postgres\n{pinned}"
+                ),
+                None,
+            ),
+            (
+                "no platforms",
+                format!("mappings:\n  - from: library/postgres\n{pinned}"),
+                None,
+            ),
+        ];
+        for (name, yaml, want_err) in cases {
+            let file = write_temp_config(&yaml);
+            match (load_config(file.path()), want_err) {
+                (Ok(_), None) => {}
+                (Err(err), Some(needle)) => {
+                    let err = err.to_string();
+                    assert!(
+                        err.contains(needle),
+                        "{name}: expected '{needle}' in: {err}"
+                    );
+                }
+                (got, want) => panic!("{name}: got {got:?}, wanted error {want:?}"),
+            }
         }
     }
 
