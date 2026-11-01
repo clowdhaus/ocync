@@ -315,8 +315,8 @@ impl Source {
 /// Where the Azure instance metadata service answers.
 const METADATA_ORIGIN: &str = "http://169.254.169.254";
 
-/// Off Azure nothing answers the metadata address, so a connection gets a
-/// second.
+/// 1 s to connect, because off Azure nothing answers the metadata address;
+/// 10 s overall for every Azure credential request.
 const TIMEOUTS: Timeouts = Timeouts {
     connect: Duration::from_secs(1),
     read: Duration::from_secs(10),
@@ -829,6 +829,7 @@ mod tests {
         let metadata = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/metadata/identity/oauth2/token"))
+            .and(header("metadata", "true"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!({"access_token": "imds-tok"})),
@@ -1027,7 +1028,7 @@ mod tests {
     }
 
     use wiremock::MockServer;
-    use wiremock::matchers::{any, body_string_contains, method, path};
+    use wiremock::matchers::{any, body_string_contains, header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     #[tokio::test]
