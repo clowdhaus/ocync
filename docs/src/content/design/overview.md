@@ -100,7 +100,7 @@ Followers cannot mount a blob from a leader until a manifest of the leader that 
 
 ### ECR BLOB_MOUNTING
 
-ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when the `from` repo has a committed manifest, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](/design/engine#ecr-blob-mounting) for full requirements.
+ECR requires an opt-in account setting (`BLOB_MOUNTING=ENABLED`, launched January 2026) for cross-repo mount to succeed. Mount POST returns 201 when a committed manifest in the `from` repo references the blob, both repos use identical encryption, and both are in the same account and region. Without `BLOB_MOUNTING` enabled, ECR returns 202 and starts a regular upload; `ocync` detects this and falls through to the standard upload path. See [ECR blob mounting in the engine doc](/design/engine#ecr-blob-mounting) for full requirements.
 
 In testing (5-image Jupyter corpus, cold sync to ECR), leader-follower election reduced requests by 44%, response bytes by 57%, and improved wall clock by 3.8x with 100% mount success. See [measured impact in the engine doc](/design/engine#measured-impact) for the full breakdown.
 

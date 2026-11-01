@@ -1052,64 +1052,6 @@ async fn sync_leader_commits_before_follower_subscribes() {
     );
 }
 
-/// Leader's manifest push fails (500). Followers waiting on the watch channel
-/// must unblock when the leader's blobs are released, find the repo not
-/// committed, and fall through to HEAD+push instead of deadlocking.
-#[tokio::test(flavor = "current_thread")]
-async fn sync_leader_manifest_push_fails_follower_falls_through() {
-    let source_server = MockServer::start().await;
-    let target_server = MockServer::start().await;
-
-    let shared_data = b"shared-leader-fail";
-    let parts_a = ManifestBuilder::new(b"config-leader-fail")
-        .layer(shared_data)
-        .build();
-    let parts_b = ManifestBuilder::new(b"config-follower-fallback")
-        .layer(shared_data)
-        .build();
-
-    parts_a.mount_source(&source_server, "src-a", "v1").await;
-    parts_b.mount_source(&source_server, "src-b", "v1").await;
-
-    // tgt-a (leader): blob uploads succeed but the manifest PUT fails (500).
-    parts_a.mount_target(&target_server, "tgt-a", "v1").await;
-    Mock::given(method("PUT"))
-        .and(path("/v2/tgt-a/manifests/v1"))
-        .respond_with(ResponseTemplate::new(500))
-        .with_priority(1)
-        .mount(&target_server)
-        .await;
-
-    // tgt-b (follower): everything succeeds, including the push fallback; the
-    // mount mock covers a mount attempt before it falls through.
-    parts_b.mount_target(&target_server, "tgt-b", "v1").await;
-    mount_blob_mount_accepted(&target_server, "tgt-b", &parts_a.layer_descs[0].digest).await;
-
-    let mappings = v1_mappings(
-        &source_server,
-        &target_server,
-        &[("src-a", "tgt-a"), ("src-b", "tgt-b")],
-    );
-    let report = run_sync_with_concurrency(mappings, 10, BlobStage::disabled()).await;
-
-    assert_eq!(report.images.len(), 2);
-    assert!(
-        report
-            .images
-            .iter()
-            .any(|r| matches!(r.status, ImageStatus::Failed { .. })),
-        "leader should fail"
-    );
-    assert!(
-        report
-            .images
-            .iter()
-            .any(|r| matches!(r.status, ImageStatus::Synced)),
-        "follower should succeed after leader failure: {:#?}",
-        report.images.iter().map(|r| &r.status).collect::<Vec<_>>()
-    );
-}
-
 /// One image in a [`DeadlockCase`]: a config blob and its layers.
 struct CaseImage {
     config: &'static [u8],
@@ -2030,6 +1972,9 @@ fn mappings_with_own_clients(
         .into()
 }
 
+/// The mount-source wait deadline of [`run_with_short_mount_wait`].
+const MOUNT_WAIT_DEADLINE: Duration = Duration::from_millis(10);
+
 /// Run `mappings` against a 10ms mount-source wait deadline, failing the test
 /// if the run outlives its 10s guard.
 async fn run_with_short_mount_wait(
@@ -2037,7 +1982,7 @@ async fn run_with_short_mount_wait(
     cache: Rc<RefCell<TransferStateCache>>,
 ) -> SyncReport {
     let engine = SyncEngine::new(fast_retry(), concurrency(10))
-        .with_mount_source_wait_deadline(Duration::from_millis(10));
+        .with_mount_source_wait_deadline(MOUNT_WAIT_DEADLINE);
     tokio::time::timeout(
         Duration::from_secs(10),
         engine.run(
@@ -2052,12 +1997,12 @@ async fn run_with_short_mount_wait(
     .expect("the mount-source wait deadline did not bound the run")
 }
 
-/// When the leader's manifest commit never arrives before the per-blob
-/// deadline, the follower falls back to push rather than hanging.
+/// When the leader's manifest commit arrives after the per-blob deadline, the
+/// follower falls back to push at the deadline rather than waiting for it.
 ///
-/// A 10ms deadline keeps the test fast. The leader's manifest PUT returns
-/// 500, so the leader fails and never commits; the follower's deadline trips
-/// and it pushes its own copy of the shared blob.
+/// The leader's manifest PUT answers 201 only after a delay far past the 10ms
+/// deadline, so nothing but the deadline releases the follower. A follower that
+/// waited for the commit would then mount the shared layer.
 #[tokio::test(flavor = "current_thread")]
 async fn mount_resolver_timeout_falls_back_to_push() {
     let source_server = MockServer::start().await;
@@ -2086,49 +2031,39 @@ async fn mount_resolver_timeout_falls_back_to_push() {
     for repo in ["leader", "follower"] {
         mount_target_fresh(&target_server, repo, "v1", &blobs).await;
     }
-    // The leader fails, and its blobs' watches are released.
-    Mock::given(method("PUT"))
-        .and(path("/v2/leader/manifests/v1"))
-        .respond_with(ResponseTemplate::new(500))
-        .with_priority(1)
-        .mount(&target_server)
-        .await;
+    manifest_push_with(
+        "leader",
+        "v1",
+        ResponseTemplate::new(201).set_delay(Duration::from_millis(500)),
+    )
+    .with_priority(1)
+    .mount(&target_server)
+    .await;
 
+    let started = std::time::Instant::now();
     let report = run_with_short_mount_wait(
-        mappings_with_own_clients(&source_server, &target_server, ["leader", "follower"]),
+        // A tie in leader election goes to the later image.
+        mappings_with_own_clients(&source_server, &target_server, ["follower", "leader"]),
         empty_cache(),
     )
     .await;
 
-    assert_eq!(report.images.len(), 2);
-    let status_of = |repo: &str| {
-        let source = format!("{repo}:v1");
-        let image = report.images.iter().find(|r| r.source == source);
-        &image
-            .unwrap_or_else(|| panic!("no result for {source}"))
-            .status
-    };
-    assert!(
-        matches!(status_of("follower"), ImageStatus::Synced),
-        "the follower syncs via push fallback after the deadline: {:?}",
-        status_of("follower")
-    );
-    assert!(
-        matches!(
-            status_of("leader"),
-            ImageStatus::Failed {
-                kind: ErrorKind::ManifestPush,
-                ..
-            }
-        ),
-        "the leader's manifest PUT answers 500: {:?}",
-        status_of("leader")
-    );
-    assert_eq!(report.stats.images_synced, 1);
-    assert_eq!(report.stats.images_failed, 1);
+    assert!(started.elapsed() >= MOUNT_WAIT_DEADLINE);
+    assert_all_synced(&report, 2, "both images sync");
     assert_eq!(
-        report.stats.blobs_mounted, 0,
-        "no mounts should succeed when leader never commits"
+        count_blob_uploads(
+            &target_server,
+            PathMatch::Contains("/follower/"),
+            &leader_img.layer_descs[0].digest
+        )
+        .await,
+        1,
+        "the follower pushes the shared layer at the deadline"
+    );
+    assert_eq!(
+        count_mount_posts(&target_server).await,
+        0,
+        "no mount is attempted: the follower did not wait for the leader's commit"
     );
 }
 
@@ -2170,18 +2105,15 @@ async fn failed_image_manifest_releases_followers_waiting_for_its_blobs() {
 
     let report = tokio::time::timeout(
         Duration::from_secs(10),
-        run_engine(
+        run_sync_with_concurrency(
             v1_mappings(
                 &source_server,
                 &target_server,
                 // A tie in leader election goes to the later image.
                 &[("follower", "follower"), ("leader", "leader")],
             ),
-            fast_retry(),
             10,
-            empty_cache(),
             BlobStage::disabled(),
-            None,
         ),
     )
     .await

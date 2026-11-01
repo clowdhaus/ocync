@@ -2214,11 +2214,13 @@ async fn transfer_image_blobs(
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
                 cancel.trigger();
-                // Followers waiting to mount these blobs from this repo stop
-                // now, not after the in-flight uploads drain; they fall
-                // through to HEAD+push.
-                release_blobs(ctx, blobs.iter().map(|blob| &blob.digest));
-                outcome.error = Some(err);
+                if outcome.error.is_none() {
+                    // Followers waiting to mount these blobs from this repo
+                    // stop now, not after the in-flight uploads drain; they
+                    // fall through to HEAD+push.
+                    release_blobs(ctx, blobs.iter().map(|blob| &blob.digest));
+                    outcome.error = Some(err);
+                }
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
             }

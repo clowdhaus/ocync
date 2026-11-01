@@ -246,9 +246,7 @@ impl TransferStateCache {
         let watches = self.resolution_watches.entry(target.clone()).or_default();
         self.dedup
             .repos_iter(target, digest)
-            .filter(|(r, state)| {
-                *r != current_repo && state.is_active() && **state != RepoBlobState::Committed
-            })
+            .filter(|(r, state)| *r != current_repo && state.is_active())
             .filter_map(|(repo, _)| {
                 let rx = watch_sender(watches, repo, digest).subscribe();
                 if *rx.borrow() { None } else { Some(rx) }
@@ -272,11 +270,8 @@ impl TransferStateCache {
     }
 
     /// Start a run from the blob state a reload from disk would give: every
-    /// present blob, committed ones included, becomes known only from an
-    /// earlier run and is offered as a mount source without waiting (a mount
-    /// from a repo that has since lost the blob fails and falls back to a
-    /// push, one request). Failures, upload claims and the last run's watches
-    /// are dropped.
+    /// present blob, committed ones included, becomes `Remembered`; failures,
+    /// upload claims and watches are dropped.
     pub(crate) fn start_run(&mut self) {
         self.resolution_watches.clear();
         self.dedup.remember_present();
@@ -298,7 +293,8 @@ impl TransferStateCache {
 
     /// Record each of `digests` present and committed at `repo`, after a
     /// manifest that references them was committed there, and wake the
-    /// watchers already waiting on them at that repo.
+    /// watchers already waiting on a digest whose commit was recorded. A
+    /// digest still `Uploading` or `Failed` there wakes nobody.
     pub fn confirm_blobs<'a>(
         &mut self,
         target: &TargetId,
@@ -310,7 +306,9 @@ impl TransferStateCache {
             .get(target)
             .and_then(|by_repo| by_repo.get(repo));
         for digest in digests {
-            self.dedup.confirm(target, digest, repo);
+            if !self.dedup.confirm(target, digest, repo) {
+                continue;
+            }
             if let Some(tx) = watches.and_then(|by_digest| by_digest.get(digest)) {
                 tx.send_replace(true);
             }
@@ -531,7 +529,7 @@ mod tests {
 
     #[test]
     fn mount_sources_by_commit_and_run_state() {
-        let cases: [(&str, Setup, &str, &[&str]); 9] = [
+        let cases: [(&str, Setup, &str, &[&str]); 10] = [
             (
                 "a repo recorded this run must commit before it is offered",
                 |c| c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a")),
@@ -604,6 +602,16 @@ mod tests {
                     c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
                     c.confirm_blobs(&target_id("reg.io"), &repo("repo/a"), [&test_digest()]);
                     c.start_run();
+                },
+                "repo/b",
+                &["repo/a"],
+            ),
+            (
+                "an earlier run's repo confirmed by a check is offered without a commit",
+                |c| {
+                    c.set_blob_completed(&target_id("reg.io"), test_digest(), repo("repo/a"));
+                    c.start_run();
+                    c.set_blob_verified(&target_id("reg.io"), test_digest(), repo("repo/a"));
                 },
                 "repo/b",
                 &["repo/a"],
@@ -684,12 +692,9 @@ mod tests {
         assert!(!cache.resolution_watches.contains_key(&gone));
     }
 
-    /// Commit and release are per blob. With D1 and D2 held at repo/a,
-    /// releasing D2 resolves D2 for later subscribers and leaves D1's watch
-    /// unresolved and repo/a no source; committing D1 then resolves D1's
-    /// watch and makes repo/a a source for D1 only.
+    /// Releasing D2 wakes D2's waiting subscriber and not D1's.
     #[test]
-    fn commit_and_release_resolve_one_blob_at_a_time() {
+    fn release_resolves_only_the_released_blob() {
         let (t, a, b) = (target_id("reg.io"), repo("repo/a"), repo("repo/b"));
         let (d1, d2) = (test_digest(), other_digest());
         let mut cache = TransferStateCache::new();
@@ -697,21 +702,30 @@ mod tests {
             cache.set_blob_completed(&t, d.clone(), a.clone());
         }
         let waiting_d1 = cache.unresolved_watches_for(&t, &d1, &b);
-        assert_eq!(waiting_d1.len(), 1);
+        let waiting_d2 = cache.unresolved_watches_for(&t, &d2, &b);
 
         cache.release_blobs(&t, &a, [&d2]);
-        assert!(!*waiting_d1[0].borrow(), "releasing D2 leaves D1 waiting");
-        assert!(
-            cache.unresolved_watches_for(&t, &d2, &b).is_empty(),
-            "a subscription after the release starts resolved"
-        );
-        assert!(cache.mount_sources(&t, &d2, &b).next().is_none());
 
-        cache.confirm_blobs(&t, &a, [&d1]);
-        assert!(*waiting_d1[0].borrow(), "D1's commit wakes its watch");
-        let sources = |d: &Digest| cache.mount_sources(&t, d, &b).cloned().collect::<Vec<_>>();
-        assert_eq!(sources(&d1), [a]);
-        assert!(sources(&d2).is_empty(), "D2 was released, not committed");
+        assert!(*waiting_d2[0].borrow(), "D2's subscriber is woken");
+        assert!(!*waiting_d1[0].borrow(), "D1's subscriber stays waiting");
+    }
+
+    /// A commit wakes a watch only when it was recorded: a digest still
+    /// `Uploading` at the repo gets no signal.
+    #[test]
+    fn commit_over_a_live_upload_wakes_nobody() {
+        let (t, a, b) = (target_id("reg.io"), repo("repo/a"), repo("repo/b"));
+        let mut cache = TransferStateCache::new();
+        assert!(matches!(
+            cache.claim_blob_upload(&t, &test_digest(), &a),
+            ClaimAction::Claimed
+        ));
+        let waiting = cache.unresolved_watches_for(&t, &test_digest(), &b);
+        assert_eq!(waiting.len(), 1);
+
+        cache.confirm_blobs(&t, &a, [&test_digest()]);
+
+        assert!(!*waiting[0].borrow());
     }
 
     #[test]

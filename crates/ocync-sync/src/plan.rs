@@ -90,8 +90,9 @@ pub enum RepoBlobState {
     /// batch check that misses the blob, or a manifest refused for a missing
     /// blob, drops it. Persisted as `Verified`.
     Remembered,
-    /// Present at this repo and referenced by a manifest committed there this
-    /// run, which is what a registry such as ECR requires of a mount source.
+    /// Present at this repo and either referenced by a manifest committed
+    /// there this run, or present since an earlier run and confirmed this run.
+    /// The first is what a registry such as ECR requires of a mount source.
     /// Persisted as `Verified`; a later write of `Verified` or `Completed`
     /// never replaces it.
     Committed,
@@ -106,12 +107,10 @@ impl RepoBlobState {
         )
     }
 
-    /// Whether this state was recorded this run and is not a dead end.
+    /// Whether this state was recorded this run and can still become a mount
+    /// source.
     pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            Self::Verified | Self::Uploading | Self::Completed | Self::Committed
-        )
+        matches!(self, Self::Verified | Self::Uploading | Self::Completed)
     }
 }
 
@@ -210,7 +209,9 @@ impl BlobDedupMap {
     }
 
     /// Record `state` unless the repo is `Committed`: a later check or mount
-    /// into the repo must not erase what a committed manifest proved.
+    /// into the repo must not erase what a committed manifest proved. A
+    /// `Verified` write over `Remembered` records `Committed`, since presence
+    /// since an earlier run is now confirmed and is offered at once.
     fn set_present(
         &mut self,
         target: &TargetId,
@@ -219,9 +220,12 @@ impl BlobDedupMap {
         state: RepoBlobState,
     ) {
         let repos = &mut self.entry_mut(target, digest).repos;
-        if repos.get(repo) != Some(&RepoBlobState::Committed) {
-            repos.insert(repo.clone(), state);
-        }
+        let state = match (repos.get(repo), state) {
+            (Some(RepoBlobState::Committed), _) => return,
+            (Some(RepoBlobState::Remembered), RepoBlobState::Verified) => RepoBlobState::Committed,
+            (_, state) => state,
+        };
+        repos.insert(repo.clone(), state);
     }
 
     /// Set a repo's state to `Failed` (this repo's own upload failed).
@@ -336,16 +340,22 @@ impl BlobDedupMap {
     /// Record the blob as `Committed` at `repo`, which a manifest committed
     /// there proves. A live upload claim and a `Failed` mark are left alone:
     /// the mark also excludes a mount source the registry refused, which a
-    /// commit does not make mountable.
-    pub(crate) fn confirm(&mut self, target: &TargetId, digest: &Digest, repo: &RepositoryName) {
+    /// commit does not make mountable. Returns whether the commit was recorded.
+    pub(crate) fn confirm(
+        &mut self,
+        target: &TargetId,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) -> bool {
         if let Some(RepoBlobState::Uploading | RepoBlobState::Failed(_)) =
             self.repo_state(target, digest, repo)
         {
-            return;
+            return false;
         }
         self.entry_mut(target, digest)
             .repos
             .insert(repo.clone(), RepoBlobState::Committed);
+        true
     }
 
     /// Start a run from what persisting and reloading would give: present
@@ -561,6 +571,33 @@ mod tests {
         );
     }
 
+    /// Confirming a `Remembered` blob with a check records `Committed`, so the
+    /// repo is offered as a mount source at once; a completed write does not.
+    #[test]
+    fn check_over_remembered_commits_but_completion_does_not() {
+        type Write = fn(&mut BlobDedupMap, &TargetId, &Digest, &RepositoryName);
+        let cases: [(&str, Write, RepoBlobState); 2] = [
+            (
+                "a check confirms it",
+                BlobDedupMap::set_blob_verified,
+                RepoBlobState::Committed,
+            ),
+            (
+                "a mount completes into it",
+                BlobDedupMap::set_blob_completed,
+                RepoBlobState::Completed,
+            ),
+        ];
+        for (name, write, want) in cases {
+            let (t, d, x) = (target_id("reg.io"), test_digest(), repo("x"));
+            let mut map = BlobDedupMap::default();
+            map.set_blob_completed(&t, &d, &x);
+            map.remember_present();
+            write(&mut map, &t, &d, &x);
+            assert_eq!(map.repo_state(&t, &d, &x), Some(&want), "{name}");
+        }
+    }
+
     /// A commit records `Committed` over every state but a live upload and a
     /// refused mount source, which a commit does not make mountable.
     #[test]
@@ -616,8 +653,9 @@ mod tests {
         for (name, seed, want) in cases {
             let mut map = BlobDedupMap::default();
             seed(&mut map);
-            map.confirm(&t, &d, &x);
+            let recorded = map.confirm(&t, &d, &x);
             assert_eq!(map.repo_state(&t, &d, &x), Some(&want), "{name}");
+            assert_eq!(recorded, want == RepoBlobState::Committed, "{name}");
         }
     }
 
