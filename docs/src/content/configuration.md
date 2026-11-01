@@ -81,7 +81,7 @@ global:
 
 | Field | Default | Description |
 |---|---|---|
-| `max_concurrent_transfers` | `20` | Maximum number of images synced in parallel. Must be >= 1. Each image runs up to 6 concurrent blob transfers; the per-target HTTP/2 connection bounds concurrent blob uploads at 64 by default (configurable via the registry client's `blob_upload_concurrency`) to stay under the typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` of 100-128 across major registries |
+| `max_concurrent_transfers` | `20` | Maximum number of images synced in parallel. Must be >= 1. Each image runs up to 6 concurrent blob transfers; the per-target HTTP/2 connection bounds concurrent blob uploads at 64 to stay under the typical advertised `SETTINGS_MAX_CONCURRENT_STREAMS` of 100-128 across major registries |
 | `cache_dir` | Adjacent to config file | Directory for persistent cache and blob staging |
 | `cache_ttl` | `"12h"` | How long cached blob existence checks are valid. Accepts bare integers (seconds) or integers with a suffix: `s`, `m`, `h`, `d`. `"0"` disables TTL expiry (lazy invalidation only) |
 | `staging_size_limit` | Unlimited | Maximum disk space for blob staging. Accepts `"0"` (disabled) or an integer with a suffix: `B`, `KB`, `MB`, `GB`, `TB`. Uses SI decimal prefixes (1 GB = 1,000,000,000 bytes) |

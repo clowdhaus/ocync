@@ -39,7 +39,7 @@ Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is 
 > Referrers calls -- ocync: 37, ocync@7634416: 39, regsync: 0.
 <!-- BENCH:END -->
 
-`ocync` is 6c93872, at its default of 20 images at once; `ocync@7634416` is ocync as of April 2026. cgr.dev is skipped, so the corpus is 25 images and 39 tags. Uploaded to ECR per round (blob upload PUT request bytes): ocync 53,292,924,413 B in four rounds and 53,293,057,239 B in the one where 6 of 268 mounts fell back to uploads, the April build 57,018,027,869 to 57,812,918,335 B, regsync 62,883,218,811 B.
+`ocync` is the build that raised the default to 20 images at once ([#238](https://github.com/clowdhaus/ocync/pull/238)); `ocync@7634416` is ocync as of April 2026. cgr.dev is skipped, so the corpus is 25 images and 39 tags. Uploaded to ECR per round, summed from the proxy logs' blob upload PUT request bytes: ocync 53,292,924,413 to 53,292,924,415 B in the four rounds where 1 or 2 of 268 mounts fell back to uploads and 53,293,057,239 B in the one where 6 did, the April build 57,018,027,869 to 57,812,918,335 B, regsync 62,883,218,811 B.
 
 The two ocync builds differ in six months of code. One difference is the cap on images synced at once: 50 in April, 20 today. The April build finishes in the same time but uploads 3.7 to 4.5 GB more per round and sends about 10% more requests. Raising today's cap from 10 to 20 made a cold sync about 13% faster on both ECR and Artifact Registry ([#129](https://github.com/clowdhaus/ocync/issues/129)).
 
@@ -107,7 +107,7 @@ Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is 
 | regsync | Response bytes | 0.87 | 0.87..0.87 | more | 6.25% |
 <!-- BENCH-WARM:END -->
 
-`ocync` skips tag enumeration when exact tags are configured (no wildcard, semver, or latest filters), using the configured tag names directly instead of paginating through the registry's full tag list. Combined with the transfer state cache and source manifest HEAD checks, this reduces a no-op warm sync to ~150 requests regardless of how many tags exist at the source.
+`ocync` skips tag enumeration when exact tags are configured (no wildcard, semver, or latest filters), using the configured tag names directly instead of paginating through the registry's full tag list. Combined with the transfer state cache and source manifest HEAD checks, this reduces a no-op warm sync to ~110 requests regardless of how many tags exist at the source.
 
 ## Why `ocync` is fast
 

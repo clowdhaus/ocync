@@ -126,8 +126,8 @@ pub(crate) struct Config {
 pub(crate) struct GlobalConfig {
     /// Maximum concurrent image syncs.
     ///
-    /// HTTP/2 upload streams per target are bounded separately, by the
-    /// registry client's blob upload concurrency, whatever this cap.
+    /// HTTP/2 upload streams per target are bounded separately, at 64,
+    /// whatever this cap.
     #[serde(
         default = "default_max_concurrent_transfers",
         deserialize_with = "transfers_at_least_one"
