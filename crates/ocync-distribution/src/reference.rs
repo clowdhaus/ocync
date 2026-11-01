@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::digest::Digest;
 use crate::error::Error;
-use crate::spec::RepositoryName;
+use crate::spec::{RepositoryName, Tag};
 
 const DOCKER_HUB_REGISTRY: &str = "docker.io";
 const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
@@ -22,7 +22,7 @@ const DOCKER_HUB_OFFICIAL_REPO_PREFIX: &str = "library/";
 pub struct Reference {
     registry: String,
     repository: RepositoryName,
-    tag: Option<String>,
+    tag: Option<Tag>,
     digest: Option<Digest>,
 }
 
@@ -31,7 +31,7 @@ impl Reference {
     pub fn from_parts(
         registry: impl Into<String>,
         repository: RepositoryName,
-        tag: Option<String>,
+        tag: Option<Tag>,
         digest: Option<Digest>,
     ) -> Self {
         Self {
@@ -54,7 +54,7 @@ impl Reference {
 
     /// The tag, if present (e.g. `latest`, `v1.0`).
     pub fn tag(&self) -> Option<&str> {
-        self.tag.as_deref()
+        self.tag.as_ref().map(Tag::as_str)
     }
 
     /// The digest, if present.
@@ -120,27 +120,8 @@ impl FromStr for Reference {
         // whole reference.
         let repository = RepositoryName::within(repository, s)?;
 
-        // Validate tag: must be 1-128 chars and match [a-zA-Z0-9_.-].
-        if let Some(ref t) = tag {
-            if t.len() > 128 {
-                return Err(Error::InvalidReference {
-                    input: s.into(),
-                    reason: format!("tag exceeds 128 characters ({})", t.len()),
-                });
-            }
-            if let Some(bad) = t
-                .chars()
-                .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-'))
-            {
-                return Err(Error::InvalidReference {
-                    input: s.into(),
-                    reason: format!(
-                        "tag contains invalid character '{bad}'; \
-                         allowed: [a-zA-Z0-9_.-]"
-                    ),
-                });
-            }
-        }
+        // The tag rule lives in `Tag`; the error names the whole reference.
+        let tag = tag.map(|t| Tag::within(t, s)).transpose()?;
 
         Ok(Self {
             registry,
@@ -259,7 +240,7 @@ mod tests {
         let r = Reference::from_parts(
             "ghcr.io",
             RepositoryName::new("clowdhaus/ocync").unwrap(),
-            Some("v1.0".into()),
+            Some(Tag::new("v1.0").unwrap()),
             Some(d),
         );
         assert_eq!(r.registry(), "ghcr.io");

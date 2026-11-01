@@ -310,10 +310,10 @@
           "default": null
         },
         "tags": {
-          "description": "Tag filter rules for this mapping, overriding `defaults.tags`.",
+          "description": "Tag filter rules for this mapping, overriding `defaults.tags`, or a\nlist of tags pinned to source digests.",
           "anyOf": [
             {
-              "$ref": "#/$defs/TagsConfig"
+              "$ref": "#/$defs/MappingTags"
             },
             {
               "type": "null"
@@ -344,6 +344,39 @@
       },
       "required": [
         "from"
+      ]
+    },
+    "MappingTags": {
+      "description": "Tag filter rules, or a list of tags pinned to source digests.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TagsConfig"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PinnedTag"
+          }
+        }
+      ]
+    },
+    "PinnedTag": {
+      "description": "A target tag and the source manifest digest it is copied from.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Source manifest digest to copy (`sha256:` followed by 64 hex digits).",
+          "type": "string"
+        },
+        "name": {
+          "description": "Tag written at the target.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "digest"
       ]
     },
     "RegistryConfig": {

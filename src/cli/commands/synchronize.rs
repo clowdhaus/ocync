@@ -27,8 +27,8 @@ use serde::Serialize;
 
 use crate::SyncArgs;
 use crate::cli::config::{
-    CacheTtl, Config, GlobOrList, MappingConfig, RegistryConfig, StagingLimit, TagsConfig,
-    load_config, resolve_target_names,
+    CacheTtl, Config, GlobOrList, MappingConfig, MappingTags, RegistryConfig, StagingLimit,
+    TagsConfig, load_config, resolve_target_names,
 };
 use crate::cli::output::{format_bytes, format_duration};
 use crate::cli::{
@@ -1531,8 +1531,16 @@ async fn resolve_mapping_inner(
     // --- Fetch and filter tags ---
     let source_repo_path = RepositoryName::new(&mapping.from)?;
 
-    let mapping_tags = mapping.tags.as_ref();
-    let defaults_tags = config.defaults.as_ref().and_then(|d| d.tags.as_ref());
+    // A pinned list ignores `defaults.tags` entirely: no listing, no excludes,
+    // no immutable pattern.
+    let (mapping_tags, defaults_tags) = match &mapping.tags {
+        Some(MappingTags::Pinned(_)) => (None, None),
+        Some(MappingTags::Filter(tags)) => (
+            Some(tags),
+            config.defaults.as_ref().and_then(|d| d.tags.as_ref()),
+        ),
+        None => (None, config.defaults.as_ref().and_then(|d| d.tags.as_ref())),
+    };
 
     // Fast path: exact tag names only (no wildcards, semver, latest, exclude)
     // skip listing the source. Gated on no `defaults.tags` block, or inherited
@@ -1541,15 +1549,26 @@ async fn resolve_mapping_inner(
     // `select_filtered_tags`, so the filter and the no-match WARN see the same
     // counts.
     let (filtered, candidate_count, filter_report, no_tags_template): (
-        Vec<String>,
+        Vec<TagPair>,
         Option<usize>,
         Option<ocync_sync::filter::FilterReport>,
         Option<NoTagsInfo>,
-    ) = if let Some(exact) = mapping_tags
+    ) = if let Some(MappingTags::Pinned(pins)) = &mapping.tags {
+        let pairs = pins
+            .iter()
+            .map(|pin| TagPair::pinned(pin.digest.clone(), pin.name.as_str()))
+            .collect();
+        (pairs, None, None, None)
+    } else if let Some(exact) = mapping_tags
         .filter(|_| defaults_tags.is_none())
         .and_then(|t| t.exact_tags())
     {
-        (exact, None, None, None)
+        (
+            exact.into_iter().map(TagPair::same).collect(),
+            None,
+            None,
+            None,
+        )
     } else {
         let all_tags = source_client.list_tags(&source_repo_path).await?;
         let mut samples: Vec<String> = Vec::with_capacity(NO_TAGS_SAMPLE_CAP);
@@ -1571,7 +1590,12 @@ async fn resolve_mapping_inner(
         };
         let (kept, count, report) =
             select_filtered_tags(mapping_tags, defaults_tags, all_tags, min_tags)?;
-        (kept, count, report, Some(template))
+        (
+            kept.into_iter().map(TagPair::same).collect(),
+            count,
+            report,
+            Some(template),
+        )
     };
 
     if filtered.is_empty() {
@@ -1674,7 +1698,7 @@ async fn resolve_mapping_inner(
         source_repo: RepositoryName::new(mapping.from.clone())?,
         target_repo: RepositoryName::new(target_repo)?,
         targets,
-        tags: filtered.into_iter().map(TagPair::same).collect(),
+        tags: filtered,
         platforms,
         head_first,
         immutable_glob,
@@ -4053,6 +4077,141 @@ mappings:
             observed, 3,
             "all three target listings must be open at once"
         );
+    }
+
+    /// A pinned mapping resolves and runs without listing the source or
+    /// reading the source tag: the source GET is by digest, and the target PUT
+    /// under the pinned name carries the source bytes unchanged. Breaks if
+    /// resolution lists tags or applies `defaults.tags`, the engine pulls
+    /// `/manifests/<name>`, or the pushed bytes differ from the pulled ones.
+    #[tokio::test]
+    async fn a_pinned_mapping_copies_the_pinned_digest_under_its_name() {
+        use wiremock::matchers::{body_bytes, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "size": 100,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "b".repeat(64)),
+                "size": 200,
+            }],
+        }))
+        .unwrap();
+        let digest = ocync_distribution::Digest::from_sha256(
+            ocync_distribution::sha256::Sha256::digest(&manifest),
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/img/tags/list"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // The immutable-tag listing that `defaults.tags` would trigger.
+        Mock::given(method("GET"))
+            .and(path("/v2/mirror/img/tags/list"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/repo/img/manifests/15.19"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/repo/img/manifests/{digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(manifest.clone(), OCI_MANIFEST))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Both blobs are already at the target, so only the manifest moves.
+        Mock::given(method("HEAD"))
+            .and(path_regex(r"^/v2/mirror/img/blobs/sha256:[ab]{64}$"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v2/mirror/img/manifests/15.19"))
+            .and(body_bytes(manifest.clone()))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config: Config = serde_yaml::from_str(&format!(
+            r#"
+registries:
+  src:
+    url: {uri}
+  dst:
+    url: {uri}
+defaults:
+  source: src
+  targets: [dst]
+  tags:
+    exclude: ["*"]
+    immutable_tags: "*"
+mappings:
+  - from: repo/img
+    to: mirror/img
+    tags:
+      - name: "15.19"
+        digest: "{digest}"
+"#,
+            uri = server.uri()
+        ))
+        .expect("config yaml parses");
+        let clients = ClientMap::from([
+            ("src".to_string(), Ok(test_client(&server.uri()))),
+            ("dst".to_string(), Ok(test_client(&server.uri()))),
+        ]);
+
+        let (outcome, _dropped) = resolve_mapping(
+            &config.mappings[0],
+            &config,
+            &clients,
+            &HashMap::new(),
+            MinTags::Enforce,
+        )
+        .await;
+        let MappingResolution::Resolved(mapping) = outcome.expect("the mapping resolves") else {
+            panic!("a pinned mapping has tags");
+        };
+        assert_eq!(
+            (
+                mapping.candidate_count,
+                mapping.filter_report.is_none(),
+                mapping.immutable_glob.is_none()
+            ),
+            (None, true, true),
+            "a pinned mapping ignores defaults.tags"
+        );
+
+        let report = SyncEngine::new(RetryConfig::default(), std::num::NonZeroUsize::MIN)
+            .run(
+                vec![mapping],
+                Rc::new(RefCell::new(TransferStateCache::new())),
+                BlobStage::disabled(),
+                &ocync_sync::progress::NullProgress,
+                None,
+            )
+            .await;
+
+        assert_eq!(report.stats.images_synced, 1, "{:?}", report.images);
+        assert_eq!(report.images[0].source, format!("repo/img@{digest}"));
+        assert_eq!(report.images[0].target, "mirror/img:15.19");
+        server.verify().await;
     }
 
     /// The progress line must name the item holding the step up.

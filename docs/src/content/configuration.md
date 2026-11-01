@@ -204,7 +204,7 @@ mappings:
 | `to` | No | Target repository name. When omitted, uses the full `from` path |
 | `source` | No | Override source registry for this mapping |
 | `targets` | No | Override target group or inline list for this mapping |
-| `tags` | No | Override tag filtering for this mapping |
+| `tags` | No | Override tag filtering for this mapping, or a list of tags pinned to source digests. See [Pinned digests](#pinned-digests) |
 | `platforms` | No | Override platform filter for this mapping. List must not be empty if provided |
 | `artifacts` | No | Override artifact handling for this mapping. See [Artifacts](#artifacts) |
 
@@ -369,6 +369,22 @@ mappings:
 ```
 
 On this mapping, `latest` and `latest-dev` always sync. Stable releases in the 3.12 line sync (`3.12.5`, `3.12.6`), and so do their dev variants (`3.12.5-dev`, `3.12.6-dev`). A `3.13.0-dev` drops because the version range rejects it. A `3.12.5-r3` drops because nothing in `include:` matches it.
+
+### Pinned digests
+
+A mapping's `tags:` can be a list of tags pinned to source digests instead of filter rules:
+
+```yaml
+mappings:
+  - from: library/postgres
+    tags:
+      - name: "15.19"
+        digest: "sha256:<64 hex>"
+```
+
+Each entry copies the source manifest at exactly that digest, unchanged (an index is copied whole), and writes it to the target under `name`. The source is never listed, and a source tag called `name` is never read. A pinned mapping ignores `defaults.tags` entirely, including its excludes and `immutable_tags`. A list in `defaults.tags` itself is rejected. Because an index is copied whole, a pinned mapping cannot be platform-filtered: setting `platforms:` on it, or `defaults.platforms`, is rejected.
+
+Each digest must be `sha256:` followed by 64 hex digits, each `name` a valid tag, and the list non-empty with no name repeated. If the source serves bytes that do not hash to the pinned digest, that image fails, naming both digests, and nothing is pushed for it. The rest of the run is unaffected.
 
 ## Environment variables
 

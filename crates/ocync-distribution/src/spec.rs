@@ -330,6 +330,82 @@ impl FromStr for RepositoryName {
     }
 }
 
+/// The longest tag the OCI distribution spec allows.
+const TAG_MAX_LEN: usize = 128;
+
+/// An OCI tag name (e.g. `latest`, `v1.0-rc.1`): 1 to 128 characters from
+/// `[a-zA-Z0-9_.-]`.
+///
+/// Deserialization goes through [`Tag::new`] so a tag read from a config file
+/// obeys the same rule as one parsed from a [`Reference`](crate::Reference).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Tag(String);
+
+impl TryFrom<String> for Tag {
+    type Error = Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::new(name)
+    }
+}
+
+impl Tag {
+    /// A tag name within the length and character limits above.
+    pub fn new(name: impl Into<String>) -> Result<Self, Error> {
+        let name = name.into();
+        match Self::check(&name) {
+            Ok(()) => Ok(Self(name)),
+            Err(reason) => Err(Error::InvalidReference {
+                input: name,
+                reason,
+            }),
+        }
+    }
+
+    /// [`Self::new`] for a tag taken from `reference`, so the error names the
+    /// whole reference the user wrote.
+    pub(crate) fn within(name: String, reference: &str) -> Result<Self, Error> {
+        Self::check(&name).map_err(|reason| Error::InvalidReference {
+            input: reference.to_owned(),
+            reason,
+        })?;
+        Ok(Self(name))
+    }
+
+    /// Why `name` is not a tag, if it is not.
+    fn check(name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("tag must be non-empty".into());
+        }
+        if name.len() > TAG_MAX_LEN {
+            return Err(format!(
+                "tag exceeds {TAG_MAX_LEN} characters ({})",
+                name.len()
+            ));
+        }
+        match name
+            .chars()
+            .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-'))
+        {
+            Some(bad) => Err(format!(
+                "tag contains invalid character '{bad}'; allowed: [a-zA-Z0-9_.-]"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Return the tag as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Tag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Registry authority as `host:port` (e.g. `cgr.dev:443`, `localhost:5000`).
 ///
 /// Used as a cache key to identify which registry a manifest was observed at.
@@ -859,5 +935,49 @@ mod tests {
     fn repository_name_rejects_empty() {
         let err = RepositoryName::new("").unwrap_err();
         assert!(err.to_string().contains("non-empty"), "error: {err}");
+    }
+
+    /// A tag takes 1 to 128 characters of `[a-zA-Z0-9_.-]` and nothing else.
+    /// Breaks if the length bound moves, an empty tag or a character that
+    /// would change a request URL is accepted, or an error loses its reason.
+    #[test]
+    fn tag_accepts_only_the_oci_rule() {
+        let at_limit = "a".repeat(128);
+        let over_limit = "a".repeat(129);
+        let cases = [
+            ("latest", None),
+            ("v1.0-rc.1_x", None),
+            (at_limit.as_str(), None),
+            ("", Some("tag must be non-empty")),
+            (
+                over_limit.as_str(),
+                Some("tag exceeds 128 characters (129)"),
+            ),
+            ("v1+build", Some("tag contains invalid character '+'")),
+            ("a b", Some("tag contains invalid character ' '")),
+            ("a/b", Some("tag contains invalid character '/'")),
+            ("a:b", Some("tag contains invalid character ':'")),
+            ("a@b", Some("tag contains invalid character '@'")),
+        ];
+        for (input, want_err) in cases {
+            match (Tag::new(input), want_err) {
+                (Ok(tag), None) => assert_eq!(tag.as_str(), input),
+                (Err(err), Some(needle)) => {
+                    assert!(err.to_string().contains(needle), "{input:?}: {err}")
+                }
+                (got, want) => panic!("{input:?}: got {got:?}, wanted error {want:?}"),
+            }
+        }
+    }
+
+    /// A tag serializes as a plain string and deserializing runs the rule.
+    /// Breaks if deserialization skips `Tag::new`.
+    #[test]
+    fn tag_serde_round_trips_and_rejects_invalid() {
+        let tag = Tag::new("15.19").unwrap();
+        let json = serde_json::to_string(&tag).unwrap();
+        assert_eq!(json, r#""15.19""#);
+        assert_eq!(serde_json::from_str::<Tag>(&json).unwrap(), tag);
+        assert!(serde_json::from_str::<Tag>(r#""bad tag""#).is_err());
     }
 }

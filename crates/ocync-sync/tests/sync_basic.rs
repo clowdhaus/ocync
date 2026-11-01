@@ -394,6 +394,124 @@ async fn sync_retag() {
     assert_status!(report, 0, ImageStatus::Synced);
 }
 
+/// A pinned source is pulled by digest and a target already holding that
+/// digest under the name is skipped. Breaks if the pin pulls the tag instead,
+/// or the target-side skip is lost.
+#[tokio::test]
+async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
+    source_manifest_mock(
+        "repo",
+        &parts.digest.to_string(),
+        &parts.bytes,
+        MediaType::OciManifest,
+    )
+    .expect(1)
+    .mount(&source_server)
+    .await;
+    mount_manifest_head_matching(&target_server, "repo", "stable", &parts.digest).await;
+    manifest_push_mock("repo", "stable")
+        .expect(0)
+        .mount(&target_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::pinned(parts.digest.clone(), "stable")],
+    );
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_status!(
+        report,
+        0,
+        ImageStatus::Skipped {
+            reason: SkipReason::DigestMatch,
+        }
+    );
+    assert_eq!(report.images[0].source, format!("repo@{}", parts.digest));
+}
+
+/// A source serving other bytes under a pinned digest fails that image with
+/// both digests named and pushes nothing for it, while a sibling image in the
+/// same run syncs. Breaks if the pin is not verified, the failure cancels the
+/// run, or the mismatched manifest is pushed.
+#[tokio::test]
+async fn sync_pinned_digest_mismatch_fails_only_that_image() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let pinned = ManifestBuilder::new(b"pinned-config")
+        .layer(b"pinned")
+        .build();
+    let served = ManifestBuilder::new(b"served-config")
+        .layer(b"served")
+        .build();
+    let sibling = ManifestBuilder::new(b"sibling-config")
+        .layer(b"sibling")
+        .build();
+
+    mount_source_manifest(
+        &source_server,
+        "repo",
+        &pinned.digest.to_string(),
+        &served.bytes,
+    )
+    .await;
+    mount_manifest_head_not_found(&target_server, "repo", "bad").await;
+    manifest_push_mock("repo", "bad")
+        .expect(0)
+        .mount(&target_server)
+        .await;
+    sibling
+        .mount_source(&source_server, "repo", &sibling.digest.to_string())
+        .await;
+    sibling.mount_target(&target_server, "repo", "good").await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![
+            TagPair::pinned(pinned.digest.clone(), "bad"),
+            TagPair::pinned(sibling.digest.clone(), "good"),
+        ],
+    );
+
+    let report = run_sync(vec![mapping]).await;
+
+    let status_of = |target: &str| {
+        &report
+            .images
+            .iter()
+            .find(|i| i.target.ends_with(&format!(":{target}")))
+            .unwrap_or_else(|| panic!("no result for {target}: {:?}", report.images))
+            .status
+    };
+    let ImageStatus::Failed {
+        kind,
+        error,
+        retries,
+        ..
+    } = status_of("bad")
+    else {
+        panic!("expected the mismatch to fail, got {:?}", status_of("bad"));
+    };
+    assert_eq!(kind.to_string(), "manifest pull");
+    assert!(
+        error.contains(&pinned.digest.to_string()) && error.contains(&served.digest.to_string()),
+        "error should name both digests: {error}"
+    );
+    assert_eq!(*retries, 0, "a digest mismatch is not retried");
+    assert!(matches!(status_of("good"), ImageStatus::Synced));
+    assert_eq!(report.outcome(), RunOutcome::Partial);
+}
+
 #[tokio::test]
 async fn sync_blob_transfer_failure() {
     let source_server = MockServer::start().await;

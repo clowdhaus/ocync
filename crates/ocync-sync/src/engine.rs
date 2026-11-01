@@ -94,19 +94,50 @@ impl TimingPhase {
     }
 }
 
-/// A repository and tag within one registry, displayed as `repo:tag`.
+/// How a manifest is addressed within a repository: by tag, or by digest for
+/// a source pinned to exact content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestRef {
+    /// A tag name.
+    Tag(String),
+    /// A manifest digest.
+    Digest(Digest),
+}
+
+impl fmt::Display for ManifestRef {
+    /// The string a registry takes after `/manifests/`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tag(tag) => f.write_str(tag),
+            Self::Digest(digest) => write!(f, "{digest}"),
+        }
+    }
+}
+
+impl ManifestRef {
+    /// This reference within `repo`, as `repo:tag` or `repo@digest`.
+    pub fn within(&self, repo: &RepositoryName) -> String {
+        match self {
+            Self::Tag(tag) => format!("{repo}:{tag}"),
+            Self::Digest(digest) => format!("{repo}@{digest}"),
+        }
+    }
+}
+
+/// A repository and manifest reference within one registry, displayed as
+/// `repo:tag` or `repo@digest`.
 ///
 /// Not a full OCI reference: the registry is tracked separately via the
 /// associated [`RegistryClient`].
 #[derive(Debug, Clone)]
 struct ImageRef {
     repo: RepositoryName,
-    tag: String,
+    reference: ManifestRef,
 }
 
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.repo, self.tag)
+        f.write_str(&self.reference.within(&self.repo))
     }
 }
 
@@ -282,11 +313,13 @@ impl fmt::Debug for TargetEntry {
     }
 }
 
-/// A source/target tag pair; the tags differ only for `copy` with retagging.
+/// A source reference and the target tag it is written to. The source is the
+/// same tag as the target except for `copy` with retagging and for a tag
+/// pinned to a source digest.
 #[derive(Debug, Clone)]
 pub struct TagPair {
-    /// Tag name at the source registry.
-    pub source: String,
+    /// Tag or digest at the source registry.
+    pub source: ManifestRef,
     /// Tag name at the target registry.
     pub target: String,
 }
@@ -296,7 +329,7 @@ impl TagPair {
     pub fn same(tag: impl Into<String>) -> Self {
         let t = tag.into();
         Self {
-            source: t.clone(),
+            source: ManifestRef::Tag(t.clone()),
             target: t,
         }
     }
@@ -304,8 +337,17 @@ impl TagPair {
     /// Create a pair with different source and target tags.
     pub fn retag(source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
-            source: source.into(),
+            source: ManifestRef::Tag(source.into()),
             target: target.into(),
+        }
+    }
+
+    /// Create a pair that copies the source manifest at `digest` to
+    /// `target_tag`; the source tag of that name is never read.
+    pub fn pinned(digest: Digest, target_tag: impl Into<String>) -> Self {
+        Self {
+            source: ManifestRef::Digest(digest),
+            target: target_tag.into(),
         }
     }
 }
@@ -314,10 +356,9 @@ impl fmt::Display for TagPair {
     /// Renders as the bare tag when source and target match, otherwise
     /// `source -> target`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.source == self.target {
-            f.write_str(&self.source)
-        } else {
-            write!(f, "{} -> {}", self.source, self.target)
+        match &self.source {
+            ManifestRef::Tag(source) if *source == self.target => f.write_str(source),
+            source => write!(f, "{source} -> {}", self.target),
         }
     }
 }
@@ -891,11 +932,11 @@ impl SyncEngine {
                     );
                     let source_ref = ImageRef {
                         repo: mapping.source_repo.clone(),
-                        tag: tag_pair.source.clone(),
+                        reference: tag_pair.source.clone(),
                     };
                     let target_ref = ImageRef {
                         repo: mapping.target_repo.clone(),
-                        tag: tag_pair.target.clone(),
+                        reference: ManifestRef::Tag(tag_pair.target.clone()),
                     };
                     for _entry in &mapping.targets {
                         let r = image_result(
@@ -917,11 +958,11 @@ impl SyncEngine {
                     source_authority: mapping.source_authority.clone(),
                     source: ImageRef {
                         repo: mapping.source_repo.clone(),
-                        tag: tag_pair.source.clone(),
+                        reference: tag_pair.source.clone(),
                     },
                     target: ImageRef {
                         repo: mapping.target_repo.clone(),
-                        tag: tag_pair.target.clone(),
+                        reference: ManifestRef::Tag(tag_pair.target.clone()),
                     },
                     targets: targets.clone(),
                     retry: self.retry.clone(),
@@ -1159,9 +1200,9 @@ impl SyncEngine {
             let live_keys: HashSet<SnapshotKey> = mappings
                 .iter()
                 .flat_map(|m| {
-                    m.tags
-                        .iter()
-                        .map(|t| SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source))
+                    m.tags.iter().map(|t| {
+                        SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source.to_string())
+                    })
                 })
                 .collect();
             let live_targets: HashSet<TargetId> = mappings
@@ -1244,35 +1285,39 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     // Step 1: HEAD the source manifest with a short timeout.
     let source_head_digest = match tokio::time::timeout(
         source_head_timeout,
-        source_client.manifest_head(&source.repo, &source.tag),
+        source_client.manifest_head(&source.repo, &source.reference.to_string()),
     )
     .await
     {
         Ok(Ok(Some(digest))) => Some(digest),
         Ok(Ok(None)) => {
             debug!(
-                repo = %source.repo, tag = %source.tag,
+                repo = %source.repo, tag = %source.reference,
                 "source HEAD 404, falling through to full pull"
             );
             None
         }
         Ok(Err(e)) => {
             debug!(
-                repo = %source.repo, tag = %source.tag, error = %e,
+                repo = %source.repo, tag = %source.reference, error = %e,
                 "source HEAD failed, falling through to full pull"
             );
             None
         }
         Err(_) => {
             debug!(
-                repo = %source.repo, tag = %source.tag,
+                repo = %source.repo, tag = %source.reference,
                 "source HEAD timed out, falling through to full pull"
             );
             None
         }
     };
 
-    let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, &source.tag);
+    let snapshot_key = SnapshotKey::new(
+        &source_authority,
+        &source.repo,
+        &source.reference.to_string(),
+    );
 
     // HEAD-check every target against `compare_digest`: all matching skips
     // the image with `skip_route`; otherwise only the mismatched targets are
@@ -1424,7 +1469,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
         head_checks.push(async move {
             let result = entry
                 .client()
-                .manifest_head(&target.repo, &target.tag)
+                .manifest_head(&target.repo, &target.reference.to_string())
                 .await;
             (entry, result)
         });
@@ -1438,7 +1483,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
             Ok(Some(digest)) if digest == *compare_digest => {
                 debug!(
                     source_repo = %source.repo,
-                    source_tag = %source.tag,
+                    source_tag = %source.reference,
                     target_repo = %target.repo,
                     digest = %compare_digest,
                     "skipping -- digest matches at target ({label})"
@@ -1455,7 +1500,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                 if let Err(e) = &other {
                     warn!(
                         target_repo = %target.repo,
-                        target_tag = %target.tag,
+                        target_tag = %target.reference,
                         error = %e,
                         "target manifest HEAD failed during {label}, proceeding with sync"
                     );
@@ -1509,7 +1554,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
     let source_data = match pull_source_manifest(
         source_client,
         &source.repo,
-        &source.tag,
+        &source.reference,
         retry,
         platforms,
         shared,
@@ -1520,14 +1565,14 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         Err(err) => {
             warn!(
                 source_repo = %source.repo,
-                source_tag = %source.tag,
+                source_tag = %source.reference,
                 error = %err,
                 "source pull failed, skipping all targets"
             );
             let fail_results: Vec<ImageResult> = targets
                 .iter()
                 .map(|t| ImageResult {
-                    target: format!("{} ({}):{}", target.repo, t.name(), target.tag),
+                    target: format!("{} ({}):{}", target.repo, t.name(), target.reference),
                     ..image_result(source, target, failed_status(ErrorKind::ManifestPull, &err))
                 })
                 .collect();
@@ -1555,7 +1600,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         head_checks.push(async move {
             let result = entry
                 .client()
-                .manifest_head(&target.repo, &target.tag)
+                .manifest_head(&target.repo, &target.reference.to_string())
                 .await;
             (entry, result)
         });
@@ -1568,7 +1613,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
             Ok(Some(digest)) if digest == *source_digest => {
                 debug!(
                     source_repo = %source.repo,
-                    source_tag = %source.tag,
+                    source_tag = %source.reference,
                     target_repo = %target.repo,
                     digest = %source_digest,
                     "skipping -- digest matches at target"
@@ -1585,7 +1630,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                 if let Err(e) = &other {
                     warn!(
                         target_repo = %target.repo,
-                        target_tag = %target.tag,
+                        target_tag = %target.reference,
                         error = %e,
                         "target manifest HEAD failed, proceeding with sync"
                     );
@@ -1686,9 +1731,9 @@ async fn execute_item(
 
             info!(
                 source_repo = %item.source.repo,
-                source_tag = %item.source.tag,
+                source_tag = %item.source.reference,
                 target_repo = %item.target.repo,
-                target_tag = %item.target.tag,
+                target_tag = %item.target.reference,
                 bytes = outcome.bytes_transferred,
                 "image synced"
             );
@@ -1710,7 +1755,7 @@ async fn execute_item(
                 debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
-                    target_tag = %item.target.tag,
+                    target_tag = %item.target.reference,
                     "target tag is immutable, skipping"
                 );
                 let status = ImageStatus::Skipped {
@@ -1735,23 +1780,40 @@ async fn execute_item(
 /// Pull all source manifest data for a single tag: the manifest, plus the
 /// child manifests for an index.
 ///
+/// When `reference` is a digest, the pulled bytes must hash to it, else the
+/// pull fails with nothing pushed: a registry serving other content under a
+/// pinned digest is never copied.
+///
 /// When `platforms` is `Some`, only matching children are pulled and the
 /// index's `raw_bytes` and digest are re-serialized to list only the kept
 /// descriptors, so targets receive the filtered index.
 async fn pull_source_manifest(
     client: &RegistryClient,
     repo: &RepositoryName,
-    tag: &str,
+    reference: &ManifestRef,
     retry: &RetryConfig,
     platforms: Option<&[PlatformFilter]>,
     shared: &PerRun,
 ) -> Result<PulledManifest, crate::Error> {
+    let tag = reference.to_string();
+    let tag = tag.as_str();
     let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
         .await
         .map_err(|e| crate::Error::Manifest {
             reference: tag.to_owned(),
             source: e,
         })?;
+    if let ManifestRef::Digest(pinned) = reference
+        && pull.digest != *pinned
+    {
+        return Err(crate::Error::ManifestLogic {
+            reference: tag.to_owned(),
+            reason: format!(
+                "source served content with digest {} for pinned digest {pinned}",
+                pull.digest
+            ),
+        });
+    }
 
     let children = match &pull.manifest {
         ManifestKind::Image(_) => Vec::new(),
@@ -2704,7 +2766,13 @@ async fn push_manifests(
         result?;
     }
 
-    push_manifest(ctx, &item.target.tag, &source_data.pull, Some(outcome)).await
+    push_manifest(
+        ctx,
+        &item.target.reference.to_string(),
+        &source_data.pull,
+        Some(outcome),
+    )
+    .await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
@@ -3140,13 +3208,40 @@ mod tests {
 
     use super::*;
 
+    /// A tag renders as `repo:tag` and a pinned digest as `repo@digest`, in
+    /// the image reference and the tag pair alike. Breaks if a pinned source
+    /// is shown as a tag.
+    #[test]
+    fn a_pinned_source_renders_as_repo_at_digest() {
+        let digest = test_digest("abc");
+        let repo: RepositoryName = "lib/pg".parse().unwrap();
+        let image = |reference| ImageRef {
+            repo: repo.clone(),
+            reference,
+        };
+        assert_eq!(
+            image(ManifestRef::Tag("15".into())).to_string(),
+            "lib/pg:15"
+        );
+        assert_eq!(
+            image(ManifestRef::Digest(digest.clone())).to_string(),
+            format!("lib/pg@{digest}")
+        );
+        assert_eq!(TagPair::same("15").to_string(), "15");
+        assert_eq!(TagPair::retag("15", "stable").to_string(), "15 -> stable");
+        assert_eq!(
+            TagPair::pinned(digest.clone(), "15.19").to_string(),
+            format!("{digest} -> 15.19")
+        );
+    }
+
     /// A transferred image reports its own byte count, blob stats and elapsed
     /// time, not the zeroed defaults of a skip.
     #[test]
     fn into_result_carries_transfer_counts_and_elapsed_time() {
         let image = |repo: &str| ImageRef {
             repo: repo.parse().unwrap(),
-            tag: "v1".into(),
+            reference: ManifestRef::Tag("v1".into()),
         };
         let outcome = TargetBlobOutcome {
             bytes_transferred: 42,
@@ -3248,7 +3343,7 @@ mod tests {
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
         let image = |repo: &str| ImageRef {
             repo: repo.parse().unwrap(),
-            tag: "tag".into(),
+            reference: ManifestRef::Tag("tag".into()),
         };
         ImageResult {
             bytes_transferred: bytes,
@@ -3432,11 +3527,11 @@ mod tests {
             )),
             source: ImageRef {
                 repo: RepositoryName::new(format!("source/{tag}")).unwrap(),
-                tag: tag.to_owned(),
+                reference: ManifestRef::Tag(tag.to_owned()),
             },
             target: ImageRef {
                 repo: RepositoryName::new(format!("target/{tag}")).unwrap(),
-                tag: tag.to_owned(),
+                reference: ManifestRef::Tag(tag.to_owned()),
             },
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
             discovery_retries: 0,
@@ -3497,14 +3592,14 @@ mod tests {
         let n = elect_leaders(&mut pending);
 
         assert_eq!(n, 1);
-        assert_eq!(pending[0].source.tag, "base");
+        assert_eq!(pending[0].source.reference.to_string(), "base");
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4);
         assert!(leader_blobs.contains(&test_digest("c0")));
         assert!(leader_blobs.contains(&test_digest("a3")));
         // Followers keep their original order.
-        assert_eq!(pending[1].source.tag, "child_a");
-        assert_eq!(pending[2].source.tag, "child_b");
+        assert_eq!(pending[1].source.reference.to_string(), "child_a");
+        assert_eq!(pending[2].source.reference.to_string(), "child_b");
     }
 
     #[test]
@@ -3526,10 +3621,10 @@ mod tests {
         assert_eq!(n, 2);
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4); // {c0, a1, a2, a3}
-        assert_eq!(pending[0].source.tag, "v1");
-        assert_eq!(pending[1].source.tag, "v1");
-        assert_eq!(pending[2].source.tag, "child_a");
-        assert_eq!(pending[3].source.tag, "child_b");
+        assert_eq!(pending[0].source.reference.to_string(), "v1");
+        assert_eq!(pending[1].source.reference.to_string(), "v1");
+        assert_eq!(pending[2].source.reference.to_string(), "child_a");
+        assert_eq!(pending[3].source.reference.to_string(), "child_b");
     }
 
     #[test]
@@ -3558,10 +3653,10 @@ mod tests {
         assert!(leader_blobs.contains(&test_digest("a0")));
         assert!(leader_blobs.contains(&test_digest("d0")));
 
-        let leader_tags: Vec<&str> = pending
+        let leader_tags: Vec<String> = pending
             .iter()
             .take(n)
-            .map(|t| t.source.tag.as_str())
+            .map(|t| t.source.reference.to_string())
             .collect();
 
         assert_eq!(leader_tags[0], "imgA");
@@ -3588,7 +3683,8 @@ mod tests {
         let n = elect_leaders(&mut pending);
         assert_eq!(n, 1);
         assert_eq!(
-            pending[0].source.tag, "imgB",
+            pending[0].source.reference.to_string(),
+            "imgB",
             "tie should break deterministically in favor of later candidate"
         );
     }
@@ -3646,7 +3742,7 @@ mod tests {
                     assert!(
                         leader_blobs.contains(blob),
                         "follower {} has shared blob {} not covered by leaders",
-                        task.source.tag,
+                        task.source.reference,
                         blob
                     );
                 }
