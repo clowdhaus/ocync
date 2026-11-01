@@ -348,10 +348,10 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 }
 
 impl RegistryClient {
-    /// Wait for one of this client's upload slots (see
-    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]), then for GHCR and ACR, which
-    /// buffer the whole blob, the byte-budget permit sized by `known_size`
-    /// (see [`Self::acquire_buffered_bytes_permit`]). The slot holds both
+    /// Wait for one of this client's upload slots (64 by default, set by
+    /// [`RegistryClientBuilder::blob_upload_concurrency`]), then for GHCR and
+    /// ACR, which buffer the whole blob, the byte-budget permit sized by
+    /// `known_size`. The slot holds both
     /// until it is dropped or spent.
     ///
     /// Take it before the source download opens: a copy then holds its slot
