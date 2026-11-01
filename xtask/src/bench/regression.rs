@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bench::lock::LockedAt;
+use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::report::CorpusInfo;
 
 /// Stored performance baseline for a benchmark run.
@@ -25,6 +25,11 @@ pub(crate) struct Baseline {
     /// before the lock existed, which therefore compare against no run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_locked_at: Option<LockedAt>,
+    /// What the run's tools synced each tag from. Baselines compare only with
+    /// runs that synced from the same. Absent: the tools synced source tags, or
+    /// the run had no lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sync_from: Option<SyncFrom>,
     /// Images and tags the run synced. `--limit` and `--skip-registries`
     /// shrink the corpus under the same lock, so the lock alone does not say
     /// two runs synced the same content. Zero in baselines saved before this
@@ -63,7 +68,8 @@ pub(crate) struct RegressionResult {
 }
 
 /// Refuses when `current` and `baseline` were recorded under different corpus
-/// locks, the baseline under none, or over a different number of images or
+/// locks, the baseline under none, from different sources (a tag or its locked
+/// digest), or over a different number of images or
 /// tags: they synced different content, so a delta is not a regression. Refuses
 /// a different cap on concurrent transfers or number of rounds too.
 /// `baseline_path` names the file to replace. The figures are not read, so a
@@ -90,6 +96,17 @@ pub(crate) fn ensure_comparable(
                 current.corpus.images,
                 current.corpus.tags
             ),
+        ));
+    }
+    if current.sync_from != baseline.sync_from {
+        let show = |from: Option<SyncFrom>| match from {
+            Some(SyncFrom::Digest) => "syncing from locked digests",
+            None => "syncing from source tags",
+        };
+        return Err(refusal(
+            baseline_path,
+            show(baseline.sync_from),
+            show(current.sync_from),
         ));
     }
     if current.max_concurrent_transfers != baseline.max_concurrent_transfers {
@@ -260,6 +277,7 @@ mod tests {
             requests,
             total_bytes,
             corpus_locked_at: None,
+            sync_from: None,
             corpus: CorpusInfo {
                 images: 40,
                 tags: 55,
@@ -383,6 +401,7 @@ mod tests {
             requests: 847,
             total_bytes: 2_100_000_000,
             corpus_locked_at: Some(locked_at("2026-10-30-214340")),
+            sync_from: Some(SyncFrom::Digest),
             corpus: CorpusInfo {
                 images: 40,
                 tags: 55,
@@ -397,6 +416,7 @@ mod tests {
         assert_eq!(loaded.requests, 847);
         assert_eq!(loaded.total_bytes, 2_100_000_000);
         assert_eq!(loaded.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert_eq!(loaded.sync_from, Some(SyncFrom::Digest));
         assert_eq!(
             loaded.corpus_locked_at,
             Some(locked_at("2026-10-30-214340"))

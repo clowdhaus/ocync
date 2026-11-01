@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
-use crate::bench::lock::LockedAt;
+use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::Tool;
@@ -51,6 +51,10 @@ pub(crate) struct RunRecord {
     /// sync no locked corpus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_locked_at: Option<LockedAt>,
+    /// What the tools synced each tag from, which sets the comparison series.
+    /// Absent: the tools synced source tags, or the run had no lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sync_from: Option<SyncFrom>,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
     /// Versions of binaries the benchmarked tools relay their transfers
@@ -118,6 +122,7 @@ impl RunRecord {
         Self {
             timestamp: report.timestamp.clone(),
             git_ref,
+            sync_from: SyncFrom::of(corpus_locked_at.as_ref()),
             corpus_locked_at,
             machine: MachineInfo {
                 provider: report.instance.provider(),
@@ -1706,6 +1711,14 @@ pub(crate) mod tests {
         );
         let reread: RunRecord = serde_json::from_str(&with).unwrap();
         assert_eq!(reread.corpus_locked_at, record.corpus_locked_at);
+
+        // Catches: a run of locked digests recorded as indistinguishable from
+        // the earlier runs that followed source tags, and a run with no lock
+        // claiming digests.
+        let at = || Some(crate::bench::lock::fixtures::locked_at("2026-10-30-120000"));
+        let json = |at| serde_json::to_string(&RunRecord::of(&sample_report(), "abc".into(), at));
+        assert!(json(at()).unwrap().contains(r#""sync_from":"digest""#));
+        assert!(!json(None).unwrap().contains("sync_from"));
     }
 
     #[test]

@@ -2,10 +2,33 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
+
+use ocync_distribution::Digest;
 
 use crate::bench::RegistryKind;
 use crate::bench::corpus::{Corpus, ImageEntry};
+use crate::bench::lock::Lock;
 use crate::bench::target::Kind;
+
+/// What a generated config syncs.
+#[derive(Clone, Copy)]
+pub(crate) enum Mode<'a> {
+    /// Each corpus tag from the digest `lock` pins it to, so a source tag that
+    /// has moved cannot change what is copied.
+    Sync(&'a Lock),
+    /// Resolve wildcard tags and transfer nothing, which no lock describes.
+    Prepare,
+}
+
+/// The digest `lock` pins `tag` of `source` to. `ensure_served` refuses a ref
+/// the lock lacks before any config is written, as `blobs_to_warm` relies on.
+fn locked_digest<'a>(lock: &'a Lock, source: &str, tag: &str) -> &'a Digest {
+    &lock
+        .entry(source, tag)
+        .expect("ensure_served refuses a ref the lock lacks")
+        .digest
+}
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
 ///
@@ -77,7 +100,8 @@ fn registry_key(hostname: &str) -> String {
 /// Produces a `registries:` section with unique source registries (anonymous auth)
 /// and the target registry (signed in to as `target` says), followed by a `mappings:` section.
 /// Each mapping uses `source:` and `targets:` to reference registries by name,
-/// and `tags: glob:` with a list of exact tag globs.
+/// and `tags:`. For [`Mode::Sync`], `tags:` pins each tag to its locked digest; for
+/// [`Mode::Prepare`] it is a `glob:` of the corpus tags.
 ///
 /// A `max_concurrent_transfers` writes a leading `global:` block carrying it;
 /// without one the config has no `global:` block and ocync keeps its default.
@@ -85,6 +109,7 @@ pub(crate) fn ocync_config(
     corpus: &Corpus,
     target: Kind,
     max_concurrent_transfers: Option<NonZeroUsize>,
+    mode: Mode<'_>,
 ) -> String {
     let mut out = String::new();
 
@@ -132,9 +157,20 @@ pub(crate) fn ocync_config(
         out.push_str(&format!("    source: {src_key}\n"));
         out.push_str(&format!("    targets: [{target_key}]\n"));
         out.push_str("    tags:\n");
-        out.push_str("      glob:\n");
-        for tag in &img.tags {
-            out.push_str(&format!("        - \"{tag}\"\n"));
+        match mode {
+            Mode::Sync(lock) => {
+                for tag in &img.tags {
+                    let digest = locked_digest(lock, &img.source, tag);
+                    out.push_str(&format!("      - name: \"{tag}\"\n"));
+                    out.push_str(&format!("        digest: \"{digest}\"\n"));
+                }
+            }
+            Mode::Prepare => {
+                out.push_str("      glob:\n");
+                for tag in &img.tags {
+                    out.push_str(&format!("        - \"{tag}\"\n"));
+                }
+            }
         }
     }
 
@@ -145,11 +181,14 @@ pub(crate) fn ocync_config(
 ///
 /// Produces `relay: skopeo` followed by `tasks:` grouped by source registry in deterministic
 /// order. Each task contains source/target registry fields and a flat mappings list.
+/// Each tag is written `<tag>@<digest>` from `lock`: dregsy pulls the digest and creates
+/// `<tag>` at the target, so a moved source tag cannot change what is copied. `skopeo` is
+/// the binary dregsy runs as skopeo.
 ///
 /// The ECR target gets `auth-refresh: 12h` so dregsy uses its internal AWS SDK refresher
 /// (via `GetAuthorizationToken`) instead of falling through to skopeo's Docker credential
 /// resolution. 12h matches the ECR token lifetime to minimize refresh overhead.
-pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
+pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> String {
     // Group images by source registry. BTreeMap gives deterministic iteration order.
     let mut by_registry: BTreeMap<&str, Vec<&ImageEntry>> = BTreeMap::new();
     for img in &corpus.images {
@@ -159,6 +198,8 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
 
     let mut out = String::new();
     out.push_str("relay: skopeo\n");
+    out.push('\n');
+    out.push_str(&format!("skopeo:\n  binary: \"{}\"\n", skopeo.display()));
     out.push('\n');
     out.push_str("tasks:\n");
 
@@ -194,7 +235,8 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
             out.push_str("        platform: all\n");
             out.push_str("        tags:\n");
             for tag in &img.tags {
-                out.push_str(&format!("          - \"{tag}\"\n"));
+                let digest = locked_digest(lock, &img.source, tag);
+                out.push_str(&format!("          - \"{tag}@{digest}\"\n"));
             }
         }
     }
@@ -207,8 +249,10 @@ pub(crate) fn dregsy_config(corpus: &Corpus) -> String {
 /// Produces `version: 1`, a `creds:` section with `repoAuth: true` for each source
 /// registry (required for registries that issue per-repo scoped tokens like cgr.dev,
 /// gcr.io, nvcr.io -- see regclient issue #1060) and `credHelper: docker-credential-ecr-login`
-/// for the ECR target, followed by a flat `sync:` list.
-pub(crate) fn regsync_config(corpus: &Corpus) -> String {
+/// for the ECR target, followed by a flat `sync:` list. Each entry copies the source at its
+/// locked digest from `lock` to the corpus tag, so a moved source tag cannot change what is
+/// copied.
+pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
     let mut source_registries: Vec<&str> = corpus
         .images
         .iter()
@@ -243,18 +287,19 @@ pub(crate) fn regsync_config(corpus: &Corpus) -> String {
     out.push('\n');
     out.push_str("sync:\n");
 
-    // Emit one entry per (image, tag) pair with `type: image` and the tag
-    // embedded in both source and target references. `type: repository`
-    // enumerates ALL tags (1900+ pages on quay.io/jupyter) and then filters,
-    // which is extremely slow and can skip images due to Docker v1 manifest
-    // filtering. `type: image` with an explicit tag avoids both problems.
+    // Emit one entry per (image, tag) pair with `type: image`, the source named by
+    // digest and the target by tag. `type: repository` enumerates ALL tags (1900+
+    // pages on quay.io/jupyter) and then filters, which is extremely slow and can
+    // skip images due to Docker v1 manifest filtering. `type: image` with an
+    // explicit reference avoids both problems.
     //
     // Explicit `mediaTypes` is required for quay.io: without it, regclient
     // receives Docker v1 manifests (quay.io's default when no Accept header
     // specifies v2) and skips the image entirely.
     for img in &corpus.images {
         for tag in &img.tags {
-            let source_ref = format!("{}:{}", img.source, tag);
+            let digest = locked_digest(lock, &img.source, tag);
+            let source_ref = format!("{}@{digest}", img.source);
             let target_ref = format!("{}:{}", corpus.target_ref(&img.source), tag);
             out.push_str(&format!("  - source: \"{source_ref}\"\n"));
             out.push_str(&format!("    target: \"{target_ref}\"\n"));
@@ -273,6 +318,16 @@ pub(crate) fn regsync_config(corpus: &Corpus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::lock::fixtures::{entry, lock_of};
+
+    /// Pins each of `test_corpus`'s tags to a digest of its own: `1`s, `2`s, `3`s.
+    fn test_lock() -> Lock {
+        lock_of(&[
+            ("cgr.dev/chainguard/static:latest", entry('1', &[])),
+            ("docker.io/library/alpine:3.20", entry('2', &[])),
+            ("docker.io/library/alpine:latest", entry('3', &[])),
+        ])
+    }
 
     fn test_corpus() -> Corpus {
         let yaml = r#"
@@ -295,15 +350,16 @@ images:
         // Catches: the cap silently dropped (ocync then runs at its default
         // and the measurement is of the wrong cap), and a `global:` block
         // written when none was asked for.
-        let corpus = test_corpus();
+        let (corpus, lock) = (test_corpus(), test_lock());
+        let config = |cap| ocync_config(&corpus, Kind::Ecr, cap, Mode::Sync(&lock));
         assert_eq!(
-            ocync_config(&corpus, Kind::Ecr, NonZeroUsize::new(20)),
+            config(NonZeroUsize::new(20)),
             format!(
                 "global:\n  max_concurrent_transfers: 20\n\n{}",
-                ocync_config(&corpus, Kind::Ecr, None)
+                config(None)
             )
         );
-        assert!(!ocync_config(&corpus, Kind::Ecr, None).contains("global:"));
+        assert!(!config(None).contains("global:"));
     }
 
     #[test]
@@ -311,6 +367,7 @@ images:
         use crate::bench::corpus::DockerHubAuth;
 
         let plain = test_corpus();
+        let lock = test_lock();
         let mut with_auth = test_corpus();
         with_auth.dockerhub_auth = Some(DockerHubAuth {
             username: "ocync-bench".to_string(),
@@ -324,7 +381,7 @@ images:
         for (name, config, expected) in [
             (
                 "ocync_config_artifact_registry",
-                ocync_config(&gar, Kind::ArtifactRegistry, None),
+                ocync_config(&gar, Kind::ArtifactRegistry, None, Mode::Sync(&lock)),
                 "\
 registries:
   cgr-dev:
@@ -341,21 +398,56 @@ mappings:
     source: cgr-dev
     targets: [europe-west9-docker-pkg-dev]
     tags:
-      glob:
-        - \"latest\"
+      - name: \"latest\"
+        digest: \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"
   - from: \"library/alpine\"
     to: \"example-project/run-r1/bench/library-alpine\"
     source: docker-io
     targets: [europe-west9-docker-pkg-dev]
     tags:
-      glob:
-        - \"3.20\"
-        - \"latest\"
+      - name: \"3.20\"
+        digest: \"sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+      - name: \"latest\"
+        digest: \"sha256:3333333333333333333333333333333333333333333333333333333333333333\"
 ",
             ),
             (
                 "ocync_config_exact_output",
-                ocync_config(&plain, Kind::Ecr, None),
+                ocync_config(&plain, Kind::Ecr, None, Mode::Sync(&lock)),
+                "\
+registries:
+  cgr-dev:
+    url: cgr.dev
+  docker-io:
+    url: docker.io
+  ecr:
+    url: 111111111111.dkr.ecr.us-east-1.amazonaws.com
+    auth_type: ecr
+
+mappings:
+  - from: \"chainguard/static\"
+    to: \"bench/chainguard-static\"
+    source: cgr-dev
+    targets: [ecr]
+    tags:
+      - name: \"latest\"
+        digest: \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"
+  - from: \"library/alpine\"
+    to: \"bench/library-alpine\"
+    source: docker-io
+    targets: [ecr]
+    tags:
+      - name: \"3.20\"
+        digest: \"sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+      - name: \"latest\"
+        digest: \"sha256:3333333333333333333333333333333333333333333333333333333333333333\"
+",
+            ),
+            (
+                // The prepare scenario transfers nothing and resolves wildcards, so
+                // it has no lock and keeps the tag globs.
+                "ocync_config_without_lock",
+                ocync_config(&plain, Kind::Ecr, None, Mode::Prepare),
                 "\
 registries:
   cgr-dev:
@@ -386,9 +478,12 @@ mappings:
             ),
             (
                 "dregsy_config_exact_output",
-                dregsy_config(&plain),
+                dregsy_config(&plain, &lock, Path::new("/run/dir/skopeo")),
                 "\
 relay: skopeo
+
+skopeo:
+  binary: \"/run/dir/skopeo\"
 
 tasks:
   - name: sync-cgr-dev
@@ -402,7 +497,7 @@ tasks:
         to: \"bench/chainguard-static\"
         platform: all
         tags:
-          - \"latest\"
+          - \"latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\"
   - name: sync-docker-io
     source:
       registry: docker.io
@@ -414,13 +509,13 @@ tasks:
         to: \"bench/library-alpine\"
         platform: all
         tags:
-          - \"3.20\"
-          - \"latest\"
+          - \"3.20@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+          - \"latest@sha256:3333333333333333333333333333333333333333333333333333333333333333\"
 ",
             ),
             (
                 "regsync_config_exact_output",
-                regsync_config(&plain),
+                regsync_config(&plain, &lock),
                 "\
 version: 1
 
@@ -433,7 +528,7 @@ creds:
     credHelper: docker-credential-ecr-login
 
 sync:
-  - source: \"cgr.dev/chainguard/static:latest\"
+  - source: \"cgr.dev/chainguard/static@sha256:1111111111111111111111111111111111111111111111111111111111111111\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static:latest\"
     type: image
     mediaTypes:
@@ -441,7 +536,7 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-  - source: \"docker.io/library/alpine:3.20\"
+  - source: \"docker.io/library/alpine@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:3.20\"
     type: image
     mediaTypes:
@@ -449,7 +544,7 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-  - source: \"docker.io/library/alpine:latest\"
+  - source: \"docker.io/library/alpine@sha256:3333333333333333333333333333333333333333333333333333333333333333\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:latest\"
     type: image
     mediaTypes:
@@ -461,7 +556,7 @@ sync:
             ),
             (
                 "ocync_config_with_dockerhub_auth",
-                ocync_config(&with_auth, Kind::Ecr, None),
+                ocync_config(&with_auth, Kind::Ecr, None, Mode::Sync(&lock)),
                 "\
 registries:
   cgr-dev:
@@ -482,23 +577,27 @@ mappings:
     source: cgr-dev
     targets: [ecr]
     tags:
-      glob:
-        - \"latest\"
+      - name: \"latest\"
+        digest: \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"
   - from: \"library/alpine\"
     to: \"bench/library-alpine\"
     source: docker-io
     targets: [ecr]
     tags:
-      glob:
-        - \"3.20\"
-        - \"latest\"
+      - name: \"3.20\"
+        digest: \"sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+      - name: \"latest\"
+        digest: \"sha256:3333333333333333333333333333333333333333333333333333333333333333\"
 ",
             ),
             (
                 "dregsy_config_with_dockerhub_auth",
-                dregsy_config(&with_auth),
+                dregsy_config(&with_auth, &lock, Path::new("/run/dir/skopeo")),
                 "\
 relay: skopeo
+
+skopeo:
+  binary: \"/run/dir/skopeo\"
 
 tasks:
   - name: sync-cgr-dev
@@ -512,7 +611,7 @@ tasks:
         to: \"bench/chainguard-static\"
         platform: all
         tags:
-          - \"latest\"
+          - \"latest@sha256:1111111111111111111111111111111111111111111111111111111111111111\"
   - name: sync-docker-io
     source:
       registry: docker.io
@@ -525,13 +624,13 @@ tasks:
         to: \"bench/library-alpine\"
         platform: all
         tags:
-          - \"3.20\"
-          - \"latest\"
+          - \"3.20@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+          - \"latest@sha256:3333333333333333333333333333333333333333333333333333333333333333\"
 ",
             ),
             (
                 "regsync_config_with_dockerhub_auth",
-                regsync_config(&with_auth),
+                regsync_config(&with_auth, &lock),
                 "\
 version: 1
 
@@ -546,7 +645,7 @@ creds:
     credHelper: docker-credential-ecr-login
 
 sync:
-  - source: \"cgr.dev/chainguard/static:latest\"
+  - source: \"cgr.dev/chainguard/static@sha256:1111111111111111111111111111111111111111111111111111111111111111\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static:latest\"
     type: image
     mediaTypes:
@@ -554,7 +653,7 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-  - source: \"docker.io/library/alpine:3.20\"
+  - source: \"docker.io/library/alpine@sha256:2222222222222222222222222222222222222222222222222222222222222222\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:3.20\"
     type: image
     mediaTypes:
@@ -562,7 +661,7 @@ sync:
       - \"application/vnd.docker.distribution.manifest.list.v2+json\"
       - \"application/vnd.oci.image.manifest.v1+json\"
       - \"application/vnd.oci.image.index.v1+json\"
-  - source: \"docker.io/library/alpine:latest\"
+  - source: \"docker.io/library/alpine@sha256:3333333333333333333333333333333333333333333333333333333333333333\"
     target: \"111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:latest\"
     type: image
     mediaTypes:
