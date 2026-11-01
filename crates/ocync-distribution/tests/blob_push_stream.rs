@@ -69,14 +69,9 @@ async fn empty_stream() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let result = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            data_stream(data, 1),
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let result = slot
+        .push_stream(&repo, &digest, None, data_stream(data, 1))
         .await
         .unwrap();
 
@@ -103,14 +98,9 @@ async fn post_initiation_rejected() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let err = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            data_stream(data, 4),
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let err = slot
+        .push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -151,14 +141,9 @@ async fn put_upload_failure() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let err = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            data_stream(data, 4),
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let err = slot
+        .push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -203,14 +188,9 @@ async fn put_rejected() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let err = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            data_stream(data, 4),
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let err = slot
+        .push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -251,15 +231,8 @@ async fn stream_error_propagates() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let result = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            error_stream,
-        )
-        .await;
+    let slot = client.reserve_upload_slot(None).await;
+    let result = slot.push_stream(&repo, &digest, None, error_stream).await;
 
     assert!(result.is_err(), "stream error should propagate");
 }
@@ -287,14 +260,9 @@ async fn post_returns_200_is_rejected() {
         .unwrap();
 
     let repo = RepositoryName::new("repo").unwrap();
-    let err = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            data_stream(data, 4),
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let err = slot
+        .push_stream(&repo, &digest, None, data_stream(data, 4))
         .await
         .unwrap_err();
 

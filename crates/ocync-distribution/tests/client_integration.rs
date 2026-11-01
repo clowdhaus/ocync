@@ -1107,14 +1107,9 @@ async fn a_refused_upload_drops_the_token() {
         .parse()
         .unwrap();
     let body = futures_util::stream::iter([Ok::<_, Error>(bytes::Bytes::from_static(b"blob"))]);
-    let err = client
-        .blob_push_stream(
-            &client.reserve_upload_slot().await,
-            &repo,
-            &digest,
-            None,
-            body,
-        )
+    let slot = client.reserve_upload_slot(None).await;
+    let err = slot
+        .push_stream(&repo, &digest, None, body)
         .await
         .unwrap_err();
 

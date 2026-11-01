@@ -10,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use crate::aimd::{AimdController, GooglePacing, RegistryAction};
+use crate::auth::detect::ProviderKind;
 use crate::auth::{AuthProvider, Presents, Scope, Token};
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
@@ -56,9 +57,11 @@ const DEFAULT_BLOB_UPLOAD_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(64).unwr
 /// Default cap on concurrent blob downloads per registry. Each is its own
 /// HTTP/1.1 connection while its body is open, so the cap bounds the
 /// connections and TLS handshakes one sync opens to a source. Every upload
-/// reads one download, so a lower cap would hold uploads below their own
-/// cap. A copy opens its download only after it holds an upload slot, so a
-/// higher cap matters only for pulls to disk, which take no slot.
+/// reads one download, so for one target a lower cap would hold uploads
+/// below their own cap, and a higher one would open nothing more, as a copy
+/// opens its download only after it holds an upload slot. A source feeding
+/// several targets is limited by this cap, and pulls to disk, which take no
+/// slot, open downloads of their own.
 const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: NonZeroUsize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
@@ -305,13 +308,21 @@ pub struct RegistryClient {
     rate_limit_remaining: AtomicU64,
 }
 
-/// One of a client's concurrent blob upload slots, held until dropped.
+/// One blob upload's claim on a client's capacity, bound to that client and
+/// consumed by the upload it admits.
 ///
-/// Made only by [`RegistryClient::reserve_upload_slot`] and passed to
-/// [`RegistryClient::blob_push_stream`], so a copy waits for its slot before
-/// it opens the source download rather than after.
+/// Made only by [`RegistryClient::reserve_upload_slot`] and spent by
+/// [`UploadSlot::push_stream`], so a copy waits for its slot before it opens
+/// the source download. It holds the upload count permit and, for GHCR and
+/// ACR, which buffer the whole blob, the byte-budget permit too.
 #[derive(Debug)]
-pub struct UploadSlot(OwnedSemaphorePermit);
+pub struct UploadSlot<'c> {
+    // Field order is drop order: the contested byte budget is released
+    // before the count cap, so queued buffered uploads admit at once.
+    _bytes: Option<OwnedSemaphorePermit>,
+    _count: OwnedSemaphorePermit,
+    pub(crate) client: &'c RegistryClient,
+}
 
 /// Acquire a permit from one of the client's blob caps.
 async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
@@ -324,19 +335,36 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 
 impl RegistryClient {
     /// Wait for one of this client's upload slots (see
-    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]) and hold it until the returned
-    /// slot is dropped.
+    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]), then for GHCR and ACR the
+    /// byte-budget permit sized by `known_size` (see
+    /// [`Self::acquire_buffered_bytes_permit`]). The slot holds both until it
+    /// is dropped or spent.
     ///
-    /// Take it before the source download opens, and pass it to
-    /// [`Self::blob_push_stream`] on this same client. A copy then holds its
-    /// slot and waits on the download cap, never the other way round.
-    pub async fn reserve_upload_slot(&self) -> UploadSlot {
-        UploadSlot(acquire_permit(&self.blob_upload_sem).await)
-    }
-
-    /// Whether `slot` came from this client's [`Self::reserve_upload_slot`].
-    pub(crate) fn owns_slot(&self, slot: &UploadSlot) -> bool {
-        Arc::ptr_eq(slot.0.semaphore(), &self.blob_upload_sem)
+    /// Take it before the source download opens: a copy then holds its slot
+    /// and waits on the download cap, never the other way round.
+    pub async fn reserve_upload_slot(&self, known_size: Option<u64>) -> UploadSlot<'_> {
+        let count = acquire_permit(&self.blob_upload_sem).await;
+        let bytes = match self.aimd.provider() {
+            Some(ProviderKind::Ghcr | ProviderKind::Acr) => {
+                Some(self.acquire_buffered_bytes_permit(known_size).await)
+            }
+            // Exhaustive, so a new `ProviderKind` fails to compile until it
+            // is decided whether its upload path buffers.
+            Some(
+                ProviderKind::Ecr
+                | ProviderKind::EcrPublic
+                | ProviderKind::Gar
+                | ProviderKind::Gcr
+                | ProviderKind::DockerHub
+                | ProviderKind::Chainguard,
+            )
+            | None => None,
+        };
+        UploadSlot {
+            _bytes: bytes,
+            _count: count,
+            client: self,
+        }
     }
 
     /// Acquire a permit gating concurrent blob downloads. See

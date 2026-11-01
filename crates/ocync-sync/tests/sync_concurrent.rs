@@ -13,6 +13,7 @@ use ocync_distribution::spec::MediaType;
 use ocync_sync::cache::TransferStateCache;
 use ocync_sync::engine::{ResolvedMapping, SyncEngine, TagPair};
 use ocync_sync::progress::NullProgress;
+use ocync_sync::retry::RetryConfig;
 use ocync_sync::shutdown::ShutdownSignal;
 use ocync_sync::staging::BlobStage;
 use ocync_sync::{ErrorKind, ImageStatus, RunOutcome, SyncReport};
@@ -2272,66 +2273,166 @@ fn one_upload_slot_mapping(server: &MockServer) -> ResolvedMapping {
     )
 }
 
-/// A copy between two repositories of one registry, with one client as
-/// source and target, finishes when that client allows one upload at a
-/// time. Breaks if a blob download takes an upload permit, which it would
-/// hold while its own upload waits for the permit.
-#[tokio::test]
-async fn sync_within_one_registry_does_not_wait_on_its_own_download() {
-    let server = MockServer::start().await;
-    let img = ManifestBuilder::new(b"cfg").layer(b"layer").build();
-    img.mount_source(&server, "src", "v1").await;
-    img.mount_target(&server, "dst", "v1").await;
-    let mapping = one_upload_slot_mapping(&server);
-
-    let report = tokio::time::timeout(Duration::from_secs(10), run_sync(vec![mapping]))
-        .await
-        .expect("the copy waited on its own download");
-
-    assert_status!(report, 0, ImageStatus::Synced);
-    assert_eq!(report.stats.blobs_transferred, 2);
-}
-
-/// With one upload slot and slow uploads, a copy takes its slot before its
-/// source download opens: the source blob GETs interleave with the target
-/// uploads instead of all arriving first and waiting on the slot. Breaks if a
-/// download is opened while the slot is held by another copy.
-#[tokio::test]
-async fn sync_takes_the_upload_slot_before_opening_the_download() {
-    let server = MockServer::start().await;
-    let img = ManifestBuilder::new(b"slot-cfg")
-        .layer(b"slot-layer-1")
-        .layer(b"slot-layer-2")
-        .layer(b"slot-layer-3")
-        .build();
-    img.mount_source(&server, "src", "v1").await;
-    img.mount_target(&server, "dst", "v1").await;
-    // Outranks the instant finalize in `mount_blob_push`.
-    Mock::given(method("PUT"))
-        .and(path("/v2/dst/blobs/uploads/upload-id"))
-        .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_millis(300)))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-
-    let report = run_sync(vec![one_upload_slot_mapping(&server)]).await;
-
-    assert_status!(report, 0, ImageStatus::Synced);
-    assert_eq!(report.stats.blobs_transferred, 4);
-    // `G` for a source blob GET, `P` for a target upload PUT, in arrival order.
-    let log: String = server
+/// The requests the one-slot tests order, as `G<name>` for a source blob GET
+/// (`name` from `names`, empty if the digest is not listed), `O` for a target
+/// upload POST and `P` for a target upload PUT, in arrival order.
+async fn slot_log(server: &MockServer, names: &[(&Digest, &str)]) -> Vec<String> {
+    server
         .received_requests()
         .await
         .unwrap()
         .iter()
         .filter_map(|r| match (&r.method, r.url.path()) {
-            (&Method::GET, p) if p.starts_with("/v2/src/blobs/") => Some('G'),
-            (&Method::PUT, p) if p.starts_with("/v2/dst/blobs/uploads/") => Some('P'),
+            (&Method::GET, p) if p.starts_with("/v2/src/blobs/") => {
+                let name = names
+                    .iter()
+                    .find(|(digest, _)| p.ends_with(digest.to_string().as_str()))
+                    .map_or("", |(_, name)| name);
+                Some(format!("G{name}"))
+            }
+            (&Method::POST, "/v2/dst/blobs/uploads/") => Some("O".to_owned()),
+            (&Method::PUT, p) if p.starts_with("/v2/dst/blobs/uploads/") => Some("P".to_owned()),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// With one upload slot and slow uploads, a copy takes its slot before it
+/// opens its source download, and the same client as source and target does
+/// not wait on its own download. Direct, each copy's GET, POST and PUT run
+/// together before the next copy's GET. Staged, the POSTs and PUTs alternate.
+/// Breaks if a download opens, or an upload session starts, while another copy
+/// holds the slot, or if a download takes an upload permit.
+#[tokio::test]
+async fn sync_takes_the_upload_slot_before_opening_the_download() {
+    for (row, staged, want) in [
+        ("direct", false, "GOPGOPGOPGOP"),
+        ("staged", true, "OPOPOPOP"),
+    ] {
+        let server = MockServer::start().await;
+        let img = ManifestBuilder::new(b"slot-cfg")
+            .layer(b"slot-layer-1")
+            .layer(b"slot-layer-2")
+            .layer(b"slot-layer-3")
+            .build();
+        img.mount_source(&server, "src", "v1").await;
+        img.mount_target(&server, "dst", "v1").await;
+        // Outranks the instant finalize in `mount_blob_push`.
+        Mock::given(method("PUT"))
+            .and(path("/v2/dst/blobs/uploads/upload-id"))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_millis(300)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let staging_dir = tempfile::tempdir().unwrap();
+        let stage = if staged {
+            BlobStage::new(staging_dir.path().to_path_buf())
+        } else {
+            BlobStage::disabled()
+        };
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_sync_with_concurrency(vec![one_upload_slot_mapping(&server)], 50, stage),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{row}: the copy waited on its own download"));
+
+        assert_status!(report, 0, ImageStatus::Synced, "{row}");
+        assert_eq!(report.stats.blobs_transferred, 4, "{row}");
+        // Staged, a pull to disk may land anywhere among the uploads.
+        let mut log = slot_log(&server, &[]).await.concat();
+        if staged {
+            log = log.replace('G', "");
+        }
+        assert_eq!(log, want, "{row}");
+    }
+}
+
+/// With one upload slot, a copy whose source GET answers 503 once gives its
+/// slot up while it backs off, so the other blob copies in the gap. Breaks if
+/// the slot is held across the backoff, which would make the other blob wait
+/// out the retry.
+#[tokio::test]
+async fn sync_retry_does_not_hold_the_upload_slot_during_backoff() {
+    let server = MockServer::start().await;
+    let img = ManifestBuilder::new(b"retry-cfg")
+        .layer(b"retry-layer")
+        .build();
+    img.mount_source(&server, "src", "v1").await;
+    img.mount_target(&server, "dst", "v1").await;
+    let cfg = &img.config_desc.digest;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/blobs/{cfg}")))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let retry = RetryConfig {
+        initial_backoff: Duration::from_millis(500),
+        max_backoff: Duration::from_millis(500),
+        ..fast_retry()
+    };
+
+    let report = run_engine(
+        vec![one_upload_slot_mapping(&server)],
+        retry,
+        50,
+        empty_cache(),
+        BlobStage::disabled(),
+        None,
+    )
+    .await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    let layer = &img.layer_descs[0].digest;
     assert_eq!(
-        log, "GPGPGPGP",
-        "each source download must follow the previous copy's upload"
+        slot_log(&server, &[(cfg, "cfg"), (layer, "layer")]).await,
+        ["Gcfg", "Glayer", "O", "P", "Gcfg", "O", "P"],
+        "the layer must copy while the config backs off"
+    );
+}
+
+/// With one upload slot, a blob queued for it behind a copy that then fails
+/// is cancelled with the image and never opens its source download. Breaks if
+/// a copy waiting for a slot ignores the image's cancel.
+#[tokio::test]
+async fn sync_cancel_stops_copies_waiting_for_an_upload_slot() {
+    let server = MockServer::start().await;
+    let img = ManifestBuilder::new(b"cancel-cfg")
+        .layer(b"cancel-layer-1")
+        .layer(b"cancel-layer-2")
+        .build();
+    img.mount_source(&server, "src", "v1").await;
+    img.mount_target(&server, "dst", "v1").await;
+    // The config holds the slot for its whole GET, so both layers queue.
+    let cfg = &img.config_desc.digest;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src/blobs/{cfg}")))
+        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(200)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let no_retries = RetryConfig {
+        max_retries: 0,
+        ..fast_retry()
+    };
+
+    let report = run_engine(
+        vec![one_upload_slot_mapping(&server)],
+        no_retries,
+        50,
+        empty_cache(),
+        BlobStage::disabled(),
+        None,
+    )
+    .await;
+
+    assert_status!(report, 0, ImageStatus::Failed { .. });
+    assert_eq!(
+        slot_log(&server, &[(cfg, "cfg")]).await,
+        ["Gcfg"],
+        "no queued copy may open its download after the image failed"
     );
 }
