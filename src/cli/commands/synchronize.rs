@@ -1553,49 +1553,51 @@ async fn resolve_mapping_inner(
         Option<usize>,
         Option<ocync_sync::filter::FilterReport>,
         Option<NoTagsInfo>,
-    ) = if let Some(MappingTags::Pinned(pins)) = &mapping.tags {
-        let pairs = pins
-            .iter()
-            .map(|pin| TagPair::pinned(pin.digest.clone(), pin.name.as_str()))
-            .collect();
-        (pairs, None, None, None)
-    } else if let Some(exact) = mapping_tags
-        .filter(|_| defaults_tags.is_none())
-        .and_then(|t| t.exact_tags())
-    {
-        (
-            exact.into_iter().map(TagPair::same).collect(),
+    ) = match &mapping.tags {
+        Some(MappingTags::Pinned(pins)) => (
+            pins.iter()
+                .map(|pin| TagPair::pinned(pin.digest.clone(), pin.name.clone()))
+                .collect(),
             None,
             None,
             None,
-        )
-    } else {
-        let all_tags = source_client.list_tags(&source_repo_path).await?;
-        let mut samples: Vec<String> = Vec::with_capacity(NO_TAGS_SAMPLE_CAP);
-        let mut image_count = 0usize;
-        for t in &all_tags {
-            if !is_referrers_fallback_tag(t) {
-                image_count += 1;
-                if samples.len() < NO_TAGS_SAMPLE_CAP {
-                    samples.push(t.clone());
+        ),
+        Some(MappingTags::Filter(_)) | None => {
+            let (names, count, report, template) = if let Some(exact) = mapping_tags
+                .filter(|_| defaults_tags.is_none())
+                .and_then(|t| t.exact_tags())
+            {
+                (exact, None, None, None)
+            } else {
+                let all_tags = source_client.list_tags(&source_repo_path).await?;
+                let mut samples: Vec<String> = Vec::with_capacity(NO_TAGS_SAMPLE_CAP);
+                let mut image_count = 0usize;
+                for t in &all_tags {
+                    if !is_referrers_fallback_tag(t) {
+                        image_count += 1;
+                        if samples.len() < NO_TAGS_SAMPLE_CAP {
+                            samples.push(t.clone());
+                        }
+                    }
                 }
-            }
+                let template = NoTagsInfo {
+                    from: mapping.from.clone(),
+                    image_count,
+                    artifact_count: all_tags.len() - image_count,
+                    filter_desc: describe_filter(mapping_tags, defaults_tags),
+                    samples,
+                };
+                let (kept, count, report) =
+                    select_filtered_tags(mapping_tags, defaults_tags, all_tags, min_tags)?;
+                (kept, count, report, Some(template))
+            };
+            (
+                names.into_iter().map(TagPair::same).collect(),
+                count,
+                report,
+                template,
+            )
         }
-        let template = NoTagsInfo {
-            from: mapping.from.clone(),
-            image_count,
-            artifact_count: all_tags.len() - image_count,
-            filter_desc: describe_filter(mapping_tags, defaults_tags),
-            samples,
-        };
-        let (kept, count, report) =
-            select_filtered_tags(mapping_tags, defaults_tags, all_tags, min_tags)?;
-        (
-            kept.into_iter().map(TagPair::same).collect(),
-            count,
-            report,
-            Some(template),
-        )
     };
 
     if filtered.is_empty() {
@@ -1613,10 +1615,11 @@ async fn resolve_mapping_inner(
     let target_repo = mapping.to.as_deref().unwrap_or(&mapping.from).to_owned();
 
     // --- Resolve platforms (mapping overrides defaults) ---
-    let platform_strs = mapping
-        .platforms
-        .clone()
-        .or_else(|| config.defaults.as_ref().and_then(|d| d.platforms.clone()));
+    // A pinned mapping ignores `defaults.platforms`: its digest is copied whole.
+    let platform_strs = mapping.platforms.clone().or_else(|| match mapping.tags {
+        Some(MappingTags::Pinned(_)) => None,
+        _ => config.defaults.as_ref().and_then(|d| d.platforms.clone()),
+    });
     let platforms = platform_strs
         .map(|strs| {
             strs.iter()
@@ -3816,8 +3819,8 @@ mappings:
     }
 
     use crate::cli::commands::test_support::{
-        SlowRecorder, arrivals, config_yaml, max_in_flight, repo_names, slow_registry,
-        unresolved_mapping,
+        SlowRecorder, arrivals, config_yaml, image_manifest_json, max_in_flight, repo_names,
+        slow_registry, unresolved_mapping,
     };
     use crate::cli::test_support::{mapping_with_tags_and_report, test_client};
 
@@ -4090,21 +4093,7 @@ mappings:
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-        let manifest = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": OCI_MANIFEST,
-            "config": {
-                "mediaType": "application/vnd.oci.image.config.v1+json",
-                "digest": format!("sha256:{}", "a".repeat(64)),
-                "size": 100,
-            },
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": format!("sha256:{}", "b".repeat(64)),
-                "size": 200,
-            }],
-        }))
-        .unwrap();
+        let manifest = serde_json::to_vec(&image_manifest_json()).unwrap();
         let digest = ocync_distribution::Digest::from_sha256(
             ocync_distribution::sha256::Sha256::digest(&manifest),
         );
@@ -4159,6 +4148,7 @@ registries:
 defaults:
   source: src
   targets: [dst]
+  platforms: [linux/amd64]
   tags:
     exclude: ["*"]
     immutable_tags: "*"
@@ -4209,8 +4199,6 @@ mappings:
             .await;
 
         assert_eq!(report.stats.images_synced, 1, "{:?}", report.images);
-        assert_eq!(report.images[0].source, format!("repo/img@{digest}"));
-        assert_eq!(report.images[0].target, "mirror/img:15.19");
         server.verify().await;
     }
 

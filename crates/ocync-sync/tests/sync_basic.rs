@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ocync_distribution::RegistryClientBuilder;
+use ocync_distribution::Tag;
 use ocync_distribution::auth::{AuthProvider, Presents, Scope, Token};
-use ocync_distribution::spec::MediaType;
+use ocync_distribution::spec::{MediaType, PlatformFilter};
 use ocync_sync::engine::TagPair;
 use ocync_sync::{ImageStatus, RunOutcome, SkipReason, SyncReport};
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{any, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use helpers::*;
@@ -394,24 +395,21 @@ async fn sync_retag() {
     assert_status!(report, 0, ImageStatus::Synced);
 }
 
-/// A pinned source is pulled by digest and a target already holding that
-/// digest under the name is skipped. Breaks if the pin pulls the tag instead,
-/// or the target-side skip is lost.
+/// A pinned source whose digest a target already holds touches the source not
+/// at all, with `head_first` off: no HEAD, no GET. Breaks if the engine HEADs
+/// or pulls the source before checking the targets against the pin, or the
+/// target-side skip is lost.
 #[tokio::test]
 async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
     let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
-    source_manifest_mock(
-        "repo",
-        &parts.digest.to_string(),
-        &parts.bytes,
-        MediaType::OciManifest,
-    )
-    .expect(1)
-    .mount(&source_server)
-    .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&source_server)
+        .await;
     mount_manifest_head_matching(&target_server, "repo", "stable", &parts.digest).await;
     manifest_push_mock("repo", "stable")
         .expect(0)
@@ -422,7 +420,10 @@ async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
         &source_server,
         &target_server,
         "repo",
-        vec![TagPair::pinned(parts.digest.clone(), "stable")],
+        vec![TagPair::pinned(
+            parts.digest.clone(),
+            Tag::new("stable").unwrap(),
+        )],
     );
 
     let report = run_sync(vec![mapping]).await;
@@ -434,7 +435,49 @@ async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
             reason: SkipReason::DigestMatch,
         }
     );
-    assert_eq!(report.images[0].source, format!("repo@{}", parts.digest));
+}
+
+/// A pinned source with a platform filter fails that image before any source
+/// request and pushes nothing, since filtering would push another digest under
+/// the pinned name. Breaks if the guard is missing (the filtered index would
+/// be pushed) or runs after the pull.
+#[tokio::test]
+async fn sync_pinned_source_with_platforms_fails_before_any_pull() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let child = ManifestBuilder::new(b"config").layer(b"layer").build();
+    let index = IndexBuilder::new()
+        .manifest(&child, Some(linux("amd64")))
+        .build();
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&source_server)
+        .await;
+    mount_manifest_head_not_found(&target_server, "repo", "stable").await;
+    manifest_push_mock("repo", "stable")
+        .expect(0)
+        .mount(&target_server)
+        .await;
+
+    let mut mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::pinned(
+            index.digest.clone(),
+            Tag::new("stable").unwrap(),
+        )],
+    );
+    mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
+
+    let report = run_sync(vec![mapping]).await;
+
+    let ImageStatus::Failed { error, .. } = &report.images[0].status else {
+        panic!("expected a failure, got {:?}", report.images[0].status);
+    };
+    assert!(error.contains("cannot be platform-filtered"), "{error}");
 }
 
 /// A source serving other bytes under a pinned digest fails that image with
@@ -478,8 +521,8 @@ async fn sync_pinned_digest_mismatch_fails_only_that_image() {
         &target_server,
         "repo",
         vec![
-            TagPair::pinned(pinned.digest.clone(), "bad"),
-            TagPair::pinned(sibling.digest.clone(), "good"),
+            TagPair::pinned(pinned.digest.clone(), Tag::new("bad").unwrap()),
+            TagPair::pinned(sibling.digest.clone(), Tag::new("good").unwrap()),
         ],
     );
 

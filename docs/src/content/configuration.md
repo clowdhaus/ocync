@@ -382,7 +382,7 @@ mappings:
         digest: "sha256:<64 hex>"
 ```
 
-Each entry copies the source manifest at exactly that digest, unchanged (an index is copied whole), and writes it to the target under `name`. The source is never listed, and a source tag called `name` is never read. A pinned mapping ignores `defaults.tags` entirely, including its excludes and `immutable_tags`. A list in `defaults.tags` itself is rejected. Because an index is copied whole, a pinned mapping cannot be platform-filtered: setting `platforms:` on it, or `defaults.platforms`, is rejected.
+Each entry copies the source manifest at exactly that digest, unchanged (an index is copied whole), and writes it to the target under `name`. The source is never listed, and a source tag called `name` is never read. A pinned mapping ignores `defaults.tags` and `defaults.platforms` entirely, including excludes and `immutable_tags`. A list in `defaults.tags` itself is rejected. Because an index is copied whole, a pinned mapping cannot be platform-filtered: setting `platforms:` on it is rejected. When every target already holds the digest under `name`, the source is not contacted at all.
 
 Each digest must be `sha256:` followed by 64 hex digits, each `name` a valid tag, and the list non-empty with no name repeated. If the source serves bytes that do not hash to the pinned digest, that image fails, naming both digests, and nothing is pushed for it. The rest of the run is unaffected.
 

@@ -15,7 +15,7 @@ use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
 
 use ocync_sync::ShutdownSignal;
-use ocync_sync::engine::ManifestRef;
+use ocync_sync::engine::{ImageRef, ManifestRef};
 use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
@@ -231,10 +231,14 @@ async fn collect_analysis(
     let retry = RetryConfig::default();
     let retry = &retry;
 
-    let mut pulls = futures_util::stream::iter(images.iter().map(|(idx, tag)| {
+    let mut pulls = futures_util::stream::iter(images.iter().map(|(idx, reference)| {
         let resolved = &resolved_mappings[*idx];
         async move {
-            let image_ref = tag.within(&resolved.source_repo);
+            let image_ref = ImageRef {
+                repo: resolved.source_repo.clone(),
+                reference: reference.clone(),
+            }
+            .to_string();
             if shutdown.is_triggered() {
                 return (*idx, image_ref, None);
             }
@@ -244,7 +248,7 @@ async fn collect_analysis(
             let pulled = pull_image_descriptors(
                 &resolved.source_client,
                 &resolved.source_repo,
-                &tag.to_string(),
+                reference.as_str(),
                 &image_ref,
                 retry,
             )

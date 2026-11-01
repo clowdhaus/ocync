@@ -347,16 +347,15 @@
       ]
     },
     "MappingTags": {
-      "description": "Tag filter rules, or a list of tags pinned to source digests.",
-      "oneOf": [
+      "description": "A mapping's `tags:` value: filter rules, or a list of pinned tags.",
+      "anyOf": [
         {
+          "description": "Filter rules applied to the source's tag list.",
           "$ref": "#/$defs/TagsConfig"
         },
         {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/PinnedTag"
-          }
+          "description": "Tags copied from exact source digests; the source is never listed.",
+          "$ref": "#/$defs/PinnedTags"
         }
       ]
     },
@@ -378,6 +377,13 @@
         "name",
         "digest"
       ]
+    },
+    "PinnedTags": {
+      "description": "A non-empty list of pinned tags with no name repeated.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PinnedTag"
+      }
     },
     "RegistryConfig": {
       "description": "Per-registry settings: URL, auth method, concurrency, and credentials.",

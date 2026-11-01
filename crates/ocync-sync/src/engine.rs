@@ -32,6 +32,7 @@ use futures_util::stream::FuturesUnordered;
 use ocync_distribution::BatchBlobChecker;
 use ocync_distribution::Digest;
 use ocync_distribution::RegistryClient;
+use ocync_distribution::Tag;
 use ocync_distribution::blob::MountResult;
 use ocync_distribution::manifest::ManifestPull;
 use ocync_distribution::sha256::Sha256;
@@ -104,40 +105,55 @@ pub enum ManifestRef {
     Digest(Digest),
 }
 
-impl fmt::Display for ManifestRef {
-    /// The string a registry takes after `/manifests/`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tag(tag) => f.write_str(tag),
-            Self::Digest(digest) => write!(f, "{digest}"),
-        }
-    }
-}
-
 impl ManifestRef {
-    /// This reference within `repo`, as `repo:tag` or `repo@digest`.
-    pub fn within(&self, repo: &RepositoryName) -> String {
+    /// The string a registry takes after `/manifests/`.
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Tag(tag) => format!("{repo}:{tag}"),
-            Self::Digest(digest) => format!("{repo}@{digest}"),
+            Self::Tag(tag) => tag,
+            Self::Digest(digest) => digest.as_str(),
         }
     }
 }
 
-/// A repository and manifest reference within one registry, displayed as
-/// `repo:tag` or `repo@digest`.
+impl fmt::Display for ManifestRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A source image: a repository and manifest reference within one registry,
+/// displayed as `repo:tag` or `repo@digest`.
 ///
 /// Not a full OCI reference: the registry is tracked separately via the
 /// associated [`RegistryClient`].
 #[derive(Debug, Clone)]
-struct ImageRef {
-    repo: RepositoryName,
-    reference: ManifestRef,
+pub struct ImageRef {
+    /// The source repository.
+    pub repo: RepositoryName,
+    /// The tag or digest pulled from it.
+    pub reference: ManifestRef,
 }
 
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.reference.within(&self.repo))
+        match &self.reference {
+            ManifestRef::Tag(tag) => write!(f, "{}:{tag}", self.repo),
+            ManifestRef::Digest(digest) => write!(f, "{}@{digest}", self.repo),
+        }
+    }
+}
+
+/// A target image: a repository and the tag written to it, displayed as
+/// `repo:tag`. Always a tag, since a manifest is pushed under a name.
+#[derive(Debug, Clone)]
+struct TargetRef {
+    repo: RepositoryName,
+    tag: String,
+}
+
+impl fmt::Display for TargetRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.repo, self.tag)
     }
 }
 
@@ -343,11 +359,11 @@ impl TagPair {
     }
 
     /// Create a pair that copies the source manifest at `digest` to
-    /// `target_tag`; the source tag of that name is never read.
-    pub fn pinned(digest: Digest, target_tag: impl Into<String>) -> Self {
+    /// `target`; the source tag of that name is never read.
+    pub fn pinned(digest: Digest, target: Tag) -> Self {
         Self {
             source: ManifestRef::Digest(digest),
-            target: target_tag.into(),
+            target: target.to_string(),
         }
     }
 }
@@ -375,7 +391,7 @@ fn collect_image_blobs(manifest: &ImageManifest) -> Vec<&Descriptor> {
 
 /// Build an `ImageResult` with zero transfer and zero duration; callers that
 /// moved bytes override those fields with struct update syntax.
-fn image_result(source: &ImageRef, target: &ImageRef, status: ImageStatus) -> ImageResult {
+fn image_result(source: &ImageRef, target: &TargetRef, status: ImageStatus) -> ImageResult {
     ImageResult {
         image_id: Uuid::now_v7(),
         source: source.to_string(),
@@ -420,7 +436,7 @@ impl TargetBlobOutcome {
     fn into_result(
         self,
         source: &ImageRef,
-        target: &ImageRef,
+        target: &TargetRef,
         status: ImageStatus,
         start: Instant,
     ) -> ImageResult {
@@ -471,7 +487,7 @@ struct TransferTask {
     /// Source image reference (repo + tag, for display/logging and blob pulls).
     source: ImageRef,
     /// Target image reference (repo + tag, for pushing manifests and blobs).
-    target: ImageRef,
+    target: TargetRef,
     /// Artifact sync configuration (Rc-shared with mapping).
     artifacts_config: Rc<ResolvedArtifacts>,
     /// Retries made discovering this image, counted into its total.
@@ -934,9 +950,9 @@ impl SyncEngine {
                         repo: mapping.source_repo.clone(),
                         reference: tag_pair.source.clone(),
                     };
-                    let target_ref = ImageRef {
+                    let target_ref = TargetRef {
                         repo: mapping.target_repo.clone(),
-                        reference: ManifestRef::Tag(tag_pair.target.clone()),
+                        tag: tag_pair.target.clone(),
                     };
                     for _entry in &mapping.targets {
                         let r = image_result(
@@ -960,9 +976,9 @@ impl SyncEngine {
                         repo: mapping.source_repo.clone(),
                         reference: tag_pair.source.clone(),
                     },
-                    target: ImageRef {
+                    target: TargetRef {
                         repo: mapping.target_repo.clone(),
-                        reference: ManifestRef::Tag(tag_pair.target.clone()),
+                        tag: tag_pair.target.clone(),
                     },
                     targets: targets.clone(),
                     retry: self.retry.clone(),
@@ -1201,7 +1217,7 @@ impl SyncEngine {
                 .iter()
                 .flat_map(|m| {
                     m.tags.iter().map(|t| {
-                        SnapshotKey::new(&m.source_authority, &m.source_repo, &t.source.to_string())
+                        SnapshotKey::new(&m.source_authority, &m.source_repo, t.source.as_str())
                     })
                 })
                 .collect();
@@ -1241,7 +1257,7 @@ struct DiscoveryParams {
     source_client: Arc<RegistryClient>,
     source_authority: RegistryAuthority,
     source: ImageRef,
-    target: ImageRef,
+    target: TargetRef,
     targets: Vec<Rc<TargetEntry>>,
     retry: RetryConfig,
     platforms: Option<Vec<PlatformFilter>>,
@@ -1254,6 +1270,7 @@ struct DiscoveryParams {
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
+/// A pinned source skips the HEAD and checks the targets against the pin.
 ///
 /// Returns the outcome and which route was taken. The flow:
 /// 1. HEAD the source manifest with a short timeout.
@@ -1282,42 +1299,44 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
     let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
 
-    // Step 1: HEAD the source manifest with a short timeout.
-    let source_head_digest = match tokio::time::timeout(
-        source_head_timeout,
-        source_client.manifest_head(&source.repo, &source.reference.to_string()),
-    )
-    .await
-    {
-        Ok(Ok(Some(digest))) => Some(digest),
-        Ok(Ok(None)) => {
-            debug!(
-                repo = %source.repo, tag = %source.reference,
-                "source HEAD 404, falling through to full pull"
-            );
-            None
-        }
-        Ok(Err(e)) => {
-            debug!(
-                repo = %source.repo, tag = %source.reference, error = %e,
-                "source HEAD failed, falling through to full pull"
-            );
-            None
-        }
-        Err(_) => {
-            debug!(
-                repo = %source.repo, tag = %source.reference,
-                "source HEAD timed out, falling through to full pull"
-            );
-            None
-        }
+    // Step 1: HEAD the source manifest with a short timeout. A pinned source
+    // already names its digest, so there is nothing to ask: the pin stands in
+    // for the HEAD digest, and the source is touched only if a target lacks it.
+    let pinned = matches!(source.reference, ManifestRef::Digest(_));
+    let source_head_digest = match &source.reference {
+        ManifestRef::Digest(pin) => Some(pin.clone()),
+        ManifestRef::Tag(tag) => match tokio::time::timeout(
+            source_head_timeout,
+            source_client.manifest_head(&source.repo, tag),
+        )
+        .await
+        {
+            Ok(Ok(Some(digest))) => Some(digest),
+            Ok(Ok(None)) => {
+                debug!(
+                    repo = %source.repo, tag = %source.reference,
+                    "source HEAD 404, falling through to full pull"
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    repo = %source.repo, tag = %source.reference, error = %e,
+                    "source HEAD failed, falling through to full pull"
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    repo = %source.repo, tag = %source.reference,
+                    "source HEAD timed out, falling through to full pull"
+                );
+                None
+            }
+        },
     };
 
-    let snapshot_key = SnapshotKey::new(
-        &source_authority,
-        &source.repo,
-        &source.reference.to_string(),
-    );
+    let snapshot_key = SnapshotKey::new(&source_authority, &source.repo, source.reference.as_str());
 
     // HEAD-check every target against `compare_digest`: all matching skips
     // the image with `skip_route`; otherwise only the mismatched targets are
@@ -1384,14 +1403,15 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         }
     }
 
-    // head_first: on a cache miss, HEAD-check all targets against the source
-    // HEAD digest (reused from step 1) before the full manifest GET, saving
-    // source rate-limit tokens when targets are already in sync.
+    // head_first, and always for a pinned source: on a cache miss, HEAD-check
+    // all targets against the source HEAD digest (reused from step 1, or the
+    // pin) before the full manifest GET, saving source rate-limit tokens when
+    // targets are already in sync.
     //
     // Skipped when platform filtering is active: the target then holds a
     // filtered index whose digest differs from the source HEAD digest, so the
     // comparison would always miss. The full pull compares filtered digests.
-    if head_first && platforms.is_none() {
+    if (head_first || pinned) && platforms.is_none() {
         if let Some(ref head_digest) = source_head_digest {
             // A match writes no cache entry: the full manifest was never pulled,
             // so there is no filtered_digest. In watch mode head_first
@@ -1439,7 +1459,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 struct TargetCheckParams<'a> {
     targets: &'a [Rc<TargetEntry>],
     source: &'a ImageRef,
-    target: &'a ImageRef,
+    target: &'a TargetRef,
     compare_digest: &'a Digest,
     /// Label for log messages (e.g., `"cache hit"`, `"head_first"`).
     label: &'static str,
@@ -1469,7 +1489,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
         head_checks.push(async move {
             let result = entry
                 .client()
-                .manifest_head(&target.repo, &target.reference.to_string())
+                .manifest_head(&target.repo, &target.tag)
                 .await;
             (entry, result)
         });
@@ -1500,7 +1520,7 @@ async fn check_targets_against_digest(params: TargetCheckParams<'_>) -> TargetCh
                 if let Err(e) = &other {
                     warn!(
                         target_repo = %target.repo,
-                        target_tag = %target.reference,
+                        target_tag = %target.tag,
                         error = %e,
                         "target manifest HEAD failed during {label}, proceeding with sync"
                     );
@@ -1521,7 +1541,7 @@ struct FullPullParams<'a> {
     source_client: &'a Arc<RegistryClient>,
     shared: &'a PerRun,
     source: &'a ImageRef,
-    target: &'a ImageRef,
+    target: &'a TargetRef,
     targets: &'a [Rc<TargetEntry>],
     skipped_results: Vec<ImageResult>,
     retry: &'a RetryConfig,
@@ -1572,7 +1592,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
             let fail_results: Vec<ImageResult> = targets
                 .iter()
                 .map(|t| ImageResult {
-                    target: format!("{} ({}):{}", target.repo, t.name(), target.reference),
+                    target: format!("{} ({}):{}", target.repo, t.name(), target.tag),
                     ..image_result(source, target, failed_status(ErrorKind::ManifestPull, &err))
                 })
                 .collect();
@@ -1600,7 +1620,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
         head_checks.push(async move {
             let result = entry
                 .client()
-                .manifest_head(&target.repo, &target.reference.to_string())
+                .manifest_head(&target.repo, &target.tag)
                 .await;
             (entry, result)
         });
@@ -1630,7 +1650,7 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
                 if let Err(e) = &other {
                     warn!(
                         target_repo = %target.repo,
-                        target_tag = %target.reference,
+                        target_tag = %target.tag,
                         error = %e,
                         "target manifest HEAD failed, proceeding with sync"
                     );
@@ -1733,7 +1753,7 @@ async fn execute_item(
                 source_repo = %item.source.repo,
                 source_tag = %item.source.reference,
                 target_repo = %item.target.repo,
-                target_tag = %item.target.reference,
+                target_tag = %item.target.tag,
                 bytes = outcome.bytes_transferred,
                 "image synced"
             );
@@ -1755,7 +1775,7 @@ async fn execute_item(
                 debug!(
                     source_repo = %item.source.repo,
                     target_repo = %item.target.repo,
-                    target_tag = %item.target.reference,
+                    target_tag = %item.target.tag,
                     "target tag is immutable, skipping"
                 );
                 let status = ImageStatus::Skipped {
@@ -1780,9 +1800,9 @@ async fn execute_item(
 /// Pull all source manifest data for a single tag: the manifest, plus the
 /// child manifests for an index.
 ///
-/// When `reference` is a digest, the pulled bytes must hash to it, else the
-/// pull fails with nothing pushed: a registry serving other content under a
-/// pinned digest is never copied.
+/// A digest `reference` is verified by `manifest_pull`, and is refused with
+/// `platforms` before any request: filtering an index would push a different
+/// digest under the pinned name.
 ///
 /// When `platforms` is `Some`, only matching children are pulled and the
 /// index's `raw_bytes` and digest are re-serialized to list only the kept
@@ -1795,25 +1815,21 @@ async fn pull_source_manifest(
     platforms: Option<&[PlatformFilter]>,
     shared: &PerRun,
 ) -> Result<PulledManifest, crate::Error> {
-    let tag = reference.to_string();
-    let tag = tag.as_str();
+    let tag = reference.as_str();
+    if matches!(reference, ManifestRef::Digest(_)) && platforms.is_some() {
+        return Err(crate::Error::ManifestLogic {
+            reference: tag.to_owned(),
+            reason: "a pinned digest cannot be platform-filtered: filtering would push a \
+                     different digest under the pinned name"
+                .into(),
+        });
+    }
     let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
         .await
         .map_err(|e| crate::Error::Manifest {
             reference: tag.to_owned(),
             source: e,
         })?;
-    if let ManifestRef::Digest(pinned) = reference
-        && pull.digest != *pinned
-    {
-        return Err(crate::Error::ManifestLogic {
-            reference: tag.to_owned(),
-            reason: format!(
-                "source served content with digest {} for pinned digest {pinned}",
-                pull.digest
-            ),
-        });
-    }
 
     let children = match &pull.manifest {
         ManifestKind::Image(_) => Vec::new(),
@@ -2766,13 +2782,7 @@ async fn push_manifests(
         result?;
     }
 
-    push_manifest(
-        ctx,
-        &item.target.reference.to_string(),
-        &source_data.pull,
-        Some(outcome),
-    )
-    .await
+    push_manifest(ctx, &item.target.tag, &source_data.pull, Some(outcome)).await
 }
 
 /// Wait until the target reports every blob in `digests` visible, when it
@@ -3230,7 +3240,7 @@ mod tests {
         assert_eq!(TagPair::same("15").to_string(), "15");
         assert_eq!(TagPair::retag("15", "stable").to_string(), "15 -> stable");
         assert_eq!(
-            TagPair::pinned(digest.clone(), "15.19").to_string(),
+            TagPair::pinned(digest.clone(), Tag::new("15.19").unwrap()).to_string(),
             format!("{digest} -> 15.19")
         );
     }
@@ -3239,9 +3249,13 @@ mod tests {
     /// time, not the zeroed defaults of a skip.
     #[test]
     fn into_result_carries_transfer_counts_and_elapsed_time() {
-        let image = |repo: &str| ImageRef {
+        let source = |repo: &str| ImageRef {
             repo: repo.parse().unwrap(),
             reference: ManifestRef::Tag("v1".into()),
+        };
+        let target = |repo: &str| TargetRef {
+            repo: repo.parse().unwrap(),
+            tag: "v1".into(),
         };
         let outcome = TargetBlobOutcome {
             bytes_transferred: 42,
@@ -3255,7 +3269,8 @@ mod tests {
         let start = Instant::now();
         std::thread::sleep(Duration::from_millis(5));
 
-        let result = outcome.into_result(&image("src"), &image("dst"), ImageStatus::Synced, start);
+        let result =
+            outcome.into_result(&source("src"), &target("dst"), ImageStatus::Synced, start);
 
         assert_eq!(result.bytes_transferred, 42);
         assert_eq!(
@@ -3341,13 +3356,17 @@ mod tests {
     }
 
     fn make_image_result(status: ImageStatus, bytes: u64) -> ImageResult {
-        let image = |repo: &str| ImageRef {
-            repo: repo.parse().unwrap(),
+        let source = ImageRef {
+            repo: "source/repo".parse().unwrap(),
             reference: ManifestRef::Tag("tag".into()),
+        };
+        let target = TargetRef {
+            repo: "target/repo".parse().unwrap(),
+            tag: "tag".into(),
         };
         ImageResult {
             bytes_transferred: bytes,
-            ..image_result(&image("source/repo"), &image("target/repo"), status)
+            ..image_result(&source, &target, status)
         }
     }
 
@@ -3529,9 +3548,9 @@ mod tests {
                 repo: RepositoryName::new(format!("source/{tag}")).unwrap(),
                 reference: ManifestRef::Tag(tag.to_owned()),
             },
-            target: ImageRef {
+            target: TargetRef {
                 repo: RepositoryName::new(format!("target/{tag}")).unwrap(),
-                reference: ManifestRef::Tag(tag.to_owned()),
+                tag: tag.to_owned(),
             },
             artifacts_config: Rc::new(ResolvedArtifacts::default()),
             discovery_retries: 0,

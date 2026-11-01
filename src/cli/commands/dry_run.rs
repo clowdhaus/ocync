@@ -154,7 +154,7 @@ fn write_kept<W: Write>(w: &mut W, tags: &[TagPair], include_kept: &[String]) ->
     writeln!(w, "{header}")?;
     let include_set: HashSet<&str> = include_kept.iter().map(String::as_str).collect();
     for tag_pair in tags {
-        if include_set.contains(tag_pair.source.to_string().as_str()) {
+        if include_set.contains(tag_pair.source.as_str()) {
             writeln!(w, "    {tag_pair}  [via include]")?;
         } else {
             writeln!(w, "    {tag_pair}")?;

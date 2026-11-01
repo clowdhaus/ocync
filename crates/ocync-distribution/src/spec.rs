@@ -333,8 +333,7 @@ impl FromStr for RepositoryName {
 /// The longest tag the OCI distribution spec allows.
 const TAG_MAX_LEN: usize = 128;
 
-/// An OCI tag name (e.g. `latest`, `v1.0-rc.1`): 1 to 128 characters from
-/// `[a-zA-Z0-9_.-]`.
+/// An OCI tag name (e.g. `latest`, `v1.0-rc.1`): `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
 ///
 /// Deserialization goes through [`Tag::new`] so a tag read from a config file
 /// obeys the same rule as one parsed from a [`Reference`](crate::Reference).
@@ -350,15 +349,12 @@ impl TryFrom<String> for Tag {
 }
 
 impl Tag {
-    /// A tag name within the length and character limits above.
+    /// A tag name obeying the rule above.
     pub fn new(name: impl Into<String>) -> Result<Self, Error> {
         let name = name.into();
         match Self::check(&name) {
             Ok(()) => Ok(Self(name)),
-            Err(reason) => Err(Error::InvalidReference {
-                input: name,
-                reason,
-            }),
+            Err(reason) => Err(Error::InvalidTag { tag: name, reason }),
         }
     }
 
@@ -383,15 +379,18 @@ impl Tag {
                 name.len()
             ));
         }
-        match name
+        if let Some(bad) = name
             .chars()
             .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.' | '-'))
         {
-            Some(bad) => Err(format!(
+            return Err(format!(
                 "tag contains invalid character '{bad}'; allowed: [a-zA-Z0-9_.-]"
-            )),
-            None => Ok(()),
+            ));
         }
+        if name.starts_with(['.', '-']) {
+            return Err("tag must start with [a-zA-Z0-9_]".into());
+        }
+        Ok(())
     }
 
     /// Return the tag as a string slice.
@@ -958,6 +957,9 @@ mod tests {
             ("a/b", Some("tag contains invalid character '/'")),
             ("a:b", Some("tag contains invalid character ':'")),
             ("a@b", Some("tag contains invalid character '@'")),
+            (".hidden", Some("tag must start with [a-zA-Z0-9_]")),
+            ("-flag", Some("tag must start with [a-zA-Z0-9_]")),
+            ("_ok", None),
         ];
         for (input, want_err) in cases {
             match (Tag::new(input), want_err) {

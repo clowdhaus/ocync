@@ -9,6 +9,24 @@ use std::time::{Duration, Instant};
 
 use wiremock::{MockServer, Request, Respond, ResponseTemplate};
 
+/// A single-layer OCI image manifest, config `a...` and layer `b...`.
+pub(crate) fn image_manifest_json() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "size": 100,
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": format!("sha256:{}", "b".repeat(64)),
+            "size": 200,
+        }],
+    })
+}
+
 /// Instants at which requests reached a stub, shared with the test.
 pub(crate) type Arrivals = Arc<Mutex<Vec<Instant>>>;
 
@@ -59,20 +77,7 @@ impl SlowRecorder {
         Self {
             arrivals: Arc::clone(arrivals),
             delay,
-            body: serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "config": {
-                    "mediaType": "application/vnd.oci.image.config.v1+json",
-                    "digest": format!("sha256:{}", "a".repeat(64)),
-                    "size": 100,
-                },
-                "layers": [{
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                    "digest": format!("sha256:{}", "b".repeat(64)),
-                    "size": 200,
-                }],
-            }),
+            body: image_manifest_json(),
             content_type: Some("application/vnd.oci.image.manifest.v1+json"),
         }
     }

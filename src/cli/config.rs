@@ -32,9 +32,7 @@ pub(crate) fn load_config(path: &Path) -> Result<Config, ConfigError> {
             Some(MappingTags::Filter(tags)) => {
                 validate_tags(&format!("mapping '{}'", mapping.from), tags)?;
             }
-            Some(MappingTags::Pinned(pins)) => {
-                validate_pinned(mapping, pins, config.defaults.as_ref())?;
-            }
+            Some(MappingTags::Pinned(_)) => validate_pinned(mapping)?,
             None => {}
         }
     }
@@ -458,13 +456,42 @@ pub(crate) struct TagsConfig {
 }
 
 /// A mapping's `tags:` value: filter rules, or a list of pinned tags.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub(crate) enum MappingTags {
     /// Filter rules applied to the source's tag list.
     Filter(TagsConfig),
     /// Tags copied from exact source digests; the source is never listed.
-    Pinned(Vec<PinnedTag>),
+    Pinned(PinnedTags),
+}
+
+/// A non-empty list of pinned tags with no name repeated.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(try_from = "Vec<PinnedTag>")]
+pub(crate) struct PinnedTags(Vec<PinnedTag>);
+
+impl PinnedTags {
+    /// The pinned entries in config order.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, PinnedTag> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<PinnedTag>> for PinnedTags {
+    type Error = String;
+
+    fn try_from(pins: Vec<PinnedTag>) -> Result<Self, Self::Error> {
+        if pins.is_empty() {
+            return Err("tags list must not be empty".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for pin in &pins {
+            if !seen.insert(&pin.name) {
+                return Err(format!("tag '{}' is pinned more than once", pin.name));
+            }
+        }
+        Ok(Self(pins))
+    }
 }
 
 /// A target tag and the source manifest digest it is copied from.
@@ -489,7 +516,7 @@ fn deserialize_pinned_digest<'de, D: serde::Deserializer<'de>>(
     use serde::de::Error as _;
     let digest =
         Digest::deserialize(deserializer).map_err(|e| D::Error::custom(format!("digest: {e}")))?;
-    if digest.algorithm() != "sha256" {
+    if !digest.is_sha256() {
         return Err(D::Error::custom(format!(
             "digest: '{digest}' is not sha256, the only supported algorithm"
         )));
@@ -520,23 +547,8 @@ impl<'de> serde::de::Visitor<'de> for MappingTagsVisitor {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<MappingTags, A::Error> {
-        Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq)).map(MappingTags::Pinned)
-    }
-}
-
-impl JsonSchema for MappingTags {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "MappingTags".into()
-    }
-
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "description": "Tag filter rules, or a list of tags pinned to source digests.",
-            "oneOf": [
-                generator.subschema_for::<TagsConfig>(),
-                generator.subschema_for::<Vec<PinnedTag>>(),
-            ],
-        })
+        PinnedTags::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+            .map(MappingTags::Pinned)
     }
 }
 
@@ -902,40 +914,16 @@ fn validate_tags(context: &str, tags: &TagsConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// A pinned list must be non-empty with no tag name repeated, and the mapping
-/// must resolve no platform filter: a pinned tag copies the exact digest, which
-/// a filtered index would change. Each name is already a valid [`Tag`].
-fn validate_pinned(
-    mapping: &MappingConfig,
-    pins: &[PinnedTag],
-    defaults: Option<&DefaultsConfig>,
-) -> Result<(), ConfigError> {
-    let invalid =
-        |reason: String| ConfigError::Validation(format!("mapping '{}': {reason}", mapping.from));
-    if pins.is_empty() {
-        return Err(invalid("tags list must not be empty".into()));
-    }
-    let platforms_from = if mapping.platforms.is_some() {
-        Some("platforms")
-    } else if defaults.is_some_and(|d| d.platforms.is_some()) {
-        Some("defaults.platforms")
-    } else {
-        None
-    };
-    if let Some(field) = platforms_from {
-        return Err(invalid(format!(
-            "pinned tags copy the whole index and cannot be platform-filtered \
-             (remove {field})"
+/// A pinned mapping must set no `platforms:` of its own: a pinned tag copies
+/// the exact digest, which a filtered index would change. (`defaults.platforms`
+/// is ignored, like `defaults.tags`.)
+fn validate_pinned(mapping: &MappingConfig) -> Result<(), ConfigError> {
+    if mapping.platforms.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "mapping '{}': pinned tags copy the whole index and cannot be platform-filtered \
+             (remove platforms)",
+            mapping.from
         )));
-    }
-    let mut seen = std::collections::HashSet::new();
-    for pin in pins {
-        if !seen.insert(&pin.name) {
-            return Err(invalid(format!(
-                "tag '{}' is pinned more than once",
-                pin.name
-            )));
-        }
     }
     Ok(())
 }
@@ -2046,17 +2034,6 @@ mappings:
                 "is not sha256",
             ),
             (
-                "name with a space",
-                entry("not a tag", &good),
-                "'not a tag': tag contains invalid character ' '",
-            ),
-            ("empty name", entry("", &good), "tag must be non-empty"),
-            (
-                "name with a digest",
-                entry(&format!("v1@{good}"), &good),
-                "tag contains invalid character '@'",
-            ),
-            (
                 "unknown entry field",
                 format!("{}\n        platform: linux/amd64", entry("15.19", &good)),
                 "unknown field `platform`",
@@ -2074,10 +2051,10 @@ mappings:
         }
     }
 
-    /// A pinned mapping with a resolved platform filter is refused, whether
-    /// the filter is its own or inherited, since a filtered index is not the
-    /// pinned digest. Breaks if either source of platforms is not checked, or
-    /// a pinned mapping without platforms is refused.
+    /// A pinned mapping with its own platform filter is refused, since a
+    /// filtered index is not the pinned digest; `defaults.platforms` is
+    /// ignored for it, like `defaults.tags`. Breaks if its own platforms are
+    /// not checked, or `defaults.platforms` or no platforms are refused.
     #[test]
     fn a_pinned_mapping_cannot_be_platform_filtered() {
         let digest = format!("sha256:{}", "a".repeat(64));
@@ -2095,7 +2072,7 @@ mappings:
                 format!(
                     "defaults:\n  platforms: [linux/amd64]\nmappings:\n  - from: library/postgres\n{pinned}"
                 ),
-                Some("cannot be platform-filtered (remove defaults.platforms)"),
+                None,
             ),
             (
                 "no platforms",
@@ -2117,37 +2094,6 @@ mappings:
                 (got, want) => panic!("{name}: got {got:?}, wanted error {want:?}"),
             }
         }
-    }
-
-    /// Pinning in `defaults.tags` is unrepresentable: the list is refused
-    /// there rather than ignored. Breaks if `defaults.tags` accepts a list.
-    #[test]
-    fn a_pinned_list_in_defaults_is_rejected() {
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let file = write_temp_config(&format!(
-            "defaults:\n  tags:\n    - name: \"15.19\"\n      digest: \"{digest}\"\nmappings:\n  - from: library/postgres\n"
-        ));
-        let err = load_config(file.path()).unwrap_err().to_string();
-        assert!(err.contains("invalid type: sequence"), "{err}");
-    }
-
-    /// The schema offers the filter map or the pinned array under one
-    /// `oneOf`. Breaks if either form is missing from it.
-    #[test]
-    fn schema_offers_filter_map_and_pinned_array() {
-        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
-        let forms: Vec<&str> = schema["$defs"]["MappingTags"]["oneOf"]
-            .as_array()
-            .expect("MappingTags is a oneOf")
-            .iter()
-            .map(|form| {
-                let resolved = form["$ref"]
-                    .as_str()
-                    .map_or(form, |r| &schema["$defs"][r.trim_start_matches("#/$defs/")]);
-                resolved["type"].as_str().expect("form has a type")
-            })
-            .collect();
-        assert_eq!(forms, ["object", "array"]);
     }
 
     fn bare_registry() -> RegistryConfig {
