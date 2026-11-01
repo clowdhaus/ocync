@@ -16,7 +16,7 @@ pub(crate) mod skopeo_shim;
 pub(crate) mod stats;
 pub(crate) mod target;
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -1650,11 +1650,12 @@ enum BlobOutcome {
     Hit,
     /// Served from the origin, which warms the cache.
     Miss,
-    /// Served with none of the headers a CDN sets, so the registry has no
-    /// blob cache to warm. The body is not read.
+    /// Served with none of the headers a CDN sets. The body is not read.
+    /// Eight of these from a registry, and no hit or miss, is a registry with
+    /// no blob cache to warm; from any other it is a [`Self::Miss`].
     Uncached,
-    /// Not requested: its registry already answered a blob [`Self::Uncached`].
-    Skipped,
+    /// Not requested: its registry is judged to have no blob cache.
+    NotRequested,
     /// Refused, unreachable or still failing after the attempts.
     Failed,
     /// Not warmed by the deadline: not sent, or not finished.
@@ -1680,7 +1681,7 @@ fn outcome_of(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap)
         });
     if hit {
         BlobOutcome::Hit
-    } else if header("x-cache").is_some() || header("cf-cache-status").is_some() {
+    } else if headers.contains_key("x-cache") || headers.contains_key("cf-cache-status") {
         BlobOutcome::Miss
     } else {
         BlobOutcome::Uncached
@@ -1745,8 +1746,8 @@ struct PrewarmStats {
     misses: u64,
     /// Blobs answered with no cache header: the registry has no blob cache.
     uncached: u64,
-    /// Blobs not requested because an earlier one answered uncached.
-    skipped: u64,
+    /// Blobs not requested because the registry has no blob cache.
+    not_requested: u64,
     /// Blobs that could not be warmed.
     failed: u64,
     /// Blobs not finished because the deadline came first.
@@ -1760,44 +1761,60 @@ impl PrewarmStats {
             BlobOutcome::Hit => &mut self.hits,
             BlobOutcome::Miss => &mut self.misses,
             BlobOutcome::Uncached => &mut self.uncached,
-            BlobOutcome::Skipped => &mut self.skipped,
+            BlobOutcome::NotRequested => &mut self.not_requested,
             BlobOutcome::Failed => &mut self.failed,
             BlobOutcome::PastDeadline => &mut self.past_deadline,
         };
         *count += 1;
     }
 
+    /// Whether the registry has no blob cache: [`PREWARM_PER_REGISTRY`]
+    /// blobs answered with no cache header and none with one. Any hit or miss
+    /// means a cache, for the rest of the pre-warm.
+    fn no_cache(&self) -> bool {
+        self.hits + self.misses == 0 && self.uncached >= PREWARM_PER_REGISTRY as u64
+    }
+
+    /// The counts once the pre-warm is over: a header-less answer from a
+    /// registry that has a cache warmed nothing at an edge, so it is a miss.
+    fn settled(mut self) -> Self {
+        if !self.no_cache() {
+            self.misses += self.uncached;
+            self.uncached = 0;
+        }
+        self
+    }
+
+    /// Blobs that were not warmed. Those not requested are not among them
+    /// unless a hit came in after the registry was judged to have no cache.
+    fn unwarmed(&self) -> u64 {
+        let not_requested = if self.no_cache() {
+            0
+        } else {
+            self.not_requested
+        };
+        self.failed + self.past_deadline + not_requested
+    }
+
     /// The registry's line in the pre-warm summary.
     fn summary(&self) -> String {
-        let unwarmed = format!(
-            "{} failed, {} past the deadline",
-            self.failed, self.past_deadline
+        let counts = format!(
+            "{} blobs warmed ({} hits, {} misses), {} failed, {} past the deadline",
+            self.hits + self.misses,
+            self.hits,
+            self.misses,
+            self.failed,
+            self.past_deadline
         );
-        if self.uncached == 0 {
-            return format!(
-                "{} blobs warmed ({} hits, {} misses), {unwarmed}",
-                self.hits + self.misses,
-                self.hits,
-                self.misses
-            );
-        }
-        let line = format!(
-            "no blob cache, not warmed ({} checked, {} skipped)",
-            self.uncached, self.skipped
-        );
-        if self.failed + self.past_deadline > 0 {
-            format!("{line}, {unwarmed}")
+        if self.no_cache() {
+            format!(
+                "{counts}, no blob cache ({} checked, {} not requested)",
+                self.uncached, self.not_requested
+            )
         } else {
-            line
+            counts
         }
     }
-}
-
-/// Whether the CDN needs time to settle after the pre-warm: a miss is an
-/// origin fetch that warms an edge, which a hit, an uncached registry and a
-/// skipped blob are not.
-fn needs_cdn_wait(stats: &BTreeMap<&str, PrewarmStats>) -> bool {
-    stats.values().any(|s| s.misses > 0)
 }
 
 /// The (repository, digest) of every blob the pre-warm fetches: all those the
@@ -1827,7 +1844,7 @@ fn blobs_to_warm<'a>(
 fn unwarmed(stats: &BTreeMap<&str, PrewarmStats>) -> BTreeMap<String, u64> {
     stats
         .iter()
-        .map(|(host, s)| ((*host).to_owned(), s.failed + s.past_deadline))
+        .map(|(host, s)| ((*host).to_owned(), s.unwarmed()))
         .filter(|(_, blobs)| *blobs > 0)
         .collect()
 }
@@ -1843,59 +1860,54 @@ const PREWARM_PER_REGISTRY: usize = 8;
 /// Attempts at one blob whose body fails mid-read.
 const PREWARM_MAX_ATTEMPTS: u32 = 2;
 
-/// What one registry's blobs share.
-struct RegistrySlots {
+/// What the blobs of one registry share.
+struct RegistryState {
     /// Bounds the requests in flight to it at [`PREWARM_PER_REGISTRY`].
     permits: tokio::sync::Semaphore,
-    /// Set once one of its blobs answers [`BlobOutcome::Uncached`]. Blobs
-    /// already in flight finish; none starts after.
-    uncached: Cell<bool>,
+    /// What its blobs have answered so far, which decides whether the next is
+    /// requested.
+    stats: RefCell<PrewarmStats>,
 }
 
 /// Warm every blob, at most [`PREWARM_PER_REGISTRY`] at a time per registry,
-/// each by `deadline`, and count the outcomes by registry. A registry that
-/// answers a blob [`BlobOutcome::Uncached`] has no cache to warm, so its other
-/// blobs are [`BlobOutcome::Skipped`]. `send` requests one blob, `what` naming
-/// it in notices.
+/// each by `deadline`, and count the outcomes by registry. Once a registry is
+/// judged to have no blob cache ([`PrewarmStats::no_cache`]) its other blobs
+/// are [`BlobOutcome::NotRequested`]; those already in flight finish. `send`
+/// requests one blob, `what` naming it in notices.
 async fn warm_blobs<'a>(
     blobs: &[(registry::Repository<'a>, &'a Digest)],
     deadline: Instant,
     send: impl AsyncFn(&registry::Repository<'_>, &Digest, &str) -> Result<reqwest::Response, String>,
 ) -> BTreeMap<&'a str, PrewarmStats> {
-    let slots: HashMap<&str, RegistrySlots> = blobs
+    let states: HashMap<&str, RegistryState> = blobs
         .iter()
         .map(|(repo, _)| {
-            let slots = RegistrySlots {
+            let state = RegistryState {
                 permits: tokio::sync::Semaphore::new(PREWARM_PER_REGISTRY),
-                uncached: Cell::new(false),
+                stats: RefCell::default(),
             };
-            (repo.host.api_host(), slots)
+            (repo.host.api_host(), state)
         })
         .collect();
-    let outcomes = futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
-        let (slots, send) = (&slots, &send);
+    futures_util::future::join_all(blobs.iter().map(|(repo, digest)| {
+        let (states, send) = (&states, &send);
         async move {
-            let host = repo.host.api_host();
-            let slot = &slots[host];
-            let _permit = slot.permits.acquire().await.unwrap();
-            if slot.uncached.get() {
-                return (host, BlobOutcome::Skipped);
-            }
-            let what = format!("blob pre-warm {repo}@{digest}");
-            let outcome =
-                warm_blob(deadline, &what, async || send(repo, digest, &what).await).await;
-            if outcome == BlobOutcome::Uncached {
-                slot.uncached.set(true);
-            }
-            (host, outcome)
+            let state = &states[repo.host.api_host()];
+            let _permit = state.permits.acquire().await.unwrap();
+            let outcome = if state.stats.borrow().no_cache() {
+                BlobOutcome::NotRequested
+            } else {
+                let what = format!("blob pre-warm {repo}@{digest}");
+                warm_blob(deadline, &what, async || send(repo, digest, &what).await).await
+            };
+            state.stats.borrow_mut().record(outcome);
         }
     }))
     .await;
-    let mut stats: BTreeMap<&str, PrewarmStats> = BTreeMap::new();
-    for (host, outcome) in outcomes {
-        stats.entry(host).or_default().record(outcome);
-    }
-    stats
+    states
+        .into_iter()
+        .map(|(host, state)| (host, state.stats.into_inner().settled()))
+        .collect()
 }
 
 /// Pull every unique source blob once to warm CDN edge caches.
@@ -1930,14 +1942,26 @@ async fn cdn_prewarm(
     eprintln!("bench: blob CDN pre-warm done");
     let outcome = Prewarm::Done {
         unwarmed: unwarmed(&stats),
+        no_cache: stats
+            .iter()
+            .filter(|(_, s)| s.no_cache())
+            .map(|(host, _)| (*host).to_owned())
+            .collect(),
     };
-    if let Some(note) = outcome.note() {
+    // A registry with no cache costs nothing a later tool could pay, so it is
+    // in the summary and the record but not a warning.
+    if let Prewarm::Done { unwarmed, .. } = &outcome
+        && !unwarmed.is_empty()
+        && let Some(note) = outcome.note()
+    {
         eprintln!(
             "WARNING: {note}; the tool that runs first may pay the CDN misses and tool order matters"
         );
     }
 
-    if needs_cdn_wait(&stats) {
+    // A miss is an origin fetch, which CloudFront edges need time to settle
+    // after; all hits leave nothing to wait for.
+    if stats.values().any(|s| s.misses > 0) {
         let wait_secs = 360; // 6 minutes
         eprintln!("bench: waiting {wait_secs}s for CDN propagation...");
         tokio::time::sleep(Duration::from_secs(wait_secs)).await;
@@ -3031,13 +3055,25 @@ images:
             s.record(BlobOutcome::Failed);
             s
         });
-        // An uncached registry's blobs are not a failure to warm.
-        stats.insert("uncached.example", {
-            let mut s = PrewarmStats::default();
-            s.record(BlobOutcome::Uncached);
-            s.record(BlobOutcome::Skipped);
-            s
-        });
+        // A registry with no blob cache has nothing to warm.
+        stats.insert(
+            "nocache.example",
+            PrewarmStats {
+                uncached: PREWARM_PER_REGISTRY as u64,
+                not_requested: 5,
+                ..PrewarmStats::default()
+            },
+        );
+        // Catches: blobs left unrequested by a registry that turned out to
+        // have a cache passing as warmed.
+        stats.insert(
+            "raced.example",
+            PrewarmStats {
+                hits: 1,
+                not_requested: 2,
+                ..PrewarmStats::default()
+            },
+        );
         stats.insert("late.example", {
             let mut s = PrewarmStats::default();
             s.record(BlobOutcome::PastDeadline);
@@ -3047,7 +3083,8 @@ images:
             unwarmed(&stats),
             BTreeMap::from([
                 ("failed.example".to_owned(), 1),
-                ("late.example".to_owned(), 1)
+                ("late.example".to_owned(), 1),
+                ("raced.example".to_owned(), 2)
             ])
         );
     }
@@ -3305,7 +3342,7 @@ images:
         deadline: Instant,
     ) -> (BlobOutcome, usize) {
         let sends = script.len();
-        let script = std::cell::RefCell::new(std::collections::VecDeque::from(script));
+        let script = RefCell::new(std::collections::VecDeque::from(script));
         let outcome = block_on(warm_blob(deadline, "blob", async || {
             script.borrow_mut().pop_front().expect("no send left")
         }));
@@ -3362,25 +3399,37 @@ images:
         assert_eq!(stats["hung.example"].past_deadline, hung_paths.len() as u64);
     }
 
-    /// A blob answered with none of a CDN's headers, and how many were sent.
-    fn warm_with_an_uncached_registry(
-        blobs_each: usize,
-        yield_before_answering: bool,
+    /// When the answer to a blob request arrives.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// At once, so each blob is settled before the next starts.
+        Ready,
+        /// After the other blobs in flight have started.
+        Late,
+    }
+
+    /// Warm `answers.len()` blobs of "test.example", each answered with the
+    /// `X-Cache` value at its index (`None` for no header), beside as many of
+    /// "cdn.example", all hits. Returns each registry's statistics and how
+    /// many requests "test.example" received.
+    fn warm_beside_a_cdn(
+        answers: &[Option<&str>],
+        timing: Answer,
     ) -> (BTreeMap<String, PrewarmStats>, usize) {
         use registry::{Host, Repository};
         let digest = lock::fixtures::digest('1');
-        let paths: Vec<String> = (0..blobs_each).map(|i| format!("p{i}")).collect();
+        let paths: Vec<String> = (0..answers.len()).map(|i| format!("{i}")).collect();
         let blobs: Vec<_> = paths
             .iter()
             .flat_map(|path| {
-                ["bare.example", "cdn.example"].map(|host| Repository {
+                ["test.example", "cdn.example"].map(|host| Repository {
                     host: Host::Other(host),
                     path,
                 })
             })
             .map(|repo| (repo, &digest))
             .collect();
-        let sent = Cell::new(0);
+        let sent = std::cell::Cell::new(0);
         let stats = block_on_within_five_seconds(warm_blobs(
             &blobs,
             Instant::now() + Duration::from_secs(10),
@@ -3389,11 +3438,18 @@ images:
                     return served("Hit from cloudfront");
                 }
                 sent.set(sent.get() + 1);
-                if yield_before_answering {
+                if matches!(timing, Answer::Late) {
                     tokio::task::yield_now().await;
                 }
-                let response = http::Response::builder().body("blob bytes");
-                Ok(reqwest::Response::from(response.unwrap()))
+                let answer = answers[repo.path.parse::<usize>().unwrap()];
+                let response = http::Response::builder();
+                let response = match answer {
+                    Some(x_cache) => response.header("x-cache", x_cache),
+                    None => response,
+                };
+                Ok(reqwest::Response::from(
+                    response.body("blob bytes").unwrap(),
+                ))
             },
         ));
         let stats = stats
@@ -3404,61 +3460,79 @@ images:
     }
 
     #[test]
-    fn a_registry_with_no_blob_cache_is_not_asked_for_its_other_blobs() {
-        // Catches: the whole corpus of a registry with no cache downloaded to
-        // warm nothing, or the skipping spilling over to a registry that has
-        // one.
+    fn a_registry_is_judged_to_have_no_blob_cache_only_by_a_full_set_of_header_less_answers() {
+        // Catches: one header-less answer from a registry with a CDN (the
+        // direct 200s public.ecr.aws gives) stopping its pre-warm, a registry
+        // with no cache downloaded in full, and the judgement spilling over to
+        // a registry that has a cache.
         let blobs = 4 * PREWARM_PER_REGISTRY;
-        // Each answer is ready, so the first settles the registry.
-        let (stats, sent) = warm_with_an_uncached_registry(blobs, false);
-        assert_eq!(sent, 1);
-        assert_eq!(stats["bare.example"].uncached, 1);
-        assert_eq!(stats["bare.example"].skipped, blobs as u64 - 1);
-        assert_eq!(stats["cdn.example"].hits, blobs as u64);
-        assert_eq!(stats["cdn.example"].skipped, 0);
-        // Each answer is late, so the blobs already in flight finish and the
-        // ones queued behind them are skipped.
-        let (stats, sent) = warm_with_an_uncached_registry(blobs, true);
-        assert_eq!(sent, PREWARM_PER_REGISTRY);
-        assert_eq!(stats["bare.example"].uncached, PREWARM_PER_REGISTRY as u64);
-        assert_eq!(
-            stats["bare.example"].skipped,
-            (blobs - PREWARM_PER_REGISTRY) as u64
-        );
-    }
-
-    #[test]
-    fn only_a_blob_that_missed_the_cdn_makes_the_run_wait() {
-        // Catches: an uncached registry, or the blobs skipped after it,
-        // holding the run for the CDN wait.
-        let mut uncached = PrewarmStats::default();
-        uncached.record(BlobOutcome::Uncached);
-        uncached.record(BlobOutcome::Skipped);
-        let mut missed = PrewarmStats::default();
-        missed.record(BlobOutcome::Miss);
-        let mut stats = BTreeMap::from([("quay.io", uncached)]);
-        assert!(!needs_cdn_wait(&stats));
-        stats.insert("public.ecr.aws", missed);
-        assert!(needs_cdn_wait(&stats));
+        let mixed = |header_less: usize| -> Vec<Option<&str>> {
+            (0..blobs)
+                .map(|i| (i >= header_less).then_some("Hit from cloudfront"))
+                .collect()
+        };
+        // (answers, timing, requests sent, header-less answers settled as
+        // misses, blobs not requested)
+        let cases = [
+            // A CDN registry: one header-less answer among hits.
+            (
+                [None]
+                    .into_iter()
+                    .chain(mixed(0).into_iter().skip(1))
+                    .collect::<Vec<_>>(),
+                Answer::Ready,
+                blobs,
+                1,
+                0,
+            ),
+            // One short of the eight that make a registry uncached.
+            (mixed(PREWARM_PER_REGISTRY - 1), Answer::Ready, blobs, 7, 0),
+            (mixed(PREWARM_PER_REGISTRY - 1), Answer::Late, blobs, 7, 0),
+            // Eight, each settled before the next: nothing else is requested.
+            (
+                mixed(PREWARM_PER_REGISTRY),
+                Answer::Ready,
+                PREWARM_PER_REGISTRY,
+                0,
+                blobs - PREWARM_PER_REGISTRY,
+            ),
+            // Eight in flight at once: they finish, the queued are not requested.
+            (
+                mixed(PREWARM_PER_REGISTRY),
+                Answer::Late,
+                PREWARM_PER_REGISTRY,
+                0,
+                blobs - PREWARM_PER_REGISTRY,
+            ),
+        ];
+        for (answers, timing, sent, misses, not_requested) in cases {
+            let (stats, requests) = warm_beside_a_cdn(&answers, timing);
+            let test = &stats["test.example"];
+            assert_eq!(requests, sent, "{answers:?}");
+            assert_eq!(test.misses, misses, "{answers:?}");
+            assert_eq!(test.not_requested, not_requested as u64, "{answers:?}");
+            assert_eq!(test.no_cache(), not_requested > 0, "{answers:?}");
+            assert_eq!(test.unwarmed(), 0, "{answers:?}");
+            assert_eq!(stats["cdn.example"].hits, blobs as u64);
+            assert_eq!(stats["cdn.example"].not_requested, 0);
+        }
     }
 
     #[test]
     fn the_summary_says_when_a_registry_has_no_blob_cache() {
-        // Catches: an uncached registry reported as warmed, or its failures
-        // dropped from the line.
+        // Catches: a registry with no cache reported as warmed, and a count
+        // left out of the line.
         let mut s = PrewarmStats::default();
-        s.record(BlobOutcome::Uncached);
-        for _ in 0..361 {
-            s.record(BlobOutcome::Skipped);
+        for _ in 0..PREWARM_PER_REGISTRY {
+            s.record(BlobOutcome::Uncached);
+        }
+        for _ in 0..354 {
+            s.record(BlobOutcome::NotRequested);
         }
         assert_eq!(
             s.summary(),
-            "no blob cache, not warmed (1 checked, 361 skipped)"
-        );
-        s.record(BlobOutcome::Failed);
-        assert_eq!(
-            s.summary(),
-            "no blob cache, not warmed (1 checked, 361 skipped), 1 failed, 0 past the deadline"
+            "0 blobs warmed (0 hits, 0 misses), 0 failed, 0 past the deadline, \
+             no blob cache (8 checked, 354 not requested)"
         );
         let mut s = PrewarmStats::default();
         s.record(BlobOutcome::Hit);

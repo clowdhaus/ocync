@@ -181,26 +181,37 @@ pub(crate) enum Prewarm {
     Skipped,
     /// Ran.
     Done {
-        /// For each registry with a blob that failed or was not finished by
-        /// the deadline, started or not, how many; empty when every blob was
-        /// warmed.
+        /// For each registry with a blob that failed, was not finished by the
+        /// deadline (started or not) or was not requested though the registry
+        /// has a cache, how many; empty when every blob was warmed.
         unwarmed: BTreeMap<String, u64>,
+        /// Registries judged to have no blob cache: not warmed, and not
+        /// counted as unwarmed.
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        no_cache: BTreeSet<String>,
     },
 }
 
 impl Prewarm {
-    /// The line the summary carries, when the pre-warm was skipped or left a
-    /// registry unwarmed.
+    /// The line the summary carries, when the pre-warm was skipped, left a
+    /// registry unwarmed or found one with no blob cache.
     pub(crate) fn note(&self) -> Option<String> {
         match self {
             Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
-            Self::Done { unwarmed } if unwarmed.is_empty() => None,
-            Self::Done { unwarmed } => {
-                let counts: Vec<String> = unwarmed
-                    .iter()
-                    .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
-                    .collect();
-                Some(format!("Pre-warm: not warmed for {}", counts.join(", ")))
+            Self::Done { unwarmed, no_cache } => {
+                let mut parts = Vec::new();
+                if !unwarmed.is_empty() {
+                    let counts: Vec<String> = unwarmed
+                        .iter()
+                        .map(|(registry, blobs)| format!("{registry} ({blobs} blobs)"))
+                        .collect();
+                    parts.push(format!("not warmed for {}", counts.join(", ")));
+                }
+                if !no_cache.is_empty() {
+                    let hosts: Vec<&str> = no_cache.iter().map(String::as_str).collect();
+                    parts.push(format!("no blob cache at {}", hosts.join(", ")));
+                }
+                (!parts.is_empty()).then(|| format!("Pre-warm: {}", parts.join("; ")))
             }
         }
     }
@@ -1786,16 +1797,23 @@ pub(crate) mod tests {
         // numbers would see it.
         let unwarmed = Prewarm::Done {
             unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
+            no_cache: BTreeSet::new(),
+        };
+        let no_cache = Prewarm::Done {
+            unwarmed: BTreeMap::new(),
+            no_cache: BTreeSet::from(["cgr.dev".to_owned()]),
         };
         let cases = [
             (
                 Prewarm::Done {
                     unwarmed: BTreeMap::new(),
+                    no_cache: BTreeSet::new(),
                 },
                 None,
             ),
             (Prewarm::Skipped, Some("Pre-warm: skipped (--skip-prewarm)")),
             (unwarmed, Some("Pre-warm: not warmed for quay.io (3 blobs)")),
+            (no_cache, Some("Pre-warm: no blob cache at cgr.dev")),
         ];
         for (outcome, line) in cases {
             let mut report = sample_report();
@@ -1823,13 +1841,26 @@ pub(crate) mod tests {
         let mut report = sample_report();
         report.prewarm = Some(Prewarm::Done {
             unwarmed: BTreeMap::from([("quay.io".to_owned(), 3)]),
+            no_cache: BTreeSet::new(),
         });
         let record = RunRecord::of(&report, "abc1234".into(), None);
         let written = serde_json::to_value(&record).unwrap();
         assert_eq!(written["relays"], serde_json::json!({}));
+        // Catches: an empty no-cache set written into every record.
         assert_eq!(
             written["prewarm"],
             serde_json::json!({"done": {"unwarmed": {"quay.io": 3}}})
+        );
+        // Catches: a registry judged to have no cache missing from the record.
+        report.prewarm = Some(Prewarm::Done {
+            unwarmed: BTreeMap::new(),
+            no_cache: BTreeSet::from(["cgr.dev".to_owned()]),
+        });
+        let record = RunRecord::of(&report, "abc1234".into(), None);
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            written["prewarm"],
+            serde_json::json!({"done": {"unwarmed": {}, "no_cache": ["cgr.dev"]}})
         );
     }
 
