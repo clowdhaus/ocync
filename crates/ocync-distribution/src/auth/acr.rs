@@ -23,50 +23,33 @@ use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
-use crate::credential_cache::CredentialCache;
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
-/// Decode the payload segment of a JWT token as JSON.
-fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| acr_failed("JWT has fewer than 2 segments"))?;
-    let decoded = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|e| acr_failed(format_args!("JWT payload base64 decode failed: {e}")))?;
-    crate::json::parse(&decoded)
-        .map_err(|e| acr_failed(format_args!("JWT payload is not valid JSON: {e}")))
+/// The claims of a JWT that ocync reads.
+#[derive(Deserialize)]
+struct Claims {
+    /// The expiry, or `None` when absent or too far ahead to represent.
+    #[serde(default, deserialize_with = "crate::json::epoch_seconds")]
+    exp: Option<SystemTime>,
 }
 
-/// Extract the `exp` claim from a JWT as a Unix timestamp.
-fn extract_jwt_exp(token: &str) -> Result<i64, Error> {
-    let json = decode_jwt_payload(token)?;
-    json.get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| acr_failed("JWT missing 'exp' claim"))
+/// The claims in the payload segment of a JWT, or `None` when it does not
+/// read.
+fn decode_jwt_payload(token: &str) -> Option<Claims> {
+    let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+    crate::json::parse(payload).ok()
 }
 
-/// An ACR token that does not read: [`CredentialFailure::Failed`].
-fn acr_failed(reason: impl fmt::Display) -> Error {
-    Error::cloud_credentials("ACR", CredentialFailure::Failed, reason)
-}
-
-/// Compute remaining TTL from a Unix epoch timestamp.
-fn ttl_from_unix_exp(exp: i64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_secs() as i64;
-    let remaining = exp - now;
-    if remaining > 0 {
-        Duration::from_secs(remaining as u64)
-    } else {
-        Duration::ZERO
-    }
+/// The time left on a JWT, or `default` when it carries no `exp` that
+/// reads. A token already past has none left.
+fn jwt_ttl(token: &str, default: Duration) -> Duration {
+    decode_jwt_payload(token)
+        .and_then(|claims| claims.exp)
+        .map_or(default, remaining)
 }
 
 impl AzureCloud {
@@ -731,10 +714,7 @@ impl AcrAuth {
                     }
                     failure.error
                 })?;
-                let ttl = extract_jwt_exp(&refresh_token)
-                    .ok()
-                    .map(ttl_from_unix_exp)
-                    .unwrap_or(ACR_REFRESH_TOKEN_DEFAULT_TTL);
+                let ttl = jwt_ttl(&refresh_token, ACR_REFRESH_TOKEN_DEFAULT_TTL);
                 tracing::debug!(service = %self.service, ttl_secs = ttl.as_secs(), "ACR refresh token acquired");
                 Ok((refresh_token, ttl))
             })
@@ -789,10 +769,7 @@ impl AuthProvider for AcrAuth {
                         .join(" ");
                     tracing::debug!(service = %self.service, scope = %key, "ACR token cache miss, exchanging");
                     let access_token = self.access_token_for(&scope_str).await?;
-                    let ttl = extract_jwt_exp(&access_token)
-                        .ok()
-                        .map(ttl_from_unix_exp)
-                        .unwrap_or(ACR_ACCESS_TOKEN_DEFAULT_TTL);
+                    let ttl = jwt_ttl(&access_token, ACR_ACCESS_TOKEN_DEFAULT_TTL);
                     Ok(Token::with_ttl(access_token, ttl))
                 })
                 .await
@@ -882,48 +859,27 @@ mod tests {
         format!("{header}.{payload}.fake-signature")
     }
 
+    /// A token with no `exp` gets the default, as does one that does not
+    /// read: too few segments, bad base64, or a payload that is not JSON.
+    /// One already past has no time left rather than the default, and a
+    /// fractional `exp` is read.
     #[test]
-    fn decode_jwt_payload_extracts_claims() {
-        let token = fake_jwt(r#"{"tid":"72f988bf-86f1-41af-91ab-2d7cd011db47","sub":"user"}"#);
-        let json = decode_jwt_payload(&token).unwrap();
+    fn jwt_ttl_reads_the_expiry() {
+        let default = Duration::from_secs(10_800);
+        for token in [
+            fake_jwt(r#"{"sub":"user"}"#),
+            "not-a-jwt".to_owned(),
+            "header.!!!invalid!!!.sig".to_owned(),
+            format!("header.{}.sig", URL_SAFE_NO_PAD.encode("not json")),
+        ] {
+            assert_eq!(jwt_ttl(&token, default), default, "{token}");
+        }
         assert_eq!(
-            json.get("tid").and_then(|v| v.as_str()),
-            Some("72f988bf-86f1-41af-91ab-2d7cd011db47")
+            jwt_ttl(&fake_jwt(r#"{"exp":1700000000}"#), default),
+            Duration::ZERO
         );
-    }
-
-    #[test]
-    fn extract_exp_from_acr_token() {
-        let token = fake_jwt(r#"{"exp":1700000000,"iss":"Azure Container Registry"}"#);
-        let exp = extract_jwt_exp(&token).unwrap();
-        assert_eq!(exp, 1700000000);
-    }
-
-    #[test]
-    fn extract_exp_missing() {
-        let token = fake_jwt(r#"{"sub":"user"}"#);
-        let err = extract_jwt_exp(&token).unwrap_err();
-        assert!(err.to_string().contains("missing 'exp' claim"));
-    }
-
-    #[test]
-    fn decode_jwt_malformed() {
-        let err = decode_jwt_payload("not-a-jwt").unwrap_err();
-        assert!(err.to_string().contains("fewer than 2 segments"));
-    }
-
-    #[test]
-    fn decode_jwt_invalid_base64() {
-        let err = decode_jwt_payload("header.!!!invalid!!!.sig").unwrap_err();
-        assert!(err.to_string().contains("base64 decode failed"));
-    }
-
-    #[test]
-    fn decode_jwt_invalid_json() {
-        let payload = URL_SAFE_NO_PAD.encode("not json");
-        let token = format!("header.{payload}.sig");
-        let err = decode_jwt_payload(&token).unwrap_err();
-        assert!(err.to_string().contains("not valid JSON"));
+        let ttl = jwt_ttl(&fake_jwt(r#"{"exp":4102444800.5}"#), default);
+        assert!(ttl != default && ttl > Duration::ZERO, "{ttl:?}");
     }
 
     /// Each cloud signs in at its own Entra ID authority for its own
