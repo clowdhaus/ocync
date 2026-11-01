@@ -51,10 +51,8 @@ pub(crate) struct RunRecord {
     /// sync no locked corpus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_locked_at: Option<LockedAt>,
-    /// What the tools synced each tag from. Runs that synced from source tags,
-    /// as every record written before this field did, are another series than
-    /// runs that synced from the locked digests; absent from those records and
-    /// from runs that sync no locked corpus.
+    /// What the tools synced each tag from, which sets the comparison series.
+    /// Absent: the tools synced source tags, or the run had no lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_from: Option<SyncFrom>,
     /// Machine and cloud provider metadata.

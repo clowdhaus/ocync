@@ -625,8 +625,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 &corpus,
                 args.target,
                 args.tool_selection.max_concurrent_transfers,
-                lock.as_ref()
-                    .map_or(config_gen::Mode::Prepare, config_gen::Mode::Sync),
+                config_gen::Mode::Sync(
+                    lock.as_ref().expect(
+                        "--baseline-ref is refused for prepare, the only run without a lock",
+                    ),
+                ),
             ),
         )
         .map_err(|e| format!("write config {}: {e}", config.display()))?;
@@ -2682,6 +2685,12 @@ mod tests {
         assert_eq!(median.total_bytes, 300_000);
         assert_eq!(median.rounds, 3);
         assert_eq!(median.max_concurrent_transfers, NonZeroUsize::new(20));
+        assert_eq!(median.sync_from, None, "no lock, no digests to sync from");
+        // Catches: a baseline saved from a locked run that a baseline of source
+        // tags cannot be told from.
+        let at = lock::fixtures::locked_at("2026-10-30-120000");
+        let locked = cold_ocync_median(&scenarios, corpus(), None, Some(&at)).unwrap();
+        assert_eq!(locked.sync_from, Some(lock::SyncFrom::Digest));
         assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
     }
 

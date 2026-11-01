@@ -25,9 +25,9 @@ pub(crate) struct Baseline {
     /// before the lock existed, which therefore compare against no run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) corpus_locked_at: Option<LockedAt>,
-    /// What the run's tools synced each tag from. Absent from baselines saved
-    /// when tools synced source tags, which therefore compare against no run
-    /// that synced locked digests, under the same lock or not.
+    /// What the run's tools synced each tag from. Baselines compare only with
+    /// runs that synced from the same. Absent: the tools synced source tags, or
+    /// the run had no lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_from: Option<SyncFrom>,
     /// Images and tags the run synced. `--limit` and `--skip-registries`

@@ -4,13 +4,14 @@
 //! moves after the lock changes nothing; only a digest the source stops serving
 //! stops a run.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
 use clap::Args;
 use ocync_distribution::Digest;
 use ocync_distribution::sha256::Sha256;
+use ocync_sync::engine::ManifestRef;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -344,28 +345,31 @@ pub(crate) async fn ensure_served(
     .await
 }
 
-/// [`ensure_served`] with the request `head` makes for one locked digest. Sends
-/// one per distinct repository and digest, however many tags name it.
+/// [`ensure_served`] with the request `head` makes for one locked digest. A ref
+/// the lock lacks is refused before any request goes out. Otherwise one request
+/// goes out per distinct repository and digest, and a failure is reported for
+/// every tag that names it.
 async fn check_served(
     access: &Access<'_>,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
     head: impl AsyncFn(&Repository<'_>, &Digest) -> Result<(), FetchError>,
 ) -> Result<(), NotServed> {
-    let (known, absent): (BTreeSet<_>, BTreeSet<_>) = refs
-        .iter()
-        .cloned()
-        .partition(|image| lock.images.contains_key(image));
-    let missing = absent
-        .iter()
-        .filter_map(|image| lock.entry(&image.source, &image.tag).err())
-        .collect();
-    let mut seen = HashSet::new();
-    let probes: BTreeSet<ImageRef> = known
-        .iter()
-        .filter(|image| seen.insert((image.source.as_str(), &lock.images[*image].digest)))
-        .cloned()
-        .collect();
+    let mut missing = Vec::new();
+    let mut sharing: HashMap<(&str, &Digest), Vec<&ImageRef>> = HashMap::new();
+    for image in refs {
+        match lock.entry(&image.source, &image.tag) {
+            Ok(entry) => sharing
+                .entry((&image.source, &entry.digest))
+                .or_default()
+                .push(image),
+            Err(reason) => missing.push(reason),
+        }
+    }
+    if !missing.is_empty() {
+        return judge_served(missing, &[]);
+    }
+    let probes: BTreeSet<ImageRef> = sharing.values().map(|tags| tags[0].clone()).collect();
     eprintln!(
         "bench: checking {} locked source digests are still served...",
         probes.len()
@@ -379,7 +383,15 @@ async fn check_served(
             })
         })
         .await;
-    judge_served(missing, &failed)
+    let failed: Vec<(ImageRef, FetchError)> = failed
+        .iter()
+        .flat_map(|(probe, e)| {
+            sharing[&(probe.source.as_str(), &lock.images[probe].digest)]
+                .iter()
+                .map(move |image| ((*image).clone(), e.clone()))
+        })
+        .collect();
+    judge_served(Vec::new(), &failed)
 }
 
 /// The digest of a manifest body. A registry that also reports a digest must
@@ -470,31 +482,10 @@ const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json,\
      application/vnd.oci.image.index.v1+json,\
      application/vnd.docker.distribution.manifest.list.v2+json";
 
-/// What a manifest is requested by.
-enum Reference<'a> {
-    /// A tag, which can move.
-    Tag(&'a str),
-    /// A manifest digest, which names its bytes.
-    Digest(&'a Digest),
-}
-
-impl fmt::Display for Reference<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Tag(tag) => f.write_str(tag),
-            Self::Digest(digest) => fmt::Display::fmt(digest, f),
-        }
-    }
-}
-
-impl Reference<'_> {
-    /// The reference as written after `repo`: `repo:tag` or `repo@digest`.
-    fn in_repo(&self, repo: &Repository<'_>) -> String {
-        match self {
-            Self::Tag(tag) => format!("{repo}:{tag}"),
-            Self::Digest(digest) => format!("{repo}@{digest}"),
-        }
-    }
+/// How `repo` names `reference` in a request notice: `repo:tag` or
+/// `repo@digest`.
+fn manifest_label(repo: &Repository<'_>, reference: &ManifestRef) -> String {
+    format!("{repo}{}{reference}", reference.separator())
 }
 
 /// What the lock reads through [`Access`].
@@ -506,11 +497,11 @@ impl Access<'_> {
         &self,
         method: Method,
         repo: &Repository<'_>,
-        reference: &Reference<'_>,
+        reference: &ManifestRef,
     ) -> Result<reqwest::Response, FetchError> {
         let url = repo.url(&format!("manifests/{reference}"));
         let response = self
-            .send(repo, &reference.in_repo(repo), |client| {
+            .send(repo, &manifest_label(repo, reference), |client| {
                 client
                     .request(method.clone(), &url)
                     .header("Accept", MANIFEST_ACCEPT)
@@ -556,7 +547,7 @@ impl Access<'_> {
     async fn get_manifest<T>(
         &self,
         repo: &Repository<'_>,
-        reference: &Reference<'_>,
+        reference: &ManifestRef,
         read: impl FnOnce(Digest, &[u8]) -> Result<T, String>,
     ) -> Result<T, FetchError> {
         let response = self.request_manifest(Method::GET, repo, reference).await?;
@@ -570,7 +561,7 @@ impl Access<'_> {
 
     /// HEAD the manifest `digest`, which succeeds when the repository serves it.
     async fn head_digest(&self, repo: &Repository<'_>, digest: &Digest) -> Result<(), FetchError> {
-        self.request_manifest(Method::HEAD, repo, &Reference::Digest(digest))
+        self.request_manifest(Method::HEAD, repo, &ManifestRef::Digest(digest.clone()))
             .await
             .map(drop)
     }
@@ -579,7 +570,7 @@ impl Access<'_> {
     /// and of each child's.
     async fn fetch_entry(&self, repo: &Repository<'_>, tag: &str) -> Result<Entry, FetchError> {
         let (digest, manifest) = self
-            .get_manifest(repo, &Reference::Tag(tag), |digest, body| {
+            .get_manifest(repo, &ManifestRef::Tag(tag.to_owned()), |digest, body| {
                 Ok((digest, ManifestBody::parse(body)?))
             })
             .await?;
@@ -589,7 +580,7 @@ impl Access<'_> {
                 let mut blobs = Vec::new();
                 for child in &children {
                     let found = self
-                        .get_manifest(repo, &Reference::Digest(child), |actual, body| {
+                        .get_manifest(repo, &ManifestRef::Digest(child.clone()), |actual, body| {
                             child_blobs(child, &actual, body)
                         })
                         .await
@@ -1021,18 +1012,45 @@ mod tests {
                 format!("s/b@{}", d('2')),
             ]
         );
+
+        // Catches: a shared digest the source dropped reported for one of its
+        // tags, so the count and the list understate what cannot be copied.
+        let lock = lock_of(&[
+            ("s/a:1", entry('1', &[])),
+            ("s/a:2", entry('1', &[])),
+            ("s/a:3", entry('1', &[])),
+            ("s/b:1", entry('2', &[])),
+        ]);
+        let refs = ["s/a:1", "s/a:2", "s/a:3", "s/b:1"];
+        let (verdict, asked) = check(&lock, &refs, &['2'], StatusCode::NOT_FOUND);
+        let Err(NotServed::Gone(text)) = verdict else {
+            panic!("a dropped shared digest must stop the run");
+        };
+        assert!(
+            text.contains("3 source ref(s) cannot be copied from the lock"),
+            "{text}"
+        );
+        for tag in ["s/a:1", "s/a:2", "s/a:3"] {
+            assert!(
+                text.contains(&format!("{tag}: digest {}", d('1'))),
+                "{tag}: {text}"
+            );
+        }
+        assert!(!text.contains("s/b:1"), "{text}");
+        assert_eq!(asked.len(), 2, "{asked:?}");
     }
 
     #[test]
-    fn a_ref_the_lock_lacks_stops_the_run_and_is_not_requested() {
-        // Catches: a ref with no locked digest being run from its tag.
+    fn a_ref_the_lock_lacks_stops_the_run_before_any_request() {
+        // Catches: a ref with no locked digest being run from its tag, and
+        // requests sent for a run that is refused anyway.
         let lock = lock_of(&[("s/a:1", entry('1', &[]))]);
         let (verdict, asked) = check(&lock, &["s/a:1", "s/c:1"], &['1'], StatusCode::NOT_FOUND);
         let Err(NotServed::Gone(text)) = verdict else {
             panic!("a ref the lock lacks must stop the run");
         };
         assert!(text.contains("s/c:1: not in the lock"), "{text}");
-        assert_eq!(asked, [format!("s/a@{}", d('1'))]);
+        assert!(asked.is_empty(), "{asked:?}");
     }
 
     #[test]
@@ -1080,11 +1098,11 @@ mod tests {
         // Catches: `repo:sha256:...` in retry notices, which reads as a tag.
         let repo = registry::split_source("quay.io/jupyter/base").unwrap();
         assert_eq!(
-            Reference::Tag("2026-10-28").in_repo(&repo),
+            manifest_label(&repo, &ManifestRef::Tag("2026-10-28".to_owned())),
             "quay.io/jupyter/base:2026-10-28"
         );
         assert_eq!(
-            Reference::Digest(&d('1')).in_repo(&repo),
+            manifest_label(&repo, &ManifestRef::Digest(d('1'))),
             format!("quay.io/jupyter/base@{}", d('1'))
         );
     }
