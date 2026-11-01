@@ -149,6 +149,16 @@ pub async fn run_with_shutdown_at<T: std::fmt::Debug>(
     out
 }
 
+/// Index in `report.images` of the image whose target reference contains
+/// `target`, such as a repo name or `:tag`.
+pub fn image_index(report: &SyncReport, target: &str) -> usize {
+    report
+        .images
+        .iter()
+        .position(|i| i.target.contains(target))
+        .unwrap_or_else(|| panic!("{target} is reported"))
+}
+
 /// Assert the report holds exactly `want` images, all `Synced`; `name` labels a failure.
 pub fn assert_all_synced(report: &SyncReport, want: usize, name: &str) {
     assert_eq!(report.images.len(), want, "{name}: every tag has a result");

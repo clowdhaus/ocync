@@ -4443,5 +4443,767 @@
         ]
       }
     ]
+  },
+  {
+    "timestamp": "2026-11-01-022107",
+    "git_ref": "fbea11a",
+    "corpus_locked_at": "2026-10-31-072911",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2",
+      "image_id": "ami-052b3645c2c811821"
+    },
+    "relays": {},
+    "prewarm": {
+      "done": {
+        "unwarmed": {}
+      }
+    },
+    "corpus": {
+      "images": 25,
+      "tags": 39
+    },
+    "max_concurrent_transfers": 20,
+    "rounds": {
+      "requested": 3,
+      "finished": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 214.65391529,
+            "peak_rss_kb": 54440,
+            "requests": 5793,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294216047,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293747089,
+            "cdn_hits": 1067,
+            "cdn_misses": 6,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1067,
+            "blob_cdn_misses": 6,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26281,
+              "discovery_start": 0,
+              "execution_complete": 214512
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.445586442,
+            "peak_rss_kb": 15096,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116263,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106847,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2394,
+              "discovery_start": 0,
+              "execution_complete": 2394
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 212.889758515,
+            "peak_rss_kb": 60300,
+            "requests": 5792,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294221049,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293745744,
+            "cdn_hits": 1072,
+            "cdn_misses": 1,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1072,
+            "blob_cdn_misses": 1,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26318,
+              "discovery_start": 0,
+              "execution_complete": 212747
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.467233501,
+            "peak_rss_kb": 15428,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116264,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106847,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2415,
+              "discovery_start": 0,
+              "execution_complete": 2415
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 213.792508944,
+            "peak_rss_kb": 62296,
+            "requests": 5793,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294221994,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293748328,
+            "cdn_hits": 1070,
+            "cdn_misses": 2,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1070,
+            "blob_cdn_misses": 2,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26233,
+              "discovery_start": 0,
+              "execution_complete": 213650
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.459376203,
+            "peak_rss_kb": 15372,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116265,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2408,
+              "discovery_start": 0,
+              "execution_complete": 2408
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-11-01-024907",
+    "git_ref": "cfabec1",
+    "corpus_locked_at": "2026-10-31-072911",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2",
+      "image_id": "ami-052b3645c2c811821"
+    },
+    "relays": {},
+    "prewarm": {
+      "done": {
+        "unwarmed": {}
+      }
+    },
+    "corpus": {
+      "images": 25,
+      "tags": 39
+    },
+    "max_concurrent_transfers": 20,
+    "rounds": {
+      "requested": 3,
+      "finished": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 213.146989587,
+            "peak_rss_kb": 55368,
+            "requests": 5793,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294226052,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293750731,
+            "cdn_hits": 1073,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1073,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26286,
+              "discovery_start": 0,
+              "execution_complete": 213006
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.44666143,
+            "peak_rss_kb": 15180,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116263,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106847,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2396,
+              "discovery_start": 0,
+              "execution_complete": 2396
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 219.02948268,
+            "peak_rss_kb": 57492,
+            "requests": 5792,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294219739,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293745603,
+            "cdn_hits": 1073,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1073,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26256,
+              "discovery_start": 0,
+              "execution_complete": 218892
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.463537613,
+            "peak_rss_kb": 15076,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116265,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2413,
+              "discovery_start": 0,
+              "execution_complete": 2413
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 217.093688989,
+            "peak_rss_kb": 55420,
+            "requests": 5793,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294226683,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293753132,
+            "cdn_hits": 1072,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1072,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26311,
+              "discovery_start": 0,
+              "execution_complete": 216958
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.466328356,
+            "peak_rss_kb": 15388,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116264,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2416,
+              "discovery_start": 0,
+              "execution_complete": 2416
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "timestamp": "2026-11-01-031654",
+    "git_ref": "dc9c613",
+    "corpus_locked_at": "2026-10-31-072911",
+    "machine": {
+      "provider": "aws",
+      "instance_type": "c6in.4xlarge",
+      "arch": "x86_64",
+      "vcpus": 16,
+      "memory_gib": 32.0,
+      "network": "Up to 50 Gigabit",
+      "region": "us-east-2",
+      "image_id": "ami-052b3645c2c811821"
+    },
+    "relays": {},
+    "prewarm": {
+      "done": {
+        "unwarmed": {}
+      }
+    },
+    "corpus": {
+      "images": 25,
+      "tags": 39
+    },
+    "max_concurrent_transfers": 20,
+    "rounds": {
+      "requested": 3,
+      "finished": 3
+    },
+    "scenarios": [
+      {
+        "name": "Cold sync",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 209.15211288,
+            "peak_rss_kb": 56096,
+            "requests": 5793,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294222485,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293748437,
+            "cdn_hits": 1072,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1072,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26345,
+              "discovery_start": 0,
+              "execution_complete": 209014
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 1,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.451767699,
+            "peak_rss_kb": 15700,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116265,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2402,
+              "discovery_start": 0,
+              "execution_complete": 2402
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 193.942286368,
+            "peak_rss_kb": 62308,
+            "requests": 5792,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294222076,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293748438,
+            "cdn_hits": 1071,
+            "cdn_misses": 2,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1071,
+            "blob_cdn_misses": 2,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26259,
+              "discovery_start": 0,
+              "execution_complete": 193802
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 2,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.446876937,
+            "peak_rss_kb": 15324,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116265,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2398,
+              "discovery_start": 0,
+              "execution_complete": 2398
+            }
+          }
+        ]
+      },
+      {
+        "name": "Cold sync",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 216.371752978,
+            "peak_rss_kb": 51952,
+            "requests": 5792,
+            "rate_limit_429s": 0,
+            "response_bytes": 53294222252,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 268,
+            "mount_successes": 268,
+            "source_blob_gets": 1196,
+            "source_blob_bytes": 53293748613,
+            "cdn_hits": 1073,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 1073,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 37,
+            "phase_timing_ms": {
+              "discovery_complete": 26262,
+              "discovery_start": 0,
+              "execution_complete": 216233
+            }
+          }
+        ]
+      },
+      {
+        "name": "Warm sync (no-op)",
+        "round": 3,
+        "tool_order": [
+          "ocync"
+        ],
+        "tools": [
+          {
+            "tool": "ocync",
+            "version": "ocync 0.8.2",
+            "wall_clock_secs": 2.44713007,
+            "peak_rss_kb": 15368,
+            "requests": 108,
+            "rate_limit_429s": 0,
+            "response_bytes": 116265,
+            "duplicate_blob_gets": 0,
+            "mount_attempts": 0,
+            "mount_successes": 0,
+            "source_blob_gets": 0,
+            "source_blob_bytes": 106848,
+            "cdn_hits": 0,
+            "cdn_misses": 0,
+            "manifest_cdn_hits": 0,
+            "manifest_cdn_misses": 0,
+            "blob_cdn_hits": 0,
+            "blob_cdn_misses": 0,
+            "auth_v2_pings": 3,
+            "auth_token_requests": 25,
+            "referrer_calls": 0,
+            "phase_timing_ms": {
+              "discovery_complete": 2398,
+              "discovery_start": 0,
+              "execution_complete": 2398
+            }
+          }
+        ]
+      }
+    ]
   }
 ]

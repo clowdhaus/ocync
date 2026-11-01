@@ -3,15 +3,19 @@
 
 mod helpers;
 
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ocync_distribution::Digest;
 use ocync_distribution::spec::{Descriptor, ImageManifest, MediaType};
 use ocync_sync::engine::{ResolvedArtifacts, ResolvedMapping, TagPair};
+use ocync_sync::staging::BlobStage;
 use ocync_sync::{ErrorKind, ImageStatus};
 use wiremock::http::Method;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use helpers::*;
 
@@ -567,6 +571,17 @@ async fn artifact_refused_for_a_lost_blob_is_repaired_in_the_same_run() {
         .await;
     }
     assert_eq!(sig_heads, 2, "each dropped blob is checked again once");
+    // The second push committed the manifest, so followers waiting on its
+    // blobs are released and can mount them.
+    let (target, other) = (mock_target_id("target", &target_server), repo("other"));
+    for digest in sig_blobs {
+        let cache = cache.borrow();
+        assert_eq!(
+            cache.mount_sources(&target, digest, &other).count(),
+            1,
+            "the repaired push did not record {digest} as committed"
+        );
+    }
 }
 
 /// With two targets and a transient referrers error, both report
@@ -689,23 +704,17 @@ async fn artifact_failure_from_one_source_does_not_fail_another() {
     ])
     .await;
 
-    let status = |tag: &str| {
-        &report
-            .images
-            .iter()
-            .find(|i| i.target.ends_with(&format!(":{tag}")))
-            .expect("every tag is reported")
-            .status
-    };
-    assert!(
-        matches!(status("good"), ImageStatus::Synced),
-        "the good source's mapping got the broken source's failure: {:?}",
-        status("good")
+    assert_status!(
+        report,
+        image_index(&report, ":good"),
+        ImageStatus::Synced,
+        "the good source's mapping got the broken source's failure"
     );
-    assert!(
-        matches!(status("broken"), ImageStatus::Failed { .. }),
-        "the broken source's mapping reused the good source's copy: {:?}",
-        status("broken")
+    assert_status!(
+        report,
+        image_index(&report, ":broken"),
+        ImageStatus::Failed { .. },
+        "the broken source's mapping reused the good source's copy"
     );
 }
 
@@ -752,5 +761,180 @@ async fn artifacts_sharing_a_blob_upload_it_once() {
     assert_eq!(
         uploads, 1,
         "a blob shared by two artifacts is uploaded per artifact"
+    );
+}
+
+/// How long a mocked artifact manifest PUT takes to commit.
+const ARTIFACT_COMMIT: Duration = Duration::from_millis(300);
+
+/// Two images synced into `tgt-a` and `tgt-b`, each with one referrer artifact
+/// and both artifacts sharing their config blob. Every blob upload is
+/// accepted and a mount answers 202, the generic upload POST's answer; a
+/// caller overrides an artifact manifest PUT or the shared blob's mount.
+/// Returns the artifacts and the shared config digest.
+async fn mount_images_with_artifacts_sharing_a_blob(
+    source: &MockServer,
+    target: &MockServer,
+) -> ([ArtifactParts; 2], Digest) {
+    let artifacts = [
+        ArtifactBuilder::new(b"shared-config", b"payload-a").build(),
+        ArtifactBuilder::new(b"shared-config", b"payload-b").build(),
+    ];
+    for (artifact, (src, tgt)) in artifacts
+        .iter()
+        .zip([("src-a", "tgt-a"), ("src-b", "tgt-b")])
+    {
+        let parent = ManifestBuilder::new(format!("config-{src}").as_bytes())
+            .layer(format!("layer-{src}").as_bytes())
+            .build();
+        parent.mount_source(source, src, "v1").await;
+        parent.mount_target(target, tgt, "v1").await;
+        let referrers = ReferrersIndexBuilder::new().artifact(artifact).build();
+        mount_referrers(source, src, &parent.digest, &referrers).await;
+        artifact.mount_source(source, src).await;
+        artifact.mount_target(target, tgt).await;
+    }
+    let shared = artifacts[0].config_desc.digest.clone();
+    (artifacts, shared)
+}
+
+/// Answer the PUT of an artifact manifest at `repo` with `response`, ahead of
+/// the generic manifest push mock.
+async fn mount_artifact_manifest_put(
+    server: &MockServer,
+    repo: &str,
+    artifact: &ArtifactParts,
+    response: impl Respond + 'static,
+) {
+    manifest_push_with(repo, &artifact.digest.to_string(), response)
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A blob referenced only by images' referrer artifacts is a mount source once
+/// the artifact manifest referencing it commits, not once the image commits.
+/// The target answers a mount as ECR does: 201 only once the `from` repo's
+/// artifact manifest PUT has committed, 202 before. A follower that mounts
+/// when the image commits draws a 202 and uploads the shared config.
+#[tokio::test]
+async fn artifact_blob_is_a_mount_source_only_after_its_manifest_commits() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (artifacts, shared) =
+        mount_images_with_artifacts_sharing_a_blob(&source_server, &target_server).await;
+    let arrivals: Arc<Mutex<HashMap<&'static str, Instant>>> = Arc::default();
+    for (repo, artifact) in ["tgt-a", "tgt-b"].into_iter().zip(&artifacts) {
+        let on_put = Arc::clone(&arrivals);
+        mount_artifact_manifest_put(&target_server, repo, artifact, move |_: &Request| {
+            on_put
+                .lock()
+                .unwrap()
+                .entry(repo)
+                .or_insert_with(Instant::now);
+            ResponseTemplate::new(201).set_delay(ARTIFACT_COMMIT)
+        })
+        .await;
+        let on_mount = Arc::clone(&arrivals);
+        let session = format!("/v2/{repo}/blobs/uploads/upload-id");
+        blob_mount_with(repo, &shared, move |req: &Request| {
+            let committed = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "from")
+                .and_then(|(_, from)| on_mount.lock().unwrap().get(from.as_ref()).copied())
+                .is_some_and(|arrived| arrived.elapsed() >= ARTIFACT_COMMIT);
+            if committed {
+                ResponseTemplate::new(201)
+            } else {
+                ResponseTemplate::new(202).insert_header("location", session.as_str())
+            }
+        })
+        .mount(&target_server)
+        .await;
+    }
+
+    let report = run_sync(v1_mappings(
+        &source_server,
+        &target_server,
+        &[("src-a", "tgt-a"), ("src-b", "tgt-b")],
+    ))
+    .await;
+
+    assert_all_synced(&report, 2, "both images with their artifacts");
+    assert_eq!(
+        count_mount_posts(&target_server).await,
+        1,
+        "the follower mounts the shared config once"
+    );
+    assert_eq!(
+        count_blob_uploads(&target_server, PathMatch::Any, &shared).await,
+        1,
+        "the follower mounted before the artifact manifest committed and uploaded the config"
+    );
+}
+
+/// An image whose artifact fails after its image committed releases the
+/// followers waiting on the artifact's blobs, who push them: the follower
+/// finishes well inside the default mount-source wait, and mounts nothing
+/// from the repo that never committed the blob.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_artifact_releases_followers_waiting_for_its_blob() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let (artifacts, shared) =
+        mount_images_with_artifacts_sharing_a_blob(&source_server, &target_server).await;
+    // The leader's artifact manifest PUT answers 500 slowly, past its retries,
+    // while the follower, held back at its artifact pull, waits on it.
+    let failing = ResponseTemplate::new(500).set_delay(ARTIFACT_COMMIT);
+    mount_artifact_manifest_put(&target_server, "tgt-a", &artifacts[0], failing).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/src-b/manifests/{}", artifacts[1].digest)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(artifacts[1].bytes.clone())
+                .insert_header("content-type", MediaType::OciManifest.as_str())
+                .set_delay(Duration::from_millis(100)),
+        )
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_engine(
+            v1_mappings(
+                &source_server,
+                &target_server,
+                &[("src-a", "tgt-a"), ("src-b", "tgt-b")],
+            ),
+            fast_retry(),
+            10,
+            empty_cache(),
+            BlobStage::disabled(),
+            None,
+        ),
+    )
+    .await
+    .expect("the follower sat out the mount-source wait");
+
+    assert_status!(
+        report,
+        image_index(&report, "tgt-a"),
+        ImageStatus::Failed {
+            kind: ErrorKind::ArtifactSync,
+            ..
+        }
+    );
+    assert_status!(report, image_index(&report, "tgt-b"), ImageStatus::Synced);
+    assert_eq!(
+        count_blob_uploads(&target_server, PathMatch::Contains("/tgt-b/"), &shared).await,
+        1,
+        "the follower pushes the blob once the leader fails"
+    );
+    assert_eq!(
+        count_mount_posts(&target_server).await,
+        0,
+        "nothing is mounted from a repo that never committed the blob"
     );
 }

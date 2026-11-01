@@ -16,7 +16,7 @@ use ocync_distribution::{BatchBlobChecker, BlobExistence, Digest};
 use ocync_sync::engine::TargetEntry;
 use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockBuilder, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, Request, Respond, ResponseTemplate};
 
 use super::digests::repo;
 use super::fixtures::target_entry;
@@ -158,15 +158,20 @@ async fn mount_uploads(server: &MockServer, repo: &str, expected: Option<(u64, &
     .await;
 }
 
-/// A cross-repo mount POST of `digest` into `repo` answering `status`, not yet
-/// mounted so a caller can add `.expect(n)`. Priority 1 so it wins over the
+/// A cross-repo mount POST of `digest` into `repo` answering `response`, not
+/// yet mounted so a caller can add `.expect(n)`. Priority 1 so it wins over the
 /// generic upload POST (default priority 5), which also matches mount requests.
-pub fn blob_mount_mock(repo: &str, digest: &Digest, status: u16) -> Mock {
+pub fn blob_mount_with(repo: &str, digest: &Digest, response: impl Respond + 'static) -> Mock {
     Mock::given(method("POST"))
         .and(path(format!("/v2/{repo}/blobs/uploads/")))
         .and(query_param("mount", digest.to_string()))
-        .respond_with(ResponseTemplate::new(status))
+        .respond_with(response)
         .with_priority(1)
+}
+
+/// As [`blob_mount_with`], answering a bare `status`.
+pub fn blob_mount_mock(repo: &str, digest: &Digest, status: u16) -> Mock {
+    blob_mount_with(repo, digest, ResponseTemplate::new(status))
 }
 
 /// Mount a 201 for a cross-repo mount of `digest` into `repo`.
@@ -209,11 +214,17 @@ pub async fn mount_manifest_head_matching(
         .await;
 }
 
-/// A manifest PUT returning 201, not yet mounted so a caller can add `.expect(n)`.
-pub fn manifest_push_mock(repo: &str, reference: &str) -> Mock {
+/// A manifest PUT answering `response`, not yet mounted so a caller can add
+/// `.expect(n)` or a priority.
+pub fn manifest_push_with(repo: &str, reference: &str, response: impl Respond + 'static) -> Mock {
     Mock::given(method("PUT"))
         .and(path(format!("/v2/{repo}/manifests/{reference}")))
-        .respond_with(ResponseTemplate::new(201))
+        .respond_with(response)
+}
+
+/// A manifest PUT returning 201, not yet mounted so a caller can add `.expect(n)`.
+pub fn manifest_push_mock(repo: &str, reference: &str) -> Mock {
+    manifest_push_with(repo, reference, ResponseTemplate::new(201))
 }
 
 /// Mount a manifest PUT returning 201.

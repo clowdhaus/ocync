@@ -90,15 +90,25 @@ pub enum RepoBlobState {
     /// batch check that misses the blob, or a manifest refused for a missing
     /// blob, drops it. Persisted as `Verified`.
     Remembered,
+    /// Present at this repo and either referenced by a manifest committed
+    /// there this run, or present since an earlier run and confirmed this run.
+    /// The first is what a registry such as ECR requires of a mount source.
+    /// Persisted as `Verified`; a later write of `Verified` or `Completed`
+    /// never replaces it.
+    Committed,
 }
 
 impl RepoBlobState {
     /// Whether the blob counts as present at this repo for skip purposes.
     pub fn is_present(&self) -> bool {
-        matches!(self, Self::Verified | Self::Completed | Self::Remembered)
+        matches!(
+            self,
+            Self::Verified | Self::Completed | Self::Remembered | Self::Committed
+        )
     }
 
-    /// Whether this state was recorded this run and is not a dead end.
+    /// Whether this state was recorded this run and can still become a mount
+    /// source.
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Verified | Self::Uploading | Self::Completed)
     }
@@ -165,8 +175,8 @@ impl BlobDedupMap {
         self.inner.get(target)?.get(digest)?.repos.get(repo)
     }
 
-    /// Whether the blob is present (`Verified`, `Completed` or `Remembered`) at
-    /// the given (target, repo).
+    /// Whether the blob is present (`Verified`, `Completed`, `Remembered` or
+    /// `Committed`) at the given (target, repo).
     pub(crate) fn blob_present_at(
         &self,
         target: &TargetId,
@@ -177,26 +187,45 @@ impl BlobDedupMap {
             .is_some_and(RepoBlobState::is_present)
     }
 
-    /// Set a repo's state to `Verified`, leaving other repos and the claim alone.
+    /// Set a repo's state to `Verified`, leaving other repos and the claim
+    /// alone. A `Committed` state is kept.
     pub(crate) fn set_blob_verified(
         &mut self,
         target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) {
-        let entry = self.entry_mut(target, digest);
-        entry.repos.insert(repo.clone(), RepoBlobState::Verified);
+        self.set_present(target, digest, repo, RepoBlobState::Verified);
     }
 
-    /// Set a repo's state to `Completed`.
+    /// Set a repo's state to `Completed`. A `Committed` state is kept.
     pub(crate) fn set_blob_completed(
         &mut self,
         target: &TargetId,
         digest: &Digest,
         repo: &RepositoryName,
     ) {
-        let entry = self.entry_mut(target, digest);
-        entry.repos.insert(repo.clone(), RepoBlobState::Completed);
+        self.set_present(target, digest, repo, RepoBlobState::Completed);
+    }
+
+    /// Record `state` unless the repo is `Committed`: a later check or mount
+    /// into the repo must not erase what a committed manifest proved. A
+    /// `Verified` write over `Remembered` records `Committed`, since presence
+    /// since an earlier run is now confirmed and is offered at once.
+    fn set_present(
+        &mut self,
+        target: &TargetId,
+        digest: &Digest,
+        repo: &RepositoryName,
+        state: RepoBlobState,
+    ) {
+        let repos = &mut self.entry_mut(target, digest).repos;
+        let state = match (repos.get(repo), state) {
+            (Some(RepoBlobState::Committed), _) => return,
+            (Some(RepoBlobState::Remembered), RepoBlobState::Verified) => RepoBlobState::Committed,
+            (_, state) => state,
+        };
+        repos.insert(repo.clone(), state);
     }
 
     /// Set a repo's state to `Failed` (this repo's own upload failed).
@@ -308,14 +337,25 @@ impl BlobDedupMap {
         true
     }
 
-    /// Record the blob as `Verified` at `repo`, which a manifest committed
-    /// there proves. A live upload claim, presence this run recorded, and a
-    /// `Failed` mark are left alone: the mark also excludes a mount source
-    /// the registry refused, which a commit does not make mountable.
-    pub(crate) fn confirm(&mut self, target: &TargetId, digest: &Digest, repo: &RepositoryName) {
-        if let None | Some(RepoBlobState::Remembered) = self.repo_state(target, digest, repo) {
-            self.set_blob_verified(target, digest, repo);
+    /// Record the blob as `Committed` at `repo`, which a manifest committed
+    /// there proves. A live upload claim and a `Failed` mark are left alone:
+    /// the mark also excludes a mount source the registry refused, which a
+    /// commit does not make mountable. Returns whether the commit was recorded.
+    pub(crate) fn confirm(
+        &mut self,
+        target: &TargetId,
+        digest: &Digest,
+        repo: &RepositoryName,
+    ) -> bool {
+        if let Some(RepoBlobState::Uploading | RepoBlobState::Failed(_)) =
+            self.repo_state(target, digest, repo)
+        {
+            return false;
         }
+        self.entry_mut(target, digest)
+            .repos
+            .insert(repo.clone(), RepoBlobState::Committed);
+        true
     }
 
     /// Start a run from what persisting and reloading would give: present
@@ -337,8 +377,8 @@ impl BlobDedupMap {
     }
 
     /// A copy with only persistable state: `Verified` and `Completed` survive,
-    /// `Remembered` becomes `Verified`, and `Uploading`, `Failed` and the claim
-    /// slot are stripped.
+    /// `Remembered` and `Committed` become `Verified`, and `Uploading`,
+    /// `Failed` and the claim slot are stripped.
     pub(crate) fn filter_persistable(&self) -> BlobDedupMap {
         let inner = self
             .inner
@@ -352,9 +392,9 @@ impl BlobDedupMap {
                             .iter()
                             .filter_map(|(r, state)| {
                                 let kept = match state {
-                                    RepoBlobState::Verified | RepoBlobState::Remembered => {
-                                        RepoBlobState::Verified
-                                    }
+                                    RepoBlobState::Verified
+                                    | RepoBlobState::Remembered
+                                    | RepoBlobState::Committed => RepoBlobState::Verified,
                                     RepoBlobState::Completed => RepoBlobState::Completed,
                                     RepoBlobState::Uploading | RepoBlobState::Failed(_) => {
                                         return None;
@@ -529,37 +569,138 @@ mod tests {
             Some(&RepoBlobState::Completed),
             "state this run recorded is kept"
         );
+    }
 
-        map.remember_present();
-        map.confirm(&target_id("reg.io"), &d, &repo("x"));
-        assert_eq!(
-            map.repo_state(&target_id("reg.io"), &d, &repo("x")),
-            Some(&RepoBlobState::Verified)
-        );
-        map.forget_remembered(&target_id("reg.io"), &d, &repo("y"));
-        map.confirm(&target_id("reg.io"), &d, &repo("y"));
-        assert_eq!(
-            map.repo_state(&target_id("reg.io"), &d, &repo("y")),
-            Some(&RepoBlobState::Verified),
-            "a commit records a blob a refusal dropped"
-        );
-        assert!(matches!(
-            map.claim_blob_upload(&target_id("reg.io"), &d, &repo("z")),
-            ClaimAction::Claimed
-        ));
-        map.confirm(&target_id("reg.io"), &d, &repo("z"));
-        assert_eq!(
-            map.repo_state(&target_id("reg.io"), &d, &repo("z")),
-            Some(&RepoBlobState::Uploading),
-            "a commit never overwrites a live upload claim"
-        );
-        map.set_blob_failed(&target_id("reg.io"), &d, &repo("w"), "mount refused".into());
-        map.confirm(&target_id("reg.io"), &d, &repo("w"));
-        assert!(
-            map.repo_state(&target_id("reg.io"), &d, &repo("w"))
-                .is_some_and(|state| matches!(state, RepoBlobState::Failed(_))),
-            "a commit keeps a refused mount source excluded"
-        );
+    /// Confirming a `Remembered` blob with a check records `Committed`, so the
+    /// repo is offered as a mount source at once; a completed write does not.
+    #[test]
+    fn check_over_remembered_commits_but_completion_does_not() {
+        type Write = fn(&mut BlobDedupMap, &TargetId, &Digest, &RepositoryName);
+        let cases: [(&str, Write, RepoBlobState); 2] = [
+            (
+                "a check confirms it",
+                BlobDedupMap::set_blob_verified,
+                RepoBlobState::Committed,
+            ),
+            (
+                "a mount completes into it",
+                BlobDedupMap::set_blob_completed,
+                RepoBlobState::Completed,
+            ),
+        ];
+        for (name, write, want) in cases {
+            let (t, d, x) = (target_id("reg.io"), test_digest(), repo("x"));
+            let mut map = BlobDedupMap::default();
+            map.set_blob_completed(&t, &d, &x);
+            map.remember_present();
+            write(&mut map, &t, &d, &x);
+            assert_eq!(map.repo_state(&t, &d, &x), Some(&want), "{name}");
+        }
+    }
+
+    /// A commit records `Committed` over every state but a live upload and a
+    /// refused mount source, which a commit does not make mountable.
+    #[test]
+    fn confirm_commits_the_blob_unless_uploading_or_failed() {
+        type Seed = fn(&mut BlobDedupMap);
+        let (t, d, x) = (target_id("reg.io"), test_digest(), repo("x"));
+        let cases: [(&str, Seed, RepoBlobState); 6] = [
+            (
+                "no state, as after a refusal dropped it",
+                |_| {},
+                RepoBlobState::Committed,
+            ),
+            (
+                "verified",
+                |m| m.set_blob_verified(&target_id("reg.io"), &test_digest(), &repo("x")),
+                RepoBlobState::Committed,
+            ),
+            (
+                "completed",
+                |m| m.set_blob_completed(&target_id("reg.io"), &test_digest(), &repo("x")),
+                RepoBlobState::Committed,
+            ),
+            (
+                "remembered",
+                |m| {
+                    m.set_blob_completed(&target_id("reg.io"), &test_digest(), &repo("x"));
+                    m.remember_present();
+                },
+                RepoBlobState::Committed,
+            ),
+            (
+                "a live upload claim",
+                |m| {
+                    let claim =
+                        m.claim_blob_upload(&target_id("reg.io"), &test_digest(), &repo("x"));
+                    assert!(matches!(claim, ClaimAction::Claimed));
+                },
+                RepoBlobState::Uploading,
+            ),
+            (
+                "a refused mount source",
+                |m| {
+                    m.set_blob_failed(
+                        &target_id("reg.io"),
+                        &test_digest(),
+                        &repo("x"),
+                        "mount refused".into(),
+                    )
+                },
+                RepoBlobState::Failed("mount refused".into()),
+            ),
+        ];
+        for (name, seed, want) in cases {
+            let mut map = BlobDedupMap::default();
+            seed(&mut map);
+            let recorded = map.confirm(&t, &d, &x);
+            assert_eq!(map.repo_state(&t, &d, &x), Some(&want), "{name}");
+            assert_eq!(recorded, want == RepoBlobState::Committed, "{name}");
+        }
+    }
+
+    /// A committed blob is not erased by a later check or mount into the same
+    /// repo, and follows the other present states through a new run,
+    /// persistence and a refused mount.
+    #[test]
+    fn committed_state_survives_writes_and_follows_the_transitions() {
+        type Step = fn(&mut BlobDedupMap);
+        let cases: [(&str, Step, RepoBlobState); 5] = [
+            (
+                "a batch check verifies it",
+                |m| m.set_blob_verified(&target_id("reg.io"), &test_digest(), &repo("x")),
+                RepoBlobState::Committed,
+            ),
+            (
+                "a mount completes into it",
+                |m| m.set_blob_completed(&target_id("reg.io"), &test_digest(), &repo("x")),
+                RepoBlobState::Committed,
+            ),
+            (
+                "a new run remembers it",
+                |m| m.remember_present(),
+                RepoBlobState::Remembered,
+            ),
+            (
+                "persistence writes it as verified",
+                |m| *m = m.filter_persistable(),
+                RepoBlobState::Verified,
+            ),
+            (
+                "a refused mount marks it failed",
+                |m| m.mark_blob_repo_stale(&target_id("reg.io"), &test_digest(), &repo("x")),
+                RepoBlobState::Failed("mount rejected by target".into()),
+            ),
+        ];
+        for (name, step, want) in cases {
+            let (t, d, x) = (target_id("reg.io"), test_digest(), repo("x"));
+            let mut map = BlobDedupMap::default();
+            map.set_blob_completed(&t, &d, &x);
+            map.confirm(&t, &d, &x);
+            assert_eq!(map.repo_state(&t, &d, &x), Some(&RepoBlobState::Committed));
+            step(&mut map);
+            assert_eq!(map.repo_state(&t, &d, &x), Some(&want), "{name}");
+        }
     }
 
     /// A new run, such as a watch-mode cycle, starts from what persisting
@@ -814,8 +955,8 @@ mod tests {
         assert!(!persisted.inner.contains_key(&target_id("other.io")));
     }
 
-    /// Only `Verified` and `Completed` blobs count as present; an upload in
-    /// flight and a failure do not.
+    /// Only `Verified`, `Completed` and `Committed` blobs count as present; an
+    /// upload in flight and a failure do not.
     #[test]
     fn blob_present_at_excludes_uploading_and_failed() {
         let mut map = BlobDedupMap::default();
@@ -827,9 +968,11 @@ mod tests {
             ClaimAction::Claimed
         ));
         map.set_blob_failed(&target_id("reg.io"), &d, &repo("d"), "oops".into());
+        map.confirm(&target_id("reg.io"), &d, &repo("e"));
 
         assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("a")));
         assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("b")));
+        assert!(map.blob_present_at(&target_id("reg.io"), &d, &repo("e")));
         assert!(!map.blob_present_at(&target_id("reg.io"), &d, &repo("c")));
         assert!(!map.blob_present_at(&target_id("reg.io"), &d, &repo("d")));
     }

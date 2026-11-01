@@ -140,9 +140,11 @@ async fn sync_warm_cache_mounts_from_a_cached_repo() {
             &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
         );
         if matches!(repo_a, RepoA::Committed) {
-            cache
-                .borrow_mut()
-                .mark_repo_committed(&mock_target_id("target", &target_server), &repo("repo-a"));
+            cache.borrow_mut().confirm_blobs(
+                &mock_target_id("target", &target_server),
+                &repo("repo-a"),
+                [&parts.config_desc.digest, &parts.layer_descs[0].digest],
+            );
         }
 
         let mapping = mapping_from_servers(
@@ -269,10 +271,13 @@ async fn sync_warm_cache_ecr_target_mount_not_fulfilled() {
         &repo("repo-a"),
         &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
-    // A committed repo is a valid mount source.
-    cache
-        .borrow_mut()
-        .mark_repo_committed(&target_auth, &repo("repo-a"));
+    // A repo with a committed manifest referencing the blobs is a valid mount
+    // source.
+    cache.borrow_mut().confirm_blobs(
+        &target_auth,
+        &repo("repo-a"),
+        [&parts.config_desc.digest, &parts.layer_descs[0].digest],
+    );
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -557,9 +562,10 @@ async fn sync_lazy_invalidation_clears_cache_and_records_completion() {
         &repo("stale-repo"),
         &[&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
-    cache.borrow_mut().mark_repo_committed(
+    cache.borrow_mut().confirm_blobs(
         &mock_target_id("target", &target_server),
         &repo("stale-repo"),
+        [&parts.config_desc.digest, &parts.layer_descs[0].digest],
     );
 
     let mapping = mapping_from_servers(
@@ -1805,7 +1811,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
     );
 }
 
-/// A repo-failed watch is cleared when a run starts, with cache pruning off
+/// A released watch is cleared when a run starts, with cache pruning off
 /// too, so a run in the same process does not see a stale fired watch and
 /// wait on, or mount from, a repo that never committed.
 #[tokio::test]
@@ -1814,7 +1820,7 @@ async fn run_clears_repo_watches_without_cache_pruning() {
     let cache = empty_cache();
     cache
         .borrow_mut()
-        .notify_repo_failed(&target, &repo("repo"));
+        .release_blobs(&target, &repo("repo"), [&digest_b()]);
 
     SyncEngine::new(fast_retry(), concurrency(50))
         .with_cache_pruning(false)
