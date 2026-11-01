@@ -22,6 +22,7 @@ use super::detect::AzureCloud;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
+use crate::aws::{Timeouts, credential_endpoint_client};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
@@ -284,6 +285,7 @@ fn chain_failure(failures: &[CredentialFailure]) -> CredentialFailure {
 }
 
 /// Internal error for credential chain control flow.
+#[derive(Debug)]
 enum CredentialError {
     /// Credential source is not configured (skip to next).
     NotConfigured,
@@ -310,12 +312,29 @@ impl Source {
     ];
 }
 
+/// Where the Azure instance metadata service answers.
+const METADATA_ORIGIN: &str = "http://169.254.169.254";
+
+/// 1 s to connect, because off Azure nothing answers the metadata address;
+/// 10 s overall for every Azure credential request.
+const TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(1),
+    read: Duration::from_secs(10),
+};
+
 /// Azure credential chain that tries four credential sources in order and
 /// keeps using the first that succeeds until reset.
 struct AzureCredentialChain {
     cloud: AzureCloud,
     cached_source: Mutex<Option<Source>>,
+    /// Follows the environment's proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`, `NO_PROXY`), like registry traffic.
     http: reqwest::Client,
+    /// Straight to the instance metadata service, never through a proxy, so
+    /// the managed identity token never reaches a proxy host.
+    metadata: reqwest::Client,
+    /// Where `metadata` finds the instance metadata service.
+    metadata_origin: String,
 }
 
 impl fmt::Debug for AzureCredentialChain {
@@ -327,18 +346,22 @@ impl fmt::Debug for AzureCredentialChain {
 }
 
 impl AzureCredentialChain {
-    fn new(cloud: AzureCloud) -> Self {
+    fn new(cloud: AzureCloud) -> Result<Self, Error> {
         crate::install_crypto_provider();
         let http = no_redirect_builder()
-            .connect_timeout(Duration::from_secs(1))
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build Azure credential HTTP client");
-        Self {
+            .connect_timeout(TIMEOUTS.connect)
+            .timeout(TIMEOUTS.read)
+            .build()?;
+        let metadata = credential_endpoint_client(TIMEOUTS)
+            .timeout(TIMEOUTS.read)
+            .build()?;
+        Ok(Self {
             cloud,
             cached_source: Mutex::new(None),
             http,
-        }
+            metadata,
+            metadata_origin: METADATA_ORIGIN.to_owned(),
+        })
     }
 
     /// The source that last gave a token, if any.
@@ -452,11 +475,12 @@ impl AzureCredentialChain {
         // `&` or `#`, so it needs no encoding.
         let resource = self.cloud.resource();
         let url = format!(
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2019-08-01&resource={resource}"
+            "{}/metadata/identity/oauth2/token?api-version=2019-08-01&resource={resource}",
+            self.metadata_origin
         );
 
         let resp = self
-            .http
+            .metadata
             .get(&url)
             .header("metadata", "true")
             .send()
@@ -639,7 +663,7 @@ impl AcrAuth {
     /// its client uses.
     pub async fn new(registry: &url::Url) -> Result<Self, Error> {
         let hostname = registry.host_str().unwrap_or_default().to_owned();
-        let api = Box::new(AzureCredentialChain::new(AzureCloud::of_host(&hostname)));
+        let api = Box::new(AzureCredentialChain::new(AzureCloud::of_host(&hostname))?);
         Ok(Self {
             base_url: registry_origin(registry),
             service: hostname,
@@ -790,6 +814,39 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    /// The managed identity token is fetched from the metadata service and
+    /// the proxy sees nothing. Breaks if that request is sent with the
+    /// proxied client.
+    #[tokio::test]
+    async fn managed_identity_is_fetched_without_the_proxy() {
+        let proxy = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&proxy)
+            .await;
+        let metadata = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/metadata/identity/oauth2/token"))
+            .and(header("metadata", "true"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "imds-tok"})),
+            )
+            .expect(1)
+            .mount(&metadata)
+            .await;
+
+        let mut chain = AzureCredentialChain::new(AzureCloud::Public).unwrap();
+        chain.http = no_redirect_builder()
+            .proxy(reqwest::Proxy::all(proxy.uri()).unwrap())
+            .build()
+            .unwrap();
+        chain.metadata_origin = metadata.uri();
+
+        assert_eq!(chain.try_managed_identity().await.unwrap(), "imds-tok");
+    }
 
     /// A chain is refused when any source refused, whichever failed first,
     /// else transient when any may pass. Breaks if a refused CLI login is
@@ -971,7 +1028,7 @@ mod tests {
     }
 
     use wiremock::MockServer;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{any, body_string_contains, header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     #[tokio::test]
