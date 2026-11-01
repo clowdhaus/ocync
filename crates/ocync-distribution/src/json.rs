@@ -1,6 +1,8 @@
 //! Answer reading and JSON decoding shared by the registry, AWS and Google
 //! clients.
 
+use std::time::{Duration, SystemTime};
+
 use serde::Deserialize;
 
 use crate::Error;
@@ -15,6 +17,21 @@ where
     T: Default + Deserialize<'de>,
 {
     Ok(<Option<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Read a time sent as seconds since the UNIX epoch, whole or fractional.
+/// One before the epoch has passed; one too far ahead to represent reads as
+/// no time, so a default lifetime applies rather than the credential
+/// failing.
+pub(crate) fn epoch_seconds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SystemTime>, D::Error> {
+    let Some(secs) = Option::<f64>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Duration::try_from_secs_f64(secs.max(0.0))
+        .ok()
+        .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch)))
 }
 
 /// Why JSON that holds or may hold a credential, such as an endpoint's
@@ -266,6 +283,24 @@ pub(crate) fn value_as<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seconds are read whole or fractional. A negative time is the epoch,
+    /// so it has passed; one too large to represent, or null, is no time.
+    #[test]
+    fn epoch_seconds_reads_a_time() {
+        for (sent, expected) in [
+            ("1700000000", Some(1_700_000_000_000)),
+            ("4102444800.5", Some(4_102_444_800_500)),
+            ("-1", Some(0)),
+            ("1e300", None),
+            ("null", None),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(sent).unwrap();
+            let expected =
+                expected.map(|millis| SystemTime::UNIX_EPOCH + Duration::from_millis(millis));
+            assert_eq!(epoch_seconds(&value).unwrap(), expected, "{sent}");
+        }
+    }
 
     /// An answer that is not the JSON expected names who sent it and where
     /// and why it failed, with no value from the body in its text or debug

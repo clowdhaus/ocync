@@ -23,6 +23,7 @@ use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Presents, Scope, Token, scopes_cache_key};
+use crate::aws::Service;
 use crate::credential_cache::CredentialCache;
 use crate::error::{CredentialFailure, Error};
 
@@ -72,7 +73,7 @@ impl EcrApi for AwsEcrPublicApi {
                 )
             })?;
 
-            auth_data.into_response(crate::aws::Service::EcrPublic, ECR_PUBLIC_HOST)
+            auth_data.into_response(Service::EcrPublic, ECR_PUBLIC_HOST)
         })
     }
 }
@@ -123,7 +124,7 @@ impl EcrPublicAuth {
         let client = crate::aws::Client::from_env(
             ECR_PUBLIC_REGION,
             None,
-            crate::aws::Service::EcrPublic,
+            Service::EcrPublic,
             aws_credentials,
         )
         .map_err(|e| Error::cloud_credentials(ECR_PUBLIC_HOST, CredentialFailure::Failed, e))?;

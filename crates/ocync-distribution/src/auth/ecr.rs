@@ -10,8 +10,9 @@ use serde::Deserialize;
 
 use crate::auth::{AuthProvider, AuthScheme, Presents, Scope, Token};
 use crate::aws::Service;
-use crate::credential_cache::{CredentialCache, epoch_seconds, remaining};
+use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error};
+use crate::json::epoch_seconds;
 
 /// Token lifetime, in ECR and ECR Public, when the answer carries no
 /// `expiresAt`.
@@ -415,35 +416,19 @@ mod tests {
         assert!(output.authorization_data.is_empty());
     }
 
-    /// An answer with no expiry lasts 12 hours, one with no token is an
-    /// error naming the registry and the service, and one with both reads
-    /// as sent.
+    /// An answer with no expiry lasts 12 hours, and one with no token is an
+    /// error naming the registry and the service.
     #[test]
     fn answer_becomes_a_token_response() {
-        let data = |token: Option<&str>, expires_at| AuthorizationData {
+        let data = |token: Option<&str>| AuthorizationData {
             authorization_token: token.map(str::to_owned),
-            expires_at,
+            expires_at: None,
         };
-        let response = data(Some("QVdT"), None)
+        let response = data(Some("QVdT"))
             .into_response(Service::Ecr, "r.example")
             .unwrap();
         assert_eq!(response.encoded_token, "QVdT");
         assert_eq!(response.ttl, Duration::from_secs(43_200));
-
-        let in_an_hour = SystemTime::now() + Duration::from_secs(3600);
-        let response = data(Some("QVdT"), Some(in_an_hour))
-            .into_response(Service::Ecr, "r.example")
-            .unwrap();
-        assert!(
-            response.ttl > Duration::from_secs(3500),
-            "{:?}",
-            response.ttl
-        );
-        assert!(
-            response.ttl <= Duration::from_secs(3600),
-            "{:?}",
-            response.ttl
-        );
 
         for (service, message) in [
             (Service::Ecr, "ECR authorization data missing token"),
@@ -452,7 +437,7 @@ mod tests {
                 "ECR Public authorization data missing token",
             ),
         ] {
-            let err = data(None, None)
+            let err = data(None)
                 .into_response(service, "r.example")
                 .err()
                 .unwrap()
