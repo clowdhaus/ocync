@@ -7,11 +7,19 @@
 //! nothing is made up front and the instance's identity, which can push but not
 //! delete, needs nothing more. The run ends by deleting them here.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde::Deserialize;
 
 use crate::bench::acr::{AcrTarget, Guid, RegistryName};
-use crate::bench::provision::{Cli, Output, RunEnd, repository_id, terraform_output, with_prefix};
+use crate::bench::provision::{
+    Cli, Output, RoundId, RoundIds, deleted_all, terraform_outputs, with_prefix,
+};
+use crate::bench::target::Kind;
 use crate::bench::{Rounds, RunTimestamp};
+
+/// The most `az` deletions in flight at once.
+const DELETE_PARALLELISM: usize = 8;
 
 /// Terraform directory whose outputs name the Azure side of the bench.
 const TERRAFORM_DIR: &str = "bench/terraform/azure";
@@ -37,15 +45,13 @@ pub(crate) struct Outputs {
 }
 
 impl Outputs {
-    /// Reads the outputs from `terraform output -json`, naming the one that
-    /// is missing or malformed.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "reads Terraform's own output, which holds no credential"
-    )]
-    pub(crate) fn parse(json: &str) -> Result<Self, String> {
-        let raw: RawOutputs = serde_json::from_str(json)
-            .map_err(|e| format!("terraform output of {TERRAFORM_DIR}: {e}"))?;
+    /// Reads the outputs of the applied Terraform stack.
+    pub(crate) fn read() -> Result<Self, String> {
+        Self::from_raw(terraform_outputs(TERRAFORM_DIR)?)
+    }
+
+    /// The outputs `raw` holds, each checked.
+    fn from_raw(raw: RawOutputs) -> Result<Self, String> {
         let malformed = |name, why| format!("terraform output `{name}`: {why}");
         Ok(Self {
             registry: RegistryName::from_host(&raw.registry.value)
@@ -61,11 +67,6 @@ impl Outputs {
                 .parse()
                 .map_err(|e| malformed("client_id", e))?,
         })
-    }
-
-    /// Reads the outputs of the applied Terraform stack.
-    pub(crate) fn read() -> Result<Self, String> {
-        Self::parse(&terraform_output(TERRAFORM_DIR)?)
     }
 }
 
@@ -102,41 +103,61 @@ fn delete_argv(registry: &RegistryName, repository: &str) -> Vec<String> {
 }
 
 /// Deletes each repository of `registry` that starts with the sweep's prefix
-/// and that `keep` selects, trying all, and names those that stayed.
+/// and that `to_delete` selects, [`DELETE_PARALLELISM`] at a time, trying all,
+/// and names those that stayed.
 fn delete_where(
     az: &Cli,
     registry: &RegistryName,
-    keep: impl Fn(&str) -> bool,
+    to_delete: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
     let listed = az.run(&list_argv(registry))?;
-    let failures: Vec<String> = with_prefix(&listed)
-        .filter(|repository| keep(repository))
-        .filter_map(|repository| {
-            az.run(&delete_argv(registry, repository))
-                .err()
-                .map(|e| format!("{repository}: {e}"))
-        })
+    let repositories: Vec<&str> = with_prefix(&listed)
+        .filter(|repository| to_delete(repository))
         .collect();
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "failed to delete {} ACR repositories, content left behind: {}",
-            failures.len(),
-            failures.join("; ")
-        ))
-    }
+    let next = AtomicUsize::new(0);
+    let mut failures: Vec<(usize, String)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..DELETE_PARALLELISM.min(repositories.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut failed = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&repository) = repositories.get(at) else {
+                            break failed;
+                        };
+                        if let Err(e) = az.run(&delete_argv(registry, repository)) {
+                            failed.push((at, format!("{repository}: {e}")));
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    failures.sort();
+    let failures: Vec<String> = failures.into_iter().map(|(_, failure)| failure).collect();
+    deleted_all(Kind::Acr, &failures)
 }
 
 /// The repositories one run made, removed when it ends.
 ///
-/// Dropping deletes whatever [`Self::settle`] has not, so a run that fails or
-/// returns early leaves nothing behind. A process that is killed relies on the
-/// next run's sweep of [`crate::bench::provision::REPOSITORY_PREFIX`] instead.
+/// Dropping deletes whatever [`Provisioned::delete`] has not, so a run that
+/// fails or returns early leaves nothing behind. A process that is killed
+/// relies on the next run's sweep of
+/// [`REPOSITORY_PREFIX`](crate::bench::provision::REPOSITORY_PREFIX) instead.
 pub(crate) struct Provisioned {
     az: Cli,
-    /// The run's path prefixes, round 1 first. Deleting empties them.
+    /// The run's path prefixes.
     pub(crate) target: AcrTarget,
+    /// The path prefixes still to delete, round 1 first.
+    pending: Vec<RoundId>,
 }
 
 impl Provisioned {
@@ -153,12 +174,11 @@ impl Provisioned {
             tenant,
             client,
         } = outputs;
-        let prefixes = (1..=rounds.get())
-            .map(|round| repository_id(timestamp, round))
-            .collect::<Result<_, _>>()?;
+        let prefixes = RoundIds::for_run(timestamp, rounds)?;
         delete_where(&az, &registry, |_| true)?;
         Ok(Self {
             az,
+            pending: prefixes.iter().cloned().collect(),
             target: AcrTarget {
                 registry,
                 tenant,
@@ -168,28 +188,15 @@ impl Provisioned {
         })
     }
 
-    /// Deletes the repositories when the run's end is [`RunEnd::Settled`]; when
-    /// it is [`RunEnd::Unknown`], keeps them, since the benchmark may still be
-    /// pushing, and says so.
-    pub(crate) fn settle(&mut self, end: RunEnd) -> Result<(), String> {
-        match end {
-            RunEnd::Settled => self.delete(),
-            RunEnd::Unknown => {
-                let kept = std::mem::take(&mut self.target.prefixes);
-                eprintln!(
-                    "bench-remote: kept the ACR repositories under {} prefixes because the run \
-                     may still be live on the instance; the next `--target acr` run deletes \
-                     them once the instance is free",
-                    kept.len()
-                );
-                Ok(())
-            }
-        }
+    /// Gives up the repositories without deleting them, and returns how many
+    /// prefixes they are below.
+    pub(crate) fn keep(&mut self) -> usize {
+        std::mem::take(&mut self.pending).len()
     }
 
     /// Deletes every repository below this run's prefixes.
-    fn delete(&mut self) -> Result<(), String> {
-        let prefixes: Vec<String> = std::mem::take(&mut self.target.prefixes)
+    pub(crate) fn delete(&mut self) -> Result<(), String> {
+        let prefixes: Vec<String> = std::mem::take(&mut self.pending)
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -197,7 +204,9 @@ impl Provisioned {
             return Ok(());
         }
         delete_where(&self.az, &self.target.registry, |repository| {
-            let first = repository.split('/').next().unwrap_or(repository);
+            let first = repository
+                .split_once('/')
+                .map_or(repository, |(first, _)| first);
             prefixes.iter().any(|prefix| prefix == first)
         })
     }
@@ -212,10 +221,12 @@ impl Drop for Provisioned {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::bench::provision::parse_terraform_outputs;
+    use crate::bench::target::rounds;
 
     const OUTPUTS: &str = r#"{
   "connect": {"sensitive": false, "type": "string", "value": "ssh bench@example.invalid"},
@@ -224,13 +235,17 @@ mod tests {
   "tenant_id": {"sensitive": false, "type": "string", "value": "11111111-2222-3333-4444-555555555555"}
 }"#;
 
+    fn read_outputs(json: &str) -> Result<Outputs, String> {
+        Outputs::from_raw(parse_terraform_outputs(TERRAFORM_DIR, json)?)
+    }
+
     fn registry() -> RegistryName {
         RegistryName::from_host("ocyncbench1a2b3c.azurecr.io").unwrap()
     }
 
     #[test]
     fn terraform_outputs_are_parsed_and_a_bad_one_is_named() {
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
+        let outputs = read_outputs(OUTPUTS).unwrap();
         assert_eq!(outputs.registry, registry());
         assert_eq!(
             outputs.tenant,
@@ -260,7 +275,7 @@ mod tests {
                 "`client_id`",
             ),
         ] {
-            let err = Outputs::parse(json).unwrap_err();
+            let err = read_outputs(json).unwrap_err();
             assert!(err.contains(named), "{name}: {err}");
         }
     }
@@ -330,16 +345,19 @@ mod tests {
         (Cli::new(program), log)
     }
 
-    fn provision(dir: &Path, bad: &str) -> (Provisioned, PathBuf) {
+    /// A run provisioned against [`stub_az`] for three rounds, and the log of
+    /// the calls it made.
+    pub(in crate::bench) fn provision(dir: &Path, bad: &str) -> (Provisioned, PathBuf) {
         let (az, log) = stub_az(dir, bad);
         let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
-        let provisioned =
-            Provisioned::create(az, outputs, &timestamp, "3".parse().unwrap()).unwrap();
+        let outputs = read_outputs(OUTPUTS).unwrap();
+        let provisioned = Provisioned::create(az, outputs, &timestamp, rounds("3")).unwrap();
         (provisioned, log)
     }
 
-    /// The repositories the log shows deleted, in order.
+    /// The repositories the log shows deleted, in order. Deletions run side by
+    /// side, so only the order of the sweep before the run and of the run
+    /// after it is meaningful, not the order within either.
     fn deleted(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log)
             .unwrap()
@@ -357,16 +375,22 @@ mod tests {
         let (mut provisioned, log) = provision(dir.path(), "-r2/bench/b");
         // Catches: a sweep that deletes the bench's own repositories or any
         // other in the registry.
-        assert_eq!(provisioned.target.prefixes.len(), 3, "one prefix per round");
         assert_eq!(
-            deleted(&log),
+            provisioned.target.prefixes.iter().count(),
+            3,
+            "one prefix per round"
+        );
+        let mut swept = deleted(&log);
+        swept.sort();
+        assert_eq!(
+            swept,
             [
                 "ocync-bench-run-old-r1/bench/a",
                 "ocync-bench-run-old-r1/bench/b"
             ]
         );
 
-        let err = provisioned.settle(RunEnd::Settled).unwrap_err();
+        let err = provisioned.delete().unwrap_err();
         assert!(
             err.contains("ocync-bench-run-2026-10-30-120000-r2/bench/b: ")
                 && err.contains("denied"),
@@ -382,8 +406,10 @@ mod tests {
         // the run's: only repositories below the run's own prefixes go, the
         // failure of one did not stop the rest, and the drop deleted nothing
         // twice.
+        let mut removed = deleted(&log)[2..].to_vec();
+        removed.sort();
         assert_eq!(
-            deleted(&log)[2..],
+            removed,
             [
                 "ocync-bench-run-2026-10-30-120000-r1/bench/a",
                 "ocync-bench-run-2026-10-30-120000-r2/bench/a",
@@ -402,25 +428,64 @@ mod tests {
     }
 
     #[test]
-    fn repositories_are_kept_when_the_end_of_the_run_is_unknown() {
-        // Catches: deleting repositories a detached benchmark is still
-        // pushing into, by `settle` or by the drop that follows it.
+    fn deletions_run_side_by_side_within_the_bound_and_every_failure_is_named() {
+        // Catches: deletions one after another, which a registry with the
+        // corpus's repositories takes minutes to clear; more at once than the
+        // bound; and a failure among them lost.
         let dir = tempfile::tempdir().unwrap();
-        let (mut provisioned, log) = provision(dir.path(), "never");
-        let before = std::fs::read_to_string(&log).unwrap().lines().count();
+        let (peak, log) = (dir.path().join("peak"), dir.path().join("calls.log"));
+        let program = dir.path().join("az");
+        let repositories: String = (1..=20)
+            .map(|n| format!("ocync-bench-run-x-r{n}/bench/a\\n"))
+            .collect();
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/bash\n\
+                 case \"$*\" in\n\
+                 *list*) printf '{repositories}' ;;\n\
+                 *delete*) echo \"$*\" >> '{log}'\n\
+                   mkdir '{dir}'/in.$$\n\
+                   ls '{dir}' | grep -c '^in[.]' >> '{peak}'\n\
+                   sleep 0.2\n\
+                   rmdir '{dir}'/in.$$\n\
+                   case \"$*\" in *-r7/*|*-r13/*) echo denied >&2; exit 1 ;; esac ;;\n\
+                 esac\n",
+                log = log.display(),
+                dir = dir.path().display(),
+                peak = peak.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
 
-        assert_eq!(provisioned.settle(RunEnd::Unknown), Ok(()));
-        drop(provisioned);
+        let err = delete_where(&Cli::new(program), &registry(), |_| true).unwrap_err();
 
-        let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.lines().count(), before, "{calls}");
+        assert!(
+            err.starts_with("failed to delete 2 ACR repositories, content left behind: ")
+                && err.contains("ocync-bench-run-x-r7/bench/a: ")
+                && err.contains("ocync-bench-run-x-r13/bench/a: "),
+            "{err}"
+        );
+        assert_eq!(deleted(&log).len(), 20, "all tried despite the failures");
+        let highest = std::fs::read_to_string(&peak)
+            .unwrap()
+            .lines()
+            .map(|n| n.parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!((2..=8).contains(&highest), "{highest} at once");
     }
 
     #[test]
     fn a_sweep_that_cannot_list_fails_the_run_before_it_starts() {
         let err = Provisioned::create(
             Cli::new("/nonexistent/az"),
-            Outputs::parse(OUTPUTS).unwrap(),
+            read_outputs(OUTPUTS).unwrap(),
             &"2026-10-30-120000".parse().unwrap(),
             "3".parse().unwrap(),
         )

@@ -2,15 +2,12 @@
 //! target the instance parses from its environment, and the client that signs
 //! in to it.
 
-use std::fmt;
-use std::str::FromStr;
-
 use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::acr::AcrAuth;
 
 use crate::bench::Rounds;
-use crate::bench::provision::RepositoryId;
-use crate::bench::target::{ENV_REGISTRY, require, round_ids};
+use crate::bench::provision::{RoundIds, id};
+use crate::bench::target::{ENV_REGISTRY, registry_client, require, round_ids};
 
 /// Environment variable holding the path prefixes of the rounds' repositories,
 /// comma-separated, in round order.
@@ -23,30 +20,34 @@ pub(crate) const ENV_CLIENT: &str = "AZURE_CLIENT_ID";
 /// with, which it rereads on every sign-in.
 pub(crate) const ENV_TOKEN_FILE: &str = "AZURE_FEDERATED_TOKEN_FILE";
 
+/// The Entra authority host ocync gets its token from for a `.azurecr.io`
+/// registry.
+pub(crate) const SIGN_IN_HOSTS: &[&str] = &["login.microsoftonline.com"];
+
 /// What follows the registry's name in its host.
 const HOST_SUFFIX: &str = ".azurecr.io";
 
-/// The name of a registry: 5 to 50 lowercase letters and digits.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RegistryName(String);
+/// Whether `name` is 5 to 50 lowercase letters and digits.
+fn is_registry_name(name: &str) -> bool {
+    (5..=50).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+id!(
+    /// The name of a registry.
+    RegistryName,
+    "a registry name (5 to 50 lowercase letters or digits)",
+    is_registry_name
+);
 
 impl RegistryName {
     /// The name a registry host (`<name>.azurecr.io`) carries.
     pub(crate) fn from_host(host: &str) -> Result<Self, String> {
-        let name = host
-            .strip_suffix(HOST_SUFFIX)
-            .ok_or_else(|| format!("{host:?} is not a <name>{HOST_SUFFIX} host"))?;
-        if (5..=50).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        {
-            Ok(Self(name.to_owned()))
-        } else {
-            Err(format!(
-                "{host:?} does not name a registry (5 to 50 lowercase letters or digits)"
-            ))
-        }
+        host.strip_suffix(HOST_SUFFIX)
+            .ok_or_else(|| format!("{host:?} is not a <name>{HOST_SUFFIX} host"))?
+            .parse()
     }
 
     /// The registry's host.
@@ -55,39 +56,22 @@ impl RegistryName {
     }
 }
 
-impl fmt::Display for RegistryName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+/// Whether `s` is a GUID: hexadecimal digits in groups of 8, 4, 4, 4 and 12
+/// divided by hyphens.
+fn is_guid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
-/// A GUID, as Entra writes tenant and application ids: hexadecimal digits in
-/// groups of 8, 4, 4, 4 and 12 divided by hyphens.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Guid(String);
-
-impl FromStr for Guid {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        let shaped = s.len() == 36
-            && s.bytes().enumerate().all(|(i, b)| match i {
-                8 | 13 | 18 | 23 => b == b'-',
-                _ => b.is_ascii_hexdigit(),
-            });
-        if shaped {
-            Ok(Self(s.to_owned()))
-        } else {
-            Err(format!("{s:?} is not a GUID"))
-        }
-    }
-}
-
-impl fmt::Display for Guid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+id!(
+    /// A GUID, as Entra writes tenant and application ids.
+    Guid,
+    "a GUID",
+    is_guid
+);
 
 /// The repositories in an ACR a run syncs into, one path prefix per round.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,27 +84,16 @@ pub(crate) struct AcrTarget {
     pub(crate) client: Guid,
     /// The path prefix of each round's repositories, round 1 first. A first
     /// push creates the repositories below it.
-    pub(crate) prefixes: Vec<RepositoryId>,
+    pub(crate) prefixes: RoundIds,
 }
 
 impl AcrTarget {
-    /// The target prefix of `round` (from 1): the round's own path prefix, then
-    /// the corpus's `prefix` level, so repository names match ECR's below it.
-    pub(crate) fn target_prefix(&self, round: usize, prefix: &str) -> String {
-        let round_prefix = self
-            .prefixes
-            .get(round - 1)
-            .expect("parsing leaves one prefix for every round");
-        format!("{round_prefix}/{prefix}")
-    }
-
     /// The environment that describes this target to the instance. The token
     /// file's path is the instance's own to choose.
     pub(crate) fn env(&self) -> [(&'static str, String); 4] {
-        let ids: Vec<String> = self.prefixes.iter().map(ToString::to_string).collect();
         [
             (ENV_REGISTRY, self.registry.host()),
-            (ENV_PREFIXES, ids.join(",")),
+            (ENV_PREFIXES, self.prefixes.to_string()),
             (ENV_TENANT, self.tenant.to_string()),
             (ENV_CLIENT, self.client.to_string()),
         ]
@@ -148,16 +121,12 @@ impl AcrTarget {
 
 /// A client for `host` signed in the way ocync signs in to ACR.
 pub(crate) async fn client(host: &str) -> Result<RegistryClient, String> {
-    ocync_distribution::install_crypto_provider();
-    let url = reqwest::Url::parse(&format!("https://{host}"))
-        .map_err(|e| format!("registry host {host}: {e}"))?;
-    let auth = AcrAuth::new(&url)
-        .await
-        .map_err(|e| format!("Azure sign-in for {host}: {e}"))?;
-    RegistryClient::builder(url)
-        .auth(auth)
-        .build()
-        .map_err(|e| format!("registry client for {host}: {e}"))
+    registry_client(host, async |url| {
+        AcrAuth::new(url)
+            .await
+            .map_err(|e| format!("Azure sign-in for {host}: {e}"))
+    })
+    .await
 }
 
 /// Environment for an ACR target in tests.
@@ -280,13 +249,13 @@ mod tests {
                 "malformed prefix",
                 with(ENV_PREFIXES, "run-r1,Run_2"),
                 "3",
-                "BENCH_ACR_PREFIXES: \"Run_2\" is not a repository id",
+                "BENCH_ACR_PREFIXES: \"Run_2\" is not a round id",
             ),
             (
                 "fewer prefixes than rounds",
                 FULL_ENV.to_vec(),
                 "5",
-                "BENCH_ACR_PREFIXES names 3 repositories but 5 rounds need one each",
+                "BENCH_ACR_PREFIXES: 3 ids but 5 rounds need one each",
             ),
         ] {
             let err = AcrTarget::parse(&env_of(&pairs), rounds(asked)).unwrap_err();
