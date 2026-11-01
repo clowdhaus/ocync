@@ -197,11 +197,27 @@ resource "aws_iam_policy" "bench" {
         Action   = ["sts:GetServiceBearerToken"]
         Resource = "*"
       },
+      {
+        # The token ocync signs in to Azure with, through the Entra
+        # federated credential in bench/terraform/azure. Entra supports
+        # only RS256 and the audience it documents.
+        Effect   = "Allow"
+        Action   = ["sts:GetWebIdentityToken"]
+        Resource = "*"
+        Condition = {
+          "ForAllValues:StringEquals" = { "sts:IdentityTokenAudience" = "api://AzureADTokenExchange" }
+          StringEquals                = { "sts:SigningAlgorithm" = "RS256" }
+        }
+      },
     ]
   })
 
   tags = module.tags.tags
 }
+
+# Lets this account's principals ask STS for a signed token another cloud
+# trusts. Account-wide: destroying it turns token issuing off for the account.
+resource "aws_iam_outbound_web_identity_federation" "this" {}
 
 ################################################################################
 # EC2 Instance

@@ -7,11 +7,13 @@ use std::fmt;
 
 use aws_sdk_ecr::Client;
 use clap::ValueEnum;
-use ocync_distribution::{Digest, RegistryClient};
+use ocync_distribution::{Digest, RegistryClient, RepositoryName};
 
+use crate::bench::acr::{self, AcrTarget, ENV_TOKEN_FILE};
 use crate::bench::corpus::Corpus;
 use crate::bench::gar::{self, ArtifactRegistryTarget, ENV_CREDENTIALS};
 use crate::bench::lock::{Entry, Lock};
+use crate::bench::provision::RepositoryId;
 use crate::bench::report::ScenarioKind;
 use crate::bench::runner::Tool;
 use crate::bench::{Rounds, Scenario, ecr, value_name};
@@ -26,6 +28,8 @@ pub(crate) enum Kind {
     Ecr,
     /// Google Artifact Registry, in the project `bench/terraform/gcp` names.
     ArtifactRegistry,
+    /// Azure Container Registry, the one `bench/terraform/azure` names.
+    Acr,
 }
 
 impl Kind {
@@ -34,6 +38,16 @@ impl Kind {
         match self {
             Self::Ecr => "ecr",
             Self::ArtifactRegistry => "gar",
+            Self::Acr => "acr",
+        }
+    }
+
+    /// What a message calls this registry.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ecr => "ECR",
+            Self::ArtifactRegistry => "Artifact Registry",
+            Self::Acr => "ACR",
         }
     }
 }
@@ -46,18 +60,22 @@ pub(crate) enum Target {
     Ecr,
     /// Google Artifact Registry, one repository per round.
     ArtifactRegistry(ArtifactRegistryTarget),
+    /// Azure Container Registry, one repository path prefix per round.
+    Acr(AcrTarget),
 }
 
-/// Fails unless a run of `scenario` with `tools` can sync into Artifact
-/// Registry. Shared by the instance and by `bench-remote`, which refuses
-/// before it creates anything.
-pub(crate) fn ensure_artifact_registry_applies(
+/// Fails unless a run of `scenario` with `tools` can sync into `kind`, a
+/// registry whose repositories this machine provisions. Shared by the instance
+/// and by `bench-remote`, which refuses before it creates anything.
+pub(crate) fn ensure_target_applies(
+    kind: Kind,
     scenario: Scenario,
     tools: &[Tool],
 ) -> Result<(), String> {
+    let name = kind.name();
     if !matches!(scenario, Scenario::Sync) {
         return Err(format!(
-            "the {} scenario cannot sync into Artifact Registry yet; only sync can",
+            "the {} scenario cannot sync into {name} yet; only sync can",
             value_name(&scenario)
         ));
     }
@@ -66,23 +84,52 @@ pub(crate) fn ensure_artifact_registry_applies(
         .find(|tool| !matches!(tool, Tool::Ocync | Tool::OcyncBaseline))
     {
         return Err(format!(
-            "{tool} cannot sync into Artifact Registry: its config hardcodes ECR credentials"
+            "{tool} cannot sync into {name}: its config hardcodes ECR credentials"
         ));
     }
     if tools.len() != 1 {
         return Err(format!(
-            "{} tools cannot share one Artifact Registry repository per round; run one tool",
+            "{} tools cannot share one {name} repository per round; run one tool",
             tools.len()
         ));
     }
     Ok(())
 }
 
+/// The value of a variable that must be set and not empty.
+pub(crate) fn require(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<String, String> {
+    env(name)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} is not set"))
+}
+
+/// The ids in the variable `name`, comma-separated in round order, which must
+/// hold one for each of `rounds`.
+pub(crate) fn round_ids(
+    env: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    rounds: Rounds,
+) -> Result<Vec<RepositoryId>, String> {
+    let ids = require(env, name)?
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<RepositoryId>, _>>()
+        .map_err(|e| format!("{name}: {e}"))?;
+    if ids.len() < rounds.get() {
+        return Err(format!(
+            "{name} names {} repositories but {} rounds need one each",
+            ids.len(),
+            rounds.get()
+        ));
+    }
+    Ok(ids)
+}
+
 impl Target {
     /// Reads the `kind` of target from `env`, which an ECR run does not read.
-    /// Refuses a run that Artifact Registry cannot serve before anything is
-    /// built or pulled, a `--regression` run among them: the one stored
-    /// baseline is ECR's.
+    /// Refuses a run that Artifact Registry or ACR cannot serve before
+    /// anything is built or pulled, a `--regression` run among them: the one
+    /// stored baseline is ECR's.
     pub(crate) fn from_env(
         kind: Kind,
         env: &dyn Fn(&str) -> Option<String>,
@@ -93,32 +140,38 @@ impl Target {
     ) -> Result<Self, String> {
         match kind {
             Kind::Ecr => Ok(Self::Ecr),
-            Kind::ArtifactRegistry => {
+            Kind::ArtifactRegistry | Kind::Acr => {
                 if regression {
-                    return Err("--regression cannot run against Artifact Registry: \
-                         the one stored baseline is ECR's"
-                        .to_owned());
+                    return Err(format!(
+                        "--regression cannot run against {}: the one stored baseline is ECR's",
+                        kind.name()
+                    ));
                 }
-                ensure_artifact_registry_applies(scenario, tools)?;
-                gar::require(env, ENV_CREDENTIALS)?;
-                ArtifactRegistryTarget::parse(env, rounds).map(Self::ArtifactRegistry)
+                ensure_target_applies(kind, scenario, tools)?;
+                if kind == Kind::Acr {
+                    require(env, ENV_TOKEN_FILE)?;
+                    AcrTarget::parse(env, rounds).map(Self::Acr)
+                } else {
+                    require(env, ENV_CREDENTIALS)?;
+                    ArtifactRegistryTarget::parse(env, rounds).map(Self::ArtifactRegistry)
+                }
             }
         }
     }
 
     /// `corpus` as `round` (from 1) of the sync scenario syncs it: Artifact
-    /// Registry gives each round a repository of its own, so no round meets
-    /// blobs an earlier one left behind.
+    /// Registry and ACR give each round repositories of its own, so no round
+    /// meets blobs an earlier one left behind.
     pub(crate) fn round_corpus<'a>(&self, corpus: &'a Corpus, round: usize) -> Cow<'a, Corpus> {
-        match self {
-            Self::Ecr => Cow::Borrowed(corpus),
-            Self::ArtifactRegistry(target) => {
-                let mut corpus = corpus.clone();
-                corpus.settings.target_prefix =
-                    target.target_prefix(round, &corpus.settings.target_prefix);
-                Cow::Owned(corpus)
-            }
-        }
+        let prefix = &corpus.settings.target_prefix;
+        let target_prefix = match self {
+            Self::Ecr => return Cow::Borrowed(corpus),
+            Self::ArtifactRegistry(target) => target.target_prefix(round, prefix),
+            Self::Acr(target) => target.target_prefix(round, prefix),
+        };
+        let mut corpus = corpus.clone();
+        corpus.settings.target_prefix = target_prefix;
+        Cow::Owned(corpus)
     }
 }
 
@@ -128,6 +181,9 @@ pub(crate) enum Store {
     Ecr(Client),
     /// Artifact Registry, whose repositories `bench-remote` creates.
     ArtifactRegistry(Box<RegistryClient>),
+    /// ACR, whose repositories the first push creates and `bench-remote`
+    /// deletes.
+    Acr(Box<RegistryClient>),
 }
 
 impl Store {
@@ -141,8 +197,13 @@ impl Store {
             }
             Target::ArtifactRegistry(target) => {
                 let client = gar::client(&target.location.host()).await?;
-                gar::check_sign_in(&client, target).await?;
+                check_sign_in(&client, "Google", &target.target_prefix(1, SIGN_IN_REPO)).await?;
                 Ok(Self::ArtifactRegistry(Box::new(client)))
+            }
+            Target::Acr(target) => {
+                let client = acr::client(&target.registry.host()).await?;
+                check_sign_in(&client, "Azure", &target.target_prefix(1, SIGN_IN_REPO)).await?;
+                Ok(Self::Acr(Box::new(client)))
             }
         }
     }
@@ -159,7 +220,7 @@ pub(crate) struct Destination<'a> {
 impl Destination<'_> {
     /// Leaves the target empty for `corpus`. ECR repositories are deleted and
     /// recreated, since one that exists may hold an aborted run's data;
-    /// Artifact Registry's are new, made for the round.
+    /// Artifact Registry's and ACR's are new, made for the round.
     pub(crate) async fn reset(&self, corpus: &Corpus) -> Result<(), String> {
         if let Store::Ecr(client) = self.store {
             ecr::delete_repos(client, corpus).await?;
@@ -174,7 +235,7 @@ impl Destination<'_> {
     pub(crate) async fn release(&self, corpus: &Corpus) -> Result<(), String> {
         match self.store {
             Store::Ecr(client) => ecr::delete_repos(client, corpus).await,
-            Store::ArtifactRegistry(_) => Ok(()),
+            Store::ArtifactRegistry(_) | Store::Acr(_) => Ok(()),
         }
     }
 
@@ -182,9 +243,81 @@ impl Destination<'_> {
     async fn list(&self, repo: &str, expected: &[(&str, &Entry)]) -> Result<RepoListing, String> {
         match self.store {
             Store::Ecr(client) => ecr::list_repo(client, repo).await,
-            Store::ArtifactRegistry(client) => gar::list_repo(client, repo, expected).await,
+            Store::ArtifactRegistry(client) | Store::Acr(client) => {
+                list_by_head(client, repo, expected).await
+            }
         }
     }
+}
+
+/// A tag no image carries, so a signed-in client is answered "absent".
+const SIGN_IN_PROBE_TAG: &str = "ocync-bench-sign-in-probe";
+
+/// The corpus level under a round's first prefix that the sign-in check asks
+/// in.
+const SIGN_IN_REPO: &str = "sign-in-probe";
+
+/// Sends one authenticated request, so a broken federation or a missing grant
+/// fails before the build and the pre-warm rather than after them. An absent
+/// tag in `repo` answers 404: Artifact Registry's repository exists by now,
+/// and ACR's is made by a first push, so it may not.
+async fn check_sign_in(client: &RegistryClient, cloud: &str, repo: &str) -> Result<(), String> {
+    let name = RepositoryName::new(repo).map_err(|e| format!("{repo}: {e}"))?;
+    client
+        .manifest_head(&name, SIGN_IN_PROBE_TAG)
+        .await
+        .map(drop)
+        .map_err(|e| format!("{cloud} sign-in check against {repo} failed: {e}"))
+}
+
+/// What `repo` holds of the `expected` tags and, for a tag at its locked
+/// digest, of the index children the lock lists. The registry API lists tags
+/// only, so each child is asked for by digest.
+async fn list_by_head(
+    client: &RegistryClient,
+    repo: &str,
+    expected: &[(&str, &Entry)],
+) -> Result<RepoListing, String> {
+    let name = &RepositoryName::new(repo).map_err(|e| format!("{repo}: {e}"))?;
+    let mut listing = RepoListing::default();
+    for (tag, locked) in expected {
+        let head = |reference: String| async move {
+            client
+                .manifest_head(name, &reference)
+                .await
+                .map_err(|e| format!("{repo}: HEAD {reference} failed ({e})"))
+        };
+        let Some(digest) = head((*tag).to_owned()).await? else {
+            continue;
+        };
+        let locked_digest = digest == locked.digest;
+        listing.insert(Some(*tag), digest);
+        if locked_digest {
+            for child in &locked.children {
+                if head(child.to_string()).await?.is_some() {
+                    listing.insert(None, child.clone());
+                }
+            }
+        }
+    }
+    Ok(listing)
+}
+
+/// A lookup over `pairs`, standing in for the process environment.
+#[cfg(test)]
+pub(super) fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    |name| {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    }
+}
+
+/// `n` rounds, as the command line spells them.
+#[cfg(test)]
+pub(super) fn rounds(n: &str) -> Rounds {
+    n.parse().unwrap()
 }
 
 /// What a target repository holds, tagged and untagged.
@@ -350,7 +483,8 @@ pub(crate) async fn verify_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench::gar::{ENV_PROJECT, ENV_REPOSITORIES, env_of, rounds};
+    use crate::bench::acr::{self, ENV_TENANT, FULL_ENV};
+    use crate::bench::gar::{ENV_PROJECT, ENV_REPOSITORIES};
     use crate::bench::lock::fixtures::{digest as d, entry as locked};
 
     fn listing(entries: &[(Option<&str>, char)]) -> RepoListing {
@@ -461,12 +595,24 @@ mod tests {
     }
 
     #[test]
-    fn an_ecr_run_reads_none_of_the_artifact_registry_names() {
-        // Catches: Artifact Registry chosen, or a plain ECR run refused, for
-        // the sake of a variable it does not use.
+    fn each_registry_is_configured_with_the_auth_type_ocync_reads() {
+        // Catches: ocync signing in to a registry the way another one needs.
+        for (kind, auth_type) in [
+            (Kind::Ecr, "ecr"),
+            (Kind::ArtifactRegistry, "gar"),
+            (Kind::Acr, "acr"),
+        ] {
+            assert_eq!(kind.auth_type(), auth_type);
+        }
+    }
+
+    #[test]
+    fn an_ecr_run_reads_none_of_the_artifact_registry_or_acr_names() {
+        // Catches: Artifact Registry or ACR chosen, or a plain ECR run
+        // refused, for the sake of a variable it does not use.
         let target = parse(
             Kind::Ecr,
-            &[(ENV_PROJECT, "Not A Project")],
+            &[(ENV_PROJECT, "Not A Project"), (ENV_TENANT, "contoso")],
             Scenario::All,
             &[Tool::Ocync, Tool::Dregsy],
             "3",
@@ -475,31 +621,30 @@ mod tests {
     }
 
     #[test]
-    fn an_artifact_registry_run_is_refused_by_name_before_anything_is_built() {
-        let without = |name: &str| -> Vec<(&str, &str)> {
-            GAR_ENV
-                .iter()
-                .filter(|(k, _)| *k != name)
-                .copied()
-                .collect()
+    fn a_provisioned_registry_run_is_refused_by_name_before_anything_is_built() {
+        let without = |env: &[(&'static str, &'static str)], name: &str| -> Vec<(&str, &str)> {
+            env.iter().filter(|(k, _)| *k != name).copied().collect()
         };
-        for (name, pairs, scenario, tools, error) in [
+        for (name, kind, pairs, scenario, tools, error) in [
             (
                 "no credentials file",
-                without(ENV_CREDENTIALS),
+                Kind::ArtifactRegistry,
+                without(&GAR_ENV, ENV_CREDENTIALS),
                 Scenario::Sync,
                 vec![Tool::Ocync],
                 "GOOGLE_APPLICATION_CREDENTIALS is not set",
             ),
             (
                 "no project",
-                without(ENV_PROJECT),
+                Kind::ArtifactRegistry,
+                without(&GAR_ENV, ENV_PROJECT),
                 Scenario::Sync,
                 vec![Tool::Ocync],
                 "BENCH_GAR_PROJECT is not set",
             ),
             (
                 "partial scenario",
+                Kind::ArtifactRegistry,
                 GAR_ENV.to_vec(),
                 Scenario::Partial,
                 vec![Tool::Ocync],
@@ -507,6 +652,7 @@ mod tests {
             ),
             (
                 "all scenarios",
+                Kind::ArtifactRegistry,
                 GAR_ENV.to_vec(),
                 Scenario::All,
                 vec![Tool::Ocync],
@@ -514,6 +660,7 @@ mod tests {
             ),
             (
                 "competitor tool",
+                Kind::ArtifactRegistry,
                 GAR_ENV.to_vec(),
                 Scenario::Sync,
                 vec![Tool::Regsync],
@@ -521,6 +668,7 @@ mod tests {
             ),
             (
                 "ocync beside a competitor",
+                Kind::ArtifactRegistry,
                 GAR_ENV.to_vec(),
                 Scenario::Sync,
                 vec![Tool::Ocync, Tool::Dregsy],
@@ -528,13 +676,78 @@ mod tests {
             ),
             (
                 "ocync beside its baseline",
+                Kind::ArtifactRegistry,
                 GAR_ENV.to_vec(),
                 Scenario::Sync,
                 vec![Tool::Ocync, Tool::OcyncBaseline],
                 "2 tools cannot share one Artifact Registry repository per round; run one tool",
             ),
+            (
+                "ACR without a token file",
+                Kind::Acr,
+                without(&FULL_ENV, ENV_TOKEN_FILE),
+                Scenario::Sync,
+                vec![Tool::Ocync],
+                "AZURE_FEDERATED_TOKEN_FILE is not set",
+            ),
+            (
+                "ACR without a tenant",
+                Kind::Acr,
+                without(&FULL_ENV, ENV_TENANT),
+                Scenario::Sync,
+                vec![Tool::Ocync],
+                "AZURE_TENANT_ID is not set",
+            ),
+            (
+                "ACR without a client",
+                Kind::Acr,
+                without(&FULL_ENV, acr::ENV_CLIENT),
+                Scenario::Sync,
+                vec![Tool::Ocync],
+                "AZURE_CLIENT_ID is not set",
+            ),
+            (
+                "ACR without prefixes",
+                Kind::Acr,
+                without(&FULL_ENV, acr::ENV_PREFIXES),
+                Scenario::Sync,
+                vec![Tool::Ocync],
+                "BENCH_ACR_PREFIXES is not set",
+            ),
+            (
+                "ACR with Artifact Registry's variables only",
+                Kind::Acr,
+                GAR_ENV.to_vec(),
+                Scenario::Sync,
+                vec![Tool::Ocync],
+                "AZURE_FEDERATED_TOKEN_FILE is not set",
+            ),
+            (
+                "ACR partial scenario",
+                Kind::Acr,
+                FULL_ENV.to_vec(),
+                Scenario::Partial,
+                vec![Tool::Ocync],
+                "the partial scenario cannot sync into ACR yet; only sync can",
+            ),
+            (
+                "ACR competitor tool",
+                Kind::Acr,
+                FULL_ENV.to_vec(),
+                Scenario::Sync,
+                vec![Tool::Regsync],
+                "regsync cannot sync into ACR: its config hardcodes ECR credentials",
+            ),
+            (
+                "ACR ocync beside its baseline",
+                Kind::Acr,
+                FULL_ENV.to_vec(),
+                Scenario::Sync,
+                vec![Tool::Ocync, Tool::OcyncBaseline],
+                "2 tools cannot share one ACR repository per round; run one tool",
+            ),
         ] {
-            let err = parse(Kind::ArtifactRegistry, &pairs, scenario, &tools, "3").unwrap_err();
+            let err = parse(kind, &pairs, scenario, &tools, "3").unwrap_err();
             assert!(err.contains(error), "{name}: {err}");
         }
         assert!(matches!(
@@ -547,40 +760,52 @@ mod tests {
             ),
             Ok(Target::ArtifactRegistry(_))
         ));
+        assert!(matches!(
+            parse(Kind::Acr, &FULL_ENV, Scenario::Sync, &[Tool::Ocync], "3"),
+            Ok(Target::Acr(_))
+        ));
     }
 
     #[test]
-    fn regression_is_refused_with_artifact_registry_and_still_allowed_with_ecr() {
-        // Catches: a Google run compared with, or saved as, ECR's one baseline.
-        let from_env = |kind, regression| {
+    fn regression_is_refused_with_artifact_registry_and_acr_and_still_allowed_with_ecr() {
+        // Catches: a Google or Azure run compared with, or saved as, ECR's one
+        // baseline.
+        let from_env = |kind, pairs: &[(&str, &str)], regression| {
             Target::from_env(
                 kind,
-                &env_of(&GAR_ENV),
+                &env_of(pairs),
                 Scenario::Sync,
                 &[Tool::Ocync],
                 regression,
                 rounds("3"),
             )
         };
-        let err = from_env(Kind::ArtifactRegistry, true).unwrap_err();
-        assert!(
-            err.starts_with("--regression cannot run against Artifact Registry"),
-            "{err}"
-        );
-        assert_eq!(from_env(Kind::Ecr, true), Ok(Target::Ecr));
+        for (kind, pairs, name) in [
+            (Kind::ArtifactRegistry, &GAR_ENV[..], "Artifact Registry"),
+            (Kind::Acr, &FULL_ENV[..], "ACR"),
+        ] {
+            let err = from_env(kind, pairs, true).unwrap_err();
+            assert_eq!(
+                err,
+                format!("--regression cannot run against {name}: the one stored baseline is ECR's")
+            );
+        }
+        assert_eq!(from_env(Kind::Ecr, &GAR_ENV, true), Ok(Target::Ecr));
     }
 
     #[test]
-    fn round_n_syncs_into_repository_n_and_ecr_keeps_one_corpus() {
-        let corpus: Corpus = serde_yaml::from_str(
-            r#"
-corpus: { target_registry: "europe-west9-docker.pkg.dev", target_prefix: "bench" }
+    fn round_n_syncs_into_the_prefix_of_round_n_and_ecr_keeps_one_corpus() {
+        let corpus = |host: &str| -> Corpus {
+            serde_yaml::from_str(&format!(
+                r#"
+corpus: {{ target_registry: "{host}", target_prefix: "bench" }}
 images:
   - source: "docker.io/library/alpine"
     tags: ["3.20"]
-"#,
-        )
-        .unwrap();
+"#
+            ))
+            .unwrap()
+        };
         let gar = parse(
             Kind::ArtifactRegistry,
             &GAR_ENV,
@@ -589,24 +814,107 @@ images:
             "3",
         )
         .unwrap();
-        for (round, repo) in [(1, "run-r1"), (2, "run-r2"), (3, "run-r3")] {
-            let round_corpus = gar.round_corpus(&corpus, round);
-            assert_eq!(
-                round_corpus.target_repo("docker.io/library/alpine"),
-                format!("example-project/{repo}/bench/library-alpine"),
-                "round {round}"
-            );
-            // The host the proxy and the source-error check compare against
-            // stays bare.
-            assert_eq!(
-                round_corpus.settings.target_registry,
-                "europe-west9-docker.pkg.dev"
-            );
+        let acr = parse(Kind::Acr, &FULL_ENV, Scenario::Sync, &[Tool::Ocync], "3").unwrap();
+        for (target, host, below) in [
+            (&gar, "europe-west9-docker.pkg.dev", "example-project/"),
+            (&acr, "ocyncbench1a2b3c.azurecr.io", ""),
+        ] {
+            let corpus = corpus(host);
+            for round in 1..=3 {
+                let round_corpus = target.round_corpus(&corpus, round);
+                assert_eq!(
+                    round_corpus.target_repo("docker.io/library/alpine"),
+                    format!("{below}run-r{round}/bench/library-alpine"),
+                    "{host} round {round}"
+                );
+                // The host the proxy and the source-error check compare
+                // against stays bare.
+                assert_eq!(round_corpus.settings.target_registry, host);
+            }
         }
-        let ecr = Target::Ecr.round_corpus(&corpus, 2);
+        let one = corpus("x.example");
+        let ecr = Target::Ecr.round_corpus(&one, 2);
         assert_eq!(
             ecr.target_repo("docker.io/library/alpine"),
             "bench/library-alpine"
         );
+    }
+
+    /// Answers one request with `status`, and returns the request line it saw.
+    fn serve_once(status: &str) -> (reqwest::Url, std::thread::JoinHandle<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let status = status.to_owned();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            request_line
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn the_sign_in_check_is_one_head_in_the_first_round_and_a_refusal_fails_it() {
+        // Catches: a broken federation or a missing grant surfacing only after
+        // the build, a check that sends nothing or the wrong request, and a
+        // check made in a later round's repository.
+        let gar = parse(
+            Kind::ArtifactRegistry,
+            &GAR_ENV,
+            Scenario::Sync,
+            &[Tool::Ocync],
+            "3",
+        )
+        .unwrap();
+        let acr = parse(Kind::Acr, &FULL_ENV, Scenario::Sync, &[Tool::Ocync], "3").unwrap();
+        let first_round = |target: &Target| match target {
+            Target::ArtifactRegistry(t) => t.target_prefix(1, SIGN_IN_REPO),
+            Target::Acr(t) => t.target_prefix(1, SIGN_IN_REPO),
+            Target::Ecr => unreachable!("ECR has no sign-in check"),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let check = |target: &Target, cloud: &str, status: &str| {
+            let (url, seen) = serve_once(status);
+            let client = RegistryClient::builder(url).build().unwrap();
+            let result = runtime.block_on(check_sign_in(&client, cloud, &first_round(target)));
+            (result, seen.join().unwrap())
+        };
+
+        for (target, cloud, head) in [
+            (
+                &gar,
+                "Google",
+                "HEAD /v2/example-project/run-r1/sign-in-probe/manifests/ocync-bench-sign-in-probe HTTP/1.1\r\n",
+            ),
+            (
+                &acr,
+                "Azure",
+                "HEAD /v2/run-r1/sign-in-probe/manifests/ocync-bench-sign-in-probe HTTP/1.1\r\n",
+            ),
+        ] {
+            let (result, request) = check(target, cloud, "404 Not Found");
+            assert_eq!(result, Ok(()), "{cloud}");
+            assert_eq!(request, head, "{cloud}");
+            let (result, _) = check(target, cloud, "403 Forbidden");
+            let err = result.unwrap_err();
+            assert!(
+                err.starts_with(&format!("{cloud} sign-in check against ")),
+                "{err}"
+            );
+        }
     }
 }

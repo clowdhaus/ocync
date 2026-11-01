@@ -1,18 +1,14 @@
 //! Google Artifact Registry as a benchmark target: the ids that name it, the
-//! target the instance parses from its environment, and listing a repository
-//! by manifest HEADs.
-
-use std::fmt;
-use std::ops::RangeInclusive;
-use std::str::FromStr;
+//! target the instance parses from its environment, and the client that signs
+//! in to it.
 
 use ocync_distribution::auth::gcp::{GcpAuth, Residency, SharedGoogleToken};
-use ocync_distribution::{AwsCredentialProviders, RegistryClient, RepositoryName};
+use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 
 use crate::bench::Rounds;
-use crate::bench::lock::Entry;
+use crate::bench::provision::{RepositoryId, id};
 use crate::bench::registry::http_client;
-use crate::bench::target::{ENV_REGISTRY, RepoListing};
+use crate::bench::target::{ENV_REGISTRY, require, round_ids};
 
 /// Environment variable holding the project the repositories are in.
 pub(crate) const ENV_PROJECT: &str = "BENCH_GAR_PROJECT";
@@ -25,50 +21,6 @@ pub(crate) const ENV_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 /// What follows the location in an Artifact Registry host.
 const HOST_SUFFIX: &str = "-docker.pkg.dev";
 
-/// Whether `s` is a lowercase letter, then lowercase letters, digits and
-/// hyphens, ending in a letter or digit, within `len` characters.
-fn is_lowercase_id(s: &str, len: RangeInclusive<usize>) -> bool {
-    let mut chars = s.chars();
-    len.contains(&s.len())
-        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !s.ends_with('-')
-}
-
-/// Declares a string newtype that is parsed against a rule and read back as
-/// text.
-macro_rules! id {
-    ($(#[$doc:meta])* $name:ident, $what:literal, $len:expr) => {
-        $(#[$doc])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub(crate) struct $name(String);
-
-        impl FromStr for $name {
-            type Err = String;
-
-            fn from_str(s: &str) -> Result<Self, String> {
-                if is_lowercase_id(s, $len) {
-                    Ok(Self(s.to_owned()))
-                } else {
-                    Err(format!("{s:?} is not {}", $what))
-                }
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-    };
-}
-
-id!(
-    /// An Artifact Registry repository id.
-    RepositoryId,
-    "a repository id (a lowercase letter, then lowercase letters, digits or hyphens, ending in a letter or digit, at most 63)",
-    1..=63
-);
 id!(
     /// A Google Cloud project id.
     Project,
@@ -136,31 +88,13 @@ impl ArtifactRegistryTarget {
     ) -> Result<Self, String> {
         let location = Location::from_host(&require(env, ENV_REGISTRY)?)?;
         let project = require(env, ENV_PROJECT)?.parse()?;
-        let repositories = require(env, ENV_REPOSITORIES)?
-            .split(',')
-            .map(str::parse)
-            .collect::<Result<Vec<RepositoryId>, _>>()
-            .map_err(|e| format!("{ENV_REPOSITORIES}: {e}"))?;
-        if repositories.len() < rounds.get() {
-            return Err(format!(
-                "{ENV_REPOSITORIES} names {} repositories but {} rounds need one each",
-                repositories.len(),
-                rounds.get()
-            ));
-        }
+        let repositories = round_ids(env, ENV_REPOSITORIES, rounds)?;
         Ok(Self {
             location,
             project,
             repositories,
         })
     }
-}
-
-/// The value of a variable that must be set and not empty.
-pub(crate) fn require(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<String, String> {
-    env(name)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{name} is not set"))
 }
 
 /// A client for `host` signed in the way ocync signs in to Artifact Registry.
@@ -182,78 +116,10 @@ pub(crate) async fn client(host: &str) -> Result<RegistryClient, String> {
         .map_err(|e| format!("registry client for {host}: {e}"))
 }
 
-/// A tag no image carries, so a signed-in client is answered "absent".
-const SIGN_IN_PROBE_TAG: &str = "ocync-bench-sign-in-probe";
-
-/// Sends one authenticated request, so a broken federation file or a missing
-/// grant fails before the build and the pre-warm rather than after them. The
-/// first repository exists by now, and an absent tag in it answers 404.
-pub(crate) async fn check_sign_in(
-    client: &RegistryClient,
-    target: &ArtifactRegistryTarget,
-) -> Result<(), String> {
-    let repo = target.target_prefix(1, "sign-in-probe");
-    let name = RepositoryName::new(&repo).map_err(|e| format!("{repo}: {e}"))?;
-    client
-        .manifest_head(&name, SIGN_IN_PROBE_TAG)
-        .await
-        .map(drop)
-        .map_err(|e| format!("Google sign-in check against {repo} failed: {e}"))
-}
-
-/// What `repo` holds of the `expected` tags and, for a tag at its locked
-/// digest, of the index children the lock lists. Artifact Registry has no
-/// listing that names untagged images, so each is asked for by digest.
-pub(crate) async fn list_repo(
-    client: &RegistryClient,
-    repo: &str,
-    expected: &[(&str, &Entry)],
-) -> Result<RepoListing, String> {
-    let name = &RepositoryName::new(repo).map_err(|e| format!("{repo}: {e}"))?;
-    let mut listing = RepoListing::default();
-    for (tag, locked) in expected {
-        let head = |reference: String| async move {
-            client
-                .manifest_head(name, &reference)
-                .await
-                .map_err(|e| format!("{repo}: HEAD {reference} failed ({e})"))
-        };
-        let Some(digest) = head((*tag).to_owned()).await? else {
-            continue;
-        };
-        let locked_digest = digest == locked.digest;
-        listing.insert(Some(*tag), digest);
-        if locked_digest {
-            for child in &locked.children {
-                if head(child.to_string()).await?.is_some() {
-                    listing.insert(None, child.clone());
-                }
-            }
-        }
-    }
-    Ok(listing)
-}
-
-/// A lookup over `pairs`, standing in for the process environment.
-#[cfg(test)]
-pub(super) fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-    |name| {
-        pairs
-            .iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| (*value).to_owned())
-    }
-}
-
-/// `n` rounds, as the command line spells them.
-#[cfg(test)]
-pub(super) fn rounds(n: &str) -> Rounds {
-    n.parse().unwrap()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::target::{env_of, rounds};
 
     const FULL: [(&str, &str); 3] = [
         (ENV_REGISTRY, "europe-west9-docker.pkg.dev"),
@@ -262,22 +128,8 @@ mod tests {
     ];
 
     #[test]
-    fn ids_are_parsed_against_their_rules() {
+    fn project_and_location_ids_are_parsed_against_their_rules() {
         // Catches: an id that would reach gcloud or a URL unchecked.
-        let long = format!("a{}", "b".repeat(63));
-        for (id, ok) in [
-            ("ocync-bench-run-2026-10-30-120000-r1", true),
-            ("a", true),
-            ("1abc", false),
-            ("Abc", false),
-            ("a_b", false),
-            ("run-", false),
-            ("", false),
-            (long.as_str(), false),
-            (&long[..63], true),
-        ] {
-            assert_eq!(id.parse::<RepositoryId>().is_ok(), ok, "{id:?}");
-        }
         assert!("example-project".parse::<Project>().is_ok());
         assert!("short".parse::<Project>().is_err(), "under 6 characters");
         assert!(
@@ -292,56 +144,6 @@ mod tests {
         );
         assert!(Location::from_host("123.dkr.ecr.us-east-1.amazonaws.com").is_err());
         assert!(Location::from_host("-docker.pkg.dev").is_err());
-    }
-
-    /// Answers one request with `status`, and returns the request line it saw.
-    fn serve_once(status: &str) -> (reqwest::Url, std::thread::JoinHandle<String>) {
-        use std::io::{BufRead, BufReader, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        let status = status.to_owned();
-        let seen = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request_line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut request_line)
-                .unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            request_line
-        });
-        (url, seen)
-    }
-
-    #[test]
-    fn the_sign_in_check_is_one_head_in_the_first_repository_and_a_refusal_fails_it() {
-        // Catches: a broken federation file or a missing grant surfacing only
-        // after the build, and a check that sends nothing or the wrong request.
-        let target = ArtifactRegistryTarget::parse(&env_of(&FULL), rounds("3")).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let check = |status: &str| {
-            let (url, seen) = serve_once(status);
-            let client = RegistryClient::builder(url).build().unwrap();
-            let result = runtime.block_on(check_sign_in(&client, &target));
-            (result, seen.join().unwrap())
-        };
-
-        let (result, request) = check("404 Not Found");
-        assert_eq!(result, Ok(()));
-        assert_eq!(
-            request,
-            "HEAD /v2/example-project/run-r1/sign-in-probe/manifests/ocync-bench-sign-in-probe HTTP/1.1\r\n"
-        );
-        let (result, _) = check("403 Forbidden");
-        assert!(result.unwrap_err().contains("sign-in check"), "refused");
     }
 
     #[test]

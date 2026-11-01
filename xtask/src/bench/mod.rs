@@ -1,11 +1,14 @@
 //! Benchmark suite for comparing ocync against dregsy and regsync.
 
+pub(crate) mod acr;
+pub(crate) mod az;
 pub(crate) mod config_gen;
 pub(crate) mod corpus;
 pub(crate) mod ecr;
 pub(crate) mod gar;
 pub(crate) mod gcloud;
 pub(crate) mod lock;
+pub(crate) mod provision;
 pub(crate) mod proxy;
 pub(crate) mod registry;
 pub(crate) mod regression;
@@ -196,9 +199,9 @@ pub(crate) struct BenchArgs {
     #[command(flatten)]
     pub(crate) paths: corpus::CorpusPaths,
 
-    /// Registry the run syncs into. Artifact Registry reads its project,
-    /// repositories and credentials from the environment, as `bench-remote`
-    /// sets them.
+    /// Registry the run syncs into. Artifact Registry and ACR read their
+    /// registry, repositories or prefixes, and credentials from the
+    /// environment, as `bench-remote` sets them.
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: target::Kind,
 
@@ -875,7 +878,7 @@ fn deferred_output(
     };
     let page = match target {
         Target::Ecr => report::PageBlocks::of(report),
-        Target::ArtifactRegistry(_) => report::PageBlocks::default(),
+        Target::ArtifactRegistry(_) | Target::Acr(_) => report::PageBlocks::default(),
     };
     report::Deferred::new(
         RegistryKind::of(target_registry).archive_stem(),
@@ -2392,15 +2395,18 @@ mod tests {
     }
 
     #[test]
-    fn a_google_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+    fn a_google_or_azure_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+        use crate::bench::acr::{AcrTarget, FULL_ENV};
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::report::tests::sample_report;
+        use crate::bench::target::{env_of, rounds};
 
         let google = Target::ArtifactRegistry(ArtifactRegistryTarget {
             location: "europe-west9".parse().unwrap(),
             project: "example-project".parse().unwrap(),
             repositories: vec!["run-r1".parse().unwrap(), "run-r2".parse().unwrap()],
         });
+        let azure = Target::Acr(AcrTarget::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
         let report = sample_report();
         let output = |target: &Target, host: &str| {
             let deferred = deferred_output(target, host, &report, "abc1234".into(), None);
@@ -2411,22 +2417,36 @@ mod tests {
             )
         };
 
-        let (gar, text) = output(&google, "europe-west9-docker.pkg.dev");
-        // Catches: the target registry's cloud written as the machine's.
-        assert_eq!(gar["record"]["machine"]["provider"], "aws");
-        assert_eq!(gar["archive_key"], "gcr");
-        // Catches: a Google run rewriting the ECR comparison page.
-        assert_eq!(gar["page"], serde_json::json!({"cold": null, "warm": null}));
-        // Catches: the project, the repositories or the host reaching a file
-        // that is tracked in git.
-        for name in [
-            "example-project",
-            "run-r1",
-            "run-r2",
-            "europe-west9",
-            "pkg.dev",
+        for (target, host, key, names) in [
+            (
+                &google,
+                "europe-west9-docker.pkg.dev",
+                "gcr",
+                // Catches: the project, the repositories or the host reaching
+                // a file that is tracked in git.
+                ["example-project", "run-r1", "europe-west9", "pkg.dev"],
+            ),
+            (
+                &azure,
+                "ocyncbench1a2b3c.azurecr.io",
+                "acr",
+                // Catches: the registry, the prefixes or the Entra ids
+                // reaching a file that is tracked in git.
+                ["ocyncbench1a2b3c", "run-r1", "11111111-2222", "azurecr.io"],
+            ),
         ] {
-            assert!(!text.contains(name), "{name} in {text}");
+            let (record, text) = output(target, host);
+            // Catches: the target registry's cloud written as the machine's.
+            assert_eq!(record["record"]["machine"]["provider"], "aws", "{key}");
+            assert_eq!(record["archive_key"], key);
+            // Catches: a non-ECR run rewriting the ECR comparison page.
+            assert_eq!(
+                record["page"],
+                serde_json::json!({"cold": null, "warm": null})
+            );
+            for name in names {
+                assert!(!text.contains(name), "{name} in {text}");
+            }
         }
 
         let (ecr, _) = output(&Target::Ecr, "111111111111.dkr.ecr.us-east-1.amazonaws.com");

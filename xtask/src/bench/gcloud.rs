@@ -6,28 +6,19 @@
 //! gets a repository of its own, which the bench service account can write to
 //! but not create. The instance only pushes.
 
-use std::ffi::OsString;
-use std::fs::{File, TryLockError};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::bench::gar::{ArtifactRegistryTarget, Location, Project, RepositoryId};
-use crate::bench::{Rounds, RunTimestamp, captured};
-
-/// What every repository this tool makes is named from. A run removes the
-/// repositories with this prefix that an earlier run left, and touches no
-/// other.
-const REPOSITORY_PREFIX: &str = "ocync-bench-run-";
+use crate::bench::gar::{ArtifactRegistryTarget, Location, Project};
+use crate::bench::provision::{
+    Cli, Output, RepositoryId, RunEnd, repository_id, terraform_output, with_prefix,
+};
+use crate::bench::{Rounds, RunTimestamp};
 
 /// What `gcloud` prints, among its error, when the repository it was asked to
 /// delete is not there.
 const ALREADY_GONE: &str = "NOT_FOUND";
-
-/// File in the temp directory whose lock serializes Artifact Registry runs on
-/// this machine.
-const LOCAL_LOCK: &str = "ocync-bench-gar.lock";
 
 /// Role that lets the bench service account push.
 const WRITER_ROLE: &str = "roles/artifactregistry.writer";
@@ -55,12 +46,6 @@ impl TryFrom<String> for ServiceAccount {
             _ => Err(format!("{email:?} is not an email address")),
         }
     }
-}
-
-/// One Terraform output, as `terraform output -json` writes it.
-#[derive(Deserialize)]
-struct Output<T> {
-    value: T,
 }
 
 /// The outputs of `bench/terraform/gcp` the run reads.
@@ -113,62 +98,7 @@ impl Outputs {
 
     /// Reads the outputs of the applied Terraform stack.
     pub(crate) fn read() -> Result<Self, String> {
-        let json = captured(Command::new("terraform").args([
-            &format!("-chdir={TERRAFORM_DIR}"),
-            "output",
-            "-json",
-        ]))
-        .map_err(|e| {
-            format!("terraform output -json failed: {e}. Did you run `terraform apply` in {TERRAFORM_DIR}?")
-        })?;
-        Self::parse(&json)
-    }
-}
-
-/// Takes the lock that keeps a second Artifact Registry run on this machine out
-/// until the returned file is dropped. The sweep of one run would delete the
-/// repositories of the other, which may still be provisioning or fetching with
-/// no run on the instance for the instance probe to see.
-pub(crate) fn lock_local_run() -> Result<File, String> {
-    lock_at(&std::env::temp_dir().join(LOCAL_LOCK))
-}
-
-/// Takes an exclusive lock on the file at `path`, which is made if absent.
-fn lock_at(path: &Path) -> Result<File, String> {
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(format!(
-            "another Artifact Registry bench-remote run is going on this machine ({}): \
-             this one would sweep its repositories",
-            path.display()
-        )),
-        Err(TryLockError::Error(e)) => Err(format!("lock {}: {e}", path.display())),
-    }
-}
-
-/// The program that talks to Google Cloud.
-pub(crate) struct Gcloud(OsString);
-
-impl Gcloud {
-    /// The `gcloud` on `PATH`.
-    pub(crate) fn installed() -> Self {
-        Self("gcloud".into())
-    }
-
-    fn run(&self, argv: &[String]) -> Result<String, String> {
-        captured(Command::new(&self.0).args(argv)).map_err(|e| {
-            format!(
-                "{} {} failed: {e}",
-                self.0.to_string_lossy(),
-                argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ")
-            )
-        })
+        Self::parse(&terraform_output(TERRAFORM_DIR)?)
     }
 }
 
@@ -235,38 +165,21 @@ fn delete_argv(target: &ArtifactRegistryTarget, id: &RepositoryId) -> Vec<String
     repositories_argv("delete", Some(id), &[], target)
 }
 
-/// The id of round `round`'s repository in the run that started at `timestamp`.
-fn repository_id(timestamp: &RunTimestamp, round: usize) -> Result<RepositoryId, String> {
-    format!("{REPOSITORY_PREFIX}{timestamp}-r{round}").parse()
-}
-
 /// The repositories in a `list` answer that an earlier run made: those whose
-/// id starts with [`REPOSITORY_PREFIX`].
+/// id starts with [`REPOSITORY_PREFIX`](crate::bench::provision::REPOSITORY_PREFIX).
 fn leftovers(listed: &str) -> Vec<RepositoryId> {
-    listed
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with(REPOSITORY_PREFIX))
+    with_prefix(listed)
         .filter_map(|line| line.parse().ok())
         .collect()
-}
-
-/// Whether the instance's run is known to have ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RunEnd {
-    /// The script's own exit was read, or the run never reached the instance.
-    Settled,
-    /// The connection dropped, so the detached benchmark may still be pushing.
-    Unknown,
 }
 
 /// The repositories one run made, removed when it ends.
 ///
 /// Dropping deletes whatever [`Self::settle`] has not, so a run that fails or
 /// returns early leaves nothing behind. A process that is killed relies on the
-/// next run's sweep of [`REPOSITORY_PREFIX`] instead.
+/// next run's sweep of [`REPOSITORY_PREFIX`](crate::bench::provision::REPOSITORY_PREFIX) instead.
 pub(crate) struct Provisioned {
-    gcloud: Gcloud,
+    gcloud: Cli,
     /// The repositories made so far, round 1 first. Deleting empties it.
     pub(crate) target: ArtifactRegistryTarget,
     service_account: ServiceAccount,
@@ -279,7 +192,7 @@ impl Provisioned {
     /// lets the bench service account push to each. All exist before the
     /// instance is reached, so the grants have time to take effect.
     pub(crate) fn create(
-        gcloud: Gcloud,
+        gcloud: Cli,
         outputs: Outputs,
         timestamp: &RunTimestamp,
         rounds: Rounds,
@@ -370,6 +283,8 @@ impl Drop for Provisioned {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const OUTPUTS: &str = r#"{
@@ -489,12 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_round_names_its_repository_from_the_run_start_and_the_sweep_keeps_to_that_prefix() {
-        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        assert_eq!(
-            repository_id(&timestamp, 3).unwrap(),
-            id("ocync-bench-run-2026-10-30-120000-r3")
-        );
+    fn the_sweep_keeps_to_the_prefix() {
         // Catches: a sweep that deletes the bench's own repositories or any
         // other that happens to be in the project.
         let listed = "ocync-bench\nocync-bench-mirror\nocync-bench-run-2026-10-29-090000-r1\n\
@@ -511,7 +421,7 @@ mod tests {
     /// A `gcloud` that logs its argv to `log`, fails a `delete` of `bad`, and
     /// answers a `delete` of a repository named `gone` as Google does when it
     /// is already deleted.
-    fn stub_gcloud(dir: &Path, bad: &str) -> (Gcloud, PathBuf) {
+    fn stub_gcloud(dir: &Path, bad: &str) -> (Cli, PathBuf) {
         let log = dir.join("calls.log");
         let program = dir.join("gcloud");
         std::fs::write(
@@ -532,7 +442,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        (Gcloud(program.into()), log)
+        (Cli::new(program), log)
     }
 
     #[test]
@@ -603,19 +513,5 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(calls.lines().count(), before, "{calls}");
-    }
-
-    #[test]
-    fn a_second_local_run_is_refused_until_the_first_ends() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run.lock");
-        let first = lock_at(&path).unwrap();
-        let err = lock_at(&path).unwrap_err();
-        assert!(
-            err.contains("another Artifact Registry bench-remote run"),
-            "{err}"
-        );
-        drop(first);
-        assert!(lock_at(&path).is_ok(), "released with the first run");
     }
 }

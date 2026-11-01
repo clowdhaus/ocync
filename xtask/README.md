@@ -31,6 +31,7 @@ A run already in progress on the instance, including one still checking out or b
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
+| `--target` | `ecr`, `artifact-registry`, `acr` | `ecr` | Registry the instance syncs into. `artifact-registry` needs `bench/terraform/gcp` applied and `gcloud` signed in on this machine; `acr` needs `bench/terraform/azure` applied (and the AWS stack's token issuer) and `az` signed in on this machine. Both run the `sync` scenario with one ocync tool, and refuse `--regression`. Each round syncs into repositories of its own, which `bench-remote` deletes when the run ends: Artifact Registry's are made first with `gcloud`, ACR's are created by the first push, under `ocync-bench-run-<run timestamp>-r<round>/`, and deleted with `az`. The instance signs in to ACR as the Entra app through a token from `aws sts get-web-identity-token`, refreshed every 30 minutes |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
 | `--tools` | string | `ocync` | Tools to benchmark |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios (see [Rounds](#rounds-and-the-baseline-build)) |
