@@ -96,7 +96,7 @@ Multiple images in a sync run often share base layers. If all images push indepe
 
 ### Progressive promotion
 
-Followers cannot mount from a leader until the leader's manifest is committed. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are repos with committed manifests, then repos known to hold the blob only from an earlier run, which are offered without waiting because nothing in this run commits them. See [progressive promotion in the engine doc](/design/engine#progressive-promotion) for details.
+Followers cannot mount a blob from a leader until a manifest of the leader that references it is committed, which for a blob only a referrer artifact references is the artifact's manifest. All tasks are promoted simultaneously after discovery, with leaders ordered first so they acquire semaphore permits and claim blob uploads before followers. Followers that need a blob still in-flight wait on per-blob `Notify` handles via `ClaimAction::Wait`. Mount sources are repos where a committed manifest references the blob, then repos known to hold the blob only from an earlier run, which are offered without waiting because nothing in this run commits them. See [progressive promotion in the engine doc](/design/engine#progressive-promotion) for details.
 
 ### ECR BLOB_MOUNTING
 

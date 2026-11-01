@@ -126,9 +126,9 @@ fn round_trip_mount_source_survives() {
     cache.persist(&path).unwrap();
 
     let mut loaded = TransferStateCache::load(&path, long_ttl());
-    // Committed repos are runtime-only: a loaded `Verified` entry is offered
-    // as a mount source only once its repo is committed.
-    loaded.mark_repo_committed(&target_id("reg.io"), &repo("repo/a"));
+    // Commits are runtime-only: a loaded `Verified` entry is offered as a
+    // mount source only once a manifest referencing the blob is committed.
+    loaded.confirm_blobs(&target_id("reg.io"), &repo("repo/a"), [&digest_a()]);
     assert_eq!(
         loaded
             .mount_sources(&target_id("reg.io"), &digest_a(), &repo("repo/b"))

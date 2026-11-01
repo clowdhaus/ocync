@@ -983,7 +983,7 @@ async fn sync_image_with_more_layers_than_blob_concurrency_limit() {
 }
 
 /// The leader's manifest push succeeds instantly, while the follower's config
-/// pull is delayed. The leader calls `mark_repo_committed` before the follower
+/// pull is delayed. The leader commits its manifest before the follower
 /// ever calls `unresolved_watches_for` (fire-before-subscribe).
 ///
 /// Without `send_replace` (plain `send`), the leader's signal would be lost
@@ -1284,7 +1284,7 @@ async fn sync_cross_image_blob_claim_no_deadlock() {
     assert_all_synced(&report, 2, "both images should sync (no deadlock)");
 }
 
-/// Pre-warm the cache with committed repos so the follower's mount-source
+/// Pre-warm the cache with committed blobs so the follower's mount-source
 /// lookup returns a Tier 1 match (committed + preferred). The follower should
 /// mount immediately without waiting on the watch channel, exercising the
 /// `Some(repo) if is_committed` branch (not the watch-wait branch).
@@ -1325,9 +1325,11 @@ async fn sync_prewarmed_committed_repo_skips_watch_wait() {
         &repo("tgt-a"),
         &[&parts_a.layer_descs[0].digest],
     );
-    cache
-        .borrow_mut()
-        .mark_repo_committed(&target_auth, &repo("tgt-a"));
+    cache.borrow_mut().confirm_blobs(
+        &target_auth,
+        &repo("tgt-a"),
+        [&parts_a.layer_descs[0].digest],
+    );
 
     let mapping = resolved_mapping(
         mock_client(&source_server),
@@ -2223,7 +2225,11 @@ async fn resolver_retries_mount_after_source_marked_stale() {
     );
     {
         let mut c = cache.borrow_mut();
-        c.mark_repo_committed(&mock_target_id("target", &target_server), &repo("tgt-a"));
+        c.confirm_blobs(
+            &mock_target_id("target", &target_server),
+            &repo("tgt-a"),
+            [layer],
+        );
         c.mark_blob_repo_stale(
             &mock_target_id("target", &target_server),
             layer,

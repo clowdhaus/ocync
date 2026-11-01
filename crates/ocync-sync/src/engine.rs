@@ -1652,15 +1652,14 @@ async fn execute_item(
     let outcome = outcome.into_inner();
     match pushed {
         Ok(()) => {
-            // The repo now has a committed manifest, so it is a valid
-            // cross-repo mount source.
-            cache
-                .borrow_mut()
-                .mark_repo_committed(item.target_entry.id(), &item.target.repo);
-
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
                 Err(err) => {
+                    // The artifacts' manifests will not commit, so followers
+                    // waiting on their blobs stop waiting.
+                    cache
+                        .borrow_mut()
+                        .notify_repo_failed(item.target_entry.id(), &item.target.repo);
                     let (kind, retries) = if err.is_required_artifacts_missing() {
                         (ErrorKind::RequiredArtifactsMissing, 0)
                     } else {
@@ -2722,7 +2721,7 @@ async fn push_manifest(
     );
     // A blob still recorded present is skipped from the cache, so only the
     // lost ones cost a request.
-    let repair = transfer_image_blobs(ctx, blobs, &HashMap::new()).await;
+    let repair = transfer_image_blobs(ctx, blobs.clone(), &HashMap::new()).await;
     if let Some(outcome) = outcome {
         outcome.borrow_mut().absorb_repair(&repair);
     }
@@ -2730,10 +2729,14 @@ async fn push_manifest(
         return Err(err);
     }
     // No commit wait here: a batch check settles every earlier run's entry
-    // before the push, so only a target without one reaches the repair. The
-    // blobs copied again are recorded present, so this push has nothing left
-    // to settle, and a second refusal is returned as is.
-    put_manifest(ctx, reference, manifest).await
+    // before the push, so only a target without one reaches the repair. A
+    // second refusal is returned as is, but a commit is recorded, so waiters
+    // on these blobs are released.
+    let repushed = put_manifest(ctx, reference, manifest).await;
+    if repushed.is_ok() {
+        settle_blobs(ctx, &blobs, &repushed);
+    }
+    repushed
 }
 
 /// Push `manifest` to the task's target repo as `reference`, retrying
