@@ -86,8 +86,8 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 `bench/corpus.lock.json` pins every (source, tag) the benchmark syncs to its manifest digest and the blob digests it holds, so runs on different dates sync the same content. It is tracked in git, sits beside the corpus it locks, and is written only by `cargo xtask bench-lock`. A prepare-only run reads no lock.
 
 - **`cargo xtask bench-lock`** resolves every ref in the corpus and the partial overrides and writes the lock. A ref that cannot be resolved fails the command and is named. Over unchanged sources it leaves the file, and its `locked_at`, untouched. It needs the network and Docker Hub credentials (anonymous works for a small corpus), and writes nothing to a cloud.
-- **A moved source is refused.** `bench` re-resolves each ref it will sync before the build, and again before every later scenario and round except prepare. A digest that differs, a ref missing from the lock, or a tag the registry no longer has (404, 403, or 401 after a new token) aborts the start of the run and stops the scenarios still to run. A ref that cannot be reached after retries aborts the start of the run too, naming `--skip-registries`, but only warns between scenarios, since the post-pass digest check still guards the content. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
-- **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and its sources have since moved, the error says so.
+- **Every tool syncs the locked digest under the corpus tag**, so a moved source tag changes nothing. Before the build, `bench` checks once that each locked digest is still served (one HEAD per distinct digest). A ref missing from the lock stops the run before any request; a digest answered 404, 403 or 401 stops it naming every tag that shares it; a source that cannot be reached after retries stops it naming `--skip-registries`. Re-lock with `cargo xtask bench-lock`; a new lock starts a new comparison series.
+- **Any scenario failure keeps the finished scenarios.** They are still written to the summary and appended to the archive, and the run exits non-zero with every message. When a scenario fails and a locked digest is no longer served, the error says so.
 - **`corpus_locked_at`** in each run record is the lock's `locked_at`. Records under different values are different series. `--regression` refuses a baseline recorded under another lock, under none, or over another corpus size; delete `bench/results/baseline.json` to record a new one.
 - A floating tag stays in the corpus only where the source publishes no more specific tag for the same content, or, as with alpine, where the corpus comment says the shared index is what it measures.
 
@@ -95,7 +95,7 @@ Two of those exemptions are explicit in the harness rather than automatic, and b
 
 The harness enforces these automatically -- do not bypass them.
 
-**Before the build, and again before every later scenario and round except prepare:** every source ref the scenario syncs still resolves to its locked digest (see [The corpus lock](#the-corpus-lock)).
+**Before the build, except prepare:** every locked digest the run syncs is still served by its source (see [The corpus lock](#the-corpus-lock)).
 
 **Before any tool runs (once per run):**
 
