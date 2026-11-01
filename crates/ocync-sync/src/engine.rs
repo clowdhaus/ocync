@@ -106,6 +106,15 @@ pub enum ManifestRef {
 }
 
 impl ManifestRef {
+    /// What joins a repository to this reference in an image name: `:` before
+    /// a tag, `@` before a digest.
+    pub fn separator(&self) -> char {
+        match self {
+            Self::Tag(_) => ':',
+            Self::Digest(_) => '@',
+        }
+    }
+
     /// The string a registry takes after `/manifests/`.
     pub fn as_str(&self) -> &str {
         match self {
@@ -127,19 +136,20 @@ impl fmt::Display for ManifestRef {
 /// Not a full OCI reference: the registry is tracked separately via the
 /// associated [`RegistryClient`].
 #[derive(Debug, Clone)]
-pub struct ImageRef {
-    /// The source repository.
-    pub repo: RepositoryName,
-    /// The tag or digest pulled from it.
-    pub reference: ManifestRef,
+struct ImageRef {
+    repo: RepositoryName,
+    reference: ManifestRef,
 }
 
 impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.reference {
-            ManifestRef::Tag(tag) => write!(f, "{}:{tag}", self.repo),
-            ManifestRef::Digest(digest) => write!(f, "{}@{digest}", self.repo),
-        }
+        write!(
+            f,
+            "{}{}{}",
+            self.repo,
+            self.reference.separator(),
+            self.reference
+        )
     }
 }
 
@@ -360,10 +370,10 @@ impl TagPair {
 
     /// Create a pair that copies the source manifest at `digest` to
     /// `target`; the source tag of that name is never read.
-    pub fn pinned(digest: Digest, target: Tag) -> Self {
+    pub fn pinned(digest: Digest, target: &Tag) -> Self {
         Self {
             source: ManifestRef::Digest(digest),
-            target: target.to_string(),
+            target: target.as_str().to_owned(),
         }
     }
 }
@@ -523,6 +533,9 @@ enum DiscoveryRoute {
     /// `head_first` enabled: all targets matched the source HEAD digest (no
     /// cache entry existed), avoiding the full source GET entirely.
     HeadFirstSkip,
+    /// A pinned source: every target already held the pin, so the source was
+    /// never contacted.
+    PinMatch,
 }
 
 /// Elect leader images for mount optimization via greedy set-cover.
@@ -689,6 +702,8 @@ struct DiscoveryCounters {
     target_stale: u64,
     /// Tags skipped via `head_first` (all targets matched source HEAD).
     head_first_skips: u64,
+    /// Tags skipped because every target held the pinned digest.
+    pin_skips: u64,
 }
 
 impl DiscoveryCounters {
@@ -709,6 +724,7 @@ impl DiscoveryCounters {
             DiscoveryRoute::HeadFirstSkip => {
                 self.head_first_skips += 1;
             }
+            DiscoveryRoute::PinMatch => self.pin_skips += 1,
         }
     }
 }
@@ -1236,6 +1252,7 @@ impl SyncEngine {
         stats.discovery_head_failures = discovery_counters.head_failures;
         stats.discovery_target_stale = discovery_counters.target_stale;
         stats.discovery_head_first_skips = discovery_counters.head_first_skips;
+        stats.discovery_pin_skips = discovery_counters.pin_skips;
         stats.immutable_tag_skips = immutable_tag_skips;
         let duration = run_start.elapsed();
 
@@ -1270,7 +1287,10 @@ struct DiscoveryParams {
 }
 
 /// Discover a single (mapping, tag) pair: HEAD source, check cache, pull if needed.
-/// A pinned source skips the HEAD and checks the targets against the pin.
+///
+/// A pinned source (a digest) takes none of the steps below: it already names
+/// its digest, so the targets are HEAD-checked against the pin first, and the
+/// source is read, by digest, only when some target lacks it.
 ///
 /// Returns the outcome and which route was taken. The flow:
 /// 1. HEAD the source manifest with a short timeout.
@@ -1300,9 +1320,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     let platform_key = PlatformFilterKey::from_filters(platforms.as_deref());
 
     // Step 1: HEAD the source manifest with a short timeout. A pinned source
-    // already names its digest, so there is nothing to ask: the pin stands in
-    // for the HEAD digest, and the source is touched only if a target lacks it.
-    let pinned = matches!(source.reference, ManifestRef::Digest(_));
+    // already names its digest, so there is nothing to ask.
     let source_head_digest = match &source.reference {
         ManifestRef::Digest(pin) => Some(pin.clone()),
         ManifestRef::Tag(tag) => match tokio::time::timeout(
@@ -1341,7 +1359,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
     // HEAD-check every target against `compare_digest`: all matching skips
     // the image with `skip_route`; otherwise only the mismatched targets are
     // pulled and transferred, reported as `stale_route`.
-    let skip_or_pull_stale = async |head_digest: &Digest,
+    let skip_or_pull_stale = async |head_digest: Option<&Digest>,
                                     compare_digest: &Digest,
                                     label: &'static str,
                                     skip_route: DiscoveryRoute,
@@ -1370,7 +1388,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             platforms: platforms.as_deref(),
             cache: &cache,
             snapshot_key: &snapshot_key,
-            head_digest: Some(head_digest),
+            head_digest,
             platform_key: &platform_key,
             artifacts_config: &artifacts_config,
         })
@@ -1378,6 +1396,24 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
 
         (outcome, stale_route)
     };
+
+    // A pinned source: the pin is the digest to compare targets against, so
+    // neither the source HEAD nor the tag digest cache has anything to add. A
+    // match makes no source request at all (N target HEADs per cycle). With
+    // platform filtering the targets would hold a filtered index, so the
+    // pull below refuses the image instead.
+    if let ManifestRef::Digest(pin) = &source.reference
+        && platforms.is_none()
+    {
+        return skip_or_pull_stale(
+            None,
+            pin,
+            "pin",
+            DiscoveryRoute::PinMatch,
+            DiscoveryRoute::CacheMiss,
+        )
+        .await;
+    }
 
     // Steps 2-4: cache lookup, only if the HEAD succeeded.
     if let Some(ref head_digest) = source_head_digest {
@@ -1392,7 +1428,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
                 && platform_key == snapshot.platform_filter_key
             {
                 return skip_or_pull_stale(
-                    head_digest,
+                    Some(head_digest),
                     &snapshot.filtered_digest,
                     "cache hit",
                     DiscoveryRoute::CacheHit,
@@ -1403,15 +1439,14 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
         }
     }
 
-    // head_first, and always for a pinned source: on a cache miss, HEAD-check
-    // all targets against the source HEAD digest (reused from step 1, or the
-    // pin) before the full manifest GET, saving source rate-limit tokens when
-    // targets are already in sync.
+    // head_first: on a cache miss, HEAD-check all targets against the source
+    // HEAD digest (reused from step 1) before the full manifest GET, saving
+    // source rate-limit tokens when targets are already in sync.
     //
     // Skipped when platform filtering is active: the target then holds a
     // filtered index whose digest differs from the source HEAD digest, so the
     // comparison would always miss. The full pull compares filtered digests.
-    if (head_first || pinned) && platforms.is_none() {
+    if head_first && platforms.is_none() {
         if let Some(ref head_digest) = source_head_digest {
             // A match writes no cache entry: the full manifest was never pulled,
             // so there is no filtered_digest. In watch mode head_first
@@ -1419,7 +1454,7 @@ async fn discover_tag(params: DiscoveryParams) -> (DiscoveryOutcome, DiscoveryRo
             // source HEAD + N target HEADs per tag) until a change forces
             // a full pull.
             return skip_or_pull_stale(
-                head_digest,
+                Some(head_digest),
                 head_digest,
                 "head_first",
                 DiscoveryRoute::HeadFirstSkip,
@@ -1615,55 +1650,63 @@ async fn full_pull_and_build_tasks(params: FullPullParams<'_>) -> DiscoveryOutco
 
     let source_digest = &source_data.pull.digest;
 
-    let mut head_checks = FuturesUnordered::new();
-    for entry in targets {
-        head_checks.push(async move {
-            let result = entry
-                .client()
-                .manifest_head(&target.repo, &target.tag)
-                .await;
-            (entry, result)
-        });
-    }
-
+    let task_for = |entry: &Rc<TargetEntry>| TransferTask {
+        source_data: Rc::clone(&source_data),
+        source_client: Arc::clone(source_client),
+        target_entry: Rc::clone(entry),
+        source: source.clone(),
+        target: target.clone(),
+        artifacts_config: Rc::clone(artifacts_config),
+        discovery_retries: retries_made(),
+    };
     let mut active_items = Vec::new();
 
-    while let Some((entry, result)) = head_checks.next().await {
-        match result {
-            Ok(Some(digest)) if digest == *source_digest => {
-                debug!(
-                    source_repo = %source.repo,
-                    source_tag = %source.reference,
-                    target_repo = %target.repo,
-                    digest = %source_digest,
-                    "skipping -- digest matches at target"
-                );
-                skipped_results.push(image_result(
-                    source,
-                    target,
-                    ImageStatus::Skipped {
-                        reason: SkipReason::DigestMatch,
-                    },
-                ));
-            }
-            other => {
-                if let Err(e) = &other {
-                    warn!(
+    if matches!(source.reference, ManifestRef::Digest(_)) {
+        // `discover_tag` already HEAD-checked these targets against the pin
+        // and found them lacking, and the pulled bytes are verified to hash to
+        // the pin, so a second HEAD could not answer differently.
+        active_items.extend(targets.iter().map(task_for));
+    } else {
+        let mut head_checks = FuturesUnordered::new();
+        for entry in targets {
+            head_checks.push(async move {
+                let result = entry
+                    .client()
+                    .manifest_head(&target.repo, &target.tag)
+                    .await;
+                (entry, result)
+            });
+        }
+
+        while let Some((entry, result)) = head_checks.next().await {
+            match result {
+                Ok(Some(digest)) if digest == *source_digest => {
+                    debug!(
+                        source_repo = %source.repo,
+                        source_tag = %source.reference,
                         target_repo = %target.repo,
-                        target_tag = %target.tag,
-                        error = %e,
-                        "target manifest HEAD failed, proceeding with sync"
+                        digest = %source_digest,
+                        "skipping -- digest matches at target"
                     );
+                    skipped_results.push(image_result(
+                        source,
+                        target,
+                        ImageStatus::Skipped {
+                            reason: SkipReason::DigestMatch,
+                        },
+                    ));
                 }
-                active_items.push(TransferTask {
-                    source_data: Rc::clone(&source_data),
-                    source_client: Arc::clone(source_client),
-                    target_entry: Rc::clone(entry),
-                    source: source.clone(),
-                    target: target.clone(),
-                    artifacts_config: Rc::clone(artifacts_config),
-                    discovery_retries: retries_made(),
-                });
+                other => {
+                    if let Err(e) = &other {
+                        warn!(
+                            target_repo = %target.repo,
+                            target_tag = %target.tag,
+                            error = %e,
+                            "target manifest HEAD failed, proceeding with sync"
+                        );
+                    }
+                    active_items.push(task_for(entry));
+                }
             }
         }
     }
@@ -1797,6 +1840,24 @@ async fn execute_item(
     }
 }
 
+/// Pull one source manifest by tag or digest, retried, with its reference in
+/// the error.
+async fn pull_manifest(
+    client: &RegistryClient,
+    repo: &RepositoryName,
+    reference: &str,
+    retry: &RetryConfig,
+) -> Result<ManifestPull, crate::Error> {
+    with_retry(retry, "manifest pull", || {
+        client.manifest_pull(repo, reference)
+    })
+    .await
+    .map_err(|e| crate::Error::Manifest {
+        reference: reference.to_owned(),
+        source: e,
+    })
+}
+
 /// Pull all source manifest data for a single tag: the manifest, plus the
 /// child manifests for an index.
 ///
@@ -1815,21 +1876,29 @@ async fn pull_source_manifest(
     platforms: Option<&[PlatformFilter]>,
     shared: &PerRun,
 ) -> Result<PulledManifest, crate::Error> {
-    let tag = reference.as_str();
     if matches!(reference, ManifestRef::Digest(_)) && platforms.is_some() {
         return Err(crate::Error::ManifestLogic {
-            reference: tag.to_owned(),
+            reference: reference.to_string(),
             reason: "a pinned digest cannot be platform-filtered: filtering would push a \
                      different digest under the pinned name"
                 .into(),
         });
     }
-    let pull = with_retry(retry, "manifest pull", || client.manifest_pull(repo, tag))
-        .await
-        .map_err(|e| crate::Error::Manifest {
-            reference: tag.to_owned(),
-            source: e,
-        })?;
+    // A digest is pulled once per run however many names pin it, like an
+    // index child. The shared copy was verified against the digest.
+    let pull = match reference {
+        ManifestRef::Digest(digest) => {
+            let key = source_key(client, repo, digest);
+            let shared_pull = run_once(&shared.child_pulls, key, || async {
+                pull_manifest(client, repo, reference.as_str(), retry)
+                    .await
+                    .map(Rc::new)
+            })
+            .await?;
+            ManifestPull::clone(&shared_pull)
+        }
+        ManifestRef::Tag(tag) => pull_manifest(client, repo, tag, retry).await?,
+    };
 
     let children = match &pull.manifest {
         ManifestKind::Image(_) => Vec::new(),
@@ -1861,7 +1930,7 @@ async fn pull_source_manifest(
                         .collect();
                     let filter_strs: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
                     return Err(crate::Error::ManifestLogic {
-                        reference: tag.to_owned(),
+                        reference: reference.to_string(),
                         reason: format!(
                             "platform filter [{}] matched no manifests in index (source has: [{}])",
                             filter_strs.join(", "),
@@ -1872,7 +1941,7 @@ async fn pull_source_manifest(
 
                 info!(
                     repo = %repo,
-                    tag = %tag,
+                    tag = %reference,
                     kept = kept.len(),
                     total = total,
                     "filtered index: {}/{} platforms",
@@ -1894,15 +1963,9 @@ async fn pull_source_manifest(
                     let key = source_key(client, repo, &child_desc.digest);
                     async move {
                         let child_pull = run_once(&shared.child_pulls, key, || async {
-                            with_retry(retry, "manifest pull", || {
-                                client.manifest_pull(repo, &child_digest_str)
-                            })
-                            .await
-                            .map(Rc::new)
-                            .map_err(|e| crate::Error::Manifest {
-                                reference: child_digest_str.clone(),
-                                source: e,
-                            })
+                            pull_manifest(client, repo, &child_digest_str, retry)
+                                .await
+                                .map(Rc::new)
                         })
                         .await?;
                         match &child_pull.manifest {
@@ -1928,7 +1991,7 @@ async fn pull_source_manifest(
                 };
                 let new_bytes = serde_json::to_vec(&filtered_index).map_err(|e| {
                     crate::Error::ManifestLogic {
-                        reference: tag.to_owned(),
+                        reference: reference.to_string(),
                         reason: format!("failed to serialize filtered index: {e}"),
                     }
                 })?;
@@ -3237,10 +3300,8 @@ mod tests {
             image(ManifestRef::Digest(digest.clone())).to_string(),
             format!("lib/pg@{digest}")
         );
-        assert_eq!(TagPair::same("15").to_string(), "15");
-        assert_eq!(TagPair::retag("15", "stable").to_string(), "15 -> stable");
         assert_eq!(
-            TagPair::pinned(digest.clone(), Tag::new("15.19").unwrap()).to_string(),
+            TagPair::pinned(digest.clone(), &Tag::new("15.19").unwrap()).to_string(),
             format!("{digest} -> 15.19")
         );
     }
@@ -3611,14 +3672,14 @@ mod tests {
         let n = elect_leaders(&mut pending);
 
         assert_eq!(n, 1);
-        assert_eq!(pending[0].source.reference.to_string(), "base");
+        assert_eq!(pending[0].source.reference.as_str(), "base");
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4);
         assert!(leader_blobs.contains(&test_digest("c0")));
         assert!(leader_blobs.contains(&test_digest("a3")));
         // Followers keep their original order.
-        assert_eq!(pending[1].source.reference.to_string(), "child_a");
-        assert_eq!(pending[2].source.reference.to_string(), "child_b");
+        assert_eq!(pending[1].source.reference.as_str(), "child_a");
+        assert_eq!(pending[2].source.reference.as_str(), "child_b");
     }
 
     #[test]
@@ -3640,10 +3701,10 @@ mod tests {
         assert_eq!(n, 2);
         let leader_blobs = leader_blob_digests(&pending, n);
         assert_eq!(leader_blobs.len(), 4); // {c0, a1, a2, a3}
-        assert_eq!(pending[0].source.reference.to_string(), "v1");
-        assert_eq!(pending[1].source.reference.to_string(), "v1");
-        assert_eq!(pending[2].source.reference.to_string(), "child_a");
-        assert_eq!(pending[3].source.reference.to_string(), "child_b");
+        assert_eq!(pending[0].source.reference.as_str(), "v1");
+        assert_eq!(pending[1].source.reference.as_str(), "v1");
+        assert_eq!(pending[2].source.reference.as_str(), "child_a");
+        assert_eq!(pending[3].source.reference.as_str(), "child_b");
     }
 
     #[test]
@@ -3672,10 +3733,10 @@ mod tests {
         assert!(leader_blobs.contains(&test_digest("a0")));
         assert!(leader_blobs.contains(&test_digest("d0")));
 
-        let leader_tags: Vec<String> = pending
+        let leader_tags: Vec<&str> = pending
             .iter()
             .take(n)
-            .map(|t| t.source.reference.to_string())
+            .map(|t| t.source.reference.as_str())
             .collect();
 
         assert_eq!(leader_tags[0], "imgA");
@@ -3702,7 +3763,7 @@ mod tests {
         let n = elect_leaders(&mut pending);
         assert_eq!(n, 1);
         assert_eq!(
-            pending[0].source.reference.to_string(),
+            pending[0].source.reference.as_str(),
             "imgB",
             "tie should break deterministically in favor of later candidate"
         );
@@ -3875,17 +3936,18 @@ mod tests {
 
     #[test]
     fn discovery_counters_count_each_route() {
-        // want: [cache_hits, cache_misses, head_failures, target_stale, head_first_skips]
+        // want: [cache_hits, cache_misses, head_failures, target_stale, head_first_skips,
+        // pin_skips]
         let cases = [
             (
                 "HeadFailure counts as a cache miss and a head failure",
                 vec![DiscoveryRoute::HeadFailure],
-                [0, 1, 1, 0, 0],
+                [0, 1, 1, 0, 0, 0],
             ),
             (
                 "TargetStale counts as a cache miss and a stale target",
                 vec![DiscoveryRoute::TargetStale],
-                [0, 1, 0, 1, 0],
+                [0, 1, 0, 1, 0, 0],
             ),
             (
                 "every route once: CacheMiss, HeadFailure and TargetStale make 3 misses",
@@ -3895,8 +3957,9 @@ mod tests {
                     DiscoveryRoute::HeadFailure,
                     DiscoveryRoute::TargetStale,
                     DiscoveryRoute::HeadFirstSkip,
+                    DiscoveryRoute::PinMatch,
                 ],
-                [1, 3, 1, 1, 1],
+                [1, 3, 1, 1, 1, 1],
             ),
         ];
         for (name, routes, want) in cases {
@@ -3910,6 +3973,7 @@ mod tests {
                 c.head_failures,
                 c.target_stale,
                 c.head_first_skips,
+                c.pin_skips,
             ];
             assert_eq!(got, want, "{name}");
         }

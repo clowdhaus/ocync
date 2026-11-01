@@ -1531,16 +1531,14 @@ async fn resolve_mapping_inner(
     // --- Fetch and filter tags ---
     let source_repo_path = RepositoryName::new(&mapping.from)?;
 
-    // A pinned list ignores `defaults.tags` entirely: no listing, no excludes,
-    // no immutable pattern.
-    let (mapping_tags, defaults_tags) = match &mapping.tags {
-        Some(MappingTags::Pinned(_)) => (None, None),
-        Some(MappingTags::Filter(tags)) => (
-            Some(tags),
-            config.defaults.as_ref().and_then(|d| d.tags.as_ref()),
-        ),
-        None => (None, config.defaults.as_ref().and_then(|d| d.tags.as_ref())),
+    // A pinned list ignores `defaults` (tags and platforms) entirely: no
+    // listing, no excludes, no immutable pattern, no platform filter.
+    let (pins, mapping_tags, defaults) = match &mapping.tags {
+        Some(MappingTags::Pinned(pins)) => (Some(pins), None, None),
+        Some(MappingTags::Filter(tags)) => (None, Some(tags), config.defaults.as_ref()),
+        None => (None, None, config.defaults.as_ref()),
     };
+    let defaults_tags = defaults.and_then(|d| d.tags.as_ref());
 
     // Fast path: exact tag names only (no wildcards, semver, latest, exclude)
     // skip listing the source. Gated on no `defaults.tags` block, or inherited
@@ -1553,16 +1551,16 @@ async fn resolve_mapping_inner(
         Option<usize>,
         Option<ocync_sync::filter::FilterReport>,
         Option<NoTagsInfo>,
-    ) = match &mapping.tags {
-        Some(MappingTags::Pinned(pins)) => (
+    ) = match pins {
+        Some(pins) => (
             pins.iter()
-                .map(|pin| TagPair::pinned(pin.digest.clone(), pin.name.clone()))
+                .map(|pin| TagPair::pinned(pin.digest.clone(), &pin.name))
                 .collect(),
             None,
             None,
             None,
         ),
-        Some(MappingTags::Filter(_)) | None => {
+        None => {
             let (names, count, report, template) = if let Some(exact) = mapping_tags
                 .filter(|_| defaults_tags.is_none())
                 .and_then(|t| t.exact_tags())
@@ -1615,11 +1613,10 @@ async fn resolve_mapping_inner(
     let target_repo = mapping.to.as_deref().unwrap_or(&mapping.from).to_owned();
 
     // --- Resolve platforms (mapping overrides defaults) ---
-    // A pinned mapping ignores `defaults.platforms`: its digest is copied whole.
-    let platform_strs = mapping.platforms.clone().or_else(|| match mapping.tags {
-        Some(MappingTags::Pinned(_)) => None,
-        _ => config.defaults.as_ref().and_then(|d| d.platforms.clone()),
-    });
+    let platform_strs = mapping
+        .platforms
+        .clone()
+        .or_else(|| defaults.and_then(|d| d.platforms.clone()));
     let platforms = platform_strs
         .map(|strs| {
             strs.iter()

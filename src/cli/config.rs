@@ -468,6 +468,7 @@ pub(crate) enum MappingTags {
 /// A non-empty list of pinned tags with no name repeated.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(try_from = "Vec<PinnedTag>")]
+#[schemars(extend("minItems" = 1))]
 pub(crate) struct PinnedTags(Vec<PinnedTag>);
 
 impl PinnedTags {

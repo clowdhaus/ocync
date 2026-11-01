@@ -240,6 +240,10 @@ pub struct SyncStats {
     /// of `discovery_cache_hits` and `discovery_cache_misses`: the cache had
     /// no entry, but no full pull was needed either.
     pub discovery_head_first_skips: u64,
+    /// Pinned tags skipped because every target already held the pinned
+    /// digest; the source was not contacted. Counted apart from
+    /// `discovery_head_first_skips` and `discovery_cache_hits`.
+    pub discovery_pin_skips: u64,
     /// (Tag, target) pairs skipped via immutable-glob match (zero API calls).
     ///
     /// Unit is per-target: 2 tags across 3 targets = 6. Consistent with

@@ -397,8 +397,8 @@ async fn sync_retag() {
 
 /// A pinned source whose digest a target already holds touches the source not
 /// at all, with `head_first` off: no HEAD, no GET. Breaks if the engine HEADs
-/// or pulls the source before checking the targets against the pin, or the
-/// target-side skip is lost.
+/// or pulls the source before checking the targets against the pin, the
+/// target-side skip is lost, or the skip is counted as `head_first`.
 #[tokio::test]
 async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
     let source_server = MockServer::start().await;
@@ -422,7 +422,7 @@ async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
         "repo",
         vec![TagPair::pinned(
             parts.digest.clone(),
-            Tag::new("stable").unwrap(),
+            &Tag::new("stable").unwrap(),
         )],
     );
 
@@ -435,6 +435,14 @@ async fn sync_pinned_source_skips_a_target_that_holds_the_digest() {
             reason: SkipReason::DigestMatch,
         }
     );
+    assert_eq!(
+        (
+            report.stats.discovery_pin_skips,
+            report.stats.discovery_head_first_skips,
+        ),
+        (1, 0),
+        "a pinned skip is its own route, never head_first"
+    );
 }
 
 /// A pinned source with a platform filter fails that image before any source
@@ -446,16 +454,12 @@ async fn sync_pinned_source_with_platforms_fails_before_any_pull() {
     let source_server = MockServer::start().await;
     let target_server = MockServer::start().await;
 
-    let child = ManifestBuilder::new(b"config").layer(b"layer").build();
-    let index = IndexBuilder::new()
-        .manifest(&child, Some(linux("amd64")))
-        .build();
+    let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
     Mock::given(any())
         .respond_with(ResponseTemplate::new(404))
         .expect(0)
         .mount(&source_server)
         .await;
-    mount_manifest_head_not_found(&target_server, "repo", "stable").await;
     manifest_push_mock("repo", "stable")
         .expect(0)
         .mount(&target_server)
@@ -466,8 +470,8 @@ async fn sync_pinned_source_with_platforms_fails_before_any_pull() {
         &target_server,
         "repo",
         vec![TagPair::pinned(
-            index.digest.clone(),
-            Tag::new("stable").unwrap(),
+            parts.digest.clone(),
+            &Tag::new("stable").unwrap(),
         )],
     );
     mapping.platforms = Some(vec!["linux/amd64".parse::<PlatformFilter>().unwrap()]);
@@ -480,10 +484,56 @@ async fn sync_pinned_source_with_platforms_fails_before_any_pull() {
     assert!(error.contains("cannot be platform-filtered"), "{error}");
 }
 
+/// One digest pinned under two names makes one source manifest GET, and both
+/// names are written. Breaks if the second name pulls the source again.
+#[tokio::test]
+async fn sync_one_pinned_digest_under_two_names_pulls_the_source_once() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let parts = ManifestBuilder::new(b"config").layer(b"layer").build();
+    source_manifest_mock(
+        "repo",
+        &parts.digest.to_string(),
+        &parts.bytes,
+        MediaType::OciManifest,
+    )
+    .expect(1)
+    .mount(&source_server)
+    .await;
+    parts.mount_blob_pulls(&source_server, "repo").await;
+    parts.mount_target_blob_misses(&target_server, "repo").await;
+    mount_blob_push(&target_server, "repo").await;
+    for tag in ["15.19", "stable"] {
+        manifest_head_mock("repo", tag, ResponseTemplate::new(404))
+            .mount(&target_server)
+            .await;
+        manifest_push_mock("repo", tag)
+            .expect(1)
+            .mount(&target_server)
+            .await;
+    }
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        ["15.19", "stable"]
+            .map(|tag| TagPair::pinned(parts.digest.clone(), &Tag::new(tag).unwrap()))
+            .to_vec(),
+    );
+
+    let report = run_sync(vec![mapping]).await;
+
+    assert_eq!(report.stats.images_synced, 2, "{:?}", report.images);
+}
+
 /// A source serving other bytes under a pinned digest fails that image with
 /// both digests named and pushes nothing for it, while a sibling image in the
-/// same run syncs. Breaks if the pin is not verified, the failure cancels the
-/// run, or the mismatched manifest is pushed.
+/// same run syncs. Each target is HEAD-checked exactly once, since the pulled
+/// bytes equal the pin. Breaks if the pin is not verified, the failure cancels
+/// the run, the mismatched manifest is pushed, or a target is HEAD-checked again
+/// after the pull.
 #[tokio::test]
 async fn sync_pinned_digest_mismatch_fails_only_that_image() {
     let source_server = MockServer::start().await;
@@ -506,7 +556,13 @@ async fn sync_pinned_digest_mismatch_fails_only_that_image() {
         &served.bytes,
     )
     .await;
-    mount_manifest_head_not_found(&target_server, "repo", "bad").await;
+    // Each target is HEAD-checked once: against the pin, before any pull.
+    for tag in ["bad", "good"] {
+        manifest_head_mock("repo", tag, ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&target_server)
+            .await;
+    }
     manifest_push_mock("repo", "bad")
         .expect(0)
         .mount(&target_server)
@@ -521,8 +577,8 @@ async fn sync_pinned_digest_mismatch_fails_only_that_image() {
         &target_server,
         "repo",
         vec![
-            TagPair::pinned(pinned.digest.clone(), Tag::new("bad").unwrap()),
-            TagPair::pinned(sibling.digest.clone(), Tag::new("good").unwrap()),
+            TagPair::pinned(pinned.digest.clone(), &Tag::new("bad").unwrap()),
+            TagPair::pinned(sibling.digest.clone(), &Tag::new("good").unwrap()),
         ],
     );
 

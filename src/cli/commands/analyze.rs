@@ -15,7 +15,7 @@ use ocync_distribution::spec::ManifestKind;
 use ocync_distribution::{Digest, RepositoryName};
 
 use ocync_sync::ShutdownSignal;
-use ocync_sync::engine::{ImageRef, ManifestRef};
+use ocync_sync::engine::ManifestRef;
 use ocync_sync::retry::{RetryConfig, with_retry};
 
 use crate::cli::commands::synchronize::{
@@ -216,10 +216,10 @@ async fn collect_analysis(
         }
     }
 
-    let images: Vec<(usize, ManifestRef)> = resolved_mappings
+    let images: Vec<(usize, &ManifestRef)> = resolved_mappings
         .iter()
         .enumerate()
-        .flat_map(|(idx, m)| m.tags.iter().map(move |t| (idx, t.source.clone())))
+        .flat_map(|(idx, m)| m.tags.iter().map(move |t| (idx, &t.source)))
         .collect();
 
     // Its own step: resolution finishes long before the walk, and the ticker
@@ -234,11 +234,11 @@ async fn collect_analysis(
     let mut pulls = futures_util::stream::iter(images.iter().map(|(idx, reference)| {
         let resolved = &resolved_mappings[*idx];
         async move {
-            let image_ref = ImageRef {
-                repo: resolved.source_repo.clone(),
-                reference: reference.clone(),
-            }
-            .to_string();
+            let image_ref = format!(
+                "{}{}{reference}",
+                resolved.source_repo,
+                reference.separator()
+            );
             if shutdown.is_triggered() {
                 return (*idx, image_ref, None);
             }
@@ -354,12 +354,12 @@ enum Completeness {
 async fn pull_image_descriptors(
     source_client: &ocync_distribution::RegistryClient,
     source_repo: &RepositoryName,
-    tag: &str,
+    reference: &str,
     image_ref: &str,
     retry: &RetryConfig,
 ) -> Result<(Vec<BlobDescriptor>, Completeness), CliError> {
     let pulled = with_retry(retry, "analyze manifest pull", || {
-        source_client.manifest_pull(source_repo, tag)
+        source_client.manifest_pull(source_repo, reference)
     })
     .await
     .map_err(|e| CliError::Input(format!("manifest_pull {image_ref}: {e}")))?;
