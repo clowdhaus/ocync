@@ -27,6 +27,23 @@ use tracing::{info, warn};
 
 use crate::plan::{BlobDedupMap, ClaimAction, RepoBlobState, TargetId};
 
+/// Resolution watches of one target: per repo and blob, a channel that turns
+/// `true` once the repo commits a manifest referencing the blob or releases it.
+type RepoWatches = HashMap<RepositoryName, HashMap<Digest, watch::Sender<bool>>>;
+
+/// The watch for (`repo`, `digest`), created unresolved if absent.
+fn watch_sender<'a>(
+    watches: &'a mut RepoWatches,
+    repo: &RepositoryName,
+    digest: &Digest,
+) -> &'a watch::Sender<bool> {
+    watches
+        .entry(repo.clone())
+        .or_default()
+        .entry(digest.clone())
+        .or_insert_with(|| watch::channel(false).0)
+}
+
 /// Cache file format version. Bump when the layout or the meaning of a key
 /// changes; a mismatched file is discarded and rebuilt.
 const CACHE_VERSION: u32 = 2;
@@ -110,22 +127,14 @@ type SourceSnapshotMap = HashMap<SnapshotKey, SourceSnapshot>;
 pub struct TransferStateCache {
     dedup: BlobDedupMap,
     snapshots: SourceSnapshotMap,
-    /// Runtime-only: per target and blob, the repos where a committed manifest
-    /// references the blob. They are mount sources ahead of repos known only
-    /// from an earlier run. Kept across runs in one process: a repo committed
-    /// earlier still holds its manifest, and a stale entry self-heals through
-    /// `mark_blob_repo_stale` when a mount from it fails.
-    committed_blobs: HashMap<TargetId, HashMap<Digest, HashSet<RepositoryName>>>,
-    /// Runtime-only: per-(target, repo, digest) channel that turns `true` when
-    /// a manifest referencing the blob commits at the repo or the repo fails
-    /// (resolved either way). Followers subscribe through
+    /// Runtime-only: per target, repo and blob, a channel that turns `true`
+    /// when a manifest referencing the blob commits at the repo
+    /// ([`Self::confirm_blobs`]) or the repo will not commit one this run
+    /// ([`Self::release_blobs`]). Followers subscribe through
     /// `unresolved_watches_for` and consume it with `wait_for(|&v| v)`, never
     /// `changed()`, which misses a value sent before they subscribed. Fresh
     /// each run.
-    commit_watches: HashMap<TargetId, HashMap<(RepositoryName, Digest), watch::Sender<bool>>>,
-    /// Runtime-only: repos that failed this run. Their watches are resolved,
-    /// and a later subscription for them starts resolved. Fresh each run.
-    failed_repos: HashMap<TargetId, HashSet<RepositoryName>>,
+    resolution_watches: HashMap<TargetId, RepoWatches>,
 }
 
 impl TransferStateCache {
@@ -139,8 +148,8 @@ impl TransferStateCache {
         self.dedup.is_empty() && self.snapshots.is_empty()
     }
 
-    /// Whether the blob is present (`Verified`, `Completed` or `Remembered`) at
-    /// the given (target, repo).
+    /// Whether the blob is present (`Verified`, `Completed`, `Remembered` or
+    /// `Committed`) at the given (target, repo).
     pub fn blob_present_at(
         &self,
         target: &TargetId,
@@ -199,91 +208,77 @@ impl TransferStateCache {
 
     /// Mount sources for a blob, excluding `current_repo`.
     ///
-    /// Yields first the repos holding the blob where a committed manifest
-    /// references it at `target` in this process, then the uncommitted repos
-    /// holding it only according to an earlier run. An earlier run's repo is
-    /// offered without waiting, because its commit watch fires only if this run
-    /// pushes a manifest referencing the blob to it: its manifest most likely
-    /// already does, and a mount the registry refuses marks it stale and falls
-    /// back to a push. Order within each group is `BTreeMap` order.
+    /// Yields first the repos where a manifest committed this run references
+    /// the blob (`Committed`), then the repos holding it only according to an
+    /// earlier run (`Remembered`). An earlier run's repo is offered without
+    /// waiting, because nothing this run is certain to commit it: its manifest
+    /// most likely already references the blob, and a mount the registry
+    /// refuses marks it stale and falls back to a push. Order within each
+    /// group is `BTreeMap` order.
     pub fn mount_sources<'a>(
         &'a self,
         target: &'a TargetId,
         digest: &'a Digest,
         current_repo: &'a RepositoryName,
     ) -> impl Iterator<Item = &'a RepositoryName> + 'a {
-        let committed_set = self
-            .committed_blobs
-            .get(target)
-            .and_then(|blobs| blobs.get(digest));
-        let is_committed =
-            move |r: &RepositoryName| committed_set.is_some_and(|set| set.contains(r));
         let others = move || {
             self.dedup
                 .repos_iter(target, digest)
                 .filter(move |(r, _)| *r != current_repo)
         };
-        let committed = others().filter(move |(r, state)| state.is_present() && is_committed(r));
-        let remembered_uncommitted = others()
-            .filter(move |(r, state)| **state == RepoBlobState::Remembered && !is_committed(r));
-        committed.chain(remembered_uncommitted).map(|(r, _)| r)
+        let committed = others().filter(|(_, state)| **state == RepoBlobState::Committed);
+        let remembered = others().filter(|(_, state)| **state == RepoBlobState::Remembered);
+        committed.chain(remembered).map(|(r, _)| r)
     }
 
-    /// Commit watches for repos that hold the blob this run (`Verified`,
-    /// `Completed` or `Uploading`, not `Failed`) and whose watch for this blob
-    /// has not yet fired, so a caller waits only on repos that can still become
-    /// a mount source. A repo known only from an earlier run is never waited
-    /// on: [`Self::mount_sources`] offers it at once.
+    /// Resolution watches, still unresolved, for repos that hold the blob this
+    /// run without a commit (`Verified`, `Completed` or `Uploading`), so a
+    /// caller waits only on repos that can still become a mount source. A
+    /// committed repo is never waited on: [`Self::mount_sources`] returns it.
+    /// Neither is a repo known only from an earlier run, which
+    /// `mount_sources` offers at once.
     pub fn unresolved_watches_for(
         &mut self,
         target: &TargetId,
         digest: &Digest,
         current_repo: &RepositoryName,
     ) -> Vec<watch::Receiver<bool>> {
-        let candidates: Vec<RepositoryName> = self
-            .dedup
+        let watches = self.resolution_watches.entry(target.clone()).or_default();
+        self.dedup
             .repos_iter(target, digest)
-            .filter(|(r, state)| *r != current_repo && state.is_active())
-            .map(|(r, _)| r.clone())
-            .collect();
-
-        let failed = self.failed_repos.get(target);
-        let watches = self.commit_watches.entry(target.clone()).or_default();
-        candidates
-            .into_iter()
-            .filter(|repo| !failed.is_some_and(|set| set.contains(repo)))
-            .filter_map(|repo| {
-                let tx = watches
-                    .entry((repo, digest.clone()))
-                    .or_insert_with(|| watch::channel(false).0);
-                let rx = tx.subscribe();
+            .filter(|(r, state)| {
+                *r != current_repo && state.is_active() && **state != RepoBlobState::Committed
+            })
+            .filter_map(|(repo, _)| {
+                let rx = watch_sender(watches, repo, digest).subscribe();
                 if *rx.borrow() { None } else { Some(rx) }
             })
             .collect()
     }
 
-    /// Mark a repo as failed this run, unblocking followers: every watch at the
-    /// repo resolves, and a later subscription for it starts resolved.
-    pub fn notify_repo_failed(&mut self, target: &TargetId, repo: &RepositoryName) {
-        self.failed_repos
-            .entry(target.clone())
-            .or_default()
-            .insert(repo.clone());
-        let watches = self.commit_watches.get(target).into_iter().flatten();
-        for (_, tx) in watches.filter(|((watch_repo, _), _)| watch_repo == repo) {
-            tx.send_replace(true);
+    /// Resolve the watches for `digests` at `repo`: the repo will not commit a
+    /// manifest referencing them this run, so followers stop waiting on it. A
+    /// later subscription starts resolved.
+    pub fn release_blobs<'a>(
+        &mut self,
+        target: &TargetId,
+        repo: &RepositoryName,
+        digests: impl IntoIterator<Item = &'a Digest>,
+    ) {
+        let watches = self.resolution_watches.entry(target.clone()).or_default();
+        for digest in digests {
+            watch_sender(watches, repo, digest).send_replace(true);
         }
     }
 
     /// Start a run from the blob state a reload from disk would give: every
-    /// present blob becomes known only from an earlier run, and failures,
-    /// upload claims and the last run's watch handles and repo failures are
-    /// dropped. Committed blobs are kept: a mount from a repo that has since
-    /// lost the blob fails and falls back to a push (one request), while
-    /// forgetting them would push blobs a mount could have saved.
+    /// present blob, committed ones included, becomes known only from an
+    /// earlier run and is offered as a mount source without waiting (a mount
+    /// from a repo that has since lost the blob fails and falls back to a
+    /// push, one request). Failures, upload claims and the last run's watches
+    /// are dropped.
     pub(crate) fn start_run(&mut self) {
-        self.commit_watches.clear();
-        self.failed_repos.clear();
+        self.resolution_watches.clear();
         self.dedup.remember_present();
     }
 
@@ -303,27 +298,22 @@ impl TransferStateCache {
 
     /// Record each of `digests` present and committed at `repo`, after a
     /// manifest that references them was committed there, and wake the
-    /// watchers waiting on them at that repo.
+    /// watchers already waiting on them at that repo.
     pub fn confirm_blobs<'a>(
         &mut self,
         target: &TargetId,
         repo: &RepositoryName,
         digests: impl IntoIterator<Item = &'a Digest>,
     ) {
+        let watches = self
+            .resolution_watches
+            .get(target)
+            .and_then(|by_repo| by_repo.get(repo));
         for digest in digests {
             self.dedup.confirm(target, digest, repo);
-            self.committed_blobs
-                .entry(target.clone())
-                .or_default()
-                .entry(digest.clone())
-                .or_default()
-                .insert(repo.clone());
-            self.commit_watches
-                .entry(target.clone())
-                .or_default()
-                .entry((repo.clone(), digest.clone()))
-                .or_insert_with(|| watch::channel(false).0)
-                .send_replace(true);
+            if let Some(tx) = watches.and_then(|by_digest| by_digest.get(digest)) {
+                tx.send_replace(true);
+            }
         }
     }
 
@@ -343,15 +333,11 @@ impl TransferStateCache {
         self.snapshots.retain(|k, _| live_keys.contains(k));
     }
 
-    /// Remove blob state, committed blobs, commit watches and repo failures for
-    /// targets not in `live_targets`. Call after each sync cycle so targets
+    /// Remove blob state and resolution watches for targets not in
+    /// `live_targets`. Call after each sync cycle so targets
     /// dropped from config do not grow the cache without bound.
     pub fn prune_dedup(&mut self, live_targets: &HashSet<TargetId>) {
-        self.committed_blobs
-            .retain(|target, _| live_targets.contains(target));
-        self.commit_watches
-            .retain(|target, _| live_targets.contains(target));
-        self.failed_repos
+        self.resolution_watches
             .retain(|target, _| live_targets.contains(target));
         let removed = self.dedup.retain_targets(live_targets);
         if removed > 0 {
@@ -646,12 +632,17 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_watches_skip_fired_and_failed_repos() {
+    fn unresolved_watches_skip_committed_released_and_stale_sources() {
         // The third field is the repo whose watch must be the one left.
-        let cases: [(&str, Setup, &str); 2] = [
+        let cases: [(&str, Setup, &str); 3] = [
             (
-                "a repo whose watch already fired",
+                "a repo that committed the blob",
                 |c| c.confirm_blobs(&target_id("reg.io"), &repo("repo/a"), [&test_digest()]),
+                "repo/b",
+            ),
+            (
+                "a repo released from the blob",
+                |c| c.release_blobs(&target_id("reg.io"), &repo("repo/a"), [&test_digest()]),
                 "repo/b",
             ),
             (
@@ -674,86 +665,53 @@ mod tests {
         }
     }
 
-    /// Pruning drops every per-target map for a target no longer in the
-    /// config, not only its blob state, and leaves the live target alone.
+    /// Pruning drops the watches of a target no longer in the config along
+    /// with its blob state, and leaves the live target alone.
     #[test]
-    fn prune_dedup_drops_committed_blobs_watches_and_failures_of_removed_targets() {
+    fn prune_dedup_drops_watches_of_removed_targets() {
         let (live, gone) = (target_id("live.io"), target_id("gone.io"));
         let mut cache = TransferStateCache::new();
         for t in [&live, &gone] {
             cache.set_blob_completed(t, test_digest(), repo("repo/a"));
-            cache.confirm_blobs(t, &repo("repo/a"), [&test_digest()]);
-            cache.notify_repo_failed(t, &repo("repo/a"));
+            cache.release_blobs(t, &repo("repo/a"), [&test_digest()]);
         }
 
         cache.prune_dedup(&HashSet::from([live.clone()]));
 
         assert!(cache.blob_present_at(&live, &test_digest(), &repo("repo/a")));
-        assert!(cache.committed_blobs.contains_key(&live));
-        assert!(cache.commit_watches.contains_key(&live));
-        assert!(cache.failed_repos.contains_key(&live));
+        assert!(cache.resolution_watches.contains_key(&live));
         assert!(!cache.blob_present_at(&gone, &test_digest(), &repo("repo/a")));
-        assert!(!cache.committed_blobs.contains_key(&gone));
-        assert!(!cache.commit_watches.contains_key(&gone));
-        assert!(!cache.failed_repos.contains_key(&gone));
+        assert!(!cache.resolution_watches.contains_key(&gone));
     }
 
-    /// A commit is a fact about one blob at one repo. A manifest referencing
-    /// only D1 makes the repo a source for D1 and resolves D1's watch, while
-    /// D2, held at the same repo, stays unresolved and not a source until a
-    /// manifest referencing it commits. A repo failure then resolves what is
-    /// outstanding.
-    #[tokio::test(flavor = "current_thread")]
-    async fn commit_is_per_blob_and_failure_is_per_repo() {
+    /// Commit and release are per blob. With D1 and D2 held at repo/a,
+    /// releasing D2 resolves D2 for later subscribers and leaves D1's watch
+    /// unresolved and repo/a no source; committing D1 then resolves D1's
+    /// watch and makes repo/a a source for D1 only.
+    #[test]
+    fn commit_and_release_resolve_one_blob_at_a_time() {
         let (t, a, b) = (target_id("reg.io"), repo("repo/a"), repo("repo/b"));
         let (d1, d2) = (test_digest(), other_digest());
         let mut cache = TransferStateCache::new();
         for d in [&d1, &d2] {
             cache.set_blob_completed(&t, d.clone(), a.clone());
         }
-        let sources = |c: &TransferStateCache, d: &Digest| -> Vec<RepositoryName> {
-            c.mount_sources(&t, d, &b).cloned().collect()
-        };
-        let mut waiting_d1 = cache.unresolved_watches_for(&t, &d1, &b);
-        let mut waiting_d2 = cache.unresolved_watches_for(&t, &d2, &b);
-        assert_eq!((waiting_d1.len(), waiting_d2.len()), (1, 1));
+        let waiting_d1 = cache.unresolved_watches_for(&t, &d1, &b);
+        assert_eq!(waiting_d1.len(), 1);
+
+        cache.release_blobs(&t, &a, [&d2]);
+        assert!(!*waiting_d1[0].borrow(), "releasing D2 leaves D1 waiting");
+        assert!(
+            cache.unresolved_watches_for(&t, &d2, &b).is_empty(),
+            "a subscription after the release starts resolved"
+        );
+        assert!(cache.mount_sources(&t, &d2, &b).next().is_none());
 
         cache.confirm_blobs(&t, &a, [&d1]);
-        assert!(waiting_d1.pop().unwrap().wait_for(|&v| v).await.is_ok());
-        assert_eq!(
-            sources(&cache, &d1),
-            std::slice::from_ref(&a),
-            "D1 is committed at a"
-        );
-        assert!(sources(&cache, &d2).is_empty(), "D2 is not committed at a");
-        assert!(!*waiting_d2[0].borrow(), "D2's watch is unresolved");
-        assert_eq!(cache.unresolved_watches_for(&t, &d2, &b).len(), 1);
-
-        cache.confirm_blobs(&t, &a, [&d2]);
-        assert!(waiting_d2.pop().unwrap().wait_for(|&v| v).await.is_ok());
-        assert_eq!(
-            sources(&cache, &d2),
-            std::slice::from_ref(&a),
-            "D2 is committed at a"
-        );
-
-        let d3 = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            .parse::<Digest>()
-            .unwrap();
-        cache.set_blob_completed(&t, d3.clone(), a.clone());
-        let mut waiting_d3 = cache.unresolved_watches_for(&t, &d3, &b);
-        assert_eq!(waiting_d3.len(), 1, "D3 waits for a commit");
-        cache.notify_repo_failed(&t, &a);
-        assert!(waiting_d3.pop().unwrap().wait_for(|&v| v).await.is_ok());
-        assert!(sources(&cache, &d3).is_empty(), "failure commits nothing");
-        let d4 = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-            .parse::<Digest>()
-            .unwrap();
-        cache.set_blob_completed(&t, d4.clone(), a.clone());
-        assert!(
-            cache.unresolved_watches_for(&t, &d4, &b).is_empty(),
-            "a subscription after the failure starts resolved"
-        );
+        assert!(*waiting_d1[0].borrow(), "D1's commit wakes its watch");
+        let sources = |d: &Digest| cache.mount_sources(&t, d, &b).cloned().collect::<Vec<_>>();
+        assert_eq!(sources(&d1), [a]);
+        assert!(sources(&d2).is_empty(), "D2 was released, not committed");
     }
 
     #[test]

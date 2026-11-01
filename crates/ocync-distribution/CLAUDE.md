@@ -57,7 +57,7 @@ With `auth_type` unset, `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized 
 ## Cross-repo mount
 
 - ECR fulfills mount when `BLOB_MOUNTING=ENABLED` account setting + a committed manifest in the source repo *references the specific blob being mounted*. "Source repo has *some* committed manifest" is insufficient — the committed manifest must include the blob in its config or layer set.
-- The engine waits per blob, not per repo: a repo is a mount source for a blob only once a committed manifest in it references that blob (`confirm_blobs` after each manifest push). A repo with tag1 committed while tag2's blobs still upload, or whose referrer artifacts (SOCI indexes, attestations) push after the image, is not offered for those blobs until their manifest commits; a mount sooner draws a 202 and costs an upload. A repo that will never commit releases its waiters (`notify_repo_failed`).
+- The engine offers a repo as a mount source for a blob only once a committed manifest in it references that blob; see the commit rule in `crates/ocync-sync/CLAUDE.md`.
 - Mount POST returns 201 (success) or 202 (not fulfilled, upload session started).
 - Mount is attempted on all providers unconditionally; the 202 fallback is cheap (~100ms).
 

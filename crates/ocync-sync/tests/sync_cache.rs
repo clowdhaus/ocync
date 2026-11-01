@@ -1811,7 +1811,7 @@ async fn manifest_commit_wait_skipped_once_a_shared_child_failed() {
     );
 }
 
-/// A repo-failed watch is cleared when a run starts, with cache pruning off
+/// A released watch is cleared when a run starts, with cache pruning off
 /// too, so a run in the same process does not see a stale fired watch and
 /// wait on, or mount from, a repo that never committed.
 #[tokio::test]
@@ -1820,7 +1820,7 @@ async fn run_clears_repo_watches_without_cache_pruning() {
     let cache = empty_cache();
     cache
         .borrow_mut()
-        .notify_repo_failed(&target, &repo("repo"));
+        .release_blobs(&target, &repo("repo"), [&digest_b()]);
 
     SyncEngine::new(fast_retry(), concurrency(50))
         .with_cache_pruning(false)

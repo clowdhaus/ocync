@@ -1053,8 +1053,8 @@ async fn sync_leader_commits_before_follower_subscribes() {
 }
 
 /// Leader's manifest push fails (500). Followers waiting on the watch channel
-/// must unblock via `notify_repo_failed`, find the repo not committed,
-/// and fall through to HEAD+push instead of deadlocking.
+/// must unblock when the leader's blobs are released, find the repo not
+/// committed, and fall through to HEAD+push instead of deadlocking.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_leader_manifest_push_fails_follower_falls_through() {
     let source_server = MockServer::start().await;
@@ -1285,9 +1285,8 @@ async fn sync_cross_image_blob_claim_no_deadlock() {
 }
 
 /// Pre-warm the cache with committed blobs so the follower's mount-source
-/// lookup returns a Tier 1 match (committed + preferred). The follower should
-/// mount immediately without waiting on the watch channel, exercising the
-/// `Some(repo) if is_committed` branch (not the watch-wait branch).
+/// lookup finds a committed repo at once. The follower should mount
+/// immediately without waiting on a watch.
 #[tokio::test(flavor = "current_thread")]
 async fn sync_prewarmed_committed_repo_skips_watch_wait() {
     let source_server = MockServer::start().await;
@@ -1491,15 +1490,6 @@ async fn resolver_cancel_during_wait_drops_cleanly() {
         1,
         "the shared layer is uploaded once; its waiter had not pushed it"
     );
-}
-
-/// Index in `report.images` of the image synced into `target_repo`.
-fn image_index(report: &SyncReport, target_repo: &str) -> usize {
-    report
-        .images
-        .iter()
-        .position(|i| i.target.contains(target_repo))
-        .unwrap_or_else(|| panic!("{target_repo} is reported"))
 }
 
 /// A blob failure ends the image's other blobs' waits. Image B's shared layer
@@ -2096,7 +2086,7 @@ async fn mount_resolver_timeout_falls_back_to_push() {
     for repo in ["leader", "follower"] {
         mount_target_fresh(&target_server, repo, "v1", &blobs).await;
     }
-    // The leader fails, and its watch fires via notify_repo_failed.
+    // The leader fails, and its blobs' watches are released.
     Mock::given(method("PUT"))
         .and(path("/v2/leader/manifests/v1"))
         .respond_with(ResponseTemplate::new(500))
@@ -2139,6 +2129,81 @@ async fn mount_resolver_timeout_falls_back_to_push() {
     assert_eq!(
         report.stats.blobs_mounted, 0,
         "no mounts should succeed when leader never commits"
+    );
+}
+
+/// A leader whose image manifest push fails releases the blobs it holds, so a
+/// follower that reaches the shared layer afterwards pushes it at once. With
+/// the default mount-source wait, an unreleased follower outlives the 10s guard.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_image_manifest_releases_followers_waiting_for_its_blobs() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+
+    let leader_img = ManifestBuilder::new(b"release-leader-cfg")
+        .layer(b"release-shared")
+        .build();
+    let follower_img = ManifestBuilder::new(b"release-follower-cfg")
+        .layer(b"release-shared")
+        .build();
+    leader_img
+        .mount_source(&source_server, "leader", "v1")
+        .await;
+    follower_img
+        .mount_source(&source_server, "follower", "v1")
+        .await;
+    let shared = &leader_img.layer_descs[0].digest;
+    let blobs = [
+        &leader_img.config_desc.digest,
+        &follower_img.config_desc.digest,
+        shared,
+    ];
+    for repo in ["leader", "follower"] {
+        mount_target_fresh(&target_server, repo, "v1", &blobs).await;
+    }
+    Mock::given(method("PUT"))
+        .and(path("/v2/leader/manifests/v1"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&target_server)
+        .await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_engine(
+            v1_mappings(
+                &source_server,
+                &target_server,
+                // A tie in leader election goes to the later image.
+                &[("follower", "follower"), ("leader", "leader")],
+            ),
+            fast_retry(),
+            10,
+            empty_cache(),
+            BlobStage::disabled(),
+            None,
+        ),
+    )
+    .await
+    .expect("the follower sat out the mount-source wait");
+
+    assert_status!(
+        report,
+        image_index(&report, "leader"),
+        ImageStatus::Failed {
+            kind: ErrorKind::ManifestPush,
+            ..
+        }
+    );
+    assert_status!(
+        report,
+        image_index(&report, "follower"),
+        ImageStatus::Synced
+    );
+    assert_eq!(
+        count_blob_uploads(&target_server, PathMatch::Contains("/follower/"), shared).await,
+        1,
+        "the follower pushes the shared layer once the leader fails"
     );
 }
 

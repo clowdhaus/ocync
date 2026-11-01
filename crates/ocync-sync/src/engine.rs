@@ -1655,11 +1655,6 @@ async fn execute_item(
             let artifacts_skipped = match discover_and_sync_artifacts(&ctx, &item).await {
                 Ok(skipped) => skipped,
                 Err(err) => {
-                    // The artifacts' manifests will not commit, so followers
-                    // waiting on their blobs stop waiting.
-                    cache
-                        .borrow_mut()
-                        .notify_repo_failed(item.target_entry.id(), &item.target.repo);
                     let (kind, retries) = if err.is_required_artifacts_missing() {
                         (ErrorKind::RequiredArtifactsMissing, 0)
                     } else {
@@ -1703,10 +1698,13 @@ async fn execute_item(
             }
         }
         Err(err) => {
-            // Unblock followers waiting on this repo's manifest commit.
-            cache
-                .borrow_mut()
-                .notify_repo_failed(item.target_entry.id(), &item.target.repo);
+            // Unblock followers waiting on this item's blobs to commit.
+            release_blobs(
+                &ctx,
+                blobs_from_manifest(&item.source_data)
+                    .iter()
+                    .map(|blob| &blob.digest),
+            );
 
             if err.manifest_refusal() == Some(ManifestRefusal::ImmutableTag) {
                 debug!(
@@ -2216,12 +2214,10 @@ async fn transfer_image_blobs(
             BlobResult::Cancelled => {}
             BlobResult::Failed(err) => {
                 cancel.trigger();
-                // Followers waiting to mount from this repo stop now, not
-                // after the in-flight uploads drain; they fall through to
-                // HEAD+push.
-                ctx.cache
-                    .borrow_mut()
-                    .notify_repo_failed(ctx.target_id, ctx.target_repo);
+                // Followers waiting to mount these blobs from this repo stop
+                // now, not after the in-flight uploads drain; they fall
+                // through to HEAD+push.
+                release_blobs(ctx, blobs.iter().map(|blob| &blob.digest));
                 outcome.error = Some(err);
                 // No break: drain the remaining futures so permits are
                 // released and the cancel flag takes effect.
@@ -2391,7 +2387,7 @@ async fn resolve_mount_source(
         tokio::select! {
             _ = &mut wait => continue,
             _ = tokio::time::sleep_until(deadline) => {
-                debug!(
+                warn!(
                     %digest,
                     target = %ctx.target_id.alias(),
                     "mount-source wait deadline reached, falling back to push"
@@ -2730,11 +2726,11 @@ async fn push_manifest(
     }
     // No commit wait here: a batch check settles every earlier run's entry
     // before the push, so only a target without one reaches the repair. A
-    // second refusal is returned as is, but a commit is recorded, so waiters
-    // on these blobs are released.
+    // commit is recorded only when this second push succeeds; a second
+    // refusal is returned as is.
     let repushed = put_manifest(ctx, reference, manifest).await;
     if repushed.is_ok() {
-        settle_blobs(ctx, &blobs, &repushed);
+        record_commit(ctx, &blobs);
     }
     repushed
 }
@@ -2771,20 +2767,17 @@ fn settle_blobs(
     blobs: &[&Descriptor],
     pushed: &Result<(), crate::Error>,
 ) -> bool {
-    let digests = blobs.iter().map(|b| &b.digest);
     let key = |digest: &Digest| target_key(ctx.target_id.alias(), ctx.target_repo, digest);
     match pushed {
         Ok(()) => {
-            ctx.cache
-                .borrow_mut()
-                .confirm_blobs(ctx.target_id, ctx.target_repo, digests);
+            record_commit(ctx, blobs);
             false
         }
         Err(e) if e.manifest_refusal() == Some(ManifestRefusal::Invalid) => {
             let dropped = ctx.cache.borrow_mut().forget_remembered_blobs(
                 ctx.target_id,
                 ctx.target_repo,
-                digests,
+                blobs.iter().map(|b| &b.digest),
             );
             let mut lost = ctx.shared.lost_blobs.borrow_mut();
             lost.extend(dropped.into_iter().map(key));
@@ -2792,6 +2785,24 @@ fn settle_blobs(
         }
         Err(_) => false,
     }
+}
+
+/// Record that a manifest referencing `blobs` committed at the task's target
+/// repo, which makes the repo a mount source for them and wakes their waiters.
+fn record_commit(ctx: &TransferContext<'_>, blobs: &[&Descriptor]) {
+    ctx.cache.borrow_mut().confirm_blobs(
+        ctx.target_id,
+        ctx.target_repo,
+        blobs.iter().map(|b| &b.digest),
+    );
+}
+
+/// Release the waiters on `digests` at the task's target repo, which will not
+/// commit a manifest referencing them this run.
+fn release_blobs<'a>(ctx: &TransferContext<'_>, digests: impl IntoIterator<Item = &'a Digest>) {
+    ctx.cache
+        .borrow_mut()
+        .release_blobs(ctx.target_id, ctx.target_repo, digests);
 }
 
 /// Discover referrers for a synced manifest and transfer matching artifacts.
@@ -2928,12 +2939,13 @@ async fn sync_artifact(
     wait_for_commit(item, retry, &blob_digests).await;
 
     // Pushed by digest, not tag; its blob work stays out of the image's report.
-    push_manifest(ctx, &artifact_digest_str, &artifact_pull, None)
-        .await
-        .map_err(|e| crate::Error::ArtifactSync {
+    if let Err(e) = push_manifest(ctx, &artifact_digest_str, &artifact_pull, None).await {
+        release_blobs(ctx, &blob_digests);
+        return Err(crate::Error::ArtifactSync {
             reference: artifact_digest_str.clone(),
             reason: format!("manifest push failed: {e}"),
-        })?;
+        });
+    }
 
     debug!(
         repo = %source_repo,
