@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
 use crate::auth::detect::ProviderKind;
-use crate::client::{RegistryClient, auth_headers, build_url, report_permit};
+use crate::client::{RegistryClient, UploadSlot, auth_headers, build_url, report_permit};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
@@ -105,9 +105,8 @@ impl RegistryClient {
     /// Pull a blob as a streaming response. The GET and any redirect it
     /// follows go over HTTP/1.1, so a body left unread holds back only its
     /// own connection. A download permit is held by the returned stream
-    /// until it is dropped, bounding open download connections; it is never
-    /// an upload permit, which a copy's upload waits for while its download
-    /// is open.
+    /// until it is dropped, bounding open download connections. It is never
+    /// an upload slot: a copy reserves its slot first and then waits here.
     pub async fn blob_pull(
         &self,
         repository: &RepositoryName,
@@ -196,8 +195,13 @@ impl RegistryClient {
     /// Push a blob with a streaming upload: a POST, then a PUT whose body is
     /// the stream, unbuffered, with the digest for the registry to verify.
     /// GHCR and ACR take buffered fallbacks instead.
+    ///
+    /// `slot` is the caller's upload slot from this client's
+    /// [`RegistryClient::reserve_upload_slot`], held across the whole call
+    /// and across any retry of it.
     pub async fn blob_push_stream<E>(
         &self,
+        slot: &UploadSlot,
         repository: &RepositoryName,
         expected_digest: &Digest,
         known_size: Option<u64>,
@@ -206,6 +210,10 @@ impl RegistryClient {
     where
         E: Into<Error> + Send,
     {
+        debug_assert!(
+            self.owns_slot(slot),
+            "upload slot reserved on another client"
+        );
         let stream = stream.map(|r| r.map_err(Into::into));
 
         // Exhaustive, so a new `ProviderKind` fails to compile until its
@@ -245,9 +253,6 @@ impl RegistryClient {
         let upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push stream initiate")
             .await?;
-
-        // Held for the long-lived PUT body only; the POST is brief.
-        let _upload_permit = self.acquire_blob_upload_permit().await;
 
         // Not `send_with_aimd`: the stream is consumed once, so the request
         // cannot be rebuilt for a 401 retry. A 401 here drops the token and
@@ -317,7 +322,7 @@ impl RegistryClient {
             "GHCR multi-PATCH chunked upload is broken; buffering blob for single-PATCH upload"
         );
 
-        let _permits = self.acquire_buffered_upload_permits(known_size).await;
+        let _bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
         let scopes = [Scope::pull_push(repository.as_str())];
         let upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push ghcr initiate")
@@ -394,7 +399,7 @@ impl RegistryClient {
             "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
         );
 
-        let _permits = self.acquire_buffered_upload_permits(known_size).await;
+        let _bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
 
         let raw = buffer_stream(stream, known_size).await?;
         let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
@@ -742,6 +747,29 @@ mod tests {
         Digest::from_sha256(Sha256::digest(data))
     }
 
+    /// A slot reserved on one client is refused by another, whose own cap it
+    /// would not count against. Breaks if the ownership check is dropped.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "upload slot reserved on another client")]
+    async fn blob_push_stream_refuses_a_slot_from_another_client() {
+        let (one, other) = (
+            build_test_client("a.example", 1),
+            build_test_client("b.example", 2),
+        );
+        let digest = test_digest(b"blob");
+        let repo = RepositoryName::new("repo").unwrap();
+        let _ = other
+            .blob_push_stream(
+                &one.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                None,
+                data_stream(b"blob", 4),
+            )
+            .await;
+    }
+
     /// A blob download waits for the download cap while another body is
     /// open, and proceeds once that body is dropped.
     #[tokio::test(flavor = "current_thread")]
@@ -849,7 +877,13 @@ mod tests {
 
         let repo = RepositoryName::new("my-org/my-image").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                None,
+                data_stream(data, 4),
+            )
             .await
             .unwrap();
 
@@ -926,7 +960,13 @@ mod tests {
         let client = build_test_client("myacr.azurecr.io", port);
         let repo = RepositoryName::new("myreg/myimg").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                None,
+                data_stream(data, 4),
+            )
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1001,7 +1041,13 @@ mod tests {
         let client = build_test_client("myacr.azurecr.io", port);
         let repo = RepositoryName::new("proj/img").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, Some(total_len), data_stream(&data, 65536))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                Some(total_len),
+                data_stream(&data, 65536),
+            )
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1049,7 +1095,13 @@ mod tests {
         let client = build_test_client("myacr.azurecr.io", port);
         let repo = RepositoryName::new("repo").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, Some(0), data_stream(data, 4))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                Some(0),
+                data_stream(data, 4),
+            )
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1106,7 +1158,13 @@ mod tests {
         let client = build_test_client("myacr.azurecr.io", registry_port);
         let repo = RepositoryName::new("r/i").unwrap();
         let err = client
-            .blob_push_stream(&repo, &digest, None, data_stream(data, 4))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                None,
+                data_stream(data, 4),
+            )
             .await
             .expect_err("cross-host PATCH Location must be rejected");
         let msg = err.to_string();
@@ -1367,7 +1425,13 @@ mod tests {
 
         let repo = RepositoryName::new("stream/repo").unwrap();
         let result = client
-            .blob_push_stream(&repo, &digest, known_size, data_stream(data, 4))
+            .blob_push_stream(
+                &client.reserve_upload_slot().await,
+                &repo,
+                &digest,
+                known_size,
+                data_stream(data, 4),
+            )
             .await
             .unwrap();
 
@@ -1388,8 +1452,8 @@ mod tests {
     /// Pins the byte-budget queueing contract for the buffered fallback
     /// paths (GHCR / ACR).
     ///
-    /// Two concurrent GHCR uploads, each declaring half the budget plus
-    /// a few bytes, would together exceed the byte budget if they ran
+    /// Two concurrent uploads per host (GHCR, ACR), each declaring half the
+    /// budget plus a few bytes, would together exceed the byte budget if they ran
     /// fully overlapped. The first upload is delayed by the wiremock
     /// mock (200 ms PATCH/PUT response delay) so the second must wait
     /// on the byte-budget permit before its own POST initiates.
@@ -1400,6 +1464,12 @@ mod tests {
     /// the second upload behind the first.
     #[tokio::test]
     async fn buffered_upload_byte_budget_queues_concurrent_uploads() {
+        for host in ["ghcr.io", "myreg.azurecr.io"] {
+            byte_budget_queues_two_uploads(host).await;
+        }
+    }
+
+    async fn byte_budget_queues_two_uploads(host: &str) {
         use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
         use std::time::Instant;
@@ -1451,15 +1521,12 @@ mod tests {
         let digest_a = test_digest(&blob_a);
         let digest_b = test_digest(&blob_b);
 
-        // Use the GHCR fallback path (single-PATCH then PUT, buffered),
-        // with a small 8 MB byte budget. Two 6 MB uploads must serialize.
-        let base_url = Url::parse(&format!("http://ghcr.io:{port}")).unwrap();
+        // Use the buffered fallback path of `host` (PATCH then PUT), with a
+        // small 8 MB byte budget. Two 6 MB uploads must serialize.
+        let base_url = Url::parse(&format!("http://{host}:{port}")).unwrap();
         let client = Arc::new(
             crate::client::RegistryClientBuilder::new(base_url)
-                .resolve(
-                    "ghcr.io",
-                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                )
+                .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
                 .buffered_blob_bytes(std::num::NonZeroUsize::new(8 * 1024 * 1024).unwrap())
                 .build()
                 .unwrap(),
@@ -1474,6 +1541,7 @@ mod tests {
         let h1 = tokio::spawn(async move {
             client_1
                 .blob_push_stream(
+                    &client_1.reserve_upload_slot().await,
                     &repo_a,
                     &digest_a_clone,
                     Some(blob_a_clone.len() as u64),
@@ -1499,7 +1567,9 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(5), wait_for_first_post)
             .await
-            .expect("first upload POST must fire within 5s (task 1 likely stuck)");
+            .unwrap_or_else(|_| {
+                panic!("{host}: first upload POST must fire within 5s (task 1 likely stuck)")
+            });
 
         let client_2 = Arc::clone(&client);
         let blob_b_clone = blob_b.clone();
@@ -1507,6 +1577,7 @@ mod tests {
         let h2 = tokio::spawn(async move {
             client_2
                 .blob_push_stream(
+                    &client_2.reserve_upload_slot().await,
                     &repo_b,
                     &digest_b_clone,
                     Some(blob_b_clone.len() as u64),
@@ -1517,11 +1588,19 @@ mod tests {
 
         let r1 = h1.await.unwrap();
         let r2 = h2.await.unwrap();
-        assert!(r1.is_ok(), "first upload should succeed: {:?}", r1.err());
-        assert!(r2.is_ok(), "second upload should succeed: {:?}", r2.err());
+        assert!(
+            r1.is_ok(),
+            "{host}: first upload should succeed: {:?}",
+            r1.err()
+        );
+        assert!(
+            r2.is_ok(),
+            "{host}: second upload should succeed: {:?}",
+            r2.err()
+        );
 
         let times = post_times.lock().unwrap();
-        assert_eq!(times.len(), 2, "both POSTs must have fired");
+        assert_eq!(times.len(), 2, "{host}: both POSTs must have fired");
         let gap = times[1].duration_since(times[0]);
         // Task 2 cannot POST until task 1 releases the byte permit,
         // which happens when task 1's `blob_push_stream` returns
@@ -1531,7 +1610,7 @@ mod tests {
         let lower_bound = patch_delay.saturating_sub(Duration::from_millis(100));
         assert!(
             gap >= lower_bound,
-            "second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
+            "{host}: second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
         );
     }
 }

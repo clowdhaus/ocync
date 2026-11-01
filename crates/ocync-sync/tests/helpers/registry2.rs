@@ -52,7 +52,13 @@ async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: 
     let body = Bytes::from(data);
     let s = stream::once(async move { Ok::<_, ocync_distribution::Error>(body) });
     client
-        .blob_push_stream(repo, &digest, Some(size), s)
+        .blob_push_stream(
+            &client.reserve_upload_slot().await,
+            repo,
+            &digest,
+            Some(size),
+            s,
+        )
         .await
         .expect("blob_push_stream");
 }

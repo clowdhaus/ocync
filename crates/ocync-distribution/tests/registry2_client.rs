@@ -323,7 +323,13 @@ async fn blob_push_stream_chunked() {
     let body = Bytes::from(data);
     let stream = stream::once(async move { Ok::<_, Error>(body) });
     let digest = client
-        .blob_push_stream(&repo, &expected_digest, Some(data_len), stream)
+        .blob_push_stream(
+            &client.reserve_upload_slot().await,
+            &repo,
+            &expected_digest,
+            Some(data_len),
+            stream,
+        )
         .await
         .expect("blob_push_stream failed");
 

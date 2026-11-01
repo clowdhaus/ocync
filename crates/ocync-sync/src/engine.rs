@@ -2423,6 +2423,12 @@ async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
 /// the per-image blob semaphore. Takes [`BlobIoContext`], not
 /// [`TransferContext`]: this signature is the compile-time boundary that keeps
 /// cache wait methods out of the semaphore scope.
+///
+/// The target's upload slot is reserved here, under the blob permit, after the
+/// mount, HEAD and recorded-failure checks and before any source download.
+/// Slot holders only do network I/O and so always finish. Reserving it before
+/// the blob permit would let permit holders wait on a slot whose holders wait
+/// on a permit, and would spend a slot on blobs a mount or HEAD settles.
 async fn transfer_claimed_blob(
     io: &BlobIoContext<'_>,
     digest: &Digest,
@@ -2520,18 +2526,23 @@ async fn transfer_claimed_blob(
             push_staged_blob(io, digest).await
         }
         StagingClaim::Staged => push_staged_blob(io, digest).await,
-        StagingClaim::Disabled => with_retry(io.retry, "blob transfer", || async {
-            let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
-            io.target_client
-                .blob_push_stream(io.target_repo, digest, Some(size), stream)
-                .await
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::Error::BlobTransfer {
-            digest: digest.clone(),
-            source: e,
-        }),
+        StagingClaim::Disabled => {
+            // Taken before the source download opens, so a copy waiting for
+            // a slot holds no response or upload session. Held across retries.
+            let slot = io.target_client.reserve_upload_slot().await;
+            with_retry(io.retry, "blob transfer", || async {
+                let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
+                io.target_client
+                    .blob_push_stream(&slot, io.target_repo, digest, Some(size), stream)
+                    .await
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::Error::BlobTransfer {
+                digest: digest.clone(),
+                source: e,
+            })
+        }
     };
 
     match transfer_result {
@@ -2544,8 +2555,10 @@ async fn transfer_claimed_blob(
     }
 }
 
-/// Push a staged blob from disk to the target registry.
+/// Push a staged blob from disk to the target registry, waiting for an upload
+/// slot first so no file is open while it waits.
 async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(), crate::Error> {
+    let slot = io.target_client.reserve_upload_slot().await;
     with_retry(io.retry, "blob push (staged)", || async {
         let file = io
             .staging
@@ -2562,7 +2575,7 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
             })
         });
         io.target_client
-            .blob_push_stream(io.target_repo, digest, file_size, stream)
+            .blob_push_stream(&slot, io.target_repo, digest, file_size, stream)
             .await
     })
     .await
@@ -3296,6 +3309,7 @@ mod tests {
 
         let source = client
             .blob_push_stream(
+                &client.reserve_upload_slot().await,
                 &RepositoryName::new("repo").unwrap(),
                 &digest,
                 Some(4),

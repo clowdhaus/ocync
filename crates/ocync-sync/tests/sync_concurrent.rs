@@ -2254,6 +2254,24 @@ async fn resolver_retries_mount_after_source_marked_stale() {
     );
 }
 
+/// A mapping from repository `src` to `dst` of one registry, with one client
+/// as source and target that allows one upload at a time.
+fn one_upload_slot_mapping(server: &MockServer) -> ResolvedMapping {
+    let client = Arc::new(
+        ocync_distribution::RegistryClientBuilder::new(server.uri().parse().unwrap())
+            .blob_upload_concurrency(std::num::NonZeroUsize::MIN)
+            .build()
+            .unwrap(),
+    );
+    resolved_mapping(
+        Arc::clone(&client),
+        "src",
+        "dst",
+        vec![target_entry("same", client)],
+        vec![TagPair::same("v1")],
+    )
+}
+
 /// A copy between two repositories of one registry, with one client as
 /// source and target, finishes when that client allows one upload at a
 /// time. Breaks if a blob download takes an upload permit, which it would
@@ -2264,19 +2282,7 @@ async fn sync_within_one_registry_does_not_wait_on_its_own_download() {
     let img = ManifestBuilder::new(b"cfg").layer(b"layer").build();
     img.mount_source(&server, "src", "v1").await;
     img.mount_target(&server, "dst", "v1").await;
-    let client = Arc::new(
-        ocync_distribution::RegistryClientBuilder::new(server.uri().parse().unwrap())
-            .blob_upload_concurrency(std::num::NonZeroUsize::MIN)
-            .build()
-            .unwrap(),
-    );
-    let mapping = resolved_mapping(
-        Arc::clone(&client),
-        "src",
-        "dst",
-        vec![target_entry("same", client)],
-        vec![TagPair::same("v1")],
-    );
+    let mapping = one_upload_slot_mapping(&server);
 
     let report = tokio::time::timeout(Duration::from_secs(10), run_sync(vec![mapping]))
         .await
@@ -2284,4 +2290,48 @@ async fn sync_within_one_registry_does_not_wait_on_its_own_download() {
 
     assert_status!(report, 0, ImageStatus::Synced);
     assert_eq!(report.stats.blobs_transferred, 2);
+}
+
+/// With one upload slot and slow uploads, a copy takes its slot before its
+/// source download opens: the source blob GETs interleave with the target
+/// uploads instead of all arriving first and waiting on the slot. Breaks if a
+/// download is opened while the slot is held by another copy.
+#[tokio::test]
+async fn sync_takes_the_upload_slot_before_opening_the_download() {
+    let server = MockServer::start().await;
+    let img = ManifestBuilder::new(b"slot-cfg")
+        .layer(b"slot-layer-1")
+        .layer(b"slot-layer-2")
+        .layer(b"slot-layer-3")
+        .build();
+    img.mount_source(&server, "src", "v1").await;
+    img.mount_target(&server, "dst", "v1").await;
+    // Outranks the instant finalize in `mount_blob_push`.
+    Mock::given(method("PUT"))
+        .and(path("/v2/dst/blobs/uploads/upload-id"))
+        .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_millis(300)))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let report = run_sync(vec![one_upload_slot_mapping(&server)]).await;
+
+    assert_status!(report, 0, ImageStatus::Synced);
+    assert_eq!(report.stats.blobs_transferred, 4);
+    // `G` for a source blob GET, `P` for a target upload PUT, in arrival order.
+    let log: String = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| match (&r.method, r.url.path()) {
+            (&Method::GET, p) if p.starts_with("/v2/src/blobs/") => Some('G'),
+            (&Method::PUT, p) if p.starts_with("/v2/dst/blobs/uploads/") => Some('P'),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        log, "GPGPGPGP",
+        "each source download must follow the previous copy's upload"
+    );
 }

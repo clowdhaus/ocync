@@ -57,7 +57,8 @@ const DEFAULT_BLOB_UPLOAD_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(64).unwr
 /// HTTP/1.1 connection while its body is open, so the cap bounds the
 /// connections and TLS handshakes one sync opens to a source. Every upload
 /// reads one download, so a lower cap would hold uploads below their own
-/// cap, and a higher one would only open more bodies waiting on uploads.
+/// cap. A copy opens its download only after it holds an upload slot, so a
+/// higher cap matters only for pulls to disk, which take no slot.
 const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: NonZeroUsize = DEFAULT_BLOB_UPLOAD_CONCURRENCY;
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
@@ -284,11 +285,12 @@ pub struct RegistryClient {
     pub(crate) blob_download_http: reqwest::Client,
     pub(crate) auth: Option<Box<dyn AuthProvider>>,
     pub(crate) aimd: AimdController,
-    /// Cap on concurrent blob uploads; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
+    /// Cap on concurrent blob uploads, taken through
+    /// [`Self::reserve_upload_slot`]; see [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
     pub(crate) blob_upload_sem: Arc<Semaphore>,
     /// Cap on concurrent blob downloads, held by [`Self::blob_pull`]'s
     /// stream until it is dropped. Never shared with uploads: a copy holds
-    /// one while its upload waits for an upload permit, which would
+    /// an upload slot while it waits for a download permit, which would
     /// deadlock if both came from one semaphore.
     pub(crate) blob_download_sem: Arc<Semaphore>,
     /// Byte budget for buffered blob bodies, one permit per byte, held by
@@ -303,6 +305,14 @@ pub struct RegistryClient {
     rate_limit_remaining: AtomicU64,
 }
 
+/// One of a client's concurrent blob upload slots, held until dropped.
+///
+/// Made only by [`RegistryClient::reserve_upload_slot`] and passed to
+/// [`RegistryClient::blob_push_stream`], so a copy waits for its slot before
+/// it opens the source download rather than after.
+#[derive(Debug)]
+pub struct UploadSlot(OwnedSemaphorePermit);
+
 /// Acquire a permit from one of the client's blob caps.
 async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
     // The client never closes its semaphores.
@@ -313,31 +323,26 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 }
 
 impl RegistryClient {
-    /// Acquire a permit gating concurrent blob uploads, held for the whole
-    /// upload body. See [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`].
-    pub(crate) async fn acquire_blob_upload_permit(&self) -> OwnedSemaphorePermit {
-        acquire_permit(&self.blob_upload_sem).await
+    /// Wait for one of this client's upload slots (see
+    /// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]) and hold it until the returned
+    /// slot is dropped.
+    ///
+    /// Take it before the source download opens, and pass it to
+    /// [`Self::blob_push_stream`] on this same client. A copy then holds its
+    /// slot and waits on the download cap, never the other way round.
+    pub async fn reserve_upload_slot(&self) -> UploadSlot {
+        UploadSlot(acquire_permit(&self.blob_upload_sem).await)
+    }
+
+    /// Whether `slot` came from this client's [`Self::reserve_upload_slot`].
+    pub(crate) fn owns_slot(&self, slot: &UploadSlot) -> bool {
+        Arc::ptr_eq(slot.0.semaphore(), &self.blob_upload_sem)
     }
 
     /// Acquire a permit gating concurrent blob downloads. See
     /// [`DEFAULT_BLOB_DOWNLOAD_CONCURRENCY`].
     pub(crate) async fn acquire_blob_download_permit(&self) -> OwnedSemaphorePermit {
         acquire_permit(&self.blob_download_sem).await
-    }
-
-    /// Acquire both the per-target count permit and the byte-budget
-    /// permit for a fallback (buffered) blob upload, in the right order.
-    ///
-    /// Returns `(bytes_permit, upload_permit)`. Tuples drop in field order,
-    /// so the contested byte budget is released before the count cap,
-    /// letting queued buffered uploads admit at once.
-    pub(crate) async fn acquire_buffered_upload_permits(
-        &self,
-        known_size: Option<u64>,
-    ) -> (OwnedSemaphorePermit, OwnedSemaphorePermit) {
-        let upload_permit = self.acquire_blob_upload_permit().await;
-        let bytes_permit = self.acquire_buffered_bytes_permit(known_size).await;
-        (bytes_permit, upload_permit)
     }
 
     /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
@@ -350,8 +355,8 @@ impl RegistryClient {
     ///   takes the whole budget and others queue until it completes, though
     ///   its memory exceeds the budget.
     /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`], also
-    ///   capped at the budget. The blob may buffer more; the upload count
-    ///   cap still bounds how many.
+    ///   capped at the budget. The blob may buffer more; the upload slots
+    ///   still bound how many.
     pub(crate) async fn acquire_buffered_bytes_permit(
         &self,
         expected: Option<u64>,
