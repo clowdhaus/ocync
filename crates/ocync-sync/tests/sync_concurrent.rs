@@ -2256,11 +2256,11 @@ async fn resolver_retries_mount_after_source_marked_stale() {
 }
 
 /// A mapping from repository `src` to `dst` of one registry, with one client
-/// as source and target that allows one upload at a time.
-fn one_upload_slot_mapping(server: &MockServer) -> ResolvedMapping {
+/// as source and target that allows `slots` uploads at a time.
+fn upload_slot_mapping(server: &MockServer, slots: usize) -> ResolvedMapping {
     let client = Arc::new(
         ocync_distribution::RegistryClientBuilder::new(server.uri().parse().unwrap())
-            .blob_upload_concurrency(std::num::NonZeroUsize::MIN)
+            .blob_upload_concurrency(std::num::NonZeroUsize::new(slots).unwrap())
             .build()
             .unwrap(),
     );
@@ -2271,6 +2271,19 @@ fn one_upload_slot_mapping(server: &MockServer) -> ResolvedMapping {
         vec![target_entry("same", client)],
         vec![TagPair::same("v1")],
     )
+}
+
+/// Make the target's HEAD for each of `digests` answer 404 after 50 ms, so the
+/// config copy, whose HEAD answers at once, takes the first upload slot.
+async fn delay_target_heads(server: &MockServer, digests: &[&Digest]) {
+    for digest in digests {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/dst/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(50)))
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
 }
 
 /// The requests the one-slot tests order, as `G<name>` for a source blob GET
@@ -2333,7 +2346,7 @@ async fn sync_takes_the_upload_slot_before_opening_the_download() {
 
         let report = tokio::time::timeout(
             Duration::from_secs(10),
-            run_sync_with_concurrency(vec![one_upload_slot_mapping(&server)], 50, stage),
+            run_sync_with_concurrency(vec![upload_slot_mapping(&server, 1)], 50, stage),
         )
         .await
         .unwrap_or_else(|_| panic!("{row}: the copy waited on its own download"));
@@ -2362,6 +2375,7 @@ async fn sync_retry_does_not_hold_the_upload_slot_during_backoff() {
     img.mount_source(&server, "src", "v1").await;
     img.mount_target(&server, "dst", "v1").await;
     let cfg = &img.config_desc.digest;
+    delay_target_heads(&server, &[&img.layer_descs[0].digest]).await;
     Mock::given(method("GET"))
         .and(path(format!("/v2/src/blobs/{cfg}")))
         .respond_with(ResponseTemplate::new(503))
@@ -2376,7 +2390,7 @@ async fn sync_retry_does_not_hold_the_upload_slot_during_backoff() {
     };
 
     let report = run_engine(
-        vec![one_upload_slot_mapping(&server)],
+        vec![upload_slot_mapping(&server, 1)],
         retry,
         50,
         empty_cache(),
@@ -2394,45 +2408,67 @@ async fn sync_retry_does_not_hold_the_upload_slot_during_backoff() {
     );
 }
 
-/// With one upload slot, a blob queued for it behind a copy that then fails
-/// is cancelled with the image and never opens its source download. Breaks if
-/// a copy waiting for a slot ignores the image's cancel.
+/// A copy of an image that fails while another copy waits is cancelled with
+/// the image: one waiting for an upload slot never opens its source download,
+/// and one that holds a slot and waits on its source download is cut off
+/// instead of finishing it. Breaks if either wait ignores the image's cancel.
 #[tokio::test]
-async fn sync_cancel_stops_copies_waiting_for_an_upload_slot() {
-    let server = MockServer::start().await;
-    let img = ManifestBuilder::new(b"cancel-cfg")
-        .layer(b"cancel-layer-1")
-        .layer(b"cancel-layer-2")
-        .build();
-    img.mount_source(&server, "src", "v1").await;
-    img.mount_target(&server, "dst", "v1").await;
-    // The config holds the slot for its whole GET, so both layers queue.
-    let cfg = &img.config_desc.digest;
-    Mock::given(method("GET"))
-        .and(path(format!("/v2/src/blobs/{cfg}")))
-        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(200)))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    let no_retries = RetryConfig {
-        max_retries: 0,
-        ..fast_retry()
-    };
+async fn sync_cancel_stops_copies_waiting_to_download() {
+    // The wait for a source download is the GET's 5 s delay: the download
+    // permit cap cannot be set from here.
+    for (row, slots, layers, want_log) in [
+        ("waiting for a slot", 1, 2, vec!["Gcfg"]),
+        ("waiting for the download", 2, 1, vec!["Gcfg", "Glayer"]),
+    ] {
+        let server = MockServer::start().await;
+        let mut builder = ManifestBuilder::new(b"cancel-cfg");
+        for n in 1..=layers {
+            builder = builder.layer(format!("cancel-layer-{n}").as_bytes());
+        }
+        let img = builder.build();
+        img.mount_source(&server, "src", "v1").await;
+        img.mount_target(&server, "dst", "v1").await;
+        let cfg = &img.config_desc.digest;
+        let layer_digests: Vec<&Digest> = img.layer_descs.iter().map(|d| &d.digest).collect();
+        delay_target_heads(&server, &layer_digests).await;
+        // The config holds its slot for its whole GET and then fails.
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/src/blobs/{cfg}")))
+            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(200)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        for digest in &layer_digests {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/src/blobs/{digest}")))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        let no_retries = RetryConfig {
+            max_retries: 0,
+            ..fast_retry()
+        };
 
-    let report = run_engine(
-        vec![one_upload_slot_mapping(&server)],
-        no_retries,
-        50,
-        empty_cache(),
-        BlobStage::disabled(),
-        None,
-    )
-    .await;
+        let report = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_engine(
+                vec![upload_slot_mapping(&server, slots)],
+                no_retries,
+                50,
+                empty_cache(),
+                BlobStage::disabled(),
+                None,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{row}: a copy outlived the failed image"));
 
-    assert_status!(report, 0, ImageStatus::Failed { .. });
-    assert_eq!(
-        slot_log(&server, &[(cfg, "cfg")]).await,
-        ["Gcfg"],
-        "no queued copy may open its download after the image failed"
-    );
+        assert_status!(report, 0, ImageStatus::Failed { .. }, "{row}");
+        let names: Vec<(&Digest, &str)> = std::iter::once((cfg, "cfg"))
+            .chain(layer_digests.iter().map(|d| (*d, "layer")))
+            .collect();
+        assert_eq!(slot_log(&server, &names).await, want_log, "{row}");
+    }
 }

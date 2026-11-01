@@ -8,8 +8,9 @@ use tracing::{debug, warn};
 
 use crate::aimd::RegistryAction;
 use crate::auth::Scope;
-use crate::auth::detect::ProviderKind;
-use crate::client::{RegistryClient, UploadSlot, auth_headers, build_url, report_permit};
+use crate::client::{
+    RegistryClient, UploadPath, UploadSlot, auth_headers, build_url, report_permit,
+};
 use crate::digest::Digest;
 use crate::error::Error;
 use crate::sha256::Sha256;
@@ -89,47 +90,32 @@ impl UploadSlot<'_> {
     /// the stream, unbuffered, with the digest for the registry to verify.
     /// GHCR and ACR take buffered fallbacks instead.
     ///
-    /// Spends the slot, which is held until the upload ends. A caller that
-    /// retries reserves a fresh slot per attempt, so none is held across a
-    /// backoff.
+    /// Spends the slot, which is held until the upload ends.
     pub async fn push_stream<E>(
         self,
         repository: &RepositoryName,
         expected_digest: &Digest,
-        known_size: Option<u64>,
         stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     ) -> Result<Digest, Error>
     where
         E: Into<Error> + Send,
     {
         let client = self.client;
+        let known_size = self.known_size;
         let stream = stream.map(|r| r.map_err(Into::into));
 
-        // Exhaustive, so a new `ProviderKind` fails to compile until its
-        // upload path is chosen here.
-        match client.aimd.provider() {
-            Some(ProviderKind::Ghcr) => {
+        match self.path {
+            UploadPath::Ghcr => {
                 return client
                     .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
                     .await;
             }
-            Some(ProviderKind::Acr) => {
+            UploadPath::Acr => {
                 return client
                     .blob_push_stream_acr(repository, expected_digest, known_size, stream)
                     .await;
             }
-            // Artifact Registry answers a second PATCH in one session with
-            // 405 and a monolithic POST with 502, but takes the streaming
-            // PUT.
-            Some(
-                ProviderKind::Ecr
-                | ProviderKind::EcrPublic
-                | ProviderKind::Gar
-                | ProviderKind::Gcr
-                | ProviderKind::DockerHub
-                | ProviderKind::Chainguard,
-            )
-            | None => {}
+            UploadPath::Streaming => {}
         }
 
         debug!(
@@ -853,7 +839,7 @@ mod tests {
         let repo = RepositoryName::new("my-org/my-image").unwrap();
         let slot = client.reserve_upload_slot(None).await;
         let result = slot
-            .push_stream(&repo, &digest, None, data_stream(data, 4))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .unwrap();
 
@@ -931,7 +917,7 @@ mod tests {
         let repo = RepositoryName::new("myreg/myimg").unwrap();
         let slot = client.reserve_upload_slot(None).await;
         let result = slot
-            .push_stream(&repo, &digest, None, data_stream(data, 4))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1007,7 +993,7 @@ mod tests {
         let repo = RepositoryName::new("proj/img").unwrap();
         let slot = client.reserve_upload_slot(Some(total_len)).await;
         let result = slot
-            .push_stream(&repo, &digest, Some(total_len), data_stream(&data, 65536))
+            .push_stream(&repo, &digest, data_stream(&data, 65536))
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1056,7 +1042,7 @@ mod tests {
         let repo = RepositoryName::new("repo").unwrap();
         let slot = client.reserve_upload_slot(Some(0)).await;
         let result = slot
-            .push_stream(&repo, &digest, Some(0), data_stream(data, 4))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1114,7 +1100,7 @@ mod tests {
         let repo = RepositoryName::new("r/i").unwrap();
         let slot = client.reserve_upload_slot(None).await;
         let err = slot
-            .push_stream(&repo, &digest, None, data_stream(data, 4))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .expect_err("cross-host PATCH Location must be rejected");
         let msg = err.to_string();
@@ -1376,7 +1362,7 @@ mod tests {
         let repo = RepositoryName::new("stream/repo").unwrap();
         let slot = client.reserve_upload_slot(known_size).await;
         let result = slot
-            .push_stream(&repo, &digest, known_size, data_stream(data, 4))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .unwrap();
 
@@ -1424,7 +1410,7 @@ mod tests {
             let slot = client.reserve_upload_slot(None).await;
             let pushed = tokio::time::timeout(
                 Duration::from_secs(5),
-                slot.push_stream(&repo, &digest, None, data_stream(data, 4)),
+                slot.push_stream(&repo, &digest, data_stream(data, 4)),
             )
             .await
             .unwrap_or_else(|_| panic!("{host}: the push waited for a second slot"));
@@ -1526,13 +1512,8 @@ mod tests {
             let slot = client_1
                 .reserve_upload_slot(Some(blob_a_clone.len() as u64))
                 .await;
-            slot.push_stream(
-                &repo_a,
-                &digest_a_clone,
-                Some(blob_a_clone.len() as u64),
-                data_stream(&blob_a_clone, 65536),
-            )
-            .await
+            slot.push_stream(&repo_a, &digest_a_clone, data_stream(&blob_a_clone, 65536))
+                .await
         });
 
         // Deterministic synchronization (no head-start race): wait until
@@ -1563,13 +1544,8 @@ mod tests {
             let slot = client_2
                 .reserve_upload_slot(Some(blob_b_clone.len() as u64))
                 .await;
-            slot.push_stream(
-                &repo_b,
-                &digest_b_clone,
-                Some(blob_b_clone.len() as u64),
-                data_stream(&blob_b_clone, 65536),
-            )
-            .await
+            slot.push_stream(&repo_b, &digest_b_clone, data_stream(&blob_b_clone, 65536))
+                .await
         });
 
         let r1 = h1.await.unwrap();
@@ -1589,7 +1565,7 @@ mod tests {
         assert_eq!(times.len(), 2, "{host}: both POSTs must have fired");
         let gap = times[1].duration_since(times[0]);
         // Task 2 cannot POST until task 1 releases the byte permit,
-        // which happens when task 1's `blob_push_stream` returns
+        // which happens when task 1's `push_stream` returns
         // (after PATCH-delay + fast PUT). The lower bound is
         // patch_delay minus a generous CI margin (100 ms) since we
         // already eliminated the head-start race above.

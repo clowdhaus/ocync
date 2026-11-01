@@ -1,4 +1,4 @@
-//! Integration tests for `blob_push_stream` -- streaming PUT uploads.
+//! Integration tests for `push_stream` -- streaming PUT uploads.
 
 use bytes::Bytes;
 use futures_util::stream;
@@ -71,7 +71,7 @@ async fn empty_stream() {
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
     let result = slot
-        .push_stream(&repo, &digest, None, data_stream(data, 1))
+        .push_stream(&repo, &digest, data_stream(data, 1))
         .await
         .unwrap();
 
@@ -100,7 +100,7 @@ async fn post_initiation_rejected() {
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
     let err = slot
-        .push_stream(&repo, &digest, None, data_stream(data, 4))
+        .push_stream(&repo, &digest, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -143,7 +143,7 @@ async fn put_upload_failure() {
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
     let err = slot
-        .push_stream(&repo, &digest, None, data_stream(data, 4))
+        .push_stream(&repo, &digest, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -190,7 +190,7 @@ async fn put_rejected() {
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
     let err = slot
-        .push_stream(&repo, &digest, None, data_stream(data, 4))
+        .push_stream(&repo, &digest, data_stream(data, 4))
         .await
         .unwrap_err();
 
@@ -232,7 +232,7 @@ async fn stream_error_propagates() {
 
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
-    let result = slot.push_stream(&repo, &digest, None, error_stream).await;
+    let result = slot.push_stream(&repo, &digest, error_stream).await;
 
     assert!(result.is_err(), "stream error should propagate");
 }
@@ -262,7 +262,7 @@ async fn post_returns_200_is_rejected() {
     let repo = RepositoryName::new("repo").unwrap();
     let slot = client.reserve_upload_slot(None).await;
     let err = slot
-        .push_stream(&repo, &digest, None, data_stream(data, 4))
+        .push_stream(&repo, &digest, data_stream(data, 4))
         .await
         .unwrap_err();
 

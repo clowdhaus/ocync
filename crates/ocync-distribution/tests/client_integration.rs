@@ -1108,10 +1108,7 @@ async fn a_refused_upload_drops_the_token() {
         .unwrap();
     let body = futures_util::stream::iter([Ok::<_, Error>(bytes::Bytes::from_static(b"blob"))]);
     let slot = client.reserve_upload_slot(None).await;
-    let err = slot
-        .push_stream(&repo, &digest, None, body)
-        .await
-        .unwrap_err();
+    let err = slot.push_stream(&repo, &digest, body).await.unwrap_err();
 
     assert!(matches!(err, Error::UploadTokenRefused { .. }), "{err:?}");
     // The POST carried `token-0` and the PUT `token-1`: the PUT's is refused.
