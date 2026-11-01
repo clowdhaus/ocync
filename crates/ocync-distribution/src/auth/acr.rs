@@ -22,6 +22,7 @@ use super::detect::AzureCloud;
 use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
+use crate::aws::{Timeouts, credential_endpoint_client};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
 use crate::credential_cache::{CredentialCache, remaining};
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
@@ -315,7 +316,11 @@ impl Source {
 struct AzureCredentialChain {
     cloud: AzureCloud,
     cached_source: Mutex<Option<Source>>,
+    /// Through `HTTPS_PROXY` and `NO_PROXY`, like registry traffic.
     http: reqwest::Client,
+    /// Straight to the instance metadata service, never through a proxy, so
+    /// the managed identity token never reaches a proxy host.
+    metadata: reqwest::Client,
 }
 
 impl fmt::Debug for AzureCredentialChain {
@@ -334,10 +339,27 @@ impl AzureCredentialChain {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build Azure credential HTTP client");
+        let metadata = credential_endpoint_client(Timeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_secs(10),
+        })
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("failed to build Azure metadata HTTP client");
         Self {
             cloud,
             cached_source: Mutex::new(None),
             http,
+            metadata,
+        }
+    }
+
+    /// The client `source` sends its request with. Only the metadata
+    /// service is reached directly; `AzureCli` sends no request.
+    fn client(&self, source: Source) -> &reqwest::Client {
+        match source {
+            Source::ManagedIdentity => &self.metadata,
+            Source::ClientSecret | Source::WorkloadIdentity | Source::AzureCli => &self.http,
         }
     }
 
@@ -413,7 +435,13 @@ impl AzureCredentialChain {
             ("scope", scope.as_str()),
         ];
 
-        Self::post_entra_token(&self.http, &url, &form, "client secret").await
+        Self::post_entra_token(
+            self.client(Source::ClientSecret),
+            &url,
+            &form,
+            "client secret",
+        )
+        .await
     }
 
     async fn try_workload_identity(&self) -> Result<String, CredentialError> {
@@ -444,7 +472,13 @@ impl AzureCredentialChain {
             ("scope", scope.as_str()),
         ];
 
-        Self::post_entra_token(&self.http, &url, &form, "workload identity").await
+        Self::post_entra_token(
+            self.client(Source::WorkloadIdentity),
+            &url,
+            &form,
+            "workload identity",
+        )
+        .await
     }
 
     async fn try_managed_identity(&self) -> Result<String, CredentialError> {
@@ -456,7 +490,7 @@ impl AzureCredentialChain {
         );
 
         let resp = self
-            .http
+            .client(Source::ManagedIdentity)
             .get(&url)
             .header("metadata", "true")
             .send()
@@ -790,6 +824,25 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    /// The managed identity request goes to the metadata client, which
+    /// ignores `HTTP_PROXY`, and the Entra ID requests go to the proxied
+    /// one. Breaks if the instance metadata service, which answers with an
+    /// access token, is fetched through the proxy.
+    #[test]
+    fn managed_identity_is_fetched_without_the_proxy() {
+        let chain = AzureCredentialChain::new(AzureCloud::Public);
+        assert!(std::ptr::eq(
+            chain.client(Source::ManagedIdentity),
+            &chain.metadata
+        ));
+        for source in [Source::ClientSecret, Source::WorkloadIdentity] {
+            assert!(
+                std::ptr::eq(chain.client(source), &chain.http),
+                "{source:?}"
+            );
+        }
+    }
 
     /// A chain is refused when any source refused, whichever failed first,
     /// else transient when any may pass. Breaks if a refused CLI login is
