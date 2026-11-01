@@ -51,10 +51,10 @@ async fn push_blob_stream(client: &RegistryClient, repo: &RepositoryName, data: 
     let size = data.len() as u64;
     let body = Bytes::from(data);
     let s = stream::once(async move { Ok::<_, ocync_distribution::Error>(body) });
-    client
-        .blob_push_stream(repo, &digest, Some(size), s)
+    let slot = client.reserve_upload_slot(Some(size)).await;
+    slot.push_stream(repo, &digest, s)
         .await
-        .expect("blob_push_stream");
+        .expect("push_stream");
 }
 
 /// Pushes `corpus` to `client`, each image tagged `v1` in repository

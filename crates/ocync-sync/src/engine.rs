@@ -1956,10 +1956,13 @@ struct BlobIoContext<'a> {
     target_repo: &'a RepositoryName,
     retry: &'a RetryConfig,
     staging: &'a Rc<BlobStage>,
+    /// The image's cancel signal, raced against the waits for an upload slot
+    /// and for the source download.
+    cancel: &'a ShutdownSignal,
 }
 
 impl<'a> BlobIoContext<'a> {
-    fn from_ctx(ctx: &'a TransferContext<'a>) -> Self {
+    fn from_ctx(ctx: &'a TransferContext<'a>, cancel: &'a ShutdownSignal) -> Self {
         Self {
             sink: BlobSink {
                 cache: ctx.cache,
@@ -1972,18 +1975,20 @@ impl<'a> BlobIoContext<'a> {
             target_repo: ctx.target_repo,
             retry: ctx.retry,
             staging: ctx.staging,
+            cancel,
         }
     }
 
     /// Give up a claimed blob because the image was cancelled: record it as
     /// failed and wake the claim's waiters.
-    fn abandon_claim(&self, digest: &Digest) {
+    fn abandon_claim(&self, digest: &Digest) -> BlobResult {
         self.sink.fail(
             digest.clone(),
             self.target_repo.to_owned(),
             "cancelled".into(),
         );
         self.sink.release_claim(digest);
+        BlobResult::Cancelled
     }
 
     /// The failure recorded in this run for this task's copy of `digest`.
@@ -2166,10 +2171,7 @@ async fn transfer_image_blobs(
             }
             // A cancel at any wait below gives the claim up at once: holding
             // it would keep other images' copies of this blob waiting.
-            let abandon = || {
-                BlobIoContext::from_ctx(ctx).abandon_claim(&digest);
-                BlobResult::Cancelled
-            };
+            let abandon = || BlobIoContext::from_ctx(ctx, cancel).abandon_claim(&digest);
             let mount_source = match resolve_mount_source(ctx, &digest, cancel).await {
                 MountSource::From(repo) => Some(repo),
                 MountSource::Push => None,
@@ -2183,15 +2185,17 @@ async fn transfer_image_blobs(
 
             // `transfer_claimed_blob` takes `BlobIoContext`, not
             // `TransferContext`, so `ctx` is unreachable inside the permit
-            // scope. No await separates the permit from the transfer, so the
-            // cancel checked here cannot change before I/O starts.
+            // scope. Inside it, only the wait for an upload slot and the
+            // source open (a download permit, then the GET) are interruptible,
+            // and they race the same `cancel`; the mount and HEAD before them
+            // are brief network calls.
             let _permit = tokio::select! {
                 biased;
                 () = cancel.notified() => return abandon(),
                 permit = sem.acquire() => permit.unwrap(),
             };
             transfer_claimed_blob(
-                &BlobIoContext::from_ctx(ctx),
+                &BlobIoContext::from_ctx(ctx, cancel),
                 &digest,
                 size,
                 batch,
@@ -2283,7 +2287,7 @@ async fn wait_for_blob_claim(
         if cancel.is_triggered() {
             return BlobClaim::Cancelled;
         }
-        if let Some(err) = BlobIoContext::from_ctx(ctx).recorded_failure(digest) {
+        if let Some(err) = BlobIoContext::from_ctx(ctx, cancel).recorded_failure(digest) {
             let mountable = ctx
                 .cache
                 .borrow()
@@ -2423,6 +2427,10 @@ async fn wait_any_fired(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
 /// the per-image blob semaphore. Takes [`BlobIoContext`], not
 /// [`TransferContext`]: this signature is the compile-time boundary that keeps
 /// cache wait methods out of the semaphore scope.
+///
+/// The target's upload slot is reserved here, under the blob permit, after the
+/// mount, HEAD and recorded-failure checks and before any source download, so
+/// a blob a mount or HEAD settles spends no slot.
 async fn transfer_claimed_blob(
     io: &BlobIoContext<'_>,
     digest: &Digest,
@@ -2479,7 +2487,7 @@ async fn transfer_claimed_blob(
         return BlobResult::Failed(io.release_failed(digest, err));
     }
 
-    let transfer_result: Result<(), crate::Error> = match staging {
+    let transfer_result: Result<PushOutcome, crate::Error> = match staging {
         StagingClaim::Pull(guard) => {
             if let Err(e) = with_retry(io.retry, "blob pull (to stage)", || async {
                 let mut writer =
@@ -2517,25 +2525,20 @@ async fn transfer_claimed_blob(
             // Staged: waiters read it from disk while this task pushes.
             drop(guard);
 
-            push_staged_blob(io, digest).await
+            push_staged_blob(io, digest, size).await
         }
-        StagingClaim::Staged => push_staged_blob(io, digest).await,
-        StagingClaim::Disabled => with_retry(io.retry, "blob transfer", || async {
-            let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
-            io.target_client
-                .blob_push_stream(io.target_repo, digest, Some(size), stream)
-                .await
-        })
-        .await
-        .map(|_| ())
-        .map_err(|e| crate::Error::BlobTransfer {
-            digest: digest.clone(),
-            source: e,
-        }),
+        StagingClaim::Staged => push_staged_blob(io, digest, size).await,
+        StagingClaim::Disabled => {
+            push_under_slot(io, "blob transfer", digest, size, || async {
+                io.source_client.blob_pull(io.source_repo, digest).await
+            })
+            .await
+        }
     };
 
     match transfer_result {
-        Ok(()) => {
+        Ok(PushOutcome::Cancelled) => io.abandon_claim(digest),
+        Ok(PushOutcome::Pushed) => {
             io.sink.complete(digest.clone(), io.target_repo.to_owned());
             io.sink.release_claim(digest);
             BlobResult::Transferred { bytes: size }
@@ -2544,9 +2547,59 @@ async fn transfer_claimed_blob(
     }
 }
 
+/// How a copy ended when it did not fail.
+enum PushOutcome {
+    Pushed,
+    /// The image was cancelled while the copy waited for an upload slot or
+    /// for the source to open.
+    Cancelled,
+}
+
+/// Push one blob to the target, reserving a fresh upload slot for each attempt
+/// before `open` opens its source, so no source or file is open while a copy
+/// waits for a slot and no slot is held across a retry backoff. A cancel of
+/// the image ends either wait with [`PushOutcome::Cancelled`].
+async fn push_under_slot<S, E, Open, Fut>(
+    io: &BlobIoContext<'_>,
+    operation: &str,
+    digest: &Digest,
+    size: u64,
+    open: Open,
+) -> Result<PushOutcome, crate::Error>
+where
+    Open: Fn() -> Fut,
+    Fut: Future<Output = Result<S, ocync_distribution::Error>>,
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Into<ocync_distribution::Error> + Send,
+{
+    with_retry(io.retry, operation, || async {
+        let slot = tokio::select! {
+            biased;
+            () = io.cancel.notified() => return Ok(PushOutcome::Cancelled),
+            slot = io.target_client.reserve_upload_slot(Some(size)) => slot,
+        };
+        let stream = tokio::select! {
+            biased;
+            () = io.cancel.notified() => return Ok(PushOutcome::Cancelled),
+            stream = open() => stream?,
+        };
+        slot.push_stream(io.target_repo, digest, stream).await?;
+        Ok(PushOutcome::Pushed)
+    })
+    .await
+    .map_err(|e| crate::Error::BlobTransfer {
+        digest: digest.clone(),
+        source: e,
+    })
+}
+
 /// Push a staged blob from disk to the target registry.
-async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(), crate::Error> {
-    with_retry(io.retry, "blob push (staged)", || async {
+async fn push_staged_blob(
+    io: &BlobIoContext<'_>,
+    digest: &Digest,
+    size: u64,
+) -> Result<PushOutcome, crate::Error> {
+    push_under_slot(io, "blob push (staged)", digest, size, || async {
         let file = io
             .staging
             .open_read(digest)
@@ -2554,23 +2607,15 @@ async fn push_staged_blob(io: &BlobIoContext<'_>, digest: &Digest) -> Result<(),
                 context: "staging open",
                 source: e.into(),
             })?;
-        let file_size = file.metadata().map(|m| m.len()).ok();
         let stream = file_read_stream(file).map(|r| {
             r.map_err(|e| ocync_distribution::Error::Io {
                 context: "staging read",
                 source: e.into(),
             })
         });
-        io.target_client
-            .blob_push_stream(io.target_repo, digest, file_size, stream)
-            .await
+        Ok(stream)
     })
     .await
-    .map(|_| ())
-    .map_err(|e| crate::Error::BlobTransfer {
-        digest: digest.clone(),
-        source: e,
-    })
 }
 
 /// Push all manifests (children for indexes, then top-level) to one target.
@@ -3294,13 +3339,9 @@ mod tests {
             source: std::io::Error::other("disk read failed").into(),
         })]);
 
-        let source = client
-            .blob_push_stream(
-                &RepositoryName::new("repo").unwrap(),
-                &digest,
-                Some(4),
-                unreadable,
-            )
+        let slot = client.reserve_upload_slot(Some(4)).await;
+        let source = slot
+            .push_stream(&RepositoryName::new("repo").unwrap(), &digest, unreadable)
             .await
             .expect_err("an unreadable body cannot upload");
         assert!(

@@ -137,7 +137,7 @@ fn refusal() -> String {
 
 pub use aws::AwsCredentialProviders;
 pub use blob::MountResult;
-pub use client::{RegistryClient, RegistryClientBuilder};
+pub use client::{RegistryClient, RegistryClientBuilder, UploadSlot};
 pub use digest::Digest;
 pub use ecr::{BatchBlobChecker, BlobExistence};
 pub use error::Error;
