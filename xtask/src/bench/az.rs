@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
-use crate::bench::acr::{AcrTarget, Guid, RegistryName};
+use crate::bench::acr::{Guid, RegistryName, Scope};
 use crate::bench::provision::{
     Cli, Output, RoundId, RoundIds, deleted_all, terraform_outputs, with_prefix,
 };
@@ -155,7 +155,7 @@ fn delete_where(
 pub(crate) struct Provisioned {
     az: Cli,
     /// The run's path prefixes.
-    pub(crate) target: AcrTarget,
+    pub(crate) target: Scope,
     /// The path prefixes still to delete, round 1 first.
     pending: Vec<RoundId>,
 }
@@ -179,7 +179,7 @@ impl Provisioned {
         Ok(Self {
             az,
             pending: prefixes.iter().cloned().collect(),
-            target: AcrTarget {
+            target: Scope {
                 registry,
                 tenant,
                 client,
@@ -226,7 +226,7 @@ pub(super) mod tests {
 
     use super::*;
     use crate::bench::provision::parse_terraform_outputs;
-    use crate::bench::target::rounds;
+    use crate::bench::target::{rounds, write_stub};
 
     const OUTPUTS: &str = r#"{
   "connect": {"sensitive": false, "type": "string", "value": "ssh bench@example.invalid"},
@@ -318,10 +318,10 @@ pub(super) mod tests {
     /// `r10` and a newer leftover beside them.
     fn stub_az(dir: &Path, bad: &str) -> (Cli, PathBuf) {
         let log = dir.join("calls.log");
-        let program = dir.join("az");
-        std::fs::write(
-            &program,
-            format!(
+        let program = write_stub(
+            dir,
+            "az",
+            &format!(
                 "#!/bin/bash\necho \"$@\" >> '{log}'\n\
                  case \"$*\" in\n\
                  *list*) echo x >> '{dir}/lists'\n\
@@ -335,13 +335,7 @@ pub(super) mod tests {
                 log = log.display(),
                 dir = dir.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        );
         (Cli::new(program), log)
     }
 
@@ -434,13 +428,13 @@ pub(super) mod tests {
         // bound; and a failure among them lost.
         let dir = tempfile::tempdir().unwrap();
         let (peak, log) = (dir.path().join("peak"), dir.path().join("calls.log"));
-        let program = dir.path().join("az");
         let repositories: String = (1..=20)
             .map(|n| format!("ocync-bench-run-x-r{n}/bench/a\\n"))
             .collect();
-        std::fs::write(
-            &program,
-            format!(
+        let program = write_stub(
+            dir.path(),
+            "az",
+            &format!(
                 "#!/bin/bash\n\
                  case \"$*\" in\n\
                  *list*) printf '{repositories}' ;;\n\
@@ -455,13 +449,7 @@ pub(super) mod tests {
                 dir = dir.path().display(),
                 peak = peak.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        );
 
         let err = delete_where(&Cli::new(program), &registry(), |_| true).unwrap_err();
 

@@ -2406,7 +2406,7 @@ mod tests {
 
     #[test]
     fn a_google_or_azure_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
-        use crate::bench::acr::{AcrTarget, FULL_ENV};
+        use crate::bench::acr::{FULL_ENV, Scope};
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::report::tests::sample_report;
         use crate::bench::target::{env_of, rounds};
@@ -2416,7 +2416,7 @@ mod tests {
             project: "example-project".parse().unwrap(),
             repositories: provision::RoundIds::parse("run-r1,run-r2,run-r3", rounds("3")).unwrap(),
         });
-        let azure = Target::Acr(AcrTarget::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
+        let azure = Target::Acr(Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
         let report = sample_report();
         let output = |target: &Target, host: &str| {
             let deferred = deferred_output(target, host, &report, "abc1234".into(), None);

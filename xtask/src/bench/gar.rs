@@ -6,7 +6,7 @@ use ocync_distribution::auth::gcp::{GcpAuth, Residency, SharedGoogleToken};
 use ocync_distribution::{AwsCredentialProviders, RegistryClient};
 
 use crate::bench::Rounds;
-use crate::bench::provision::{RoundIds, id, is_lowercase_id};
+use crate::bench::provision::{RoundId, RoundIds, id, is_lowercase_id};
 use crate::bench::registry::http_client;
 use crate::bench::target::{ENV_REGISTRY, registry_client, require, round_ids};
 
@@ -71,6 +71,12 @@ impl ArtifactRegistryTarget {
             (ENV_PROJECT, self.project.to_string()),
             (ENV_REPOSITORIES, self.repositories.to_string()),
         ]
+    }
+
+    /// The target prefix of the round whose repository is `repository`, then
+    /// the corpus's `prefix` level.
+    pub(crate) fn round_prefix(&self, repository: &RoundId, prefix: &str) -> String {
+        format!("{}/{repository}/{prefix}", self.project)
     }
 
     /// Reads the target from `env`, which must hold a repository for each of

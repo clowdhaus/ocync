@@ -93,6 +93,13 @@ impl RoundIds {
             .split(',')
             .map(str::parse)
             .collect::<Result<Vec<RoundId>, _>>()?;
+        if let Some((at, id)) = ids
+            .iter()
+            .enumerate()
+            .find(|(at, id)| ids[..*at].contains(id))
+        {
+            return Err(format!("round {} repeats the id {id}", at + 1));
+        }
         if ids.len() < rounds.get() {
             return Err(format!(
                 "{} ids but {} rounds need one each",
@@ -106,6 +113,11 @@ impl RoundIds {
     /// The ids, round 1 first.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &RoundId> {
         self.0.iter()
+    }
+
+    /// Round 1's id. A run has at least [`Rounds::MIN`] rounds, so it has one.
+    pub(crate) fn first(&self) -> &RoundId {
+        &self.0[0]
     }
 
     /// The id of `round`, counted from 1, if the run has that round.
@@ -227,6 +239,18 @@ pub(crate) enum Outputs {
     Acr(az::Outputs),
 }
 
+impl Outputs {
+    /// Reads the outputs of the applied Terraform stack of `kind`, which must
+    /// be a target that has one.
+    pub(crate) fn read(kind: Kind) -> Result<Self, String> {
+        match kind {
+            Kind::Ecr => Err(format!("{} has no Terraform stack to read", kind.name())),
+            Kind::ArtifactRegistry => gcloud::Outputs::read().map(Self::ArtifactRegistry),
+            Kind::Acr => az::Outputs::read().map(Self::Acr),
+        }
+    }
+}
+
 /// What one run made on this machine for its target, removed when it ends.
 /// Dropping deletes whatever [`Self::settle`] has not.
 pub(crate) enum Provisioned {
@@ -326,6 +350,7 @@ pub(crate) fn deleted_all(kind: Kind, failures: &[String]) -> Result<(), String>
 mod tests {
     use super::*;
     use crate::bench::target::rounds;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn ids_are_parsed_against_their_rules() {
@@ -395,6 +420,17 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_round_id_is_refused_by_name() {
+        // Catches: two rounds sharing a repository, so the later one meets
+        // blobs the earlier left and the sweep deletes one run's data twice.
+        assert_eq!(
+            RoundIds::parse("run-a,run-b,run-a", rounds("3")),
+            Err("round 3 repeats the id run-a".to_owned())
+        );
+        assert!(RoundIds::parse("run-a,run-b,run-c", rounds("3")).is_ok());
+    }
+
+    #[test]
     fn a_second_local_run_is_refused_until_the_first_ends() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.lock");
@@ -402,7 +438,13 @@ mod tests {
         let err = lock_at(&path).unwrap_err();
         assert!(err.contains("another bench-remote run"), "{err}");
         drop(first);
-        assert!(lock_at(&path).is_ok(), "released with the first run");
+        // A child another test forks while this lock is held keeps it until
+        // it execs, so the release is retried rather than taken at once.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_at(&path).is_err() {
+            assert!(Instant::now() < deadline, "released with the first run");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

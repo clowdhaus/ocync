@@ -21,7 +21,6 @@ use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{Provider, RunTimestamp, Scenario, ToolSelection, captured, finish_pass, value_name};
-use super::{az, gcloud};
 
 /// Common SSH options for all remote connections.
 ///
@@ -105,7 +104,7 @@ pub(crate) struct BenchRemoteArgs {
     /// older than the change that added `bench --archive` cannot run, because
     /// the instance's `bench` would not know the option, and one older than
     /// `--max-concurrent-transfers` cannot take that option for the same reason.
-    /// An Artifact Registry run needs a ref with `--target`.
+    /// An Artifact Registry or ACR run needs a ref with `--target`.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -202,14 +201,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // repositories cannot sweep the ones made below.
     let (_local_run, outputs) = match args.target {
         Kind::Ecr => (None, None),
-        Kind::ArtifactRegistry => (
-            Some(lock_local_run()?),
-            Some(Outputs::ArtifactRegistry(gcloud::Outputs::read()?)),
-        ),
-        Kind::Acr => (
-            Some(lock_local_run()?),
-            Some(Outputs::Acr(az::Outputs::read()?)),
-        ),
+        Kind::ArtifactRegistry | Kind::Acr => {
+            (Some(lock_local_run()?), Some(Outputs::read(args.target)?))
+        }
     };
 
     let git_ref = match &args.git_ref {
@@ -457,8 +451,8 @@ fn azure_token() -> String {
     format!(
         r#"fetch_azure_token() (
   umask 077
-  aws sts get-web-identity-token --region "$REGION" --audience {AZURE_TOKEN_AUDIENCE} --signing-algorithm RS256 --duration-seconds {AZURE_TOKEN_LIFETIME_SECS} --query WebIdentityToken --output text > "$AZURE_FEDERATED_TOKEN_FILE.new" &&
-    mv "$AZURE_FEDERATED_TOKEN_FILE.new" "$AZURE_FEDERATED_TOKEN_FILE"
+  aws sts get-web-identity-token --region "$REGION" --audience {AZURE_TOKEN_AUDIENCE} --signing-algorithm RS256 --duration-seconds {AZURE_TOKEN_LIFETIME_SECS} --query WebIdentityToken --output text > "$AZURE_FEDERATED_TOKEN_FILE.new.$$" &&
+    mv "$AZURE_FEDERATED_TOKEN_FILE.new.$$" "$AZURE_FEDERATED_TOKEN_FILE"
 )
 fetch_azure_token"#
     )
@@ -1183,6 +1177,7 @@ mod tests {
     use std::io::BufRead;
 
     use super::*;
+    use crate::bench::target::write_stub;
 
     #[test]
     fn parse_bench_config() {
@@ -1402,7 +1397,7 @@ mod tests {
 
     #[test]
     fn the_instance_is_told_its_repositories_and_where_the_credentials_are() {
-        use crate::bench::acr::{AcrTarget, FULL_ENV};
+        use crate::bench::acr::{FULL_ENV, Scope};
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::provision::RoundIds;
         use crate::bench::target::{env_of, rounds};
@@ -1420,7 +1415,7 @@ mod tests {
              export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.bench-gar-credentials.json\""
         );
 
-        let acr = Target::Acr(AcrTarget::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
+        let acr = Target::Acr(Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
         let azure = target_setup(&acr);
         let lines: Vec<&str> = azure.lines().collect();
         // Exactly the variables the instance reads, and the region its token
@@ -1440,11 +1435,11 @@ mod tests {
         // Catches: a token fetch that is not the signed, audience-bound,
         // RS256 one Entra accepts.
         assert!(
-            lines.contains(&"  aws sts get-web-identity-token --region \"$REGION\" --audience api://AzureADTokenExchange --signing-algorithm RS256 --duration-seconds 3600 --query WebIdentityToken --output text > \"$AZURE_FEDERATED_TOKEN_FILE.new\" &&"),
+            lines.contains(&"  aws sts get-web-identity-token --region \"$REGION\" --audience api://AzureADTokenExchange --signing-algorithm RS256 --duration-seconds 3600 --query WebIdentityToken --output text > \"$AZURE_FEDERATED_TOKEN_FILE.new.$$\" &&"),
             "{azure}"
         );
         assert!(lines.contains(
-            &"    mv \"$AZURE_FEDERATED_TOKEN_FILE.new\" \"$AZURE_FEDERATED_TOKEN_FILE\""
+            &"    mv \"$AZURE_FEDERATED_TOKEN_FILE.new.$$\" \"$AZURE_FEDERATED_TOKEN_FILE\""
         ));
         assert!(lines.contains(&"  umask 077"));
 
@@ -1855,10 +1850,7 @@ src="${@: -2:1}"
 cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
             ),
         ] {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
+            write_stub(&bin, name, &format!("#!/bin/bash\n{body}\n"));
         }
 
         let log = work.join("scp.log");
@@ -2241,10 +2233,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         // A `flock` that exits 127 ahead of any real one on the guard's PATH.
-        let stub = bin.join("flock");
-        std::fs::write(&stub, "#!/bin/sh\nexit 127\n").unwrap();
-        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        write_stub(&bin, "flock", "#!/bin/sh\nexit 127\n");
         let path = format!("{}:/usr/bin:/bin", bin.display());
 
         for existing in [ExistingRun::Refuse, ExistingRun::Kill] {

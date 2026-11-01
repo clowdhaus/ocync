@@ -10,7 +10,7 @@ use clap::ValueEnum;
 use ocync_distribution::auth::AuthProvider;
 use ocync_distribution::{Digest, RegistryClient, RepositoryName};
 
-use crate::bench::acr::{self, AcrTarget, ENV_TOKEN_FILE};
+use crate::bench::acr::{self, ENV_TOKEN_FILE, Scope};
 use crate::bench::corpus::Corpus;
 use crate::bench::gar::{self, ArtifactRegistryTarget, ENV_CREDENTIALS};
 use crate::bench::lock::{Entry, Lock};
@@ -72,7 +72,7 @@ pub(crate) enum Target {
     /// Google Artifact Registry, one repository per round.
     ArtifactRegistry(ArtifactRegistryTarget),
     /// Azure Container Registry, one repository path prefix per round.
-    Acr(AcrTarget),
+    Acr(Scope),
 }
 
 /// Fails unless a run of `scenario` with `tools` can sync into `kind`. ECR
@@ -167,7 +167,7 @@ impl Target {
             Kind::Acr => {
                 refuse_unservable(kind, scenario, tools, regression)?;
                 require(env, ENV_TOKEN_FILE)?;
-                AcrTarget::parse(env, rounds).map(Self::Acr)
+                Scope::parse(env, rounds).map(Self::Acr)
             }
         }
     }
@@ -188,21 +188,15 @@ impl Target {
     pub(crate) fn target_prefix(&self, round: usize, prefix: &str) -> Option<String> {
         match self {
             Self::Ecr => None,
-            Self::ArtifactRegistry(target) => {
-                let repository = target.repositories.get(round)?;
-                Some(format!("{}/{repository}/{prefix}", target.project))
-            }
-            Self::Acr(target) => {
-                let round_prefix = target.prefixes.get(round)?;
-                Some(format!("{round_prefix}/{prefix}"))
-            }
+            Self::ArtifactRegistry(target) => target
+                .repositories
+                .get(round)
+                .map(|repository| target.round_prefix(repository, prefix)),
+            Self::Acr(target) => target
+                .prefixes
+                .get(round)
+                .map(|round| target.round_prefix(round, prefix)),
         }
-    }
-
-    /// The repository the sign-in check asks in: round 1's, `None` for ECR,
-    /// which has no such check.
-    pub(crate) fn sign_in_repo(&self) -> Option<String> {
-        self.target_prefix(1, SIGN_IN_REPO)
     }
 
     /// `corpus` as `round` (from 1) of the sync scenario syncs it: Artifact
@@ -240,22 +234,22 @@ pub(crate) enum Store {
 impl Store {
     /// Opens the client `target` needs and checks its credentials.
     pub(crate) async fn open(target: &Target) -> Result<Self, String> {
-        let client = match target {
+        let (client, repo) = match target {
             Target::Ecr => {
                 let client = ecr::client().await;
                 ecr::validate_credentials(&client).await?;
                 return Ok(Self::Ecr(client));
             }
-            Target::ArtifactRegistry(target) => gar::client(&target.location.host()).await?,
-            Target::Acr(target) => acr::client(&target.registry.host()).await?,
+            Target::ArtifactRegistry(target) => (
+                gar::client(&target.location.host()).await?,
+                target.round_prefix(target.repositories.first(), SIGN_IN_REPO),
+            ),
+            Target::Acr(target) => (
+                acr::client(&target.registry.host()).await?,
+                target.round_prefix(target.prefixes.first(), SIGN_IN_REPO),
+            ),
         };
         let kind = target.kind();
-        let repo = target.sign_in_repo().ok_or_else(|| {
-            format!(
-                "{} sign-in check: the run has no round 1 repository",
-                kind.name()
-            )
-        })?;
         check_sign_in(&client, kind, &repo).await?;
         Ok(Self::Distribution(Box::new(client)))
     }
@@ -384,6 +378,27 @@ pub(super) fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Op
 #[cfg(test)]
 pub(super) fn rounds(n: &str) -> Rounds {
     n.parse().unwrap()
+}
+
+/// Installs `script` as the executable `dir/name`, for a test to run in place
+/// of a tool.
+///
+/// The executable is made by a child process, so this process never holds it
+/// open for writing: a child another test thread forks meanwhile would inherit
+/// that handle and make the exec fail with "text file busy".
+#[cfg(test)]
+pub(super) fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+    let source = dir.join(format!("{name}.sh"));
+    let program = dir.join(name);
+    std::fs::write(&source, script).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "0755"])
+        .arg(&source)
+        .arg(&program)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}", program.display());
+    program
 }
 
 /// What a target repository holds, tagged and untagged.
@@ -950,7 +965,11 @@ images:
         )
         .unwrap();
         let acr = parse(Kind::Acr, &FULL_ENV, Scenario::Sync, &[Tool::Ocync], "3").unwrap();
-        assert_eq!(Target::Ecr.sign_in_repo(), None, "ECR has no sign-in check");
+        assert_eq!(
+            Target::Ecr.target_prefix(1, SIGN_IN_REPO),
+            None,
+            "ECR has no sign-in check"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -958,7 +977,7 @@ images:
         let check = |target: &Target, status: &str| {
             let (url, seen) = serve_once(status);
             let client = RegistryClient::builder(url).build().unwrap();
-            let repo = target.sign_in_repo().unwrap();
+            let repo = target.target_prefix(1, SIGN_IN_REPO).unwrap();
             let result = runtime.block_on(check_sign_in(&client, target.kind(), &repo));
             (result, seen.join().unwrap())
         };

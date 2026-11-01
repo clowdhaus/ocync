@@ -265,7 +265,7 @@ pub(super) mod tests {
 
     use super::*;
     use crate::bench::provision::parse_terraform_outputs;
-    use crate::bench::target::rounds;
+    use crate::bench::target::{rounds, write_stub};
 
     const OUTPUTS: &str = r#"{
   "connect": {"sensitive": false, "type": "string", "value": "ssh bench@example.invalid"},
@@ -392,10 +392,10 @@ pub(super) mod tests {
     /// is already deleted.
     fn stub_gcloud(dir: &Path, bad: &str) -> (Cli, PathBuf) {
         let log = dir.join("calls.log");
-        let program = dir.join("gcloud");
-        std::fs::write(
-            &program,
-            format!(
+        let program = write_stub(
+            dir,
+            "gcloud",
+            &format!(
                 "#!/bin/bash\necho \"$@\" >> '{}'\n\
                  case \"$*\" in\n\
                  *list*) printf 'ocync-bench-run-old-r1\\nocync-bench-run-old-gone\\nocync-bench\\n' ;;\n\
@@ -404,13 +404,7 @@ pub(super) mod tests {
                  esac\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        );
         (Cli::new(program), log)
     }
 

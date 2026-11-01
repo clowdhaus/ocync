@@ -6,7 +6,7 @@ use ocync_distribution::RegistryClient;
 use ocync_distribution::auth::acr::AcrAuth;
 
 use crate::bench::Rounds;
-use crate::bench::provision::{RoundIds, id};
+use crate::bench::provision::{RoundId, RoundIds, id};
 use crate::bench::target::{ENV_REGISTRY, registry_client, require, round_ids};
 
 /// Environment variable holding the path prefixes of the rounds' repositories,
@@ -75,7 +75,7 @@ id!(
 
 /// The repositories in an ACR a run syncs into, one path prefix per round.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AcrTarget {
+pub(crate) struct Scope {
     /// The registry.
     pub(crate) registry: RegistryName,
     /// The Entra tenant ocync signs in to.
@@ -87,7 +87,13 @@ pub(crate) struct AcrTarget {
     pub(crate) prefixes: RoundIds,
 }
 
-impl AcrTarget {
+impl Scope {
+    /// The target prefix of the round whose prefix is `round`, then the
+    /// corpus's `prefix` level.
+    pub(crate) fn round_prefix(&self, round: &RoundId, prefix: &str) -> String {
+        format!("{round}/{prefix}")
+    }
+
     /// The environment that describes this target to the instance. The token
     /// file's path is the instance's own to choose.
     pub(crate) fn env(&self) -> [(&'static str, String); 4] {
@@ -181,16 +187,13 @@ mod tests {
 
     #[test]
     fn the_target_is_read_from_the_environment_it_describes() {
-        let target = AcrTarget::parse(&env_of(&FULL_ENV), rounds("3")).unwrap();
+        let target = Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap();
         assert_eq!(target.registry.host(), "ocyncbench1a2b3c.azurecr.io");
         // Catches: the names the local side writes drifting from the ones
         // the instance reads.
         let written = target.env();
         let pairs: Vec<(&str, &str)> = written.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        assert_eq!(
-            AcrTarget::parse(&env_of(&pairs), rounds("3")).unwrap(),
-            target
-        );
+        assert_eq!(Scope::parse(&env_of(&pairs), rounds("3")).unwrap(), target);
     }
 
     #[test]
@@ -258,7 +261,7 @@ mod tests {
                 "BENCH_ACR_PREFIXES: 3 ids but 5 rounds need one each",
             ),
         ] {
-            let err = AcrTarget::parse(&env_of(&pairs), rounds(asked)).unwrap_err();
+            let err = Scope::parse(&env_of(&pairs), rounds(asked)).unwrap_err();
             assert!(err.starts_with(error), "{name}: {err}");
         }
     }
