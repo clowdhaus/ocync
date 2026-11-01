@@ -15,14 +15,11 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 use serde::Deserialize;
 
 use super::detect::ECR_PUBLIC_HOST;
-use super::ecr::{
-    AuthorizationData, AuthorizationToken, DEFAULT_TOKEN_TTL, EcrApi, EcrTokenResponse,
-};
+use super::ecr::{AuthorizationData, AuthorizationToken, EcrApi, EcrTokenResponse};
 use super::recovery::{Recovery, judge_token_endpoint};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Credentials, Presents, Scope, Token, scopes_cache_key};
@@ -75,29 +72,20 @@ impl EcrApi for AwsEcrPublicApi {
                 )
             })?;
 
-            auth_data.into_response(
-                ECR_PUBLIC_HOST,
-                "ECR Public authorization data missing token",
-            )
+            auth_data.into_response(crate::aws::Service::EcrPublic, ECR_PUBLIC_HOST)
         })
     }
 }
 
 /// The Basic credentials for the token exchange that an ECR Public
-/// authorization token carries, with its lifetime.
-fn decode_ecr_credentials(
-    encoded_token: String,
-    ttl: Option<Duration>,
-) -> Result<(Credentials, Duration), Error> {
+/// authorization token carries.
+fn decode_ecr_credentials(encoded_token: String) -> Result<Credentials, Error> {
     let password = AuthorizationToken::parse(encoded_token, ECR_PUBLIC_HOST)?.into_password();
 
-    Ok((
-        Credentials::Basic {
-            username: "AWS".to_owned(),
-            password,
-        },
-        ttl.unwrap_or(DEFAULT_TOKEN_TTL),
-    ))
+    Ok(Credentials::Basic {
+        username: "AWS".to_owned(),
+        password,
+    })
 }
 
 /// AWS ECR Public authentication provider.
@@ -185,8 +173,8 @@ impl EcrPublicAuth {
                     tracing::warn!(error = %e, "ECR Public GetAuthorizationToken failed");
                     e
                 })?;
-                let (credentials, ttl) =
-                    decode_ecr_credentials(response.encoded_token, response.expires_in)?;
+                let credentials = decode_ecr_credentials(response.encoded_token)?;
+                let ttl = response.ttl;
                 tracing::debug!(
                     ttl_secs = ttl.as_secs(),
                     "ECR Public registry credentials refreshed"
@@ -252,6 +240,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -331,7 +320,7 @@ mod tests {
         fn succeeding(encoded_token: &str) -> Self {
             let response = EcrTokenResponse {
                 encoded_token: encoded_token.to_owned(),
-                expires_in: None,
+                ttl: Duration::from_secs(3600),
             };
             Self::with_responses(std::iter::repeat_n(response, 10).collect())
         }
@@ -370,7 +359,7 @@ mod tests {
     #[test]
     fn decode_ecr_credentials_valid() {
         let encoded = BASE64.encode("AWS:my-secret-password");
-        let (creds, _ttl) = decode_ecr_credentials(encoded, None).unwrap();
+        let creds = decode_ecr_credentials(encoded).unwrap();
         match creds {
             Credentials::Basic { username, password } => {
                 assert_eq!(username, "AWS");
@@ -380,16 +369,9 @@ mod tests {
     }
 
     #[test]
-    fn credentials_last_twelve_hours_when_the_answer_has_no_expiry() {
-        let encoded = BASE64.encode("AWS:my-secret-password");
-        let (_, ttl) = decode_ecr_credentials(encoded, None).unwrap();
-        assert_eq!(ttl, Duration::from_secs(43_200));
-    }
-
-    #[test]
     fn decode_ecr_credentials_invalid_prefix() {
         let encoded = BASE64.encode("NOTAWS:password");
-        assert!(decode_ecr_credentials(encoded, None).is_err());
+        assert!(decode_ecr_credentials(encoded).is_err());
     }
 
     #[tokio::test]
@@ -426,7 +408,7 @@ mod tests {
             crate::test_http_client(),
             MockEcrApi::with_responses(vec![EcrTokenResponse {
                 encoded_token: encoded,
-                expires_in: None,
+                ttl: Duration::from_secs(3600),
             }]),
         );
         let t1 = auth.get_token(&[Scope::pull("repo-a")]).await.unwrap();
@@ -452,11 +434,11 @@ mod tests {
                 EcrTokenResponse {
                     encoded_token: encoded1,
                     // Near-zero TTL forces immediate expiry.
-                    expires_in: Some(Duration::from_secs(1)),
+                    ttl: Duration::from_secs(1),
                 },
                 EcrTokenResponse {
                     encoded_token: encoded2,
-                    expires_in: None,
+                    ttl: Duration::from_secs(3600),
                 },
             ]),
         );
@@ -547,7 +529,7 @@ mod tests {
     fn response_for(password: &str) -> EcrTokenResponse {
         EcrTokenResponse {
             encoded_token: BASE64.encode(format!("AWS:{password}")),
-            expires_in: None,
+            ttl: Duration::from_secs(3600),
         }
     }
 

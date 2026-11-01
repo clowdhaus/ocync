@@ -9,20 +9,21 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 
 use crate::auth::{AuthProvider, AuthScheme, Presents, Scope, Token};
-use crate::credential_cache::{CredentialCache, remaining};
+use crate::aws::Service;
+use crate::credential_cache::{CredentialCache, epoch_seconds, remaining};
 use crate::error::{CredentialFailure, Error};
 
 /// Token lifetime, in ECR and ECR Public, when the answer carries no
 /// `expiresAt`.
-pub(super) const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Response from an ECR `GetAuthorizationToken` call.
 #[derive(Clone)]
 pub(super) struct EcrTokenResponse {
     /// The raw base64-encoded authorization token (`AWS:<password>`).
     pub encoded_token: String,
-    /// Time until the token expires, if provided by the API.
-    pub expires_in: Option<Duration>,
+    /// Time until the token expires.
+    pub ttl: Duration,
 }
 
 /// ECR's `GetAuthorizationToken` for one registry, injectable for tests.
@@ -46,35 +47,26 @@ pub(super) struct AuthorizationData {
 }
 
 impl AuthorizationData {
-    /// The token and the time left on it, or [`CredentialFailure::Failed`]
-    /// naming `registry` with `missing_token` when the answer holds no token.
+    /// The token and the time left on it, [`DEFAULT_TOKEN_TTL`] when the
+    /// answer has no expiry, or [`CredentialFailure::Failed`] naming
+    /// `registry` when it holds no token.
     pub(super) fn into_response(
         self,
+        service: Service,
         registry: &str,
-        missing_token: &str,
     ) -> Result<EcrTokenResponse, Error> {
         let encoded_token = self.authorization_token.ok_or_else(|| {
-            Error::cloud_credentials(registry, CredentialFailure::Failed, missing_token)
+            Error::cloud_credentials(
+                registry,
+                CredentialFailure::Failed,
+                format!("{service} authorization data missing token"),
+            )
         })?;
         Ok(EcrTokenResponse {
             encoded_token,
-            expires_in: self.expires_at.map(remaining),
+            ttl: self.expires_at.map_or(DEFAULT_TOKEN_TTL, remaining),
         })
     }
-}
-
-/// Read an expiry sent as seconds since the UNIX epoch. One before the
-/// epoch has passed; one too far ahead to represent reads as no expiry, so
-/// the default lifetime applies rather than the token failing.
-fn epoch_seconds<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<SystemTime>, D::Error> {
-    let Some(secs) = Option::<f64>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    Ok(Duration::try_from_secs_f64(secs.max(0.0))
-        .ok()
-        .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch)))
 }
 
 /// ECR's `GetAuthorizationToken`, which takes no input.
@@ -124,7 +116,7 @@ impl EcrApi for AwsEcrApi {
                     )
                 })?;
 
-            auth_data.into_response(&self.registry, "ECR authorization data missing token")
+            auth_data.into_response(Service::Ecr, &self.registry)
         })
     }
 }
@@ -245,7 +237,7 @@ impl EcrAuth {
                     e
                 })?;
                 let token = AuthorizationToken::parse(response.encoded_token, &self.hostname)?;
-                let ttl = response.expires_in.unwrap_or(DEFAULT_TOKEN_TTL);
+                let ttl = response.ttl;
                 tracing::debug!(registry = %self.hostname, ttl_secs = ttl.as_secs(), "ECR token refreshed");
                 // The encoded token is already ECR's `Basic` credential.
                 let token = Token::with_ttl(token.into_encoded(), ttl).with_scheme(AuthScheme::Basic);
@@ -338,7 +330,7 @@ mod tests {
         fn succeeding(encoded_token: &str) -> Self {
             let response = EcrTokenResponse {
                 encoded_token: encoded_token.to_owned(),
-                expires_in: None,
+                ttl: Duration::from_secs(3600),
             };
             let responses = std::iter::repeat_n(Some(response), 10).collect();
             Self {
@@ -362,7 +354,7 @@ mod tests {
                 .map(|t| {
                     t.map(|encoded_token| EcrTokenResponse {
                         encoded_token,
-                        expires_in: None,
+                        ttl: Duration::from_secs(3600),
                     })
                 })
                 .collect();
@@ -404,9 +396,8 @@ mod tests {
 
     // --- AuthorizationToken tests ---
 
-    /// ECR answers with a list of authorization data. The expiry is read
-    /// as epoch seconds. A negative one has passed, and one too large to
-    /// represent or null is no expiry; none of them fails the token.
+    /// ECR answers with a list of authorization data, the expiry in epoch
+    /// seconds.
     #[test]
     fn reads_the_get_authorization_token_output() {
         let output: GetAuthorizationTokenOutput = serde_json::from_str(
@@ -419,18 +410,56 @@ mod tests {
             data.expires_at,
             Some(SystemTime::UNIX_EPOCH + Duration::from_millis(4_102_444_800_500))
         );
-        for (sent, expected) in [
-            ("-1", Some(SystemTime::UNIX_EPOCH)),
-            ("1e300", None),
-            ("null", None),
-        ] {
-            let body = format!(r#"{{"authorizationData":[{{"expiresAt":{sent}}}]}}"#);
-            let output: GetAuthorizationTokenOutput = serde_json::from_str(&body).unwrap();
-            assert_eq!(output.authorization_data[0].expires_at, expected, "{sent}");
-        }
         let output: GetAuthorizationTokenOutput =
             serde_json::from_str(r#"{"authorizationData":null}"#).unwrap();
         assert!(output.authorization_data.is_empty());
+    }
+
+    /// An answer with no expiry lasts 12 hours, one with no token is an
+    /// error naming the registry and the service, and one with both reads
+    /// as sent.
+    #[test]
+    fn answer_becomes_a_token_response() {
+        let data = |token: Option<&str>, expires_at| AuthorizationData {
+            authorization_token: token.map(str::to_owned),
+            expires_at,
+        };
+        let response = data(Some("QVdT"), None)
+            .into_response(Service::Ecr, "r.example")
+            .unwrap();
+        assert_eq!(response.encoded_token, "QVdT");
+        assert_eq!(response.ttl, Duration::from_secs(43_200));
+
+        let in_an_hour = SystemTime::now() + Duration::from_secs(3600);
+        let response = data(Some("QVdT"), Some(in_an_hour))
+            .into_response(Service::Ecr, "r.example")
+            .unwrap();
+        assert!(
+            response.ttl > Duration::from_secs(3500),
+            "{:?}",
+            response.ttl
+        );
+        assert!(
+            response.ttl <= Duration::from_secs(3600),
+            "{:?}",
+            response.ttl
+        );
+
+        for (service, message) in [
+            (Service::Ecr, "ECR authorization data missing token"),
+            (
+                Service::EcrPublic,
+                "ECR Public authorization data missing token",
+            ),
+        ] {
+            let err = data(None, None)
+                .into_response(service, "r.example")
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("r.example"), "{err}");
+            assert!(err.contains(message), "{err}");
+        }
     }
 
     /// A token keeps its encoded form for ECR and yields its password for
@@ -526,11 +555,11 @@ mod tests {
         let fresh_encoded = BASE64.encode("AWS:refreshed");
         let short = EcrTokenResponse {
             encoded_token: short_encoded.clone(),
-            expires_in: Some(Duration::from_secs(20)),
+            ttl: Duration::from_secs(20),
         };
         let fresh = EcrTokenResponse {
             encoded_token: fresh_encoded.clone(),
-            expires_in: None,
+            ttl: Duration::from_secs(3600),
         };
         let auth = EcrAuth::with_api(
             TEST_HOST,
@@ -552,11 +581,11 @@ mod tests {
         let fresh_encoded = BASE64.encode("AWS:fresh");
         let expired = EcrTokenResponse {
             encoded_token: expired_encoded.clone(),
-            expires_in: Some(Duration::ZERO),
+            ttl: Duration::ZERO,
         };
         let fresh = EcrTokenResponse {
             encoded_token: fresh_encoded.clone(),
-            expires_in: None,
+            ttl: Duration::from_secs(3600),
         };
         let auth = EcrAuth::with_api(
             TEST_HOST,

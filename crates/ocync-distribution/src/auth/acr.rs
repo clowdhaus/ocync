@@ -23,7 +23,7 @@ use super::recovery::{Judgment, Recovery, judge_status};
 use super::token_cache::TokenCache;
 use super::{AuthProvider, Presents, Refusal, Scope, Token, registry_origin, scopes_cache_key};
 use crate::client::{no_redirect_builder, no_redirect_http_client};
-use crate::credential_cache::{CredentialCache, remaining};
+use crate::credential_cache::{CredentialCache, epoch_seconds, remaining};
 use crate::error::{CredentialFailure, Error, OAuthCode, error_chain, truncate_quoted};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -42,17 +42,17 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, Error> {
         .map_err(|e| acr_failed(format_args!("JWT payload is not valid JSON: {e}")))
 }
 
-/// The `exp` claim of a JWT as a time. One before the epoch reads as the
-/// epoch, so it has passed all the same.
-fn extract_jwt_exp(token: &str) -> Result<SystemTime, Error> {
-    let json = decode_jwt_payload(token)?;
-    let exp = json
-        .get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| acr_failed("JWT missing 'exp' claim"))?;
-    SystemTime::UNIX_EPOCH
-        .checked_add(Duration::from_secs(exp.max(0) as u64))
-        .ok_or_else(|| acr_failed("JWT 'exp' claim is out of range"))
+/// The `exp` claim of a JWT as a time, or `None` when the token has none
+/// that reads.
+fn extract_jwt_exp(token: &str) -> Option<SystemTime> {
+    let json = decode_jwt_payload(token).ok()?;
+    epoch_seconds(json.get("exp")?).ok().flatten()
+}
+
+/// The time left on a JWT, or `default` when it carries no `exp` that
+/// reads. A token already past has none left.
+fn jwt_ttl(token: &str, default: Duration) -> Duration {
+    extract_jwt_exp(token).map_or(default, remaining)
 }
 
 /// An ACR token that does not read: [`CredentialFailure::Failed`].
@@ -722,10 +722,7 @@ impl AcrAuth {
                     }
                     failure.error
                 })?;
-                let ttl = extract_jwt_exp(&refresh_token)
-                    .ok()
-                    .map(remaining)
-                    .unwrap_or(ACR_REFRESH_TOKEN_DEFAULT_TTL);
+                let ttl = jwt_ttl(&refresh_token, ACR_REFRESH_TOKEN_DEFAULT_TTL);
                 tracing::debug!(service = %self.service, ttl_secs = ttl.as_secs(), "ACR refresh token acquired");
                 Ok((refresh_token, ttl))
             })
@@ -780,10 +777,7 @@ impl AuthProvider for AcrAuth {
                         .join(" ");
                     tracing::debug!(service = %self.service, scope = %key, "ACR token cache miss, exchanging");
                     let access_token = self.access_token_for(&scope_str).await?;
-                    let ttl = extract_jwt_exp(&access_token)
-                        .ok()
-                        .map(remaining)
-                        .unwrap_or(ACR_ACCESS_TOKEN_DEFAULT_TTL);
+                    let ttl = jwt_ttl(&access_token, ACR_ACCESS_TOKEN_DEFAULT_TTL);
                     Ok(Token::with_ttl(access_token, ttl))
                 })
                 .await
@@ -886,31 +880,31 @@ mod tests {
     #[test]
     fn extract_exp_from_acr_token() {
         let token = fake_jwt(r#"{"exp":1700000000,"iss":"Azure Container Registry"}"#);
-        let exp = extract_jwt_exp(&token).unwrap();
+        let exp = extract_jwt_exp(&token);
         assert_eq!(
             exp,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
         );
     }
 
-    /// A token already past, or with a negative `exp`, has no time left
-    /// rather than falling back to the default lifetime.
+    /// A token with no `exp` gets the default. One already past has no time
+    /// left rather than the default, and a fractional `exp` is read.
     #[test]
-    fn expired_acr_token_has_no_time_left() {
-        for (name, payload) in [
-            ("past", r#"{"exp":1700000000}"#),
-            ("negative", r#"{"exp":-5}"#),
-        ] {
-            let exp = extract_jwt_exp(&fake_jwt(payload)).unwrap();
-            assert_eq!(remaining(exp), Duration::ZERO, "{name}");
-        }
+    fn jwt_ttl_reads_the_expiry() {
+        let default = Duration::from_secs(10_800);
+        assert_eq!(jwt_ttl(&fake_jwt(r#"{"sub":"user"}"#), default), default);
+        assert_eq!(
+            jwt_ttl(&fake_jwt(r#"{"exp":1700000000}"#), default),
+            Duration::ZERO
+        );
+        let ttl = jwt_ttl(&fake_jwt(r#"{"exp":4102444800.5}"#), default);
+        assert!(ttl > Duration::from_secs(50 * 365 * 86_400), "{ttl:?}");
     }
 
     #[test]
     fn extract_exp_missing() {
         let token = fake_jwt(r#"{"sub":"user"}"#);
-        let err = extract_jwt_exp(&token).unwrap_err();
-        assert!(err.to_string().contains("missing 'exp' claim"));
+        assert_eq!(extract_jwt_exp(&token), None);
     }
 
     #[test]
