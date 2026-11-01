@@ -84,7 +84,7 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 ## Fairness steps already enforced
 
-- **CDN pre-warm**, once per run before the first tool (`--skip-prewarm` skips it): every blob the corpus lock records for the run's tags is fetched once per repository, a fixed number at a time per registry, within 8 minutes. Manifests are not warmed. A skipped pre-warm, or a registry not fully warmed and how many of its blobs, is named in the run's summary and record.
+- **CDN pre-warm**, once per run before the first tool (`--skip-prewarm` skips it): every blob the corpus lock records for the run's tags is fetched once per repository, a fixed number at a time per registry, within 8 minutes, then a 6 minute wait if any blob missed the CDN cache. A registry whose blobs carry no CDN cache header (quay.io and cgr.dev serve them from object storage) has no cache to warm: it is checked with the first blobs, the rest are not requested, and its blobs never cause the wait. Manifests are not warmed, because no registry measured caches them. A skipped pre-warm, or a registry not fully warmed and how many of its blobs, is named in the run's summary and record.
 - Before each tool's cold pass:
   - **Drop the OS page cache**, so a tool does not read the previous tool's blobs from memory.
   - **Clean the staging directory** and **delete and recreate the target repositories**, so the cold pass starts empty.
