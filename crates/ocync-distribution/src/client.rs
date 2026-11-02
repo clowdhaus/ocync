@@ -596,7 +596,7 @@ impl RegistryClient {
     /// Send a request, and on 401 refuse the sent token and retry once.
     /// `build_request` is called with fresh auth headers each time. Takes no
     /// AIMD permit; callers hold their own.
-    pub(crate) async fn send_with_retry(
+    async fn send_with_retry(
         &self,
         scopes: &[Scope],
         context: &str,
@@ -906,12 +906,12 @@ mod tests {
         assert!(crate::aimd::is_paced(&gar.aimd).await);
     }
 
-    /// A 1 GB blob takes only the bytes an ACR upload holds from the byte
-    /// budget, and the whole budget on GHCR, which buffers it. Breaks if ACR
-    /// reserves the whole blob (serialising its uploads) or GHCR reserves
-    /// less (unbounded memory).
+    /// A 1 GB blob takes two 16 MiB chunks of the byte budget on ACR, and the
+    /// whole budget on GHCR, which buffers it. Breaks if ACR reserves the
+    /// whole blob (serialising its uploads) or GHCR reserves less (unbounded
+    /// memory).
     #[tokio::test]
-    async fn a_one_gb_blob_reserves_a_chunk_on_acr_and_the_whole_budget_on_ghcr() {
+    async fn a_one_gb_blob_reserves_two_chunks_on_acr_and_the_whole_budget_on_ghcr() {
         const BUDGET: usize = 512 * 1024 * 1024;
         let available = |url: &str| {
             let client = RegistryClient::builder(Url::parse(url).unwrap())
@@ -925,7 +925,7 @@ mod tests {
         };
         assert_eq!(
             available("https://myacr.azurecr.io").await,
-            BUDGET - acr_held_bytes(Some(1 << 30))
+            BUDGET - 32 * 1024 * 1024
         );
         assert_eq!(available("https://ghcr.io").await, 0);
     }
