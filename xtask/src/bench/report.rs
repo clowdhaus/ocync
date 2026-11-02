@@ -565,6 +565,29 @@ fn read_imds(path: &str) -> Option<String> {
     ]))
 }
 
+/// How much of the corpus a run synced.
+///
+/// Kept apart from [`CorpusInfo`], which baselines compare for equality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    /// Every image of the corpus.
+    Whole,
+    /// Fewer images than the corpus holds, by `--limit` or `--skip-registries`.
+    Subset,
+}
+
+impl Coverage {
+    /// What a run of `synced` images covers of a corpus holding `whole`. A
+    /// `--limit` past the end still covers it all.
+    pub(crate) fn of(whole: usize, synced: usize) -> Self {
+        if synced < whole {
+            Self::Subset
+        } else {
+            Self::Whole
+        }
+    }
+}
+
 /// Full benchmark report.
 #[derive(Debug)]
 pub(crate) struct BenchReport {
@@ -574,6 +597,8 @@ pub(crate) struct BenchReport {
     pub(crate) instance: InstanceInfo,
     /// The corpus the run synced: its name, images and tags.
     pub(crate) corpus: CorpusInfo,
+    /// Whether the run synced all of that corpus.
+    pub(crate) coverage: Coverage,
     /// Tool version strings keyed by tool name.
     pub(crate) tool_versions: BTreeMap<Tool, String>,
     /// Versions of binaries a tool relays its transfers through, keyed by
@@ -1361,11 +1386,12 @@ pub(crate) struct PageBlocks {
 impl PageBlocks {
     /// The blocks `report` produces. A run whose transfer cap is not ocync's
     /// default produces none: the page shows ocync as it runs out of the box.
-    /// Nor does a run of a named corpus: the page is the main corpus's.
+    /// Nor does a run without ocync, a run of a named corpus (the page is the
+    /// main corpus's), or a run of part of the corpus.
     pub(crate) fn of(report: &BenchReport) -> Self {
         if !report.corpus.id.is_main()
-            || effective_transfer_cap(report.max_concurrent_transfers)
-                != DEFAULT_MAX_CONCURRENT_TRANSFERS
+            || report.coverage != Coverage::Whole
+            || report.ocync_transfer_cap() != Some(DEFAULT_MAX_CONCURRENT_TRANSFERS)
         {
             return Self::default();
         }
@@ -1574,6 +1600,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -1718,6 +1745,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -1835,6 +1863,32 @@ pub(crate) mod tests {
         report.corpus.id = corpus::Id::Named(CorpusName::new("corpus-small"));
         assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
+    }
+
+    #[test]
+    fn only_a_whole_corpus_run_with_ocync_writes_page_blocks() {
+        // Catches: a `--limit` or `--skip-registries` run replacing the page's
+        // cold block with a table over a few images, and a run of only other
+        // tools replacing ocync's row with theirs; and, by the first
+        // assertion, both gates refusing every run.
+        let mut report = sample_report();
+        assert_eq!(report.coverage, Coverage::Whole);
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.coverage = Coverage::Subset;
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+
+        report.coverage = Coverage::Whole;
+        report.tool_versions.remove(&Tool::Ocync);
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+    }
+
+    #[test]
+    fn coverage_is_a_subset_only_when_images_were_dropped() {
+        // Catches: a `--limit` that drops images read as the whole corpus, and
+        // a `--limit` past the end, which syncs it all, read as a subset.
+        assert_eq!(Coverage::of(40, 3), Coverage::Subset);
+        assert_eq!(Coverage::of(40, 40), Coverage::Whole);
     }
 
     #[test]
@@ -2211,6 +2265,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -2261,6 +2316,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -2346,6 +2402,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2445,6 +2502,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2508,6 +2566,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2594,6 +2653,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
@@ -2655,6 +2715,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
@@ -2693,6 +2754,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2759,6 +2821,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2797,6 +2860,7 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2841,6 +2905,7 @@ pub(crate) mod tests {
         BenchReport {
             baseline: Some(CommitSha::fixture()),
             rounds: Rounds::DEFAULT,
+            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: vec![ScenarioKind::Cold],
             timestamp: "2026-10-30-100000".into(),

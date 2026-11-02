@@ -578,6 +578,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     let loaded = corpus::load(args.paths.corpus())?;
+    let whole_images = loaded.images.len();
     let filtered = if args.skip_registries.is_empty() {
         loaded
     } else {
@@ -599,6 +600,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         images: corpus.images.len(),
         tags: corpus.total_tags(),
     };
+
+    let coverage = report::Coverage::of(whole_images, corpus.images.len());
 
     corpus.dockerhub_auth = docker_hub_auth();
 
@@ -754,6 +757,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         timestamp: timestamp.to_string(),
         instance,
         corpus: corpus_info,
+        coverage,
         tool_versions,
         relay_versions,
         prewarm,
@@ -2553,6 +2557,29 @@ mod tests {
         ] {
             assert_eq!(RegistryKind::of(host).archive_stem(), stem, "{host}");
         }
+    }
+
+    #[test]
+    fn a_partial_ecr_run_is_archived_but_leaves_the_page_alone() {
+        // Catches: a `--limit` run dropped from the archive along with its
+        // page blocks, and one that still rewrites the page.
+        use crate::bench::report::{Coverage, tests::sample_report};
+
+        let mut report = sample_report();
+        report.coverage = Coverage::Subset;
+        let deferred = deferred_output(
+            &Target::Ecr,
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com",
+            &report,
+            "abc1234".into(),
+            None,
+        );
+        let value = serde_json::to_value(&deferred).unwrap();
+        assert!(value["record"].is_object(), "{value}");
+        assert_eq!(
+            value["page"],
+            serde_json::json!({"cold": null, "warm": null})
+        );
     }
 
     #[test]
