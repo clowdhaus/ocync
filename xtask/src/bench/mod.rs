@@ -32,7 +32,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use ocync_distribution::Digest;
 use serde::{Deserialize, Serialize};
 
-use corpus::{Corpus, CorpusId};
+use corpus::Corpus;
 use regression::Baseline;
 use remote::CommitSha;
 use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, rounds_of};
@@ -1066,14 +1066,14 @@ fn plan(
 /// asked for it would be recorded under that corpus with another's
 /// measurement: an explicit `prepare` is refused, and `all` skips it with a
 /// warning.
-fn runs_prepare(requested: Scenario, corpus: &CorpusId) -> Result<bool, String> {
+fn runs_prepare(requested: Scenario, corpus: &corpus::Id) -> Result<bool, String> {
     match (requested, corpus) {
-        (Scenario::Prepare | Scenario::All, CorpusId::Main) => Ok(true),
-        (Scenario::Prepare, CorpusId::Named(name)) => Err(format!(
+        (Scenario::Prepare | Scenario::All, corpus::Id::Main) => Ok(true),
+        (Scenario::Prepare, corpus::Id::Named(name)) => Err(format!(
             "the prepare scenario runs bench/corpus-prepare.yaml, not {name}, and would be \
              recorded under {name}; run it without --corpus"
         )),
-        (Scenario::All, CorpusId::Named(name)) => {
+        (Scenario::All, corpus::Id::Named(name)) => {
             eprintln!(
                 "bench: WARNING: skipping the prepare scenario for {name}: it runs \
                  bench/corpus-prepare.yaml whatever the corpus"
@@ -1199,11 +1199,11 @@ fn ensure_baseline_comparable(
 
 /// Where the stored baseline of `--regression` lives: one per corpus, so a run
 /// of a named corpus is never compared with the main corpus's.
-fn baseline_path(corpus: &CorpusId) -> PathBuf {
+fn baseline_path(corpus: &corpus::Id) -> PathBuf {
     let dir = Path::new(report::ARCHIVE_DIR);
     match corpus {
-        CorpusId::Main => dir.join("baseline.json"),
-        CorpusId::Named(name) => dir.join(format!("baseline-{name}.json")),
+        corpus::Id::Main => dir.join("baseline.json"),
+        corpus::Id::Named(name) => dir.join(format!("baseline-{name}.json")),
     }
 }
 
@@ -2790,7 +2790,7 @@ mod tests {
         // Catches: the refusal coming after the rounds, and a refusal for a run
         // whose comparison is skipped (proxy off, no ocync, no cold sync).
         let corpus = report::CorpusInfo {
-            id: CorpusId::Main,
+            id: corpus::Id::Main,
             images: 2,
             tags: 2,
         };
@@ -2877,7 +2877,7 @@ mod tests {
         // baseline recorded when tools followed the tags, which the same
         // `locked_at` does not tell apart.
         let corpus = report::CorpusInfo {
-            id: CorpusId::Main,
+            id: corpus::Id::Main,
             images: 2,
             tags: 2,
         };
@@ -2993,7 +2993,7 @@ mod tests {
             round(3, 20.0, 300),
         ];
         let corpus = || report::CorpusInfo {
-            id: CorpusId::Main,
+            id: corpus::Id::Main,
             images: 2,
             tags: 2,
         };
@@ -3023,7 +3023,7 @@ mod tests {
             ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![tool_run(Tool::Ocync, 10.0)])
         };
         let corpus = report::CorpusInfo {
-            id: CorpusId::Main,
+            id: corpus::Id::Main,
             images: 2,
             tags: 2,
         };
@@ -3329,23 +3329,34 @@ images:
     #[test]
     fn only_a_partial_scenario_reads_the_overrides() {
         // Catches: a run without a partial scenario refusing to start for want
-        // of an overrides file, a partial run starting without one, prepare
-        // planning a pass that reads the lock, and an explicit scale on a
-        // corpus of 10 or fewer images planning no pass.
+        // of an overrides file, and a partial run starting without one.
         let corpus = two_image_corpus();
         let missing = "/nonexistent/overrides.yaml";
-        let rounds = "3".parse().unwrap();
-        for (requested, passes) in [
-            (Scenario::Sync, 3),
-            (Scenario::Scale, 1),
-            (Scenario::Prepare, 0),
-        ] {
-            let transfers = plan(requested, &corpus, missing, rounds).unwrap();
-            assert_eq!(transfers.len(), passes, "{requested:?}");
+        for requested in [Scenario::Sync, Scenario::Scale, Scenario::Prepare] {
+            assert!(plan(requested, &corpus, missing, Rounds::DEFAULT).is_ok());
         }
         for requested in [Scenario::Partial, Scenario::All] {
-            assert!(plan(requested, &corpus, missing, rounds).is_err());
+            assert!(plan(requested, &corpus, missing, Rounds::DEFAULT).is_err());
         }
+        let transfers = plan(Scenario::Prepare, &corpus, missing, Rounds::DEFAULT).unwrap();
+        assert!(transfers.is_empty(), "prepare reads no lock");
+    }
+
+    #[test]
+    fn an_explicit_scale_runs_on_a_small_corpus() {
+        // Catches: an explicit scale on a corpus of 10 or fewer images planning
+        // no pass, or a sync pass in its place.
+        let planned: Vec<String> = plan(
+            Scenario::Scale,
+            &two_image_corpus(),
+            "/nonexistent/overrides.yaml",
+            Rounds::DEFAULT,
+        )
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(planned, ["Scale"]);
     }
 
     #[test]
@@ -3407,7 +3418,7 @@ images:
     fn only_the_main_corpus_runs_prepare() {
         // Catches: prepare, which runs corpus-prepare.yaml whatever the corpus
         // is, recorded and compared under a named corpus's name.
-        let named = CorpusId::Named(CorpusName::new("corpus-small"));
+        let named = corpus::Id::Named(CorpusName::new("corpus-small"));
         assert_eq!(
             runs_prepare(Scenario::Prepare, &named),
             Err(
@@ -3417,10 +3428,10 @@ images:
             )
         );
         for (requested, corpus, want) in [
-            (Scenario::Prepare, &CorpusId::Main, true),
-            (Scenario::All, &CorpusId::Main, true),
+            (Scenario::Prepare, &corpus::Id::Main, true),
+            (Scenario::All, &corpus::Id::Main, true),
             (Scenario::All, &named, false),
-            (Scenario::Sync, &CorpusId::Main, false),
+            (Scenario::Sync, &corpus::Id::Main, false),
             (Scenario::Scale, &named, false),
         ] {
             assert_eq!(
@@ -3472,9 +3483,9 @@ images:
         // Catches: a shape corpus compared with, or overwriting, the main
         // corpus's baseline.
         for (id, path) in [
-            (CorpusId::Main, "bench/results/baseline.json"),
+            (corpus::Id::Main, "bench/results/baseline.json"),
             (
-                CorpusId::Named(CorpusName::new("corpus-small")),
+                corpus::Id::Named(CorpusName::new("corpus-small")),
                 "bench/results/baseline-corpus-small.json",
             ),
         ] {

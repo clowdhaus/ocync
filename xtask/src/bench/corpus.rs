@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 /// The main corpus file. Its records carry no corpus name.
 const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
 
+/// The main corpus file in the workspace this binary was built from, so a path
+/// reaches it from any current directory.
+const MAIN_CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../bench/corpus.yaml");
+
 /// The file stem of a corpus other than the main one, which names its lock,
 /// baseline and run records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,11 +33,13 @@ impl std::fmt::Display for CorpusName {
     }
 }
 
-/// Which corpus a run measures. The serialized form is the optional stem,
-/// absent for the main corpus, as in every stored main-corpus record.
+/// Which corpus a run measures. Serialized alone it is the stem, or null for the
+/// main corpus; the `default` and `skip_serializing_if` attributes on the
+/// `CorpusInfo` field are what make the main corpus absent, as in every stored
+/// main-corpus record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "Option<CorpusName>", into = "Option<CorpusName>")]
-pub(crate) enum CorpusId {
+#[serde(untagged)]
+pub(crate) enum Id {
     /// The main corpus, `bench/corpus.yaml`.
     #[default]
     Main,
@@ -41,24 +47,7 @@ pub(crate) enum CorpusId {
     Named(CorpusName),
 }
 
-/// Serde reads a `CorpusId` through this.
-impl From<Option<CorpusName>> for CorpusId {
-    fn from(name: Option<CorpusName>) -> Self {
-        name.map_or(Self::Main, Self::Named)
-    }
-}
-
-/// Serde writes a `CorpusId` through this.
-impl From<CorpusId> for Option<CorpusName> {
-    fn from(id: CorpusId) -> Self {
-        match id {
-            CorpusId::Main => None,
-            CorpusId::Named(name) => Some(name),
-        }
-    }
-}
-
-impl CorpusId {
+impl Id {
     /// Whether this is the main corpus.
     pub(crate) fn is_main(&self) -> bool {
         matches!(self, Self::Main)
@@ -104,13 +93,13 @@ impl CorpusPaths {
         lock_path(Path::new(&self.corpus))
     }
 
-    /// The corpus this path names: the main corpus is the file
+    /// The corpus this path names: the main corpus is the workspace's
     /// `bench/corpus.yaml` however a path reaches it (`./bench/corpus.yaml`, an
-    /// absolute path, a `..` path). Any other file, `experiments/corpus.yaml`
+    /// absolute path, a `..` path, from any current directory). Any other file, `experiments/corpus.yaml`
     /// included, is named by its stem. A corpus file that cannot be read is an
     /// error, as when it is loaded.
-    pub(crate) fn corpus_id(&self) -> Result<CorpusId, String> {
-        id_of(&self.corpus, Path::new(DEFAULT_CORPUS))
+    pub(crate) fn corpus_id(&self) -> Result<Id, String> {
+        id_of(&self.corpus)
     }
 }
 
@@ -120,18 +109,22 @@ pub(crate) fn lock_path(corpus: &Path) -> PathBuf {
     corpus.with_extension("lock.json")
 }
 
-/// The corpus file at `corpus`: the main corpus when it is the file at `main`.
-fn id_of(corpus: &str, main: &Path) -> Result<CorpusId, String> {
+/// The corpus file at `corpus`: the main corpus when it is the workspace's
+/// `bench/corpus.yaml`.
+fn id_of(corpus: &str) -> Result<Id, String> {
     let path = Path::new(corpus);
     let file = path
         .canonicalize()
         .map_err(|e| format!("failed to read corpus file {corpus}: {e}"))?;
-    if main.canonicalize().is_ok_and(|main| main == file) {
-        return Ok(CorpusId::Main);
+    if Path::new(MAIN_CORPUS)
+        .canonicalize()
+        .is_ok_and(|main| main == file)
+    {
+        return Ok(Id::Main);
     }
     path.file_stem()
         .and_then(|stem| stem.to_str())
-        .map(|stem| CorpusId::Named(CorpusName::new(stem)))
+        .map(|stem| Id::Named(CorpusName::new(stem)))
         .ok_or_else(|| format!("corpus file {corpus} has no file name to record"))
 }
 
@@ -443,30 +436,38 @@ images:
     #[test]
     fn only_the_main_corpus_file_is_unnamed_however_its_path_is_spelled() {
         // Catches: a shape corpus's records, baseline and refusals carrying no
-        // name; the main corpus reached by `./`, `..` or an absolute path
-        // gaining one; another directory's `corpus.yaml` mistaken for the main
-        // corpus; and a missing file named instead of reported.
-        let main = format!("{BENCH_DIR}corpus.yaml");
+        // name; the main corpus reached by `./`, `..`, an absolute path or a
+        // relative path from another current directory (the tests run in
+        // `xtask/`) gaining one; another directory's `corpus.yaml` or
+        // `corpus-small.yaml` mistaken for the main corpus; and a missing file
+        // named instead of reported.
         let elsewhere = tempfile::tempdir().unwrap();
-        let same_stem = elsewhere.path().join("corpus.yaml");
-        std::fs::write(&same_stem, "").unwrap();
-        let same_stem = same_stem.to_str().unwrap();
+        let outside = |file: &str| {
+            let path = elsewhere.path().join(file);
+            std::fs::write(&path, "").unwrap();
+            path.to_str().unwrap().to_owned()
+        };
         for (corpus, want) in [
-            (main.as_str(), Ok(CorpusId::Main)),
-            (&format!("{BENCH_DIR}./corpus.yaml"), Ok(CorpusId::Main)),
+            (format!("{BENCH_DIR}corpus.yaml"), Ok(Id::Main)),
+            (format!("{BENCH_DIR}./corpus.yaml"), Ok(Id::Main)),
+            (format!("{BENCH_DIR}../bench/corpus.yaml"), Ok(Id::Main)),
+            ("../bench/corpus.yaml".to_owned(), Ok(Id::Main)),
             (
-                &format!("{BENCH_DIR}../bench/corpus.yaml"),
-                Ok(CorpusId::Main),
+                format!("{BENCH_DIR}corpus-small.yaml"),
+                Ok(Id::Named(CorpusName::new("corpus-small"))),
             ),
             (
-                &format!("{BENCH_DIR}corpus-small.yaml"),
-                Ok(CorpusId::Named(CorpusName::new("corpus-small"))),
+                outside("corpus-small.yaml"),
+                Ok(Id::Named(CorpusName::new("corpus-small"))),
             ),
-            (same_stem, Ok(CorpusId::Named(CorpusName::new("corpus")))),
+            (
+                outside("corpus.yaml"),
+                Ok(Id::Named(CorpusName::new("corpus"))),
+            ),
         ] {
-            assert_eq!(id_of(corpus, Path::new(&main)), want, "{corpus}");
+            assert_eq!(id_of(&corpus), want, "{corpus}");
         }
-        let missing = id_of("experiments/corpus.yaml", Path::new(&main)).unwrap_err();
+        let missing = id_of("experiments/corpus.yaml").unwrap_err();
         assert!(
             missing.starts_with("failed to read corpus file experiments/corpus.yaml: "),
             "{missing}"
