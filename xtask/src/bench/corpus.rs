@@ -1,5 +1,6 @@
 //! YAML corpus config parsing with environment variable expansion.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,49 @@ impl CorpusName {
 impl std::fmt::Display for CorpusName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Which corpus a run measures. The serialized form is the optional stem: absent
+/// for the main corpus, which keeps run records written before corpora were
+/// named readable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Option<CorpusName>", into = "Option<CorpusName>")]
+pub(crate) enum CorpusId {
+    /// The main corpus, `bench/corpus.yaml`.
+    #[default]
+    Main,
+    /// Any other corpus file.
+    Named(CorpusName),
+}
+
+impl From<Option<CorpusName>> for CorpusId {
+    fn from(name: Option<CorpusName>) -> Self {
+        name.map_or(Self::Main, Self::Named)
+    }
+}
+
+impl From<CorpusId> for Option<CorpusName> {
+    fn from(id: CorpusId) -> Self {
+        match id {
+            CorpusId::Main => None,
+            CorpusId::Named(name) => Some(name),
+        }
+    }
+}
+
+impl CorpusId {
+    /// Whether this is the main corpus.
+    pub(crate) fn is_main(&self) -> bool {
+        matches!(self, Self::Main)
+    }
+
+    /// The corpus as a person reads it: its name, or the main corpus.
+    pub(crate) fn label(&self) -> Cow<'static, str> {
+        match self {
+            Self::Main => Cow::Borrowed("the main corpus"),
+            Self::Named(name) => Cow::Owned(name.to_string()),
+        }
     }
 }
 
@@ -60,13 +104,13 @@ impl CorpusPaths {
         lock_path(Path::new(&self.corpus))
     }
 
-    /// The corpus file's stem; `None` for the main corpus, which is the file
+    /// The corpus this path names: the main corpus is the file
     /// `bench/corpus.yaml` however a path reaches it (`./bench/corpus.yaml`, an
     /// absolute path, a `..` path). Any other file, `experiments/corpus.yaml`
-    /// included, is named. A corpus file that cannot be read is an error, as
+    /// included, is named by its stem. A corpus file that cannot be read is an error, as
     /// when it is loaded.
-    pub(crate) fn corpus_name(&self) -> Result<Option<CorpusName>, String> {
-        name_of(&self.corpus, Path::new(DEFAULT_CORPUS))
+    pub(crate) fn corpus_id(&self) -> Result<CorpusId, String> {
+        id_of(&self.corpus, Path::new(DEFAULT_CORPUS))
     }
 }
 
@@ -76,18 +120,18 @@ pub(crate) fn lock_path(corpus: &Path) -> PathBuf {
     corpus.with_extension("lock.json")
 }
 
-/// The name of the corpus file at `corpus`, `None` when it is the file at `main`.
-fn name_of(corpus: &str, main: &Path) -> Result<Option<CorpusName>, String> {
+/// The corpus file at `corpus`: the main corpus when it is the file at `main`.
+fn id_of(corpus: &str, main: &Path) -> Result<CorpusId, String> {
     let path = Path::new(corpus);
     let file = path
         .canonicalize()
         .map_err(|e| format!("failed to read corpus file {corpus}: {e}"))?;
     if main.canonicalize().is_ok_and(|main| main == file) {
-        return Ok(None);
+        return Ok(CorpusId::Main);
     }
     path.file_stem()
         .and_then(|stem| stem.to_str())
-        .map(|stem| Some(CorpusName::new(stem)))
+        .map(|stem| CorpusId::Named(CorpusName::new(stem)))
         .ok_or_else(|| format!("corpus file {corpus} has no file name to record"))
 }
 
@@ -418,12 +462,14 @@ images:
             (same_stem, Ok(Some("corpus"))),
         ] {
             assert_eq!(
-                name_of(corpus, Path::new(&main)),
-                want.map(|name| name.map(CorpusName::new)),
+                id_of(corpus, Path::new(&main)),
+                want.map(
+                    |name| name.map_or(CorpusId::Main, |n| CorpusId::Named(CorpusName::new(n)))
+                ),
                 "{corpus}"
             );
         }
-        let missing = name_of("experiments/corpus.yaml", Path::new(&main)).unwrap_err();
+        let missing = id_of("experiments/corpus.yaml", Path::new(&main)).unwrap_err();
         assert!(
             missing.starts_with("failed to read corpus file experiments/corpus.yaml: "),
             "{missing}"

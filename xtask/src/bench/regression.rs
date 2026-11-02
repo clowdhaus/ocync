@@ -86,14 +86,14 @@ pub(crate) fn ensure_comparable(
             baseline_path,
             &format!(
                 "for {} under corpus lock {} over {} images and {} tags",
-                baseline.corpus.label(),
+                baseline.corpus.name.label(),
                 show(&baseline.corpus_locked_at),
                 baseline.corpus.images,
                 baseline.corpus.tags
             ),
             &format!(
                 "for {} under {} over {} images and {} tags",
-                current.corpus.label(),
+                current.corpus.name.label(),
                 show(&current.corpus_locked_at),
                 current.corpus.images,
                 current.corpus.tags
@@ -271,6 +271,7 @@ fn format_metric_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::corpus::{CorpusId, CorpusName};
     use crate::bench::lock::fixtures::locked_at;
 
     fn baseline(wall_clock_secs: f64, requests: u64, total_bytes: u64) -> Baseline {
@@ -281,7 +282,7 @@ mod tests {
             corpus_locked_at: None,
             sync_from: None,
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 40,
                 tags: 55,
             },
@@ -406,7 +407,7 @@ mod tests {
             corpus_locked_at: Some(locked_at("2026-10-30-214340")),
             sync_from: Some(SyncFrom::Digest),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 40,
                 tags: 55,
             },
@@ -434,7 +435,7 @@ mod tests {
         // regression, and a refusal that does not say which file to replace.
         let this_run = Some(locked_at("2026-10-30-214340"));
         let full = CorpusInfo {
-            name: None,
+            name: CorpusId::Main,
             images: 40,
             tags: 55,
         };
@@ -443,7 +444,7 @@ mod tests {
             (
                 Some(locked_at("2026-09-01-000000")),
                 CorpusInfo {
-                    name: None,
+                    name: CorpusId::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -452,7 +453,7 @@ mod tests {
             (
                 None,
                 CorpusInfo {
-                    name: None,
+                    name: CorpusId::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -461,7 +462,7 @@ mod tests {
             (
                 Some(locked_at("2026-10-30-214340")),
                 CorpusInfo {
-                    name: None,
+                    name: CorpusId::Main,
                     images: 5,
                     tags: 5,
                 },
@@ -498,7 +499,7 @@ mod tests {
         // baseline, and a refusal that does not name both corpora.
         let named = |name: Option<&str>| Baseline {
             corpus: CorpusInfo {
-                name: name.map(crate::bench::corpus::CorpusName::new),
+                name: name.map(CorpusName::new).into(),
                 images: 40,
                 tags: 55,
             },
@@ -576,7 +577,7 @@ mod tests {
         let key = |cap: usize, images: usize| Baseline {
             max_concurrent_transfers: NonZeroUsize::new(cap),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images,
                 tags: 55,
             },

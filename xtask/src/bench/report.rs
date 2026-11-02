@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
-use crate::bench::corpus::CorpusName;
+use crate::bench::corpus::CorpusId;
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
@@ -271,21 +271,12 @@ fn imds_or_unknown(path: &str) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
     /// The corpus file's stem; absent for the main corpus.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<CorpusName>,
+    #[serde(default, skip_serializing_if = "CorpusId::is_main")]
+    pub(crate) name: CorpusId,
     /// Number of distinct images.
     pub(crate) images: usize,
     /// Total tags across all images.
     pub(crate) tags: usize,
-}
-
-impl CorpusInfo {
-    /// The corpus as a person reads it: its name, or the main corpus.
-    pub(crate) fn label(&self) -> String {
-        self.name
-            .as_ref()
-            .map_or("the main corpus".to_owned(), ToString::to_string)
-    }
 }
 
 /// One scenario's results in the compact run record.
@@ -767,7 +758,7 @@ fn summary_markdown(report: &BenchReport) -> String {
 
     out.push_str(&format!(
         "Corpus: {}, {} images, {} total tags\n\n",
-        report.corpus.label(),
+        report.corpus.name.label(),
         report.corpus.images,
         report.corpus.tags
     ));
@@ -1305,7 +1296,7 @@ impl PageBlocks {
     /// default produces none: the page shows ocync as it runs out of the box.
     /// Nor does a run of a named corpus: the page is the main corpus's.
     pub(crate) fn of(report: &BenchReport) -> Self {
-        if report.corpus.name.is_some()
+        if !report.corpus.name.is_main()
             || effective_transfer_cap(report.max_concurrent_transfers)
                 != DEFAULT_MAX_CONCURRENT_TRANSFERS
         {
@@ -1496,6 +1487,7 @@ pub(crate) fn append_record(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::bench::corpus::CorpusName;
 
     fn test_instance() -> InstanceInfo {
         InstanceInfo {
@@ -1520,7 +1512,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -1596,7 +1588,7 @@ pub(crate) mod tests {
         assert!(md.contains("- **Network**: Up to 12.5 Gigabit"));
         assert!(md.contains("Corpus: the main corpus, 28 images, 40 total tags"));
         let mut named = sample_report();
-        named.corpus.name = Some(CorpusName::new("corpus-small"));
+        named.corpus.name = CorpusId::Named(CorpusName::new("corpus-small"));
         assert!(
             summary_markdown(&named).contains("Corpus: corpus-small, 28 images, 40 total tags")
         );
@@ -1664,7 +1656,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -1773,7 +1765,7 @@ pub(crate) mod tests {
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"].get("name"), None);
 
-        report.corpus.name = Some(CorpusName::new("corpus-small"));
+        report.corpus.name = CorpusId::Named(CorpusName::new("corpus-small"));
         assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
     }
@@ -2099,7 +2091,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -2149,7 +2141,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -2234,7 +2226,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 42,
                 tags: 55,
             },
@@ -2333,7 +2325,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 42,
                 tags: 55,
             },
@@ -2396,7 +2388,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 42,
                 tags: 55,
             },
@@ -2482,7 +2474,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 39,
                 tags: 51,
             },
@@ -2543,7 +2535,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 39,
                 tags: 51,
             },
@@ -2581,7 +2573,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -2642,7 +2634,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -2680,7 +2672,7 @@ pub(crate) mod tests {
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
@@ -2724,7 +2716,7 @@ pub(crate) mod tests {
             timestamp: "2026-10-30-100000".into(),
             instance: test_instance(),
             corpus: CorpusInfo {
-                name: None,
+                name: CorpusId::Main,
                 images: 28,
                 tags: 40,
             },
