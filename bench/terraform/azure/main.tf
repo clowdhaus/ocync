@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/azurerm"
       version = ">= 4.0"
     }
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = ">= 3.0"
+    }
     http = {
       source  = "hashicorp/http"
       version = ">= 3.0"
@@ -191,4 +195,47 @@ resource "azurerm_role_assignment" "bench_push" {
   # Skips the directory lookup that fails while a new identity is still
   # replicating.
   principal_type = "ServicePrincipal"
+}
+
+################################################################################
+# Federation from the AWS bench instance
+# The instance asks STS for a token (bench/terraform/aws) and signs in as this
+# application with it, so bench-remote drives ACR from the same host and
+# network as every other target. Entra matches the subject exactly: the
+# token's `sub` is the instance role's ARN.
+################################################################################
+
+data "azurerm_client_config" "current" {}
+
+data "terraform_remote_state" "aws" {
+  backend = "s3"
+  config = {
+    bucket = "clowd-haus-iac-us-east-1"
+    key    = "ocync/bench/aws/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+resource "azuread_application" "bench" {
+  display_name = local.name
+}
+
+resource "azuread_service_principal" "bench" {
+  client_id = azuread_application.bench.client_id
+}
+
+resource "azuread_application_federated_identity_credential" "aws" {
+  application_id = azuread_application.bench.id
+  display_name   = "aws-bench-instance"
+  description    = "The AWS bench instance's role, through STS GetWebIdentityToken"
+  issuer         = data.terraform_remote_state.aws.outputs.token_issuer
+  subject        = data.terraform_remote_state.aws.outputs.instance_role_arn
+  audiences      = ["api://AzureADTokenExchange"]
+}
+
+resource "azurerm_role_assignment" "federated_push" {
+  scope                = azurerm_container_registry.bench.id
+  role_definition_name = "AcrPush"
+  principal_id         = azuread_service_principal.bench.object_id
+  principal_type       = "ServicePrincipal"
 }

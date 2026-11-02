@@ -6,28 +6,20 @@
 //! gets a repository of its own, which the bench service account can write to
 //! but not create. The instance only pushes.
 
-use std::ffi::OsString;
-use std::fs::{File, TryLockError};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::bench::gar::{ArtifactRegistryTarget, Location, Project, RepositoryId};
-use crate::bench::{Rounds, RunTimestamp, captured};
-
-/// What every repository this tool makes is named from. A run removes the
-/// repositories with this prefix that an earlier run left, and touches no
-/// other.
-const REPOSITORY_PREFIX: &str = "ocync-bench-run-";
+use crate::bench::gar::{ArtifactRegistryTarget, Location, Project};
+use crate::bench::provision::{
+    Cli, Output, RoundId, RoundIds, deleted_all, terraform_outputs, with_prefix,
+};
+use crate::bench::target::Kind;
+use crate::bench::{Rounds, RunTimestamp};
 
 /// What `gcloud` prints, among its error, when the repository it was asked to
 /// delete is not there.
 const ALREADY_GONE: &str = "NOT_FOUND";
-
-/// File in the temp directory whose lock serializes Artifact Registry runs on
-/// this machine.
-const LOCAL_LOCK: &str = "ocync-bench-gar.lock";
 
 /// Role that lets the bench service account push.
 const WRITER_ROLE: &str = "roles/artifactregistry.writer";
@@ -57,12 +49,6 @@ impl TryFrom<String> for ServiceAccount {
     }
 }
 
-/// One Terraform output, as `terraform output -json` writes it.
-#[derive(Deserialize)]
-struct Output<T> {
-    value: T,
-}
-
 /// The outputs of `bench/terraform/gcp` the run reads.
 #[derive(Deserialize)]
 struct RawOutputs {
@@ -86,15 +72,13 @@ pub(crate) struct Outputs {
 }
 
 impl Outputs {
-    /// Reads the outputs from `terraform output -json`, naming the one that
-    /// is missing or malformed.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "reads Terraform's own output, which holds no credential"
-    )]
-    pub(crate) fn parse(json: &str) -> Result<Self, String> {
-        let raw: RawOutputs = serde_json::from_str(json)
-            .map_err(|e| format!("terraform output of {TERRAFORM_DIR}: {e}"))?;
+    /// Reads the outputs of the applied Terraform stack.
+    pub(crate) fn read() -> Result<Self, String> {
+        Self::from_raw(terraform_outputs(TERRAFORM_DIR)?)
+    }
+
+    /// The outputs `raw` holds, each checked.
+    fn from_raw(raw: RawOutputs) -> Result<Self, String> {
         let path = &raw.repository.value;
         let malformed = |why: String| format!("terraform output `repository` ({path:?}): {why}");
         let mut parts = path.split('/');
@@ -110,73 +94,13 @@ impl Outputs {
             credentials_file: raw.credentials_file.value,
         })
     }
-
-    /// Reads the outputs of the applied Terraform stack.
-    pub(crate) fn read() -> Result<Self, String> {
-        let json = captured(Command::new("terraform").args([
-            &format!("-chdir={TERRAFORM_DIR}"),
-            "output",
-            "-json",
-        ]))
-        .map_err(|e| {
-            format!("terraform output -json failed: {e}. Did you run `terraform apply` in {TERRAFORM_DIR}?")
-        })?;
-        Self::parse(&json)
-    }
-}
-
-/// Takes the lock that keeps a second Artifact Registry run on this machine out
-/// until the returned file is dropped. The sweep of one run would delete the
-/// repositories of the other, which may still be provisioning or fetching with
-/// no run on the instance for the instance probe to see.
-pub(crate) fn lock_local_run() -> Result<File, String> {
-    lock_at(&std::env::temp_dir().join(LOCAL_LOCK))
-}
-
-/// Takes an exclusive lock on the file at `path`, which is made if absent.
-fn lock_at(path: &Path) -> Result<File, String> {
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("open {}: {e}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(format!(
-            "another Artifact Registry bench-remote run is going on this machine ({}): \
-             this one would sweep its repositories",
-            path.display()
-        )),
-        Err(TryLockError::Error(e)) => Err(format!("lock {}: {e}", path.display())),
-    }
-}
-
-/// The program that talks to Google Cloud.
-pub(crate) struct Gcloud(OsString);
-
-impl Gcloud {
-    /// The `gcloud` on `PATH`.
-    pub(crate) fn installed() -> Self {
-        Self("gcloud".into())
-    }
-
-    fn run(&self, argv: &[String]) -> Result<String, String> {
-        captured(Command::new(&self.0).args(argv)).map_err(|e| {
-            format!(
-                "{} {} failed: {e}",
-                self.0.to_string_lossy(),
-                argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ")
-            )
-        })
-    }
 }
 
 /// The argv of a `gcloud artifacts repositories` command, with `id` and
 /// `flags` after the verb, and the project and location always explicit.
 fn repositories_argv(
     verb: &str,
-    id: Option<&RepositoryId>,
+    id: Option<&RoundId>,
     flags: &[String],
     target: &ArtifactRegistryTarget,
 ) -> Vec<String> {
@@ -204,7 +128,7 @@ fn list_argv(target: &ArtifactRegistryTarget) -> Vec<String> {
 }
 
 /// Creates the Docker repository `id`.
-fn create_argv(target: &ArtifactRegistryTarget, id: &RepositoryId) -> Vec<String> {
+fn create_argv(target: &ArtifactRegistryTarget, id: &RoundId) -> Vec<String> {
     repositories_argv(
         "create",
         Some(id),
@@ -216,7 +140,7 @@ fn create_argv(target: &ArtifactRegistryTarget, id: &RepositoryId) -> Vec<String
 /// Lets `account` push to the repository `id`.
 fn bind_argv(
     target: &ArtifactRegistryTarget,
-    id: &RepositoryId,
+    id: &RoundId,
     account: &ServiceAccount,
 ) -> Vec<String> {
     repositories_argv(
@@ -231,44 +155,30 @@ fn bind_argv(
 }
 
 /// Deletes the repository `id`, waiting for the deletion to finish.
-fn delete_argv(target: &ArtifactRegistryTarget, id: &RepositoryId) -> Vec<String> {
+fn delete_argv(target: &ArtifactRegistryTarget, id: &RoundId) -> Vec<String> {
     repositories_argv("delete", Some(id), &[], target)
 }
 
-/// The id of round `round`'s repository in the run that started at `timestamp`.
-fn repository_id(timestamp: &RunTimestamp, round: usize) -> Result<RepositoryId, String> {
-    format!("{REPOSITORY_PREFIX}{timestamp}-r{round}").parse()
-}
-
 /// The repositories in a `list` answer that an earlier run made: those whose
-/// id starts with [`REPOSITORY_PREFIX`].
-fn leftovers(listed: &str) -> Vec<RepositoryId> {
-    listed
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with(REPOSITORY_PREFIX))
+/// id starts with [`REPOSITORY_PREFIX`](crate::bench::provision::REPOSITORY_PREFIX).
+fn leftovers(listed: &str) -> Vec<RoundId> {
+    with_prefix(listed)
         .filter_map(|line| line.parse().ok())
         .collect()
 }
 
-/// Whether the instance's run is known to have ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RunEnd {
-    /// The script's own exit was read, or the run never reached the instance.
-    Settled,
-    /// The connection dropped, so the detached benchmark may still be pushing.
-    Unknown,
-}
-
 /// The repositories one run made, removed when it ends.
 ///
-/// Dropping deletes whatever [`Self::settle`] has not, so a run that fails or
-/// returns early leaves nothing behind. A process that is killed relies on the
-/// next run's sweep of [`REPOSITORY_PREFIX`] instead.
+/// Dropping deletes whatever [`Provisioned::delete`] has not, so a run that
+/// fails or returns early leaves nothing behind. A process that is killed
+/// relies on the next run's sweep of
+/// [`REPOSITORY_PREFIX`](crate::bench::provision::REPOSITORY_PREFIX) instead.
 pub(crate) struct Provisioned {
-    gcloud: Gcloud,
-    /// The repositories made so far, round 1 first. Deleting empties it.
+    gcloud: Cli,
+    /// The repositories of every round.
     pub(crate) target: ArtifactRegistryTarget,
+    /// The repositories made so far that are still to delete, round 1 first.
+    pending: Vec<RoundId>,
     service_account: ServiceAccount,
     /// The federation file the instance signs in with.
     pub(crate) credentials_file: PathBuf,
@@ -279,7 +189,7 @@ impl Provisioned {
     /// lets the bench service account push to each. All exist before the
     /// instance is reached, so the grants have time to take effect.
     pub(crate) fn create(
-        gcloud: Gcloud,
+        gcloud: Cli,
         outputs: Outputs,
         timestamp: &RunTimestamp,
         rounds: Rounds,
@@ -290,54 +200,43 @@ impl Provisioned {
             service_account,
             credentials_file,
         } = outputs;
+        let repositories = RoundIds::for_run(timestamp, rounds)?;
         let mut this = Self {
             gcloud,
             target: ArtifactRegistryTarget {
                 location,
                 project,
-                repositories: Vec::new(),
+                repositories,
             },
+            pending: Vec::new(),
             service_account,
             credentials_file,
         };
         let listed = this.gcloud.run(&list_argv(&this.target))?;
         this.delete_ids(&leftovers(&listed))?;
-        for round in 1..=rounds.get() {
-            let id = repository_id(timestamp, round)?;
-            this.gcloud.run(&create_argv(&this.target, &id))?;
-            this.target.repositories.push(id.clone());
+        for id in this.target.repositories.clone().iter() {
+            this.gcloud.run(&create_argv(&this.target, id))?;
+            this.pending.push(id.clone());
             this.gcloud
-                .run(&bind_argv(&this.target, &id, &this.service_account))?;
+                .run(&bind_argv(&this.target, id, &this.service_account))?;
         }
         Ok(this)
     }
 
-    /// Deletes the repositories when the run's end is [`RunEnd::Settled`]; when
-    /// it is [`RunEnd::Unknown`], keeps them, since the benchmark may still be
-    /// pushing, and says so.
-    pub(crate) fn settle(&mut self, end: RunEnd) -> Result<(), String> {
-        match end {
-            RunEnd::Settled => self.delete(),
-            RunEnd::Unknown => {
-                let kept = std::mem::take(&mut self.target.repositories);
-                eprintln!(
-                    "bench-remote: kept {} Artifact Registry repositories because the run may                      still be live on the instance; the next `--target artifact-registry` run                      deletes them once the instance is free",
-                    kept.len()
-                );
-                Ok(())
-            }
-        }
+    /// Gives up the repositories without deleting them, and returns how many.
+    pub(crate) fn keep(&mut self) -> usize {
+        std::mem::take(&mut self.pending).len()
     }
 
     /// Deletes every repository this run made.
-    fn delete(&mut self) -> Result<(), String> {
-        let ids = std::mem::take(&mut self.target.repositories);
+    pub(crate) fn delete(&mut self) -> Result<(), String> {
+        let ids = std::mem::take(&mut self.pending);
         self.delete_ids(&ids)
     }
 
     /// Deletes each of `ids`, trying all, and names those that stayed. One
     /// that is already gone is deleted.
-    fn delete_ids(&self, ids: &[RepositoryId]) -> Result<(), String> {
+    fn delete_ids(&self, ids: &[RoundId]) -> Result<(), String> {
         let failures: Vec<String> = ids
             .iter()
             .filter_map(|id| {
@@ -348,15 +247,7 @@ impl Provisioned {
                     .map(|e| format!("{id}: {e}"))
             })
             .collect();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "failed to delete {} Artifact Registry repositories, content left behind: {}",
-                failures.len(),
-                failures.join("; ")
-            ))
-        }
+        deleted_all(Kind::ArtifactRegistry, &failures)
     }
 }
 
@@ -369,8 +260,12 @@ impl Drop for Provisioned {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::bench::provision::parse_terraform_outputs;
+    use crate::bench::target::{rounds, write_stub};
 
     const OUTPUTS: &str = r#"{
   "connect": {"sensitive": false, "type": "string", "value": "ssh bench@example.invalid"},
@@ -379,15 +274,19 @@ mod tests {
   "service_account": {"sensitive": false, "type": "string", "value": "bench@example-project.iam.gserviceaccount.com"}
 }"#;
 
-    fn target(repositories: &[&str]) -> ArtifactRegistryTarget {
+    fn read_outputs(json: &str) -> Result<Outputs, String> {
+        Outputs::from_raw(parse_terraform_outputs(TERRAFORM_DIR, json)?)
+    }
+
+    fn target() -> ArtifactRegistryTarget {
         ArtifactRegistryTarget {
             location: "europe-west9".parse().unwrap(),
             project: "example-project".parse().unwrap(),
-            repositories: repositories.iter().map(|id| id.parse().unwrap()).collect(),
+            repositories: RoundIds::parse("run-r1,run-r2,run-r3", rounds("3")).unwrap(),
         }
     }
 
-    fn id(raw: &str) -> RepositoryId {
+    fn id(raw: &str) -> RoundId {
         raw.parse().unwrap()
     }
 
@@ -400,7 +299,7 @@ mod tests {
 
     #[test]
     fn terraform_outputs_are_parsed_and_a_bad_one_is_named() {
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
+        let outputs = read_outputs(OUTPUTS).unwrap();
         assert_eq!(outputs.location, "europe-west9".parse().unwrap());
         assert_eq!(outputs.project, "example-project".parse().unwrap());
         assert_eq!(outputs.service_account, account());
@@ -428,14 +327,14 @@ mod tests {
                 "not an email address",
             ),
         ] {
-            let err = Outputs::parse(json).unwrap_err();
+            let err = read_outputs(json).unwrap_err();
             assert!(err.contains(named), "{name}: {err}");
         }
     }
 
     #[test]
     fn each_gcloud_command_names_its_project_and_location_and_never_asks() {
-        let t = target(&[]);
+        let t = target();
         let scope = [
             "--project",
             "example-project",
@@ -488,35 +387,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_round_names_its_repository_from_the_run_start_and_the_sweep_keeps_to_that_prefix() {
-        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        assert_eq!(
-            repository_id(&timestamp, 3).unwrap(),
-            id("ocync-bench-run-2026-10-30-120000-r3")
-        );
-        // Catches: a sweep that deletes the bench's own repositories or any
-        // other that happens to be in the project.
-        let listed = "ocync-bench\nocync-bench-mirror\nocync-bench-run-2026-10-29-090000-r1\n\
-                      other-ocync-bench-run-x\nocync-bench-run-2026-10-29-090000-r2\n\n";
-        assert_eq!(
-            leftovers(listed),
-            vec![
-                id("ocync-bench-run-2026-10-29-090000-r1"),
-                id("ocync-bench-run-2026-10-29-090000-r2"),
-            ]
-        );
-    }
-
     /// A `gcloud` that logs its argv to `log`, fails a `delete` of `bad`, and
     /// answers a `delete` of a repository named `gone` as Google does when it
     /// is already deleted.
-    fn stub_gcloud(dir: &Path, bad: &str) -> (Gcloud, PathBuf) {
+    fn stub_gcloud(dir: &Path, bad: &str) -> (Cli, PathBuf) {
         let log = dir.join("calls.log");
-        let program = dir.join("gcloud");
-        std::fs::write(
-            &program,
-            format!(
+        let program = write_stub(
+            dir,
+            "gcloud",
+            &format!(
                 "#!/bin/bash\necho \"$@\" >> '{}'\n\
                  case \"$*\" in\n\
                  *list*) printf 'ocync-bench-run-old-r1\\nocync-bench-run-old-gone\\nocync-bench\\n' ;;\n\
@@ -525,27 +404,28 @@ mod tests {
                  esac\n",
                 log.display()
             ),
+        );
+        (Cli::new(program), log)
+    }
+
+    /// A run provisioned against [`stub_gcloud`] for three rounds, and the log
+    /// of the calls it made.
+    pub(in crate::bench) fn provision(dir: &Path, bad: &str) -> (Provisioned, PathBuf) {
+        let (gcloud, log) = stub_gcloud(dir, bad);
+        let outputs = read_outputs(OUTPUTS).unwrap();
+        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
+        (
+            Provisioned::create(gcloud, outputs, &timestamp, rounds("3")).unwrap(),
+            log,
         )
-        .unwrap();
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-        (Gcloud(program.into()), log)
     }
 
     #[test]
     fn every_repository_is_deleted_when_the_run_ends_and_a_failed_delete_is_named() {
         let dir = tempfile::tempdir().unwrap();
-        let (gcloud, log) = stub_gcloud(dir.path(), "-r2");
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
-        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        let rounds: Rounds = "3".parse().unwrap();
-
-        let mut provisioned = Provisioned::create(gcloud, outputs, &timestamp, rounds).unwrap();
-        assert_eq!(provisioned.target.repositories.len(), 3);
-        let err = provisioned.settle(RunEnd::Settled).unwrap_err();
+        let (mut provisioned, log) = provision(dir.path(), "-r2");
+        assert_eq!(provisioned.target.repositories.iter().count(), 3);
+        let err = provisioned.delete().unwrap_err();
         assert!(
             err.contains("ocync-bench-run-2026-10-30-120000-r2: ") && err.contains("denied"),
             "{err}"
@@ -574,48 +454,13 @@ mod tests {
     #[test]
     fn dropping_deletes_what_the_run_made() {
         let dir = tempfile::tempdir().unwrap();
-        let (gcloud, log) = stub_gcloud(dir.path(), "never");
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
-        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        drop(Provisioned::create(gcloud, outputs, &timestamp, "3".parse().unwrap()).unwrap());
+        let (provisioned, log) = provision(dir.path(), "never");
+        drop(provisioned);
         let calls = std::fs::read_to_string(&log).unwrap();
         let deleted = calls
             .lines()
             .filter(|l| l.contains("repositories delete ocync-bench-run-2026-10-30-120000-r"))
             .count();
         assert_eq!(deleted, 3, "{calls}");
-    }
-
-    #[test]
-    fn repositories_are_kept_when_the_end_of_the_run_is_unknown() {
-        // Catches: deleting repositories a detached benchmark is still
-        // pushing into, by `settle` or by the drop that follows it.
-        let dir = tempfile::tempdir().unwrap();
-        let (gcloud, log) = stub_gcloud(dir.path(), "never");
-        let outputs = Outputs::parse(OUTPUTS).unwrap();
-        let timestamp: RunTimestamp = "2026-10-30-120000".parse().unwrap();
-        let mut provisioned =
-            Provisioned::create(gcloud, outputs, &timestamp, "3".parse().unwrap()).unwrap();
-        let before = std::fs::read_to_string(&log).unwrap().lines().count();
-
-        assert_eq!(provisioned.settle(RunEnd::Unknown), Ok(()));
-        drop(provisioned);
-
-        let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.lines().count(), before, "{calls}");
-    }
-
-    #[test]
-    fn a_second_local_run_is_refused_until_the_first_ends() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run.lock");
-        let first = lock_at(&path).unwrap();
-        let err = lock_at(&path).unwrap_err();
-        assert!(
-            err.contains("another Artifact Registry bench-remote run"),
-            "{err}"
-        );
-        drop(first);
-        assert!(lock_at(&path).is_ok(), "released with the first run");
     }
 }

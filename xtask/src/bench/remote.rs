@@ -14,11 +14,12 @@ use std::process::{Command, Stdio};
 use clap::Args;
 use serde::Deserialize;
 
-use super::gar::{ArtifactRegistryTarget, ENV_CREDENTIALS};
-use super::gcloud::{Gcloud, Outputs, Provisioned, RunEnd, lock_local_run};
+use super::acr::ENV_TOKEN_FILE;
+use super::gar::ENV_CREDENTIALS;
+use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
-use super::target::{ENV_REGISTRY, Kind, ensure_artifact_registry_applies};
+use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{Provider, RunTimestamp, Scenario, ToolSelection, captured, finish_pass, value_name};
 
 /// Common SSH options for all remote connections.
@@ -50,6 +51,10 @@ fn ssh_args(config: &BenchConfig) -> Vec<&str> {
 /// the bench user's home.
 const REMOTE_CREDENTIALS: &str = ".bench-gar-credentials.json";
 
+/// Where on the instance the token ocync signs in to Azure with is kept,
+/// relative to the bench user's home.
+const REMOTE_AZURE_TOKEN: &str = ".bench-azure-token";
+
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
@@ -61,6 +66,9 @@ pub(crate) struct BenchRemoteArgs {
     /// Registry the instance syncs into. Artifact Registry needs the Google
     /// stack applied (`bench/terraform/gcp`) and `gcloud` signed in here: this
     /// command makes a repository for each round and deletes them when it ends.
+    /// ACR needs the Azure stack applied (`bench/terraform/azure`) and `az`
+    /// signed in here: each round syncs under a path prefix of its own, which
+    /// this command deletes when it ends.
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: Kind,
 
@@ -96,7 +104,7 @@ pub(crate) struct BenchRemoteArgs {
     /// older than the change that added `bench --archive` cannot run, because
     /// the instance's `bench` would not know the option, and one older than
     /// `--max-concurrent-transfers` cannot take that option for the same reason.
-    /// An Artifact Registry run needs a ref with `--target`.
+    /// An Artifact Registry or ACR run needs a ref with `--target`.
     #[arg(long)]
     pub(crate) git_ref: Option<String>,
 
@@ -182,20 +190,20 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     ensure_placement(args.provider)?;
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
-    if args.target == Kind::ArtifactRegistry {
-        ensure_artifact_registry_applies(args.scenario, &args.tool_selection.run_tools())?;
-    }
+    ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
 
     // Held, with the Terraform outputs read, until this function returns,
     // and so also after the push: a missing apply is refused before anything
-    // leaves this machine, and a second Artifact Registry run on this machine
-    // cannot sweep the repositories made below.
+    // leaves this machine, and a second run on this machine that deletes its
+    // repositories cannot sweep the ones made below.
     let (_local_run, outputs) = match args.target {
         Kind::Ecr => (None, None),
-        Kind::ArtifactRegistry => (Some(lock_local_run()?), Some(Outputs::read()?)),
+        Kind::ArtifactRegistry | Kind::Acr => {
+            (Some(lock_local_run()?), Some(Outputs::read(args.target)?))
+        }
     };
 
     let git_ref = match &args.git_ref {
@@ -234,7 +242,6 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
                 ExistingRun::from_force(args.force),
             )?;
             Some(Provisioned::create(
-                Gcloud::installed(),
                 outputs,
                 &timestamp,
                 args.tool_selection.rounds,
@@ -271,8 +278,8 @@ fn run_on_instance(
     // directory can stand in for it.
     let results_dir = timestamp.results_dir().to_string_lossy().into_owned();
 
-    if let Some(provisioned) = provisioned
-        && let Err(e) = copy_credentials(config, &provisioned.credentials_file)
+    if let Some(file) = provisioned.and_then(Provisioned::credentials_file)
+        && let Err(e) = copy_credentials(config, file)
     {
         // Before any run exists on the instance.
         return (RunEnd::Settled, Err(e));
@@ -280,11 +287,12 @@ fn run_on_instance(
 
     let bench_args = bench_args(args, timestamp);
 
+    let target = provisioned.map_or(Target::Ecr, Provisioned::target);
     let script = remote_script(
         git_ref,
         git_sha,
         &bench_args,
-        &registry_env(provisioned.map(|p| &p.target)),
+        &target,
         ExistingRun::from_force(args.force),
     );
 
@@ -380,9 +388,9 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
         "--rounds".to_string(),
         args.tool_selection.rounds.to_string(),
     ];
-    // Only for Artifact Registry, so an ECR run still works on a `--git-ref`
-    // whose `bench` has no such option.
-    if args.target == Kind::ArtifactRegistry {
+    // Only for a registry other than ECR, so an ECR run still works on a
+    // `--git-ref` whose `bench` has no such option.
+    if args.target != Kind::Ecr {
         bench_args.extend(["--target".to_string(), value_name(&args.target)]);
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
@@ -417,23 +425,97 @@ fn ensure_placement(provider: Provider) -> Result<(), String> {
     Ok(())
 }
 
-/// The shell that points the benchmark at its target registry on the instance:
-/// ECR in the instance's own account, or the repositories this machine made.
-fn registry_env(target: Option<&ArtifactRegistryTarget>) -> String {
+/// The shell that reads the instance's region from its metadata service.
+const REGION_FROM_METADATA: &str = "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)";
+
+/// The audience Entra accepts a federated token for.
+const AZURE_TOKEN_AUDIENCE: &str = "api://AzureADTokenExchange";
+
+/// Seconds an Azure token fetched from STS lasts, at most an hour.
+const AZURE_TOKEN_LIFETIME_SECS: u64 = 3600;
+
+/// Seconds between refetches of the Azure token. Half the token's lifetime, so
+/// a refetch that fails once is retried while the last token is still good.
+const AZURE_REFRESH_SECS: u64 = AZURE_TOKEN_LIFETIME_SECS / 2;
+
+/// Seconds between the refresh loop's checks of whether the benchmark is still
+/// running and the refetch is due.
+const AZURE_REFRESH_CHECK_SECS: u64 = 60;
+
+/// The shell that fetches the token ocync signs in to Azure with into
+/// `$AZURE_FEDERATED_TOKEN_FILE`. STS signs it for the audience Entra accepts.
+/// The first fetch fails the script, with the AWS error, before the benchmark
+/// starts. The file is made closed to others and replaced whole, so ocync,
+/// which rereads it on every sign-in, never reads half a token.
+fn azure_token() -> String {
+    format!(
+        r#"fetch_azure_token() (
+  umask 077
+  aws sts get-web-identity-token --region "$REGION" --audience {AZURE_TOKEN_AUDIENCE} --signing-algorithm RS256 --duration-seconds {AZURE_TOKEN_LIFETIME_SECS} --query WebIdentityToken --output text > "$AZURE_FEDERATED_TOKEN_FILE.new.$$" &&
+    mv "$AZURE_FEDERATED_TOKEN_FILE.new.$$" "$AZURE_FEDERATED_TOKEN_FILE"
+)
+fetch_azure_token"#
+    )
+}
+
+/// The shell, run once `$BENCH_PID` is set, that refetches the Azure token
+/// every `refresh_after` checks, [`AZURE_REFRESH_CHECK_SECS`] apart, for as
+/// long as the benchmark runs: it ends with the benchmark, not with the script, which
+/// a dropped connection ends first. A refetch that fails keeps the last token,
+/// is logged, and is tried again at the next check. It runs without the run
+/// lock (fd 9), so it cannot hold it past the run.
+fn azure_refresh(refresh_after: u64) -> String {
+    format!(
+        r#"(
+  checks=0
+  while kill -0 "$BENCH_PID" 2>/dev/null; do
+    sleep {AZURE_REFRESH_CHECK_SECS}
+    checks=$((checks + 1))
+    if [ "$checks" -ge {refresh_after} ]; then
+      if fetch_azure_token; then
+        checks=0
+      else
+        echo "bench-remote: warning: refreshing the Azure token failed, keeping the last one"
+      fi
+    fi
+  done
+) >> "$LOG_FILE" 2>&1 9>&- &"#
+    )
+}
+
+/// The shell that keeps what the target signs in with fresh while the
+/// benchmark runs, if it needs that. It follows the launch of the benchmark.
+fn credential_refresh(target: &Target) -> String {
     match target {
-        None => format!(
-            "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')\nREGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport {ENV_REGISTRY}=${{ACCOUNT}}.dkr.ecr.${{REGION}}.amazonaws.com"
-        ),
-        // Every value was parsed as an id or a host, so none holds shell syntax.
-        Some(target) => target
-            .env()
-            .iter()
+        Target::Acr(_) => azure_refresh(AZURE_REFRESH_SECS / AZURE_REFRESH_CHECK_SECS),
+        Target::Ecr | Target::ArtifactRegistry(_) => String::new(),
+    }
+}
+
+/// The shell that points the benchmark at its target registry on the instance
+/// and readies how it signs in: ECR in the instance's own account, or what
+/// this machine provisioned.
+fn target_setup(target: &Target) -> String {
+    // Every value was parsed as an id or a host, so none holds shell syntax.
+    let exports = |env: &[(&str, String)]| {
+        env.iter()
             .map(|(name, value)| format!("export {name}={value}"))
-            .chain([format!(
-                "export {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\""
-            )])
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n")
+    };
+    match target {
+        Target::Ecr => format!(
+            "{REGION_FROM_METADATA}\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\nexport {ENV_REGISTRY}=${{ACCOUNT}}.dkr.ecr.${{REGION}}.amazonaws.com"
+        ),
+        Target::ArtifactRegistry(target) => format!(
+            "{}\nexport {ENV_CREDENTIALS}=\"$HOME/{REMOTE_CREDENTIALS}\"",
+            exports(&target.env())
+        ),
+        Target::Acr(target) => format!(
+            "{REGION_FROM_METADATA}\n{}\nexport {ENV_TOKEN_FILE}=\"$HOME/{REMOTE_AZURE_TOKEN}\"\n{}",
+            exports(&target.env()),
+            azure_token()
+        ),
     }
 }
 
@@ -718,7 +800,7 @@ esac"#
     )
 }
 
-/// Refuses to touch Artifact Registry while a live run would be refused: the
+/// Refuses to touch the target registry while a live run would be refused: the
 /// leftover sweep would delete that run's repositories. `--force` kills the
 /// run, so its repositories go with it.
 fn may_provision(lock: RunLock, existing: ExistingRun) -> Result<(), String> {
@@ -858,7 +940,8 @@ fn runner_launch(bench_args: &[String]) -> String {
 /// The script piped to [`REMOTE_COMMAND`] on the instance.
 ///
 /// Every value is already shell-escaped or trusted: `bench_args` are quoted
-/// here, `registry_env` is shell text, and a [`CommitSha`] is hex.
+/// here, the setup and the refresh `target` needs are shell text, and a
+/// [`CommitSha`] is hex. The refresh runs once `$BENCH_PID` is set.
 ///
 /// Git commands run with fd 9 (the run lock) closed: git can daemonize a
 /// background gc that calls `setsid`, which would hold the lock from outside
@@ -867,10 +950,12 @@ fn remote_script(
     git_ref: &str,
     git_sha: &CommitSha,
     bench_args: &[String],
-    registry_env: &str,
+    target: &Target,
     existing: ExistingRun,
 ) -> String {
     let existing_run = existing_run_guard(existing);
+    let target_setup = target_setup(target);
+    let after_launch = credential_refresh(target);
     let escaped_git_ref = shell_escape(git_ref);
     let runner_launch = runner_launch(bench_args);
     format!(
@@ -946,7 +1031,7 @@ echo '[3/4] Starting benchmarks...'
 export TMPDIR=$HOME/ocync/bench/.tmp
 rm -rf "$TMPDIR"
 mkdir -p "$TMPDIR"
-{registry_env}
+{target_setup}
 
 # Launch in the background with output to the log file. The runner stays in
 # this script's process group, so --force kills the harness and every tool it
@@ -960,6 +1045,7 @@ RUNNER_EOF
 export EXIT_FILE
 {runner_launch}
 BENCH_PID=$!
+{after_launch}
 echo "{BENCH_STARTED_LINE}"
 
 # Stream log until bench exits. --pid= makes tail exit when process dies.
@@ -1091,6 +1177,7 @@ mod tests {
     use std::io::BufRead;
 
     use super::*;
+    use crate::bench::target::write_stub;
 
     #[test]
     fn parse_bench_config() {
@@ -1292,7 +1379,7 @@ mod tests {
 
     #[test]
     fn a_provider_without_registry_setup_is_refused_by_name() {
-        assert!(registry_env(None).contains(ENV_REGISTRY));
+        assert!(target_setup(&Target::Ecr).contains(ENV_REGISTRY));
         assert_eq!(ensure_placement(Provider::Aws), Ok(()));
         for (provider, expected) in [
             (
@@ -1310,19 +1397,135 @@ mod tests {
 
     #[test]
     fn the_instance_is_told_its_repositories_and_where_the_credentials_are() {
-        let target = ArtifactRegistryTarget {
+        use crate::bench::acr::{FULL_ENV, Scope};
+        use crate::bench::gar::ArtifactRegistryTarget;
+        use crate::bench::provision::RoundIds;
+        use crate::bench::target::{env_of, rounds};
+
+        let google = Target::ArtifactRegistry(ArtifactRegistryTarget {
             location: "europe-west9".parse().unwrap(),
             project: "example-project".parse().unwrap(),
-            repositories: ["run-r1", "run-r2", "run-r3"]
-                .map(|id| id.parse().unwrap())
-                .to_vec(),
-        };
+            repositories: RoundIds::parse("run-r1,run-r2,run-r3", rounds("3")).unwrap(),
+        });
         assert_eq!(
-            registry_env(Some(&target)),
+            target_setup(&google),
             "export BENCH_TARGET_REGISTRY=europe-west9-docker.pkg.dev\n\
              export BENCH_GAR_PROJECT=example-project\n\
              export BENCH_GAR_REPOSITORIES=run-r1,run-r2,run-r3\n\
              export GOOGLE_APPLICATION_CREDENTIALS=\"$HOME/.bench-gar-credentials.json\""
+        );
+
+        let acr = Target::Acr(Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
+        let azure = target_setup(&acr);
+        let lines: Vec<&str> = azure.lines().collect();
+        // Exactly the variables the instance reads, and the region its token
+        // fetch needs.
+        assert_eq!(
+            lines[..7],
+            [
+                "TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')",
+                "REGION=$(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/placement/region)",
+                "export BENCH_TARGET_REGISTRY=ocyncbench1a2b3c.azurecr.io",
+                "export BENCH_ACR_PREFIXES=run-r1,run-r2,run-r3",
+                "export AZURE_TENANT_ID=11111111-2222-3333-4444-555555555555",
+                "export AZURE_CLIENT_ID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "export AZURE_FEDERATED_TOKEN_FILE=\"$HOME/.bench-azure-token\"",
+            ]
+        );
+        // Catches: a token fetch that is not the signed, audience-bound,
+        // RS256 one Entra accepts.
+        assert!(
+            lines.contains(&"  aws sts get-web-identity-token --region \"$REGION\" --audience api://AzureADTokenExchange --signing-algorithm RS256 --duration-seconds 3600 --query WebIdentityToken --output text > \"$AZURE_FEDERATED_TOKEN_FILE.new.$$\" &&"),
+            "{azure}"
+        );
+        assert!(lines.contains(
+            &"    mv \"$AZURE_FEDERATED_TOKEN_FILE.new.$$\" \"$AZURE_FEDERATED_TOKEN_FILE\""
+        ));
+        assert!(lines.contains(&"  umask 077"));
+
+        // Catches: a first fetch that does not fail the run before the
+        // benchmark starts, a refresh that starts before the benchmark's pid
+        // exists, one not tied to that pid (a dropped connection ends the
+        // script, not the benchmark), one that holds the run lock, or one
+        // that outlives the benchmark by a trap on the script.
+        let script = remote_script(
+            "main",
+            &CommitSha::parse(SHA).unwrap(),
+            &["all".to_string()],
+            &acr,
+            ExistingRun::Refuse,
+        );
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} not in {script}"))
+        };
+        assert!(at("\nfetch_azure_token\n") < at("bash \"$RUNNER_FILE\""));
+        assert!(at("BENCH_PID=$!") < at("while kill -0 \"$BENCH_PID\""));
+        assert!(at("while kill -0 \"$BENCH_PID\"") < at("tail -n+1 -f"));
+        assert!(at("if fetch_azure_token;") > at("while kill -0 \"$BENCH_PID\""));
+        assert!(script.contains("checks\" -ge 30"), "30 checks of 60 s");
+        assert!(script.contains("--duration-seconds 3600"), "{script}");
+        assert!(
+            script.contains(") >> \"$LOG_FILE\" 2>&1 9>&- &\n"),
+            "{script}"
+        );
+        assert!(!script.contains("\ntrap "), "{script}");
+        assert_eq!(script.matches("fetch_azure_token").count(), 3, "{script}");
+
+        // Catches: a Google or ECR run fetching, refreshing or exporting an
+        // Azure token.
+        for other in [Target::Ecr, google] {
+            let script = remote_script(
+                "main",
+                &CommitSha::parse(SHA).unwrap(),
+                &["all".to_string()],
+                &other,
+                ExistingRun::Refuse,
+            );
+            assert!(
+                !script.contains("AZURE") && !script.contains("web-identity"),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_token_refetch_is_tried_again_at_the_next_check_and_logged() {
+        // Catches: a failed refetch waiting out a whole interval again, which
+        // with a token that lasts twice the interval leaves it expired before
+        // the retry; a failure that goes unlogged; and a loop that outlives
+        // the benchmark. `sleep` counts a check instead of waiting, `kill`
+        // says the benchmark is running until the second fetch, and the
+        // fetch fails the first time.
+        let dir = tempfile::tempdir().unwrap();
+        let (seen, log, done) = (
+            dir.path().join("seen"),
+            dir.path().join("log"),
+            dir.path().join("done"),
+        );
+        let script = format!(
+            "sleep() {{ CHECKS_SEEN=$((CHECKS_SEEN + 1)); }}\n\
+             kill() {{ [ ! -e '{done}' ]; }}\n\
+             fetch_azure_token() {{ CALLS=$((CALLS + 1)); echo \"$CHECKS_SEEN\" >> '{seen}'; \
+               [ \"$CALLS\" -ge 2 ] && touch '{done}'; [ \"$CALLS\" -ge 2 ]; }}\n\
+             CHECKS_SEEN=0; CALLS=0; BENCH_PID=1; LOG_FILE='{log}'\n\
+             {refresh}\nwait\n",
+            done = done.display(),
+            seen = seen.display(),
+            log = log.display(),
+            refresh = azure_refresh(3),
+        );
+        let status = Command::new("bash").args(["-c", &script]).status().unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "3\n4\n",
+            "fetched at the third check, failed, and again at the fourth"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "bench-remote: warning: refreshing the Azure token failed, keeping the last one\n"
         );
     }
 
@@ -1350,6 +1553,7 @@ mod tests {
             passed(&["--target", "artifact-registry"]),
             (true, Kind::ArtifactRegistry)
         );
+        assert_eq!(passed(&["--target", "acr"]), (true, Kind::Acr));
     }
 
     #[test]
@@ -1385,7 +1589,7 @@ mod tests {
                 "ocync".to_string(),
                 "all".to_string(),
             ],
-            &format!("export {ENV_REGISTRY}=registry.example.com"),
+            &Target::Ecr,
             existing,
         )
     }
@@ -1646,10 +1850,7 @@ src="${@: -2:1}"
 cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
             ),
         ] {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
+            write_stub(&bin, name, &format!("#!/bin/bash\n{body}\n"));
         }
 
         let log = work.join("scp.log");
@@ -2032,10 +2233,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         // A `flock` that exits 127 ahead of any real one on the guard's PATH.
-        let stub = bin.join("flock");
-        std::fs::write(&stub, "#!/bin/sh\nexit 127\n").unwrap();
-        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        write_stub(&bin, "flock", "#!/bin/sh\nexit 127\n");
         let path = format!("{}:/usr/bin:/bin", bin.display());
 
         for existing in [ExistingRun::Refuse, ExistingRun::Kill] {

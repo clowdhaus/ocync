@@ -830,6 +830,7 @@ fn textwrap_indent(text: &str, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::target::write_stub;
 
     #[test]
     fn join_tools_is_the_form_tools_flag_parses() {
@@ -1100,15 +1101,15 @@ mod tests {
 
     #[test]
     fn a_baseline_that_rejects_the_config_or_a_flag_fails_with_its_own_message() {
-        use std::os::unix::fs::PermissionsExt;
-
         // A stand-in for `ocync`, answering `sync --help` and `validate`.
         let baseline = |script: &str| {
             let root = tempfile::tempdir().unwrap();
             let binary = tool_path(Tool::OcyncBaseline, root.path()).into_owned();
-            std::fs::create_dir_all(Path::new(&binary).parent().unwrap()).unwrap();
-            std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let binary = Path::new(&binary);
+            let dir = binary.parent().unwrap();
+            std::fs::create_dir_all(dir).unwrap();
+            let name = binary.file_name().unwrap().to_str().unwrap();
+            write_stub(dir, name, &format!("#!/bin/sh\n{script}\n"));
             check_baseline_in(root.path(), Path::new("config.yaml"))
         };
         let help =

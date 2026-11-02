@@ -26,7 +26,9 @@ They live with the integration tests in `crates/ocync-distribution/tests/`. The 
 
 It lives in `xtask/src/bench/` and runs on one instance through `cargo xtask bench-remote`. All tools run on the same instance, taking turns. One instance per tool would multiply the cost by the number of tools; taking turns in a fresh random order every round, and comparing tools within the same round, is how the shared machine is kept fair.
 
-> **Status: Planned.** `bench-remote` drives only the AWS instance. The Google Cloud and Azure hosts in `bench/terraform/` are for measuring sign-in by hand until they can be driven (#168).
+`bench-remote` drives the AWS instance, which syncs into ECR, Artifact Registry or ACR (ACR through Entra federation with an STS-signed token).
+
+> **Status: Planned.** The Google Cloud and Azure virtual machines in `bench/terraform/` are for measuring sign-in by hand until `bench-remote` can use them as run hosts (#168).
 
 ## Accuracy rules
 

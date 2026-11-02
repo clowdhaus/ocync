@@ -1,11 +1,14 @@
 //! Benchmark suite for comparing ocync against dregsy and regsync.
 
+pub(crate) mod acr;
+pub(crate) mod az;
 pub(crate) mod config_gen;
 pub(crate) mod corpus;
 pub(crate) mod ecr;
 pub(crate) mod gar;
 pub(crate) mod gcloud;
 pub(crate) mod lock;
+pub(crate) mod provision;
 pub(crate) mod proxy;
 pub(crate) mod registry;
 pub(crate) mod regression;
@@ -196,9 +199,9 @@ pub(crate) struct BenchArgs {
     #[command(flatten)]
     pub(crate) paths: corpus::CorpusPaths,
 
-    /// Registry the run syncs into. Artifact Registry reads its project,
-    /// repositories and credentials from the environment, as `bench-remote`
-    /// sets them.
+    /// Registry the run syncs into. Artifact Registry and ACR read their
+    /// registry, repositories or prefixes, and credentials from the
+    /// environment, as `bench-remote` sets them.
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: target::Kind,
 
@@ -739,7 +742,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     Ok(match transfer {
                         Transfer::Sync { round } => {
                             let logs = round_dir(&output_dir, *round);
-                            let round_corpus = bench_target.round_corpus(&corpus, *round);
+                            let round_corpus = bench_target.round_corpus(&corpus, *round)?;
                             let (cold, warm) =
                                 run_sync(&args, &round_corpus, &target, order, &logs).await?;
                             vec![(ScenarioKind::Cold, cold), (ScenarioKind::Warm, warm)]
@@ -875,7 +878,7 @@ fn deferred_output(
     };
     let page = match target {
         Target::Ecr => report::PageBlocks::of(report),
-        Target::ArtifactRegistry(_) => report::PageBlocks::default(),
+        Target::ArtifactRegistry(_) | Target::Acr(_) => report::PageBlocks::default(),
     };
     report::Deferred::new(
         RegistryKind::of(target_registry).archive_stem(),
@@ -1276,7 +1279,11 @@ async fn run_single_tool(
 
     let proxy_metrics = if let Some(handle) = proxy_handle {
         let entries = proxy::stop(handle).await?;
-        check_source_errors(&entries, &corpus.settings.target_registry)?;
+        check_source_errors(
+            &entries,
+            &corpus.settings.target_registry,
+            args.target.sign_in_hosts(),
+        )?;
         Some(proxy::aggregate(&entries, &corpus.settings.target_registry))
     } else {
         None
@@ -1342,15 +1349,21 @@ fn ensure_exited_zero(tool: &str, pass: Pass, status: ExitStatus) -> Result<(), 
 
 /// Abort on source registry errors (status >= 400) that indicate tainted
 /// benchmark data. Excludes 401 (expected OCI auth challenge) and 404
-/// (expected blob existence checks).
+/// (expected blob existence checks), and the target registry and the
+/// `sign_in_hosts` the target signs in through, which are not sources.
 fn check_source_errors(
     entries: &[proxy::ProxyEntry],
     target_registry: &str,
+    sign_in_hosts: &[&str],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source_errors: BTreeMap<&str, Vec<u16>> = entries
         .iter()
         .filter(|e| {
-            e.host != target_registry && e.status >= 400 && e.status != 401 && e.status != 404
+            e.host != target_registry
+                && !sign_in_hosts.contains(&e.host.as_str())
+                && e.status >= 400
+                && e.status != 401
+                && e.status != 404
         })
         .fold(BTreeMap::new(), |mut acc, e| {
             acc.entry(e.host.as_str()).or_default().push(e.status);
@@ -2392,15 +2405,18 @@ mod tests {
     }
 
     #[test]
-    fn a_google_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+    fn a_google_or_azure_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+        use crate::bench::acr::{FULL_ENV, Scope};
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::report::tests::sample_report;
+        use crate::bench::target::{env_of, rounds};
 
         let google = Target::ArtifactRegistry(ArtifactRegistryTarget {
             location: "europe-west9".parse().unwrap(),
             project: "example-project".parse().unwrap(),
-            repositories: vec!["run-r1".parse().unwrap(), "run-r2".parse().unwrap()],
+            repositories: provision::RoundIds::parse("run-r1,run-r2,run-r3", rounds("3")).unwrap(),
         });
+        let azure = Target::Acr(Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
         let report = sample_report();
         let output = |target: &Target, host: &str| {
             let deferred = deferred_output(target, host, &report, "abc1234".into(), None);
@@ -2411,27 +2427,85 @@ mod tests {
             )
         };
 
-        let (gar, text) = output(&google, "europe-west9-docker.pkg.dev");
-        // Catches: the target registry's cloud written as the machine's.
-        assert_eq!(gar["record"]["machine"]["provider"], "aws");
-        assert_eq!(gar["archive_key"], "gcr");
-        // Catches: a Google run rewriting the ECR comparison page.
-        assert_eq!(gar["page"], serde_json::json!({"cold": null, "warm": null}));
-        // Catches: the project, the repositories or the host reaching a file
-        // that is tracked in git.
-        for name in [
-            "example-project",
-            "run-r1",
-            "run-r2",
-            "europe-west9",
-            "pkg.dev",
+        for (target, host, key, names) in [
+            (
+                &google,
+                "europe-west9-docker.pkg.dev",
+                "gcr",
+                // Catches: the project, the repositories or the host reaching
+                // a file that is tracked in git.
+                ["example-project", "run-r1", "europe-west9", "pkg.dev"],
+            ),
+            (
+                &azure,
+                "ocyncbench1a2b3c.azurecr.io",
+                "acr",
+                // Catches: the registry, the prefixes or the Entra ids
+                // reaching a file that is tracked in git.
+                ["ocyncbench1a2b3c", "run-r1", "11111111-2222", "azurecr.io"],
+            ),
         ] {
-            assert!(!text.contains(name), "{name} in {text}");
+            let (record, text) = output(target, host);
+            // Catches: the target registry's cloud written as the machine's.
+            assert_eq!(record["record"]["machine"]["provider"], "aws", "{key}");
+            assert_eq!(record["archive_key"], key);
+            // Catches: a non-ECR run rewriting the ECR comparison page.
+            assert_eq!(
+                record["page"],
+                serde_json::json!({"cold": null, "warm": null})
+            );
+            for name in names {
+                assert!(!text.contains(name), "{name} in {text}");
+            }
         }
 
         let (ecr, _) = output(&Target::Ecr, "111111111111.dkr.ecr.us-east-1.amazonaws.com");
         assert_eq!(ecr["archive_key"], "ecr");
         assert!(ecr["page"]["cold"].is_string(), "{ecr}");
+    }
+
+    #[test]
+    fn the_hosts_a_target_signs_in_through_are_not_source_registries() {
+        // Catches: an Entra or Google sign-in error reported as a source
+        // registry's, with advice to skip a registry that is not one; and a
+        // real source error let through because the target had hosts to
+        // spare.
+        let entry = |host: &str, status| proxy::ProxyEntry {
+            method: "POST".into(),
+            host: host.into(),
+            url: "/".into(),
+            request_bytes: 0,
+            response_bytes: 0,
+            status,
+            duration_ms: 0,
+            x_cache: None,
+            age: None,
+        };
+        let check = |kind: target::Kind, host: &str| {
+            check_source_errors(&[entry(host, 400)], "target.example", kind.sign_in_hosts())
+        };
+        for (kind, host) in [
+            (target::Kind::Acr, "login.microsoftonline.com"),
+            (target::Kind::ArtifactRegistry, "sts.googleapis.com"),
+            (
+                target::Kind::ArtifactRegistry,
+                "iamcredentials.googleapis.com",
+            ),
+        ] {
+            assert!(check(kind, host).is_ok(), "{host}");
+        }
+        for (kind, host) in [
+            (target::Kind::Acr, "quay.io"),
+            (target::Kind::Acr, "sts.googleapis.com"),
+            (target::Kind::Ecr, "login.microsoftonline.com"),
+        ] {
+            let err = check(kind, host).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("{host} (1x: 400)"))
+                    && err.contains(&format!("--skip-registries {host} ")),
+                "{host}: {err}"
+            );
+        }
     }
 
     #[test]

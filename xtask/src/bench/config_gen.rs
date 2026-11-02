@@ -377,6 +377,9 @@ images:
         let mut gar = test_corpus();
         gar.settings.target_registry = "europe-west9-docker.pkg.dev".to_string();
         gar.settings.target_prefix = "example-project/run-r1/bench".to_string();
+        let mut acr = test_corpus();
+        acr.settings.target_registry = "ocyncbench1a2b3c.azurecr.io".to_string();
+        acr.settings.target_prefix = "run-r1/bench".to_string();
 
         for (name, config, expected) in [
             (
@@ -404,6 +407,40 @@ mappings:
     to: \"example-project/run-r1/bench/library-alpine\"
     source: docker-io
     targets: [europe-west9-docker-pkg-dev]
+    tags:
+      - name: \"3.20\"
+        digest: \"sha256:2222222222222222222222222222222222222222222222222222222222222222\"
+      - name: \"latest\"
+        digest: \"sha256:3333333333333333333333333333333333333333333333333333333333333333\"
+",
+            ),
+            (
+                // Catches: ocync told to sign in to ACR the way ECR or Google
+                // needs.
+                "ocync_config_acr",
+                ocync_config(&acr, Kind::Acr, None, Mode::Sync(&lock)),
+                "\
+registries:
+  cgr-dev:
+    url: cgr.dev
+  docker-io:
+    url: docker.io
+  ocyncbench1a2b3c-azurecr-io:
+    url: ocyncbench1a2b3c.azurecr.io
+    auth_type: acr
+
+mappings:
+  - from: \"chainguard/static\"
+    to: \"run-r1/bench/chainguard-static\"
+    source: cgr-dev
+    targets: [ocyncbench1a2b3c-azurecr-io]
+    tags:
+      - name: \"latest\"
+        digest: \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"
+  - from: \"library/alpine\"
+    to: \"run-r1/bench/library-alpine\"
+    source: docker-io
+    targets: [ocyncbench1a2b3c-azurecr-io]
     tags:
       - name: \"3.20\"
         digest: \"sha256:2222222222222222222222222222222222222222222222222222222222222222\"
