@@ -1,6 +1,5 @@
 //! YAML corpus config parsing with environment variable expansion.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
@@ -30,9 +29,8 @@ impl std::fmt::Display for CorpusName {
     }
 }
 
-/// Which corpus a run measures. The serialized form is the optional stem: absent
-/// for the main corpus, which keeps run records written before corpora were
-/// named readable.
+/// Which corpus a run measures. The serialized form is the optional stem,
+/// absent for the main corpus, as in every stored main-corpus record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "Option<CorpusName>", into = "Option<CorpusName>")]
 pub(crate) enum CorpusId {
@@ -43,12 +41,14 @@ pub(crate) enum CorpusId {
     Named(CorpusName),
 }
 
+/// Serde reads a `CorpusId` through this.
 impl From<Option<CorpusName>> for CorpusId {
     fn from(name: Option<CorpusName>) -> Self {
         name.map_or(Self::Main, Self::Named)
     }
 }
 
+/// Serde writes a `CorpusId` through this.
 impl From<CorpusId> for Option<CorpusName> {
     fn from(id: CorpusId) -> Self {
         match id {
@@ -65,10 +65,10 @@ impl CorpusId {
     }
 
     /// The corpus as a person reads it: its name, or the main corpus.
-    pub(crate) fn label(&self) -> Cow<'static, str> {
+    pub(crate) fn label(&self) -> &str {
         match self {
-            Self::Main => Cow::Borrowed("the main corpus"),
-            Self::Named(name) => Cow::Owned(name.to_string()),
+            Self::Main => "the main corpus",
+            Self::Named(name) => &name.0,
         }
     }
 }
@@ -107,8 +107,8 @@ impl CorpusPaths {
     /// The corpus this path names: the main corpus is the file
     /// `bench/corpus.yaml` however a path reaches it (`./bench/corpus.yaml`, an
     /// absolute path, a `..` path). Any other file, `experiments/corpus.yaml`
-    /// included, is named by its stem. A corpus file that cannot be read is an error, as
-    /// when it is loaded.
+    /// included, is named by its stem. A corpus file that cannot be read is an
+    /// error, as when it is loaded.
     pub(crate) fn corpus_id(&self) -> Result<CorpusId, String> {
         id_of(&self.corpus, Path::new(DEFAULT_CORPUS))
     }
@@ -452,22 +452,19 @@ images:
         std::fs::write(&same_stem, "").unwrap();
         let same_stem = same_stem.to_str().unwrap();
         for (corpus, want) in [
-            (main.as_str(), Ok(None)),
-            (&format!("{BENCH_DIR}./corpus.yaml"), Ok(None)),
-            (&format!("{BENCH_DIR}../bench/corpus.yaml"), Ok(None)),
+            (main.as_str(), Ok(CorpusId::Main)),
+            (&format!("{BENCH_DIR}./corpus.yaml"), Ok(CorpusId::Main)),
+            (
+                &format!("{BENCH_DIR}../bench/corpus.yaml"),
+                Ok(CorpusId::Main),
+            ),
             (
                 &format!("{BENCH_DIR}corpus-small.yaml"),
-                Ok(Some("corpus-small")),
+                Ok(CorpusId::Named(CorpusName::new("corpus-small"))),
             ),
-            (same_stem, Ok(Some("corpus"))),
+            (same_stem, Ok(CorpusId::Named(CorpusName::new("corpus")))),
         ] {
-            assert_eq!(
-                id_of(corpus, Path::new(&main)),
-                want.map(
-                    |name| name.map_or(CorpusId::Main, |n| CorpusId::Named(CorpusName::new(n)))
-                ),
-                "{corpus}"
-            );
+            assert_eq!(id_of(corpus, Path::new(&main)), want, "{corpus}");
         }
         let missing = id_of("experiments/corpus.yaml", Path::new(&main)).unwrap_err();
         assert!(

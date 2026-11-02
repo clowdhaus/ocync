@@ -86,14 +86,14 @@ pub(crate) fn ensure_comparable(
             baseline_path,
             &format!(
                 "for {} under corpus lock {} over {} images and {} tags",
-                baseline.corpus.name.label(),
+                baseline.corpus.id.label(),
                 show(&baseline.corpus_locked_at),
                 baseline.corpus.images,
                 baseline.corpus.tags
             ),
             &format!(
                 "for {} under {} over {} images and {} tags",
-                current.corpus.name.label(),
+                current.corpus.id.label(),
                 show(&current.corpus_locked_at),
                 current.corpus.images,
                 current.corpus.tags
@@ -282,7 +282,7 @@ mod tests {
             corpus_locked_at: None,
             sync_from: None,
             corpus: CorpusInfo {
-                name: CorpusId::Main,
+                id: CorpusId::Main,
                 images: 40,
                 tags: 55,
             },
@@ -407,7 +407,7 @@ mod tests {
             corpus_locked_at: Some(locked_at("2026-10-30-214340")),
             sync_from: Some(SyncFrom::Digest),
             corpus: CorpusInfo {
-                name: CorpusId::Main,
+                id: CorpusId::Main,
                 images: 40,
                 tags: 55,
             },
@@ -435,7 +435,7 @@ mod tests {
         // regression, and a refusal that does not say which file to replace.
         let this_run = Some(locked_at("2026-10-30-214340"));
         let full = CorpusInfo {
-            name: CorpusId::Main,
+            id: CorpusId::Main,
             images: 40,
             tags: 55,
         };
@@ -444,7 +444,7 @@ mod tests {
             (
                 Some(locked_at("2026-09-01-000000")),
                 CorpusInfo {
-                    name: CorpusId::Main,
+                    id: CorpusId::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -453,7 +453,7 @@ mod tests {
             (
                 None,
                 CorpusInfo {
-                    name: CorpusId::Main,
+                    id: CorpusId::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -462,7 +462,7 @@ mod tests {
             (
                 Some(locked_at("2026-10-30-214340")),
                 CorpusInfo {
-                    name: CorpusId::Main,
+                    id: CorpusId::Main,
                     images: 5,
                     tags: 5,
                 },
@@ -497,17 +497,18 @@ mod tests {
     fn a_named_corpus_is_not_compared_with_the_main_corpus() {
         // Catches: a small-corpus run judged against the main corpus's
         // baseline, and a refusal that does not name both corpora.
-        let named = |name: Option<&str>| Baseline {
+        let small = CorpusId::Named(CorpusName::new("corpus-small"));
+        let named = |id: &CorpusId| Baseline {
             corpus: CorpusInfo {
-                name: name.map(CorpusName::new).into(),
+                id: id.clone(),
                 images: 40,
                 tags: 55,
             },
             ..baseline(1.0, 1, 1)
         };
         let refused = ensure_comparable(
-            &named(Some("corpus-small")),
-            &named(None),
+            &named(&small),
+            &named(&CorpusId::Main),
             Path::new("results/b.json"),
         )
         .unwrap_err();
@@ -518,11 +519,7 @@ mod tests {
              tags; record a new baseline by deleting results/b.json and rerunning"
         );
         assert_eq!(
-            ensure_comparable(
-                &named(Some("corpus-small")),
-                &named(Some("corpus-small")),
-                Path::new("b")
-            ),
+            ensure_comparable(&named(&small), &named(&small), Path::new("b")),
             Ok(())
         );
     }
@@ -577,7 +574,7 @@ mod tests {
         let key = |cap: usize, images: usize| Baseline {
             max_concurrent_transfers: NonZeroUsize::new(cap),
             corpus: CorpusInfo {
-                name: CorpusId::Main,
+                id: CorpusId::Main,
                 images,
                 tags: 55,
             },
