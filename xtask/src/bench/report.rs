@@ -74,6 +74,10 @@ pub(crate) struct RunRecord {
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
+    /// Whether the run synced all of the corpus; absent when it did, and from
+    /// records written before it was recorded.
+    #[serde(default, skip_serializing_if = "Coverage::is_whole")]
+    pub(crate) coverage: Coverage,
     /// The cap on concurrent image transfers the current ocync ran with, the
     /// default's value when none was given. Runs under different caps are
     /// different series; absent when no ocync ran and from records written
@@ -143,6 +147,7 @@ impl RunRecord {
             relays: Some(report.relay_versions.clone()),
             prewarm: report.prewarm.clone(),
             corpus: report.corpus.clone(),
+            coverage: report.coverage,
             max_concurrent_transfers: report.ocync_transfer_cap(),
             baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
             per_tag_jobs: report.per_tag_jobs(),
@@ -568,23 +573,30 @@ fn read_imds(path: &str) -> Option<String> {
 /// How much of the corpus a run synced.
 ///
 /// Kept apart from [`CorpusInfo`], which baselines compare for equality.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Coverage {
     /// Every image of the corpus.
+    #[default]
     Whole,
     /// Fewer images than the corpus holds, by `--limit` or `--skip-registries`.
     Subset,
 }
 
 impl Coverage {
-    /// What a run of `synced` images covers of a corpus holding `whole`. A
+    /// What a run that synced `synced` covers of a corpus of `whole` images. A
     /// `--limit` past the end still covers it all.
-    pub(crate) fn of(whole: usize, synced: usize) -> Self {
-        if synced < whole {
+    pub(crate) fn of(whole: usize, synced: &CorpusInfo) -> Self {
+        if synced.images < whole {
             Self::Subset
         } else {
             Self::Whole
         }
+    }
+
+    /// Whether this is [`Self::Whole`], which a record leaves unwritten.
+    fn is_whole(&self) -> bool {
+        *self == Self::Whole
     }
 }
 
@@ -1107,7 +1119,8 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
 ///
 /// Columns are tool names, rows are metrics. The best value per row is bolded
 /// when more than one tool has data for that metric, see [`is_bold`]. The Peak
-/// RSS row bolds nothing when a per-tag tool is a column.
+/// RSS row bolds nothing when a per-tag tool ran, as [`per_process_rss_footnote`]
+/// explains.
 fn render_metric_table(
     report: &BenchReport,
     columns: &[Tool],
@@ -1125,7 +1138,8 @@ fn render_metric_table(
     }
     out.push('\n');
 
-    let per_process_peaks = columns.iter().any(|tool| tool.is_per_tag());
+    // The tools that ran, as the footnote names them, not the probed columns.
+    let per_process_peaks = by_tool.keys().any(|tool| tool.is_per_tag());
     for row in &metric_rows() {
         let comparable = !(per_process_peaks && row.label == PEAK_RSS_LABEL);
         let cells: Vec<Option<Cell>> = columns
@@ -1600,7 +1614,6 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -1635,6 +1648,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            coverage: Coverage::Whole,
         }
     }
 
@@ -1745,7 +1759,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -1759,6 +1772,7 @@ pub(crate) mod tests {
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(!md.contains("## Cold"));
@@ -1849,46 +1863,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_named_corpus_is_recorded_by_name_and_writes_no_page_blocks() {
-        // Catches: a run of a shape corpus overwriting the main corpus's cold
-        // and warm blocks on the performance page, a named run recorded as the
-        // main corpus, and a main-corpus record gaining a name.
+    fn a_named_or_partial_run_writes_no_page_blocks_and_is_recorded_as_such() {
+        // Catches: a run of a shape corpus, or a `--limit` or
+        // `--skip-registries` run, overwriting the main corpus's cold and warm
+        // blocks on the performance page; a named run recorded as the main
+        // corpus; a main-corpus record gaining a name; a partial run recorded
+        // as whole; and a whole run's record gaining a coverage.
         let mut report = sample_report();
         let record = |report: &BenchReport| {
             serde_json::to_value(RunRecord::of(report, "abc1234".into(), None)).unwrap()
         };
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"].get("name"), None);
+        assert_eq!(record(&report).get("coverage"), None);
 
+        report.coverage = Coverage::Subset;
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+        assert_eq!(record(&report)["coverage"], "subset");
+
+        report.coverage = Coverage::Whole;
         report.corpus.id = corpus::Id::Named(CorpusName::new("corpus-small"));
         assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
     }
 
     #[test]
-    fn only_a_whole_corpus_run_with_ocync_writes_page_blocks() {
-        // Catches: a `--limit` or `--skip-registries` run replacing the page's
-        // cold block with a table over a few images, and a run of only other
-        // tools replacing ocync's row with theirs; and, by the first
-        // assertion, both gates refusing every run.
-        let mut report = sample_report();
-        assert_eq!(report.coverage, Coverage::Whole);
-        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
-
-        report.coverage = Coverage::Subset;
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
-
-        report.coverage = Coverage::Whole;
-        report.tool_versions.remove(&Tool::Ocync);
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
-    }
-
-    #[test]
     fn coverage_is_a_subset_only_when_images_were_dropped() {
         // Catches: a `--limit` that drops images read as the whole corpus, and
         // a `--limit` past the end, which syncs it all, read as a subset.
-        assert_eq!(Coverage::of(40, 3), Coverage::Subset);
-        assert_eq!(Coverage::of(40, 40), Coverage::Whole);
+        let synced = |images| CorpusInfo {
+            images,
+            ..CorpusInfo::default()
+        };
+        assert_eq!(Coverage::of(40, &synced(3)), Coverage::Subset);
+        assert_eq!(Coverage::of(40, &synced(40)), Coverage::Whole);
     }
 
     #[test]
@@ -1960,6 +1968,8 @@ pub(crate) mod tests {
         assert_eq!(record.max_concurrent_transfers, None);
         assert_eq!(record.baseline_max_concurrent_transfers, None);
         assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
+        // Catches: a run of only other tools replacing ocync's row on the page.
+        assert_eq!(PageBlocks::of(&no_ocync), PageBlocks::default());
     }
 
     #[test]
@@ -2265,7 +2275,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -2288,6 +2297,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         // Single tool -- nothing should be bolded.
@@ -2316,7 +2326,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
@@ -2339,6 +2348,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let warm = rounds_of(&report.scenarios, ScenarioKind::Warm);
         let md = scenario_markdown(&report, &warm, "Warm sync (no changes)");
@@ -2402,7 +2412,6 @@ pub(crate) mod tests {
         BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2455,6 +2464,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         }
     }
 
@@ -2502,7 +2512,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2546,6 +2555,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
 
@@ -2566,7 +2576,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
@@ -2607,6 +2616,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
 
@@ -2653,7 +2663,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
@@ -2688,6 +2697,7 @@ pub(crate) mod tests {
                     }],
                 ),
             ],
+            ..sample_report()
         };
         PageBlocks::of(&report).apply(&path).unwrap();
 
@@ -2715,7 +2725,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
@@ -2738,6 +2747,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         PageBlocks::of(&report).apply(&path).unwrap();
 
@@ -2754,7 +2764,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2800,6 +2809,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(
@@ -2821,7 +2831,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2844,6 +2853,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(
@@ -2860,7 +2870,6 @@ pub(crate) mod tests {
         let report = BenchReport {
             baseline: None,
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
@@ -2886,6 +2895,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let scenario = &report.scenarios[0];
         let md = scenario_markdown(&report, &[scenario], "Cold sync");
@@ -2905,7 +2915,6 @@ pub(crate) mod tests {
         BenchReport {
             baseline: Some(CommitSha::fixture()),
             rounds: Rounds::DEFAULT,
-            coverage: Coverage::Whole,
             max_concurrent_transfers: None,
             repeated: vec![ScenarioKind::Cold],
             timestamp: "2026-10-30-100000".into(),
@@ -2949,6 +2958,7 @@ pub(crate) mod tests {
                     )
                 })
                 .collect(),
+            ..sample_report()
         }
     }
 
@@ -3143,8 +3153,9 @@ pub(crate) mod tests {
     #[test]
     fn peak_rss_names_no_winner_beside_a_per_process_peak() {
         // Catches: crane's largest single process bolded against ocync's whole
-        // run, which reads as a memory win it did not have; and the rule
-        // spreading to a table of whole-run peaks.
+        // run, which reads as a memory win it did not have; the rule
+        // spreading to a table of whole-run peaks; and a per-tag tool that was
+        // probed but never ran suppressing the bold with no footnote to say why.
         let run = |tool, peak_rss_kb| ToolRun {
             tool,
             wall_clock_secs: 1.0,
@@ -3153,9 +3164,13 @@ pub(crate) mod tests {
             phase_timing_ms: BTreeMap::new(),
         };
         let report = sample_report();
-        let rss_row = |tools: &[(Tool, u64)]| {
+        let rss_row = |tools: &[(Tool, u64)], idle: &[Tool]| {
             let runs: Vec<ToolRun> = tools.iter().map(|&(t, kb)| run(t, kb)).collect();
-            let columns: Vec<Tool> = tools.iter().map(|&(t, _)| t).collect();
+            let columns: Vec<Tool> = tools
+                .iter()
+                .map(|&(t, _)| t)
+                .chain(idle.iter().copied())
+                .collect();
             let by_tool = runs.iter().map(|r| (r.tool, vec![r])).collect();
             let mut out = String::new();
             render_metric_table(&report, &columns, &by_tool, &mut out);
@@ -3166,12 +3181,19 @@ pub(crate) mod tests {
         };
 
         assert_eq!(
-            rss_row(&[(Tool::Ocync, 60_000), (Tool::Crane, 40_000)]),
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Crane, 40_000)], &[]),
             "| Peak RSS | 61.4 MB | 41.0 MB |"
         );
         assert_eq!(
-            rss_row(&[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)]),
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)], &[]),
             "| Peak RSS | **61.4 MB** | 307.2 MB |"
+        );
+        assert_eq!(
+            rss_row(
+                &[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)],
+                &[Tool::Crane]
+            ),
+            "| Peak RSS | **61.4 MB** | 307.2 MB | -- |"
         );
     }
 

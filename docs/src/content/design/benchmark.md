@@ -115,7 +115,7 @@ skopeo, crane, regctl and oras are compared too. Each copies one tag per process
 - **regctl** `image copy` does the same, with no platform, referrer or digest-tag option given.
 - **oras** `cp` copies the whole index and every blob unchanged, without `--recursive`, which would add referrers.
 
-Fairness to ocync is not automatic for them. They run one copy at a time, as a user's loop over the tags would, and the run record names that (`per_tag_jobs`). Each process pays its own ping and token per registry and a warm pass re-fetches each source manifest, so their request counts include that per-process cost. Their peak RSS is the largest single process, not a total, and the reports say so. Tuning their parallelism is a later item, under [Competitors at their best](#competitors-at-their-best).
+Fairness to ocync is not automatic for them. They run one copy at a time, as a user's loop over the tags would, and the run record names that (`per_tag_jobs`). Each process pays its own ping and token per registry and a warm pass re-fetches each source manifest, so their request counts include that per-process cost. The target's ECR token is not paid per process, since `docker-credential-ecr-login` caches it in `~/.ecr/cache.json` for 12 hours across processes, tools and rounds, so only the run's first copy fetches it. Their peak RSS is the largest single process, not a total, and the reports say so. The loop stops at the first copy that fails, naming it as `n/total` and the target repository and tag, never the registry host. Tuning their parallelism is a later item, under [Competitors at their best](#competitors-at-their-best).
 
 ## Referrers
 

@@ -78,17 +78,17 @@ cargo xtask bench-remote --provider aws --force --scenario sync
 
 `skopeo`, `crane`, `regctl` and `oras` are benchmarked beside the config-driven tools. `skopeo sync` cannot copy `source@digest` to `target:tag` (its destination name comes from the source name), so none of the four reads a config that lists the corpus: xtask runs one process per corpus tag, in corpus order (image, then tag), each copying the locked digest to the corpus tag.
 
-| Tool | Command after the binary | Inner concurrency default (documented, never set) |
-|---|---|---|
-| skopeo | `--insecure-policy copy --preserve-digests --multi-arch all --authfile <config dir>/config.json docker://<src>@<digest> docker://<target>:<tag>` | 6 parallel downloads (containers/image `maxParallelDownloads`) |
-| crane | `copy <src>@<digest> <target>:<tag>` | `-j` effectively 4 (pflag overwrites the GOMAXPROCS default with 0, which crane ignores) |
-| regctl | `image copy <src>@<digest> <target>:<tag>` | 3 requests per host (`reqConcurrent`) |
-| oras | `cp <src>@<digest> <target>:<tag>` | `--concurrency` 3 |
+| Tool | Command after the binary |
+|---|---|
+| skopeo | `--insecure-policy copy --preserve-digests --multi-arch all --authfile <config dir>/config.json docker://<src>@<digest> docker://<target>:<tag>` |
+| crane | `copy <src>@<digest> <target>:<tag>` |
+| regctl | `image copy <src>@<digest> <target>:<tag>` |
+| oras | `cp <src>@<digest> <target>:<tag>` |
 
-- **One copy at a time.** `PER_TAG_JOBS = 1` in `runner.rs`, as a user's loop over the tags would run; tuning it is a later item. The run record carries it as `per_tag_jobs`, beside `max_concurrent_transfers`, whenever one of the four ran. `run_per_tag` runs the copies in sequence and fails to compile if the constant is not 1.
+- **One copy at a time.** `PER_TAG_JOBS = 1` in `runner.rs`; the run record carries it as `per_tag_jobs` whenever one of the four ran, and `run_per_tag` fails to compile if the constant is not 1.
 - **Never** `--platform`, `--referrers`/`-r`, `--digest-tags`, `--fast` or `--all` (skopeo rejects `--all` with `--multi-arch`). Referrers are off for every competitor; regctl and oras can copy them and run with it off.
 - **Auth is one Docker-format file**, `<config dir>/config.json`, mode 0600: Docker Hub credentials under `https://index.docker.io/v1/` when the corpus has them, and `credHelpers` naming the target registry as `ecr-login`. Credentials are never on a command line, since a failed run prints its stderr. Every child gets `DOCKER_CONFIG=<config dir>` and `REGCTL_CONFIG=<config dir>/regctl.json` (never written, so `~/.regctl` cannot leak in), and `HTTPS_PROXY` when the proxy is on. The file does not name `public.ecr.aws`, which the instance's own `~/.docker/config.json` maps to the helper: the four pull it anonymously, as ocync does.
-- **What the metrics mean for them.** There is one proxy window for the whole pass. Each process pays its own ping per registry, and its own token for Docker Hub and the other sources; the target's ECR token is not paid per process, since `docker-credential-ecr-login` caches it in `~/.ecr/cache.json` for 12 hours across processes, tools and rounds, so only the run's first copy fetches it. A warm pass re-fetches each source manifest, so their request counts include that cost by design. Wall clock is one clock around the whole loop. Peak RSS is the largest of the processes, not a total, and the summary says so. The loop stops at the first copy that fails, naming it as `n/total` and the target.
+- **What the metrics mean for them** and their inner concurrency defaults: [per-tag tools](/design/benchmark#per-tag-tools) and [competitors at their best](/design/benchmark#competitors-at-their-best) in the benchmark design.
 - **No prepare mode.** `prepare` is ocync-only; `--tools` naming any other tool with the `prepare` scenario is refused by name before the run starts, as `ensure_prepare_applies` checks (`--scenario all` runs prepare with ocync alone).
 - **Versions.** crane's `could not determine build information` and `(devel)` count as no version, so its version comes from `go version -m` as for dregsy.
 

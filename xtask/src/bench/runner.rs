@@ -216,45 +216,39 @@ fn version_args(tool: Tool) -> &'static [&'static str] {
     }
 }
 
-/// Whether a tool reports its own version.
-///
-/// `dregsy` has none to report: it takes no version flag, and its release
-/// version is injected by ldflags that `go install` does not set. Its version
-/// comes from the module stamped into the binary instead. Every other tool
-/// exits zero from its version subcommand, so a failure there means the binary
-/// is broken rather than merely quiet.
-fn reports_version(tool: Tool) -> bool {
-    match tool {
-        Tool::Dregsy => false,
-        Tool::Regsync
-        | Tool::Ocync
-        | Tool::OcyncBaseline
-        | Tool::Skopeo
-        | Tool::Crane
-        | Tool::Regctl
-        | Tool::Oras => true,
-    }
+/// Where a tool's version is read from in its version probe's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VersionOutput {
+    /// The tool has no version to report, so the probe only confirms the
+    /// binary runs: a failed probe is no version rather than an error, and a
+    /// successful one is read as [`Self::FirstLine`].
+    Quiet,
+    /// The first non-blank line is the version.
+    FirstLine,
+    /// The value of this `Key: value` line is the version.
+    Keyed(&'static str),
 }
 
-/// The `Key: value` line a tool's version output carries its release on, for
-/// tools that print a labelled block rather than a one-line version.
+/// How to read a tool's version probe.
 ///
-/// `regctl version` prints `VCSTag:` first, aligned by a tab writer
-/// (regclient `internal/version/version.go`), and `oras version` prints
-/// `Version:` then `Go version:`, padded to a common column (oras
-/// `cmd/oras/root/version.go`). `None` keeps the first non-blank line, which is
-/// what skopeo, crane and the others print as their version. `regsync` is also
-/// regclient but stays on its first line so earlier records remain comparable.
-fn version_key(tool: Tool) -> Option<&'static str> {
+/// `dregsy` is quiet: it takes no version flag, and its release version is
+/// injected by ldflags that `go install` does not set, so its version comes
+/// from the module stamped into the binary instead. Every other tool exits zero
+/// from its version subcommand, so a failure there means the binary is broken.
+///
+/// `regctl version` prints `VCSTag:` first, aligned by a tab writer (regclient
+/// `internal/version/version.go`), and `oras version` prints `Version:` then
+/// `Go version:`, padded to a common column (oras `cmd/oras/root/version.go`),
+/// so those two are keyed. `regsync` is also regclient but stays on its first
+/// line so earlier records remain comparable.
+fn version_output(tool: Tool) -> VersionOutput {
     match tool {
-        Tool::Regctl => Some("VCSTag"),
-        Tool::Oras => Some("Version"),
-        Tool::Dregsy
-        | Tool::Regsync
-        | Tool::Ocync
-        | Tool::OcyncBaseline
-        | Tool::Skopeo
-        | Tool::Crane => None,
+        Tool::Dregsy => VersionOutput::Quiet,
+        Tool::Regctl => VersionOutput::Keyed("VCSTag"),
+        Tool::Oras => VersionOutput::Keyed("Version"),
+        Tool::Regsync | Tool::Ocync | Tool::OcyncBaseline | Tool::Skopeo | Tool::Crane => {
+            VersionOutput::FirstLine
+        }
     }
 }
 
@@ -308,9 +302,9 @@ const VERSION_PLACEHOLDERS: [&str; 2] = ["could not determine build information"
 
 /// Extracts a single-line version string from a completed version probe.
 ///
-/// With a `key` (see [`version_key`]) the value of that `Key: value` line is
-/// the version, and an empty value or a missing key reports none. Without one
-/// the first non-blank line is.
+/// For [`VersionOutput::Keyed`] the value of that `Key: value` line is the
+/// version, and an empty value or a missing key reports none. Otherwise the
+/// first non-blank line is.
 ///
 /// `Ok(None)` means the binary ran but reported no version, or only a
 /// [`VERSION_PLACEHOLDERS`] entry, which callers resolve from the module
@@ -324,24 +318,23 @@ const VERSION_PLACEHOLDERS: [&str; 2] = ["could not determine build information"
 /// binary runs.
 fn version_from_probe(
     name: &str,
-    reports_version: bool,
-    key: Option<&str>,
+    output: VersionOutput,
     success: bool,
     stdout: &str,
     stderr: &str,
 ) -> Result<Option<String>, String> {
     if !success {
-        if reports_version {
-            let detail = first_line(stderr, stdout).unwrap_or("no output");
-            return Err(format!("{name} version probe failed: {detail}"));
+        if output == VersionOutput::Quiet {
+            return Ok(None);
         }
-        return Ok(None);
+        let detail = first_line(stderr, stdout).unwrap_or("no output");
+        return Err(format!("{name} version probe failed: {detail}"));
     }
 
     // Some tools write the version to stderr, so fall back to it.
-    let reported = match key {
-        Some(key) => keyed_value(key, stdout, stderr),
-        None => first_line(stdout, stderr),
+    let reported = match output {
+        VersionOutput::Keyed(key) => keyed_value(key, stdout, stderr),
+        VersionOutput::Quiet | VersionOutput::FirstLine => first_line(stdout, stderr),
     };
     Ok(reported
         .filter(|line| !VERSION_PLACEHOLDERS.contains(line))
@@ -356,8 +349,7 @@ fn version_from_probe(
 async fn probe_version(
     binary: &str,
     args: &[&str],
-    reports_version: bool,
-    key: Option<&str>,
+    version_output: VersionOutput,
 ) -> Result<Option<String>, String> {
     let output = tokio::process::Command::new(binary)
         .args(args)
@@ -370,8 +362,7 @@ async fn probe_version(
 
     version_from_probe(
         binary,
-        reports_version,
-        key,
+        version_output,
         output.status.success(),
         &stdout,
         &stderr,
@@ -470,13 +461,7 @@ fn tool_path(tool: Tool, workspace_root: &Path) -> std::borrow::Cow<'static, str
 pub(crate) async fn check_tool(tool: Tool, workspace_root: &Path) -> Result<String, String> {
     let binary = tool_path(tool, workspace_root);
 
-    let probed = probe_version(
-        &binary,
-        version_args(tool),
-        reports_version(tool),
-        version_key(tool),
-    )
-    .await?;
+    let probed = probe_version(&binary, version_args(tool), version_output(tool)).await?;
     if let Some(version) = probed {
         return Ok(version);
     }
@@ -517,7 +502,7 @@ pub(crate) async fn check_relays(tools: &[Tool]) -> Result<Vec<(String, String)>
                 // so a non-zero exit is not itself an error. Either way the
                 // reason is carried, since what the binary reports may be a
                 // placeholder that reads like a healthy release build.
-                let reported = probe_version(binary, &["--version"], false, None).await?;
+                let reported = probe_version(binary, &["--version"], VersionOutput::Quiet).await?;
                 relay_version_after_failed_lookup(reported, &reason)
             }
         };
@@ -838,9 +823,10 @@ pub(crate) async fn run_tool(
 /// children, since each is its own process. The loop stops at the first child
 /// that does not exit zero and returns that child's status, its stderr printed
 /// and its name in [`RunResult::failed_copy`], both as `label n/total` and the
-/// target reference, so a pass that did less work is never timed as if it had
-/// done it all. `env` is set on every child beside
-/// `HTTPS_PROXY`.
+/// target repository and tag, so a pass that did less work is never timed as if
+/// it had done it all. The target's host is left out, since it holds the AWS
+/// account ID and the run log and errors are shared. `env` is set on every
+/// child beside `HTTPS_PROXY`.
 pub(crate) async fn run_per_tag(
     tool: Tool,
     label: &str,
@@ -864,8 +850,11 @@ pub(crate) async fn run_per_tag(
             "{label} {}/{} {}",
             index + 1,
             commands.len(),
-            // The last argument of every per-tag command is the target reference.
-            command.last().map_or("", String::as_str)
+            // The last argument of every per-tag command is the target
+            // reference, `host/repository:tag`.
+            command.last().map_or("", |target| target
+                .split_once('/')
+                .map_or(target, |(_, rest)| rest))
         );
         let child = spawn_streamed(
             tool,
@@ -1079,18 +1068,32 @@ mod tests {
         // dropped for resembling one.
         for placeholder in VERSION_PLACEHOLDERS {
             assert_eq!(
-                version_from_probe("crane", true, None, true, &format!("{placeholder}\n"), "")
-                    .unwrap(),
+                version_from_probe(
+                    "crane",
+                    version_output(Tool::Crane),
+                    true,
+                    &format!("{placeholder}\n"),
+                    ""
+                )
+                .unwrap(),
                 None,
                 "{placeholder}"
             );
         }
         assert_eq!(
-            version_from_probe("crane", true, None, true, "v0.20.6\n", "").unwrap(),
+            version_from_probe("crane", version_output(Tool::Crane), true, "v0.20.6\n", "")
+                .unwrap(),
             Some("v0.20.6".to_string())
         );
         assert_eq!(
-            version_from_probe("crane", true, None, true, "(devel) v0.20.6\n", "").unwrap(),
+            version_from_probe(
+                "crane",
+                version_output(Tool::Crane),
+                true,
+                "(devel) v0.20.6\n",
+                ""
+            )
+            .unwrap(),
             Some("(devel) v0.20.6".to_string())
         );
     }
@@ -1104,8 +1107,7 @@ mod tests {
     fn failed_probe_is_not_recorded_as_a_version() {
         let version = version_from_probe(
             "dregsy",
-            reports_version(Tool::Dregsy),
-            None,
+            version_output(Tool::Dregsy),
             false,
             "",
             DREGSY_PROBE_STDERR,
@@ -1124,15 +1126,8 @@ mod tests {
         // code. Were it to start exiting zero, its log line must not be
         // rescued by a sentinel comparison and recorded as a version.
         let logged = "time=\"2026-04-26T13:17:46Z\" level=info msg=\"dregsy \"";
-        let version = version_from_probe(
-            "dregsy",
-            reports_version(Tool::Dregsy),
-            None,
-            true,
-            logged,
-            "",
-        )
-        .unwrap();
+        let version =
+            version_from_probe("dregsy", version_output(Tool::Dregsy), true, logged, "").unwrap();
 
         assert_eq!(version, Some(logged.to_string()));
     }
@@ -1144,8 +1139,7 @@ mod tests {
         for tool in [Tool::Ocync, Tool::Regsync] {
             let err = version_from_probe(
                 tool.binary(),
-                reports_version(tool),
-                None,
+                version_output(tool),
                 false,
                 "",
                 "error: linker not found",
@@ -1522,7 +1516,7 @@ mod tests {
 
     /// Runs `commands` of the stub `crane` that appends `HTTPS_PROXY`,
     /// `DOCKER_CONFIG` and its arguments to a log, reports the first argument
-    /// as its peak RSS and fails on a second argument starting with `fail`.
+    /// as its peak RSS and fails on a second argument containing `fail`.
     /// Returns the result and the log's lines.
     fn run_stub_crane(commands: &[&[&str]]) -> (RunResult, Vec<String>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1534,7 +1528,7 @@ mod tests {
                 "#!/bin/sh\n\
                  echo \"$HTTPS_PROXY $DOCKER_CONFIG $*\" >> '{}'\n\
                  echo \"Maximum resident set size (kbytes): $1\" >&2\n\
-                 case \"$2\" in fail*) exit 3;; esac\n",
+                 case \"$2\" in *fail*) exit 3;; esac\n",
                 log.display()
             ),
         );
@@ -1591,17 +1585,28 @@ mod tests {
         // Catches: the loop going on after a failure, so a pass that did less
         // work is timed and compared as if it had done it all, a failure
         // reported as the last child's success, and an error that names only
-        // the tool, not which copy of how many.
-        let (result, log) = run_stub_crane(&[&["100", "a:1"], &["300", "fail:2"], &["200", "c:3"]]);
+        // the tool, not which copy of how many, and one that carries the
+        // target's host, which holds the AWS account ID, into the run log and
+        // the error.
+        const HOST: &str = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
+        let target = |repo_tag: &str| format!("{HOST}/{repo_tag}");
+        let (result, log) = run_stub_crane(&[
+            &["100", &target("bench/a:1")],
+            &["300", &target("bench/fail:2")],
+            &["200", &target("bench/c:3")],
+        ]);
         assert_eq!(
             log,
             [
-                "http://proxy:1 /cfg 100 a:1",
-                "http://proxy:1 /cfg 300 fail:2"
+                format!("http://proxy:1 /cfg 100 {HOST}/bench/a:1"),
+                format!("http://proxy:1 /cfg 300 {HOST}/bench/fail:2"),
             ]
         );
         assert_eq!(result.exit_status.code(), Some(3));
-        assert_eq!(result.failed_copy.as_deref(), Some("crane 2/3 fail:2"));
+        assert_eq!(
+            result.failed_copy.as_deref(),
+            Some("crane 2/3 bench/fail:2")
+        );
     }
 
     #[test]
@@ -1611,8 +1616,7 @@ mod tests {
         // and the module lookup must take precedence.
         let probed = version_from_probe(
             "docker-credential-ecr-login",
-            false,
-            None,
+            VersionOutput::Quiet,
             true,
             "docker-credential-ecr-login (github.com/awslabs/amazon-ecr-credential-helper/ecr-login) development\n",
             "",
@@ -1628,17 +1632,38 @@ mod tests {
     #[test]
     fn successful_probe_reads_the_version() {
         assert_eq!(
-            version_from_probe("ocync", true, None, true, "ocync 0.6.0\n", "").unwrap(),
+            version_from_probe(
+                "ocync",
+                version_output(Tool::Ocync),
+                true,
+                "ocync 0.6.0\n",
+                ""
+            )
+            .unwrap(),
             Some("ocync 0.6.0".to_string())
         );
         // regsync pads its output and precedes the tag with a blank line.
         assert_eq!(
-            version_from_probe("regsync", true, None, true, "\nVCSTag:     v0.11.5\n", "").unwrap(),
+            version_from_probe(
+                "regsync",
+                version_output(Tool::Regsync),
+                true,
+                "\nVCSTag:     v0.11.5\n",
+                ""
+            )
+            .unwrap(),
             Some("VCSTag:     v0.11.5".to_string())
         );
         // skopeo reports cleanly on stdout with a zero exit.
         assert_eq!(
-            version_from_probe("skopeo", true, None, true, "skopeo version 1.24.0\n", "").unwrap(),
+            version_from_probe(
+                "skopeo",
+                version_output(Tool::Skopeo),
+                true,
+                "skopeo version 1.24.0\n",
+                ""
+            )
+            .unwrap(),
             Some("skopeo version 1.24.0".to_string())
         );
     }
@@ -1656,72 +1681,44 @@ mod tests {
     #[test]
     fn a_labelled_version_block_records_only_the_value() {
         // Catches: the `Key:` label and its alignment padding recorded as the
-        // version, or `Go version:` read as the `Version:` line.
-        assert_eq!(
-            version_from_probe(
-                "regctl",
-                true,
-                version_key(Tool::Regctl),
-                true,
-                REGCTL_PROBE,
-                ""
-            )
-            .unwrap(),
-            Some("v0.11.7".to_string())
-        );
-        assert_eq!(
-            version_from_probe("oras", true, version_key(Tool::Oras), true, ORAS_PROBE, "")
-                .unwrap(),
-            Some("1.3.6".to_string())
-        );
-        // Catches: a key chosen for a tool whose first line already is its
-        // version, which would change what earlier records compare against.
-        for tool in [
-            Tool::Dregsy,
-            Tool::Regsync,
-            Tool::Ocync,
-            Tool::OcyncBaseline,
-            Tool::Skopeo,
-            Tool::Crane,
-        ] {
-            assert_eq!(version_key(tool), None, "{tool}");
-        }
-    }
-
-    #[test]
-    fn a_labelled_block_without_a_value_reports_nothing() {
-        // Catches: the raw label line recorded when the value is empty or the
-        // key is absent, instead of falling through to the module version.
-        assert_eq!(
-            version_from_probe(
-                "regctl",
-                true,
-                Some("VCSTag"),
-                true,
+        // version, `Go version:` read as the `Version:` line, and a label line
+        // recorded when the value is empty or the key absent, instead of
+        // falling through to the module version.
+        for (name, tool, stdout, expected) in [
+            ("regctl full", Tool::Regctl, REGCTL_PROBE, Some("v0.11.7")),
+            ("oras full", Tool::Oras, ORAS_PROBE, Some("1.3.6")),
+            (
+                "empty VCSTag",
+                Tool::Regctl,
                 "VCSTag:   \nVCSRef: abc\n",
-                ""
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            version_from_probe(
-                "oras",
-                true,
-                Some("Version"),
-                true,
+                None,
+            ),
+            (
+                "oras without a Version line",
+                Tool::Oras,
                 "Go version: go1.25.3\n",
-                ""
-            )
-            .unwrap(),
-            None
-        );
+                None,
+            ),
+        ] {
+            assert_eq!(
+                version_from_probe(tool.binary(), version_output(tool), true, stdout, "").unwrap(),
+                expected.map(str::to_string),
+                "{name}"
+            );
+        }
     }
 
     #[test]
     fn successful_probe_falls_back_to_stderr() {
         assert_eq!(
-            version_from_probe("ocync", true, None, true, "   ", "ocync 0.6.0").unwrap(),
+            version_from_probe(
+                "ocync",
+                version_output(Tool::Ocync),
+                true,
+                "   ",
+                "ocync 0.6.0"
+            )
+            .unwrap(),
             Some("ocync 0.6.0".to_string())
         );
     }
@@ -1729,7 +1726,7 @@ mod tests {
     #[test]
     fn successful_probe_with_no_output_reports_nothing() {
         assert_eq!(
-            version_from_probe("ocync", true, None, true, "", "").unwrap(),
+            version_from_probe("ocync", version_output(Tool::Ocync), true, "", "").unwrap(),
             None
         );
     }

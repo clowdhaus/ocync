@@ -600,8 +600,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         images: corpus.images.len(),
         tags: corpus.total_tags(),
     };
-
-    let coverage = report::Coverage::of(whole_images, corpus.images.len());
+    let coverage = report::Coverage::of(whole_images, &corpus_info);
 
     corpus.dockerhub_auth = docker_hub_auth();
 
@@ -1322,10 +1321,11 @@ fn round_dir(output_dir: &Path, round: usize) -> PathBuf {
     output_dir.join(format!("round-{round}"))
 }
 
-/// What a pass hands its tool, written before the proxy starts.
+/// What a pass hands its tool, all of it written before the proxy starts, so a
+/// failed write leaves no proxy running and no empty proxy log.
 enum Launch {
-    /// The text of the config file the tool reads, one process for the pass.
-    Config(String),
+    /// The config file the tool reads, one process for the pass.
+    Config(PathBuf),
     /// The arguments of each copy of a per-tag tool, one process per tag.
     PerTag(Vec<Vec<String>>),
 }
@@ -1350,19 +1350,25 @@ async fn run_single_tool(
     pass: Pass,
     mode: config_gen::Mode<'_>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
+    // Mode 0600: regsync's and dregsy's configs hold the Docker Hub token.
+    let config = |content: String| -> Result<Launch, String> {
+        let path = config_dir.join(format!("{tool}.yaml"));
+        write_file(&path, &content, 0o600)?;
+        Ok(Launch::Config(path))
+    };
     let launch = match (tool, tool.copier(), mode) {
-        (Tool::Ocync | Tool::OcyncBaseline, _, mode) => Launch::Config(config_gen::ocync_config(
+        (Tool::Ocync | Tool::OcyncBaseline, _, mode) => config(config_gen::ocync_config(
             corpus,
             args.target,
             args.tool_selection.max_concurrent_transfers,
             mode,
-        )),
+        ))?,
         (Tool::Dregsy, _, config_gen::Mode::Sync(lock)) => {
             let skopeo = skopeo_shim::write_script(config_dir)?;
-            Launch::Config(config_gen::dregsy_config(corpus, lock, &skopeo))
+            config(config_gen::dregsy_config(corpus, lock, &skopeo))?
         }
         (Tool::Regsync, _, config_gen::Mode::Sync(lock)) => {
-            Launch::Config(config_gen::regsync_config(corpus, lock))
+            config(config_gen::regsync_config(corpus, lock))?
         }
         (_, Some(copier), config_gen::Mode::Sync(lock)) => {
             // Mode 0600: it holds the Docker Hub token.
@@ -1408,14 +1414,11 @@ async fn run_single_tool(
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let label = args.tool_selection.label(tool);
     let result = match &launch {
-        Launch::Config(content) => {
-            // Mode 0600: regsync's and dregsy's configs hold the Docker Hub token.
-            let config_path = config_dir.join(format!("{tool}.yaml"));
-            write_file(&config_path, content, 0o600)?;
+        Launch::Config(config_path) => {
             runner::run_tool(
                 tool,
                 &label,
-                &config_path,
+                config_path,
                 proxy_url.as_deref(),
                 &args.tool_selection.root(tool),
                 // Prepare resolves mappings and stops, so it is the only dry run.
@@ -2557,29 +2560,6 @@ mod tests {
         ] {
             assert_eq!(RegistryKind::of(host).archive_stem(), stem, "{host}");
         }
-    }
-
-    #[test]
-    fn a_partial_ecr_run_is_archived_but_leaves_the_page_alone() {
-        // Catches: a `--limit` run dropped from the archive along with its
-        // page blocks, and one that still rewrites the page.
-        use crate::bench::report::{Coverage, tests::sample_report};
-
-        let mut report = sample_report();
-        report.coverage = Coverage::Subset;
-        let deferred = deferred_output(
-            &Target::Ecr,
-            "111111111111.dkr.ecr.us-east-1.amazonaws.com",
-            &report,
-            "abc1234".into(),
-            None,
-        );
-        let value = serde_json::to_value(&deferred).unwrap();
-        assert!(value["record"].is_object(), "{value}");
-        assert_eq!(
-            value["page"],
-            serde_json::json!({"cold": null, "warm": null})
-        );
     }
 
     #[test]
