@@ -239,17 +239,14 @@ impl<'a> Access<'a> {
     }
 
     /// The grant for `repo`, exchanged for the first time it is asked, or when
-    /// the one held is `rejected`, which the registry refused. `challenge` is
-    /// the `WWW-Authenticate` value of the 401 that refused it, if it carried
-    /// one; without it the registry is asked at `/v2/`.
+    /// the one held is `rejected`, which the registry refused.
     async fn grant(
         &self,
         repo: &Repository<'_>,
         rejected: Option<&Grant>,
-        challenge: Option<&str>,
     ) -> Result<Grant, String> {
         cached_grant(&self.grants, RepoKey::from(repo), rejected, async || {
-            oci_grant(self.client, repo, self.auth, challenge).await
+            oci_grant(self.client, repo, self.auth).await
         })
         .await
     }
@@ -264,8 +261,8 @@ impl<'a> Access<'a> {
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
         send_renewing(
-            async || self.grant(repo, None, None).await,
-            async |old, challenge| self.grant(repo, Some(old), challenge).await,
+            async || self.grant(repo, None).await,
+            async |old| self.grant(repo, Some(old)).await,
             async |grant| send_retrying(what, || authorize(build(self.client), grant)).await,
         )
         .await
@@ -297,100 +294,89 @@ async fn cached_grant(
     cell.get_or_init(|| exchange()).await.clone()
 }
 
-/// Send with the current grant. A 401 means the grant is not enough, so
+/// Send with the current grant. A 401 under a bearer token means it expired, so
 /// exchange for another once and send again; whatever that answers is returned,
-/// so a registry that still refuses is reported, not asked again. `renew` is
-/// given the grant refused and, for an anonymous grant, the `WWW-Authenticate`
-/// value of the 401. A 401 under [`Grant::Anonymous`] with no challenge has
-/// nothing to exchange for and is returned as it is.
+/// so a registry that still refuses is reported, not asked again. A 401 under
+/// [`Grant::Anonymous`] has nothing to renew and is returned as it is.
 async fn send_renewing<E>(
     grant: impl AsyncFn() -> Result<Grant, E>,
-    renew: impl AsyncFn(&Grant, Option<&str>) -> Result<Grant, E>,
+    renew: impl AsyncFn(&Grant) -> Result<Grant, E>,
     send: impl AsyncFn(&Grant) -> Result<reqwest::Response, E>,
 ) -> Result<reqwest::Response, E> {
     let used = grant().await?;
     let response = send(&used).await?;
-    if response.status() != StatusCode::UNAUTHORIZED {
+    if response.status() != StatusCode::UNAUTHORIZED || used == Grant::Anonymous {
         return Ok(response);
     }
-    // A bearer grant is renewed from `/v2/`; an anonymous one has only the
-    // challenge the 401 carries.
-    let challenge = (used == Grant::Anonymous)
-        .then(|| {
-            response
-                .headers()
-                .get(reqwest::header::WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        })
-        .flatten();
-    if used == Grant::Anonymous && challenge.is_none() {
-        return Ok(response);
-    }
-    send(&renew(&used, challenge.as_deref()).await?).await
+    send(&renew(&used).await?).await
 }
 
-/// Reads a challenge, or the lack of one, in the answer to `GET /v2/`: the
-/// `WWW-Authenticate` value to answer, `None` for a success without one (the
-/// registry asks for no credential), and an error for a scheme other than
-/// `Bearer` or any other answer without a challenge.
+/// Reads the challenges, or the lack of them, in the answer to `GET /v2/`: the
+/// Bearer `WWW-Authenticate` value among `challenges` to answer, `None` for a
+/// success without any (the registry asks for no credential), and an error when
+/// none is Bearer, naming the schemes seen, or for any other answer without a
+/// challenge.
 fn read_challenge<'a>(
     registry: &str,
     status: StatusCode,
-    www_authenticate: Option<&'a str>,
+    challenges: impl IntoIterator<Item = &'a str>,
 ) -> Result<Option<&'a str>, String> {
-    match www_authenticate {
-        Some(header) => {
-            let scheme = header.split_whitespace().next().unwrap_or_default();
-            if scheme.eq_ignore_ascii_case("Bearer") {
-                Ok(Some(header))
-            } else {
-                Err(format!(
-                    "{registry} challenged with the {scheme:?} scheme, and only Bearer is answered"
-                ))
-            }
-        }
-        None if status.is_success() => Ok(None),
-        None => Err(format!(
+    let challenges: Vec<&str> = challenges.into_iter().collect();
+    let scheme = |header: &str| {
+        header
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    if let Some(bearer) = challenges
+        .iter()
+        .find(|header| scheme(header).eq_ignore_ascii_case("Bearer"))
+    {
+        return Ok(Some(bearer));
+    }
+    if !challenges.is_empty() {
+        let seen: Vec<String> = challenges.iter().map(|header| scheme(header)).collect();
+        return Err(format!(
+            "{registry} challenged with {}, and only Bearer is answered",
+            seen.join(", ")
+        ));
+    }
+    if status.is_success() {
+        Ok(None)
+    } else {
+        Err(format!(
             "{registry} answered /v2/ with {status} and no WWW-Authenticate challenge"
-        )),
+        ))
     }
 }
 
 /// OCI token exchange for a single repository scope.
 ///
-/// Follows the standard flow: challenge /v2/ (unless `challenge`, the value a
-/// 401 carried, is given), parse `WWW-Authenticate`, request a bearer token
-/// from the auth realm. A registry that answers `/v2/` with success and no
+/// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
+/// request a bearer token from the auth realm. A registry that answers `/v2/` with success and no
 /// challenge is [`Grant::Anonymous`]. For Docker Hub, includes basic auth
 /// credentials if given. The error says which step failed.
 async fn oci_grant(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
-    challenge: Option<&str>,
 ) -> Result<Grant, String> {
     let registry = repo.host.api_host();
 
     // Step 1: challenge the registry to get the auth parameters.
-    let (status, header) = match challenge {
-        Some(header) => (StatusCode::UNAUTHORIZED, Some(header.to_owned())),
-        None => {
-            let challenge_url = format!("https://{registry}/v2/");
-            let answer = send_retrying(&format!("{registry} challenge"), || {
-                client.get(&challenge_url)
-            })
-            .await
-            .map_err(|e| format!("challenge to {registry} {e}"))?;
-            let header = answer
-                .headers()
-                .get(reqwest::header::WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            (answer.status(), header)
-        }
-    };
-    let Some(www_auth) = read_challenge(registry, status, header.as_deref())? else {
+    let challenge_url = format!("https://{registry}/v2/");
+    let answer = send_retrying(&format!("{registry} challenge"), || {
+        client.get(&challenge_url)
+    })
+    .await
+    .map_err(|e| format!("challenge to {registry} {e}"))?;
+    let challenges = answer
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let Some(www_auth) = read_challenge(registry, answer.status(), challenges)? else {
         return Ok(Grant::Anonymous);
     };
 
@@ -577,93 +563,42 @@ mod tests {
         assert_eq!(parse_auth_param(header, "scope"), None);
     }
 
-    /// Run `send_renewing` under `grant` with a send that answers `answers`
-    /// (status and `WWW-Authenticate`) in turn, and report the final status,
-    /// the sends made and the challenge each exchange was given.
-    fn renewing_under(
-        grant: Grant,
-        answers: &[(u16, Option<&str>)],
-    ) -> (u16, usize, Vec<Option<String>>) {
+    /// Run `send_renewing` under `grant` with a send that answers `statuses` in
+    /// turn, and report the final status, the sends made and the exchanges made.
+    fn renewing_under(grant: Grant, statuses: &[u16]) -> (u16, usize, usize) {
         let sends = Cell::new(0);
-        let exchanges = RefCell::new(Vec::new());
+        let exchanges = Cell::new(0);
         let response = send_renewing(
             async || Ok::<_, String>(grant.clone()),
-            async |rejected: &Grant, challenge: Option<&str>| {
+            async |rejected: &Grant| {
                 assert_eq!(rejected, &grant, "the refused grant is what is replaced");
-                exchanges.borrow_mut().push(challenge.map(str::to_owned));
+                exchanges.set(exchanges.get() + 1);
                 Ok(Grant::Bearer("new".to_owned()))
             },
             async |_grant: &Grant| {
-                let (status, challenge) = answers[sends.get().min(answers.len() - 1)];
+                let status = statuses[sends.get().min(statuses.len() - 1)];
                 sends.set(sends.get() + 1);
-                let mut response = http::Response::builder().status(status);
-                if let Some(challenge) = challenge {
-                    response = response.header("www-authenticate", challenge);
-                }
-                Ok(reqwest::Response::from(response.body("").unwrap()))
+                let response = http::Response::builder().status(status).body("");
+                Ok(reqwest::Response::from(response.unwrap()))
             },
         )
         .now_or_never()
         .expect("nothing here waits")
         .unwrap();
-        (
-            response.status().as_u16(),
-            sends.get(),
-            exchanges.into_inner(),
-        )
+        (response.status().as_u16(), sends.get(), exchanges.get())
     }
 
-    const CHALLENGE: &str = r#"Bearer realm="https://auth.example/token",service="r""#;
-
     #[test]
-    fn a_401_renews_a_bearer_grant_once_and_a_second_401_is_returned() {
+    fn a_401_renews_a_bearer_grant_once_and_never_an_anonymous_one() {
         let old = || Grant::Bearer("old".to_owned());
         // Catches: exchanging a token for a request that was accepted.
-        assert_eq!(renewing_under(old(), &[(200, None)]), (200, 1, vec![]));
+        assert_eq!(renewing_under(old(), &[200]), (200, 1, 0));
         // Catches: reporting an expired token as a refused source.
-        assert_eq!(
-            renewing_under(old(), &[(401, None), (200, None)]),
-            (200, 2, vec![None])
-        );
+        assert_eq!(renewing_under(old(), &[401, 200]), (200, 2, 1));
         // Catches: asking again and again of a registry that keeps refusing.
-        assert_eq!(
-            renewing_under(old(), &[(401, None), (401, None), (200, None)]),
-            (401, 2, vec![None])
-        );
-        // Catches: a bearer grant renewed from a 401's scope instead of `/v2/`.
-        assert_eq!(
-            renewing_under(old(), &[(401, Some(CHALLENGE)), (200, None)]),
-            (200, 2, vec![None])
-        );
-    }
-
-    #[test]
-    fn a_401_from_an_anonymous_registry_is_followed_only_when_it_carries_a_challenge() {
-        let anonymous = || Grant::Anonymous;
-        // Catches: an exchange attempted against a registry that has no token
-        // service, which would turn a refusal into a confusing token error.
-        assert_eq!(
-            renewing_under(anonymous(), &[(401, None), (200, None)]),
-            (401, 1, vec![])
-        );
-        assert_eq!(
-            renewing_under(anonymous(), &[(200, None)]),
-            (200, 1, vec![])
-        );
-        // Catches: a registry that serves some repositories openly and
-        // challenges for others, whose 401 is returned as a refused source.
-        assert_eq!(
-            renewing_under(anonymous(), &[(401, Some(CHALLENGE)), (200, None)]),
-            (200, 2, vec![Some(CHALLENGE.to_owned())])
-        );
-        // Catches: following the challenge again and again.
-        assert_eq!(
-            renewing_under(
-                anonymous(),
-                &[(401, Some(CHALLENGE)), (401, Some(CHALLENGE)), (200, None)]
-            ),
-            (401, 2, vec![Some(CHALLENGE.to_owned())])
-        );
+        assert_eq!(renewing_under(old(), &[401, 401, 200]), (401, 2, 1));
+        // Catches: an exchange attempted against a registry with no token service.
+        assert_eq!(renewing_under(Grant::Anonymous, &[401, 200]), (401, 1, 0));
     }
 
     #[test]
@@ -694,44 +629,41 @@ mod tests {
     #[test]
     fn a_v2_answer_is_anonymous_only_on_success_without_a_challenge() {
         // Catches: a registry answering 401 or 5xx with no challenge being
-        // treated as open, a success without one still being an error, and a
-        // Basic challenge answered as if it were Bearer.
+        // treated as open, a success without one still being an error, a
+        // Basic challenge answered as if it were Bearer, and a Bearer header
+        // missed because a Basic one came first.
+        let bearer = r#"Bearer realm="https://auth.example/token",service="r""#;
         let basic = r#"Basic realm="r""#;
+        let no_challenge = |status: &str| {
+            format!("r.example answered /v2/ with {status} and no WWW-Authenticate challenge")
+        };
         let cases = [
-            (200, Some(CHALLENGE), Ok(Some(CHALLENGE))),
-            (401, Some(CHALLENGE), Ok(Some(CHALLENGE))),
+            (200, vec![bearer], Ok(Some(bearer))),
+            (401, vec![bearer], Ok(Some(bearer))),
             (
                 401,
-                Some("bearer realm=\"x\""),
+                vec!["bearer realm=\"x\""],
                 Ok(Some("bearer realm=\"x\"")),
             ),
-            (200, None, Ok(None)),
+            (401, vec![basic, bearer], Ok(Some(bearer))),
+            (200, vec![], Ok(None)),
+            (401, vec![], Err(no_challenge("401 Unauthorized"))),
+            (503, vec![], Err(no_challenge("503 Service Unavailable"))),
             (
                 401,
-                None,
+                vec![basic, "Negotiate"],
                 Err(
-                    "r.example answered /v2/ with 401 Unauthorized and no WWW-Authenticate challenge",
+                    "r.example challenged with Basic, Negotiate, and only Bearer is answered"
+                        .to_owned(),
                 ),
-            ),
-            (
-                503,
-                None,
-                Err(
-                    "r.example answered /v2/ with 503 Service Unavailable and no WWW-Authenticate challenge",
-                ),
-            ),
-            (
-                401,
-                Some(basic),
-                Err("r.example challenged with the \"Basic\" scheme, and only Bearer is answered"),
             ),
         ];
-        for (code, header, want) in cases {
+        for (code, headers, want) in cases {
             let status = StatusCode::from_u16(code).unwrap();
             assert_eq!(
-                read_challenge("r.example", status, header),
-                want.map_err(str::to_owned),
-                "{code} {header:?}"
+                read_challenge("r.example", status, headers.iter().copied()),
+                want,
+                "{code} {headers:?}"
             );
         }
     }

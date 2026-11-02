@@ -15,6 +15,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::acr::ENV_TOKEN_FILE;
+use super::corpus;
 use super::gar::ENV_CREDENTIALS;
 use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
@@ -76,7 +77,7 @@ pub(crate) struct BenchRemoteArgs {
     /// when given; the instance's own default otherwise. The file and its
     /// `.lock.json` beside it must be committed in the commit that runs.
     #[arg(long)]
-    pub(crate) corpus: Option<PathBuf>,
+    pub(crate) corpus: Option<String>,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -405,7 +406,7 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     }
     // Only when given, for the same reason.
     if let Some(corpus) = &args.corpus {
-        bench_args.extend(["--corpus".to_string(), corpus.display().to_string()]);
+        bench_args.extend(["--corpus".to_string(), corpus.clone()]);
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
@@ -1120,12 +1121,10 @@ fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::
 fn ensure_corpus_committed(
     repo: &Path,
     commit: &CommitSha,
-    corpus: &Path,
+    corpus: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for path in [corpus.to_owned(), corpus.with_extension("lock.json")] {
-        let named = path
-            .to_str()
-            .ok_or_else(|| format!("corpus path {} is not UTF-8", path.display()))?;
+    for path in [PathBuf::from(corpus), corpus::lock_path(Path::new(corpus))] {
+        let named = path.display();
         if git(repo, &["cat-file", "-e", &format!("{commit}:{named}")]).is_err() {
             return Err(format!(
                 "{named} is not in commit {commit}, which the instance checks out; commit it \
@@ -1360,8 +1359,7 @@ mod tests {
         write("bench/corpus-new.lock.json");
 
         let check = |commit: &CommitSha, corpus: &str| {
-            ensure_corpus_committed(repo.path(), commit, Path::new(corpus))
-                .map_err(|e| e.to_string())
+            ensure_corpus_committed(repo.path(), commit, corpus).map_err(|e| e.to_string())
         };
         assert_eq!(check(&both, "bench/corpus-small.yaml"), Ok(()));
         assert_eq!(

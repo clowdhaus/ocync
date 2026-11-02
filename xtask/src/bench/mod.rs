@@ -521,6 +521,8 @@ fn git_ref() -> String {
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    let corpus_name = args.paths.corpus_name()?;
+    let prepare = runs_prepare(args.scenario, corpus_name.as_ref())?;
     let bench_target = Target::from_env(
         args.target,
         &|name| std::env::var(name).ok(),
@@ -538,7 +540,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         reject_tmpfs_tmpdir()?;
     }
 
-    let corpus_name = args.paths.corpus_name()?;
     let loaded = corpus::load(args.paths.corpus())?;
     let filtered = if args.skip_registries.is_empty() {
         loaded
@@ -556,11 +557,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         Some(n) => filtered.limit(n),
         None => filtered,
     };
-    let narrowed = if args.skip_registries.is_empty() && args.limit.is_none() {
-        Narrowing::Whole
-    } else {
-        Narrowing::Narrowed
-    };
     let corpus_info = report::CorpusInfo {
         name: corpus_name,
         images: corpus.images.len(),
@@ -576,9 +572,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &corpus,
         args.paths.partial_overrides(),
         args.tool_selection.rounds,
-        narrowed,
     )?;
-    let prepare = runs_prepare(args.scenario, corpus_info.name.as_ref());
     let lock = (!transfers.is_empty())
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
@@ -991,15 +985,6 @@ impl std::fmt::Display for Transfer {
     }
 }
 
-/// Whether `--skip-registries` or `--limit` narrowed the corpus a run uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Narrowing {
-    /// The corpus file as written.
-    Whole,
-    /// A filter removed images from it.
-    Narrowed,
-}
-
 /// The image counts the scale scenario runs at for a corpus of `total` images:
 /// 10, 25 and 50 where the corpus is at least that large, and the whole corpus.
 fn scale_sizes(total: usize) -> Vec<usize> {
@@ -1016,8 +1001,9 @@ fn scale_sizes(total: usize) -> Vec<usize> {
 /// are read once, and only for a run that has a partial scenario.
 ///
 /// Two passes that would measure nothing new are refused when asked for and
-/// skipped with a warning by `all`. Overrides that name no source of the
-/// corpus would re-sync unchanged tags and be recorded as an incremental sync.
+/// skipped with a warning by `all`. Overrides that change no tag of the
+/// corpus, by naming no source of it or by repeating its own tags, would re-sync
+/// unchanged tags and be recorded as an incremental sync.
 /// A corpus of at most 10 images scales at one size, its whole self, which
 /// repeats a cold sync.
 fn plan(
@@ -1025,36 +1011,29 @@ fn plan(
     corpus: &Corpus,
     overrides_path: &str,
     rounds: Rounds,
-    narrowing: Narrowing,
 ) -> Result<Vec<Transfer>, String> {
     let rounds = 1..=rounds.get();
     let sync = || rounds.clone().map(|round| Transfer::Sync { round });
     let partial = || {
         let overrides = corpus::load_overrides(overrides_path)?;
-        let matches = corpus::overrides_naming(&corpus.images, &overrides.overrides)
-            .next()
-            .is_some();
         let changed = Rc::new(corpus.with_overrides(&overrides.overrides));
-        Ok::<_, String>(matches.then(|| {
+        Ok::<_, String>((changed.images != corpus.images).then(|| {
             rounds.clone().map(move |round| Transfer::Partial {
                 round,
                 corpus: Rc::clone(&changed),
             })
         }))
     };
-    let unmatched = || {
-        let after = match narrowing {
-            Narrowing::Whole => "",
-            Narrowing::Narrowed => " after --skip-registries and --limit",
-        };
+    let unchanged = || {
         format!(
-            "no source in {overrides_path} is in the corpus{after}, so the partial scenario \
-             would change no tag; name overrides for this corpus with --partial-overrides"
+            "the overrides in {overrides_path} change no tag of the corpus (after \
+             --skip-registries and --limit, if given); name overrides for this corpus with \
+             --partial-overrides"
         )
     };
     Ok(match requested {
         Scenario::Sync => sync().collect(),
-        Scenario::Partial => partial()?.ok_or_else(unmatched)?.collect(),
+        Scenario::Partial => partial()?.ok_or_else(unchanged)?.collect(),
         Scenario::Scale => vec![Transfer::Scale],
         Scenario::Prepare => Vec::new(),
         Scenario::All => {
@@ -1063,7 +1042,7 @@ fn plan(
                 .unwrap_or_else(|| {
                     eprintln!(
                         "bench: WARNING: {}; skipping the partial scenario",
-                        unmatched()
+                        unchanged()
                     );
                     Vec::new()
                 });
@@ -1082,21 +1061,26 @@ fn plan(
     })
 }
 
-/// Whether the run executes the prepare scenario. `all` skips it for a named
-/// corpus with a warning: prepare reads its own wildcard corpus, which no other
-/// corpus changes, so it would repeat the main corpus's measurement. An
-/// explicit `prepare` always runs.
-fn runs_prepare(requested: Scenario, corpus_name: Option<&CorpusName>) -> bool {
+/// Whether the run executes the prepare scenario. Prepare reads its own
+/// wildcard corpus whatever corpus is named, so a run of a named corpus that
+/// asked for it would be recorded under that corpus with another's
+/// measurement: an explicit `prepare` is refused, and `all` skips it with a
+/// warning.
+fn runs_prepare(requested: Scenario, corpus_name: Option<&CorpusName>) -> Result<bool, String> {
     match (requested, corpus_name) {
-        (Scenario::Prepare, _) | (Scenario::All, None) => true,
+        (Scenario::Prepare, None) | (Scenario::All, None) => Ok(true),
+        (Scenario::Prepare, Some(name)) => Err(format!(
+            "the prepare scenario runs bench/corpus-prepare.yaml, not {name}, and would be \
+             recorded under {name}; run it without --corpus"
+        )),
         (Scenario::All, Some(name)) => {
             eprintln!(
-                "bench: WARNING: skipping the prepare scenario for {name}: it reads \
-                 bench/corpus-prepare.yaml whatever the corpus, so it repeats the main corpus's"
+                "bench: WARNING: skipping the prepare scenario for {name}: it runs \
+                 bench/corpus-prepare.yaml whatever the corpus"
             );
-            false
+            Ok(false)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -2947,7 +2931,7 @@ mod tests {
             (Scenario::Prepare, 0),
             (Scenario::All, 9),
         ] {
-            let transfers = plan(requested, &corpus, overrides, rounds, Narrowing::Whole).unwrap();
+            let transfers = plan(requested, &corpus, overrides, rounds).unwrap();
             assert_eq!(transfers.len(), passes, "{requested:?}");
         }
     }
@@ -3222,14 +3206,7 @@ images:
         .unwrap();
         let corpus = corpus_of(11);
         let rounds = "3".parse().unwrap();
-        let transfers = plan(
-            Scenario::All,
-            &corpus,
-            overrides.to_str().unwrap(),
-            rounds,
-            Narrowing::Whole,
-        )
-        .unwrap();
+        let transfers = plan(Scenario::All, &corpus, overrides.to_str().unwrap(), rounds).unwrap();
         let names: Vec<String> = transfers.iter().map(ToString::to_string).collect();
         assert_eq!(
             names,
@@ -3355,84 +3332,91 @@ images:
         let corpus = two_image_corpus();
         let missing = "/nonexistent/overrides.yaml";
         for requested in [Scenario::Sync, Scenario::Scale, Scenario::Prepare] {
-            assert!(
-                plan(
-                    requested,
-                    &corpus,
-                    missing,
-                    Rounds::DEFAULT,
-                    Narrowing::Whole
-                )
-                .is_ok()
-            );
+            assert!(plan(requested, &corpus, missing, Rounds::DEFAULT).is_ok());
         }
         for requested in [Scenario::Partial, Scenario::All] {
-            assert!(
-                plan(
-                    requested,
-                    &corpus,
-                    missing,
-                    Rounds::DEFAULT,
-                    Narrowing::Whole
-                )
-                .is_err()
-            );
+            assert!(plan(requested, &corpus, missing, Rounds::DEFAULT).is_err());
         }
-        let transfers = plan(
-            Scenario::Prepare,
-            &corpus,
-            missing,
-            Rounds::DEFAULT,
-            Narrowing::Whole,
-        )
-        .unwrap();
+        let transfers = plan(Scenario::Prepare, &corpus, missing, Rounds::DEFAULT).unwrap();
         assert!(transfers.is_empty(), "prepare reads no lock");
     }
 
     #[test]
-    fn a_partial_scenario_whose_overrides_match_no_source_is_refused_and_all_skips_it() {
-        // Catches: a partial run over a corpus the overrides do not name
-        // re-syncing unchanged tags and being recorded as an incremental sync,
-        // `all` refusing a corpus it could still sync and scale, and a
-        // refusal that blames the overrides file when a filter emptied the
-        // match.
+    fn a_partial_scenario_whose_overrides_change_no_tag_is_refused_and_all_skips_it() {
+        // Catches: a partial run that changes no tag re-syncing unchanged tags
+        // and being recorded as an incremental sync, whether its overrides name
+        // no source of the corpus or repeat the corpus's own tags; `all`
+        // refusing a corpus it could still sync and scale; a refusal that does
+        // not say how to name overrides for this corpus; and a real override
+        // not planned.
         let corpus = corpus_of(11);
         let dir = tempfile::tempdir().unwrap();
-        let overrides = dir.path().join("overrides.yaml");
-        std::fs::write(
-            &overrides,
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let other_source = write(
+            "other.yaml",
             "overrides:\n  - source: \"quay.io/jupyter/base-notebook\"\n    tags: [\"2026-10-28\"]\n",
-        )
-        .unwrap();
-        let overrides = overrides.to_str().unwrap();
+        );
+        let same_tags = write(
+            "same.yaml",
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.12\"]\n",
+        );
+        let real = write(
+            "real.yaml",
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.10\"]\n",
+        );
         let rounds = "3".parse().unwrap();
-        let refusal =
-            |narrowing| plan(Scenario::Partial, &corpus, overrides, rounds, narrowing).unwrap_err();
-        let whole = refusal(Narrowing::Whole);
-        assert!(whole.contains("--partial-overrides"), "{whole}");
-        assert!(!whole.contains("--skip-registries"), "{whole}");
-        let narrowed = refusal(Narrowing::Narrowed);
-        assert!(
-            narrowed.contains("is in the corpus after --skip-registries and --limit,"),
-            "{narrowed}"
-        );
+        let names = |requested, overrides: &str| -> Result<Vec<String>, String> {
+            plan(requested, &corpus, overrides, rounds)
+                .map(|planned| planned.iter().map(ToString::to_string).collect())
+        };
 
-        let all: Vec<String> = plan(Scenario::All, &corpus, overrides, rounds, Narrowing::Whole)
-            .unwrap()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        for overrides in [&other_source, &same_tags] {
+            let refusal = names(Scenario::Partial, overrides).unwrap_err();
+            assert_eq!(
+                refusal,
+                format!(
+                    "the overrides in {overrides} change no tag of the corpus (after \
+                     --skip-registries and --limit, if given); name overrides for this \
+                     corpus with --partial-overrides"
+                )
+            );
+            assert_eq!(
+                names(Scenario::All, overrides).unwrap(),
+                ["Sync round 1", "Sync round 2", "Sync round 3", "Scale"],
+                "{overrides}"
+            );
+        }
         assert_eq!(
-            all,
-            ["Sync round 1", "Sync round 2", "Sync round 3", "Scale"]
+            names(Scenario::Partial, &real).unwrap(),
+            ["Partial round 1", "Partial round 2", "Partial round 3"]
         );
+    }
+
+    #[test]
+    fn an_explicit_prepare_is_refused_for_a_named_corpus() {
+        // Catches: prepare, which runs corpus-prepare.yaml whatever the corpus
+        // is, recorded and compared under a named corpus's name.
+        let named = CorpusName::new("corpus-small");
+        assert_eq!(
+            runs_prepare(Scenario::Prepare, Some(&named)),
+            Err(
+                "the prepare scenario runs bench/corpus-prepare.yaml, not corpus-small, and \
+                 would be recorded under corpus-small; run it without --corpus"
+                    .to_owned()
+            )
+        );
+        assert_eq!(runs_prepare(Scenario::Prepare, None), Ok(true));
     }
 
     #[test]
     fn all_skips_what_would_repeat_a_measurement_and_a_named_scenario_always_runs() {
         // Catches: `all` on a shape corpus running prepare, which reads its own
         // corpus whatever is named, and scale at a single size, which repeats
-        // the cold sync; and an explicit scale or prepare skipped as well.
+        // the cold sync; and an explicit scale skipped as well.
         let dir = tempfile::tempdir().unwrap();
         let overrides = dir.path().join("overrides.yaml");
         std::fs::write(
@@ -3479,10 +3463,10 @@ images:
                 false,
             ),
             (
-                "prepare alone, named corpus",
+                "prepare alone, main corpus",
                 Scenario::Prepare,
                 6,
-                named.clone(),
+                None,
                 Vec::new(),
                 true,
             ),
@@ -3496,14 +3480,17 @@ images:
             ),
         ] {
             let corpus = corpus_of(images);
-            let planned: Vec<String> =
-                plan(requested, &corpus, overrides, rounds, Narrowing::Whole)
-                    .unwrap()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
+            let planned: Vec<String> = plan(requested, &corpus, overrides, rounds)
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
             assert_eq!(planned, passes, "{label}");
-            assert_eq!(runs_prepare(requested, name.as_ref()), prepare, "{label}");
+            assert_eq!(
+                runs_prepare(requested, name.as_ref()),
+                Ok(prepare),
+                "{label}"
+            );
         }
     }
 

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -57,28 +57,38 @@ impl CorpusPaths {
     /// The lock beside the corpus: `bench/corpus.yaml` is locked by
     /// `bench/corpus.lock.json`.
     pub(crate) fn lock_path(&self) -> PathBuf {
-        PathBuf::from(&self.corpus).with_extension("lock.json")
+        lock_path(Path::new(&self.corpus))
     }
 
-    /// The corpus file's stem; `None` for the main corpus, which is the path
-    /// `bench/corpus.yaml` however it is spelled (`./bench/corpus.yaml`). Any
-    /// other file, `experiments/corpus.yaml` included, is named. A stem that is
-    /// not UTF-8 is an error: it could not be recorded.
+    /// The corpus file's stem; `None` for the main corpus, which is the file
+    /// `bench/corpus.yaml` however a path reaches it (`./bench/corpus.yaml`, an
+    /// absolute path, a `..` path). Any other file, `experiments/corpus.yaml`
+    /// included, is named. A corpus file that cannot be read is an error, as
+    /// when it is loaded.
     pub(crate) fn corpus_name(&self) -> Result<Option<CorpusName>, String> {
-        let path = Path::new(&self.corpus);
-        let parts = |path| {
-            Path::components(path)
-                .filter(|part| *part != Component::CurDir)
-                .collect::<Vec<_>>()
-        };
-        if parts(path) == parts(Path::new(DEFAULT_CORPUS)) {
-            return Ok(None);
-        }
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| Some(CorpusName::new(stem)))
-            .ok_or_else(|| format!("corpus file {path:?} has no file name to record"))
+        name_of(&self.corpus, Path::new(DEFAULT_CORPUS))
     }
+}
+
+/// The lock beside `corpus`: `bench/corpus.yaml` is locked by
+/// `bench/corpus.lock.json`.
+pub(crate) fn lock_path(corpus: &Path) -> PathBuf {
+    corpus.with_extension("lock.json")
+}
+
+/// The name of the corpus file at `corpus`, `None` when it is the file at `main`.
+fn name_of(corpus: &str, main: &Path) -> Result<Option<CorpusName>, String> {
+    let path = Path::new(corpus);
+    let file = path
+        .canonicalize()
+        .map_err(|e| format!("failed to read corpus file {corpus}: {e}"))?;
+    if main.canonicalize().is_ok_and(|main| main == file) {
+        return Ok(None);
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| Some(CorpusName::new(stem)))
+        .ok_or_else(|| format!("corpus file {corpus} has no file name to record"))
 }
 
 /// Docker Hub credentials for authenticated pulls (avoids 10 pulls/hr anon limit).
@@ -131,7 +141,7 @@ pub(crate) struct CorpusSettings {
 }
 
 /// A single image entry in the corpus.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub(crate) struct ImageEntry {
     /// Source image reference.
     pub(crate) source: String,
@@ -205,7 +215,7 @@ impl Corpus {
     /// Overrides that don't match any image in the corpus are ignored.
     pub(crate) fn with_overrides(&self, overrides: &[ImageEntry]) -> Corpus {
         let mut result = self.clone();
-        for ovr in overrides_naming(&self.images, overrides) {
+        for ovr in overrides {
             if let Some(img) = result.images.iter_mut().find(|i| i.source == ovr.source) {
                 img.tags.clone_from(&ovr.tags);
             }
@@ -214,7 +224,7 @@ impl Corpus {
     }
 }
 
-/// The `overrides` that name a source of `images`; the rest change no tag.
+/// The `overrides` that name a source of `images`; the rest are ignored.
 pub(crate) fn overrides_naming<'a>(
     images: &'a [ImageEntry],
     overrides: &'a [ImageEntry],
@@ -387,32 +397,37 @@ images:
     }
 
     #[test]
-    fn only_the_main_corpus_path_is_unnamed_and_any_other_is_named_by_its_stem() {
+    fn only_the_main_corpus_file_is_unnamed_however_its_path_is_spelled() {
         // Catches: a shape corpus's records, baseline and refusals carrying no
-        // name, the main corpus spelled `./bench/corpus.yaml` gaining one, and
-        // another directory's `corpus.yaml` mistaken for the main corpus.
+        // name; the main corpus reached by `./`, `..` or an absolute path
+        // gaining one; another directory's `corpus.yaml` mistaken for the main
+        // corpus; and a missing file named instead of reported.
+        let main = format!("{BENCH_DIR}corpus.yaml");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let same_stem = elsewhere.path().join("corpus.yaml");
+        std::fs::write(&same_stem, "").unwrap();
+        let same_stem = same_stem.to_str().unwrap();
         for (corpus, want) in [
-            ("bench/corpus.yaml", Ok(None)),
-            ("./bench/corpus.yaml", Ok(None)),
-            ("bench/corpus-small.yaml", Ok(Some("corpus-small"))),
-            ("experiments/corpus.yaml", Ok(Some("corpus"))),
-            ("bench/corpus.yml", Ok(Some("corpus"))),
+            (main.as_str(), Ok(None)),
+            (&format!("{BENCH_DIR}./corpus.yaml"), Ok(None)),
+            (&format!("{BENCH_DIR}../bench/corpus.yaml"), Ok(None)),
             (
-                "bench/..",
-                Err("corpus file \"bench/..\" has no file name to record"),
+                &format!("{BENCH_DIR}corpus-small.yaml"),
+                Ok(Some("corpus-small")),
             ),
+            (same_stem, Ok(Some("corpus"))),
         ] {
-            let paths = CorpusPaths {
-                corpus: corpus.into(),
-                partial_overrides: String::new(),
-            };
             assert_eq!(
-                paths.corpus_name(),
-                want.map(|name| name.map(CorpusName::new))
-                    .map_err(str::to_owned),
+                name_of(corpus, Path::new(&main)),
+                want.map(|name| name.map(CorpusName::new)),
                 "{corpus}"
             );
         }
+        let missing = name_of("experiments/corpus.yaml", Path::new(&main)).unwrap_err();
+        assert!(
+            missing.starts_with("failed to read corpus file experiments/corpus.yaml: "),
+            "{missing}"
+        );
     }
 
     #[test]
@@ -547,11 +562,32 @@ images:
         ] {
             let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
             assert_eq!(validate(&corpus).unwrap_err(), expected, "{name}");
-            // `bench-lock` reads only the images and refuses the same.
-            if name.starts_with("two sources") {
-                assert_eq!(validate_images(&corpus.images).unwrap_err(), expected);
-            }
         }
+    }
+
+    #[test]
+    fn the_images_alone_are_refused_when_two_flatten_to_one_repository() {
+        // Catches: `bench-lock`, which reads only the images, locking a corpus
+        // that every run would then refuse to load.
+        let image = |source: &str| ImageEntry {
+            source: source.to_owned(),
+            tags: vec!["1".to_owned()],
+        };
+        assert_eq!(
+            validate_images(&[image("docker.io/nvidia/cuda"), image("nvcr.io/nvidia/cuda")]),
+            Err(
+                "corpus sources docker.io/nvidia/cuda and nvcr.io/nvidia/cuda both map to \
+                 target repository nvidia-cuda"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            validate_images(&[
+                image("docker.io/nvidia/cuda"),
+                image("nvcr.io/nvidia/cudnn")
+            ]),
+            Ok(())
+        );
     }
 
     // -- Env var expansion tests --

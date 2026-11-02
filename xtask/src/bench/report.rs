@@ -766,12 +766,8 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push('\n');
 
     out.push_str(&format!(
-        "Corpus: {}{} images, {} total tags\n\n",
-        report
-            .corpus
-            .name
-            .as_ref()
-            .map_or(String::new(), |name| format!("{name}, ")),
+        "Corpus: {}, {} images, {} total tags\n\n",
+        report.corpus.label(),
         report.corpus.images,
         report.corpus.tags
     ));
@@ -1598,7 +1594,7 @@ pub(crate) mod tests {
         assert!(md.contains("- **Type**: c7g.xlarge"));
         assert!(md.contains("- **CPU**: AWS (arm64, 4 vCPUs)"));
         assert!(md.contains("- **Network**: Up to 12.5 Gigabit"));
-        assert!(md.contains("Corpus: 28 images, 40 total tags"));
+        assert!(md.contains("Corpus: the main corpus, 28 images, 40 total tags"));
         let mut named = sample_report();
         named.corpus.name = Some(CorpusName::new("corpus-small"));
         assert!(
