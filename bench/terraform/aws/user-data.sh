@@ -86,7 +86,7 @@ echo "Rust: $${RUSTC_VERSION}"
 # ── Go ────────────────────────────────────────────────────────────────────────
 
 echo "--- Installing Go 1.26.x"
-GO_VERSION="1.26.2"
+GO_VERSION="1.26.10"
 GO_ARCHIVE="go$${GO_VERSION}.linux-amd64.tar.gz"
 
 retry "Go download" curl -fsSL "https://go.dev/dl/$${GO_ARCHIVE}" -o "/tmp/$${GO_ARCHIVE}"
@@ -107,8 +107,11 @@ chown ec2-user:ec2-user /home/ec2-user/.bashrc
 GO_VERSION_LINE="$(go version)"
 echo "Go: $${GO_VERSION_LINE}"
 
-# Go env for root builds (dregsy, regsync, skopeo, ecr-credential-helper)
-export HOME=/root GOPATH=/root/go GOCACHE=/root/.cache/go-build
+# Go env for root builds (dregsy, regsync, crane, regctl, oras, skopeo,
+# ecr-credential-helper). GOTOOLCHAIN=local makes a Go older than a tool's
+# go.mod fail here, inside retry's reach, instead of downloading a toolchain
+# outside it.
+export HOME=/root GOPATH=/root/go GOCACHE=/root/.cache/go-build GOTOOLCHAIN=local
 export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
 
 # Competitor tools install at @latest, so a run compares ocync against what
@@ -136,7 +139,7 @@ chown -R ec2-user:ec2-user /home/ec2-user/.docker
 ECR_HELPER_MOD="$(go version -m /usr/local/bin/docker-credential-ecr-login | grep -m1 -E '^[[:space:]]*mod[[:space:]]' || echo 'build info unavailable')"
 echo "ecr-credential-helper: $${ECR_HELPER_MOD}"
 
-# ── skopeo (dregsy transfer backend) ─────────────────────────────────────────
+# ── skopeo (dregsy transfer backend, and a benchmarked tool) ─────────────────
 
 echo "--- Installing skopeo"
 # skopeo moved its module path to go.podman.io/skopeo at v1.23.0. The github.com
@@ -170,6 +173,38 @@ cp /root/go/bin/regsync /usr/local/bin/regsync
 
 REGSYNC_VERSION_LINE="$(regsync version)"
 echo "regsync: $${REGSYNC_VERSION_LINE}"
+
+# ── crane ─────────────────────────────────────────────────────────────────────
+
+echo "--- Installing crane"
+retry "crane install" go install github.com/google/go-containerregistry/cmd/crane@latest
+cp /root/go/bin/crane /usr/local/bin/crane
+
+# crane prints a placeholder when built without ldflags, so the module version
+# stamped into the binary is the record, as for the helper and dregsy.
+CRANE_MOD="$(go version -m /usr/local/bin/crane | grep -m1 -E '^[[:space:]]*mod[[:space:]]' || echo 'build info unavailable')"
+echo "crane: $${CRANE_MOD}"
+
+# ── regctl ────────────────────────────────────────────────────────────────────
+
+echo "--- Installing regctl"
+retry "regctl install" go install github.com/regclient/regclient/cmd/regctl@latest
+cp /root/go/bin/regctl /usr/local/bin/regctl
+
+# awk, not head or sed q: they exit at the first line and would SIGPIPE regctl
+# under pipefail. The first non-blank line, since regctl's version template
+# starts blank.
+REGCTL_VERSION_LINE="$(regctl version | awk 'NF && !seen { print; seen = 1 }')"
+echo "regctl: $${REGCTL_VERSION_LINE}"
+
+# ── oras ──────────────────────────────────────────────────────────────────────
+
+echo "--- Installing oras"
+retry "oras install" go install oras.land/oras/cmd/oras@latest
+cp /root/go/bin/oras /usr/local/bin/oras
+
+ORAS_VERSION_LINE="$(oras version | sed -n 1p)"
+echo "oras: $${ORAS_VERSION_LINE}"
 
 # ── Clean up Go build cache ──────────────────────────────────────────────────
 

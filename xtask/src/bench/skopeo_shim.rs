@@ -7,15 +7,15 @@
 //! source content. With it skopeo fails a copy that cannot keep the digest.
 //! dregsy builds skopeo's command line from fixed flags and its config can set
 //! only the binary, so the binary it is given is a script that runs this
-//! module's subcommand, which runs skopeo.
+//! module's subcommand, which runs skopeo. The flag is also on the command line
+//! of skopeo as a benchmarked tool.
 
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The skopeo flag that keeps the source digest or fails the copy.
-const PRESERVE_DIGESTS: &str = "--preserve-digests";
+pub(crate) const PRESERVE_DIGESTS: &str = "--preserve-digests";
 
 /// `args` for skopeo, with [`PRESERVE_DIGESTS`] right after a `copy`
 /// subcommand. The subcommand is the first argument that is not a flag: dregsy
@@ -51,14 +51,7 @@ fn script(xtask: &Path) -> String {
 pub(crate) fn write_script(dir: &Path) -> Result<PathBuf, String> {
     let xtask = std::env::current_exe().map_err(|e| format!("find this binary: {e}"))?;
     let path = dir.join("skopeo");
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o755)
-        .open(&path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, script(&xtask).as_bytes()));
-    written.map_err(|e| format!("write {}: {e}", path.display()))?;
+    super::write_file(&path, &script(&xtask), 0o755)?;
     Ok(path)
 }
 
