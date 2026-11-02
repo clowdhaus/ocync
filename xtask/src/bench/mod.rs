@@ -22,6 +22,7 @@ pub(crate) mod target;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -164,6 +165,26 @@ impl ToolSelection {
         Ok(())
     }
 
+    /// Refuses a tool other than ocync for the prepare scenario, which resolves
+    /// mappings with `ocync sync --dry-run` and has no equivalent elsewhere.
+    /// Called beside [`Self::ensure_baseline_applies`], for the same two
+    /// commands. Not for `all`, which runs prepare with ocync alone.
+    pub(crate) fn ensure_prepare_applies(&self, scenario: Scenario) -> Result<(), String> {
+        let others: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|tool| **tool != Tool::Ocync)
+            .map(ToString::to_string)
+            .collect();
+        match scenario {
+            Scenario::Prepare if !others.is_empty() => Err(format!(
+                "the prepare scenario runs ocync alone: drop {} from --tools",
+                others.join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses a baseline for a scenario that has no rounds to put it in. Clap
     /// cannot say this: the scenario is a subcommand of `bench` and an option
     /// of `bench-remote`, so both call this before they do anything.
@@ -289,6 +310,20 @@ pub(crate) enum Scenario {
     Prepare,
     /// Run all scenarios in sequence.
     All,
+}
+
+/// Writes `contents` to `path`, replacing it, created with `mode`.
+pub(crate) fn write_file(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Runs `command` and returns its stdout. A failure is why it could not run,
@@ -521,6 +556,7 @@ fn git_ref() -> String {
 /// Run the benchmark suite.
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
+    args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
     let corpus_id = args.paths.corpus_id()?;
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
@@ -1290,6 +1326,16 @@ enum Launch {
     PerTag(Vec<Vec<String>>),
 }
 
+/// The environment every copy of a per-tag tool runs with. regctl reads its own
+/// config before Docker's, so it is pointed at a file that is never written and
+/// `~/.regctl` cannot leak in.
+fn per_tag_env(config_dir: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("DOCKER_CONFIG", config_dir.to_path_buf()),
+        ("REGCTL_CONFIG", config_dir.join("regctl.json")),
+    ]
+}
+
 /// Run a single tool against the corpus and return a `ToolRun`.
 async fn run_single_tool(
     args: &BenchArgs,
@@ -1300,33 +1346,32 @@ async fn run_single_tool(
     pass: Pass,
     mode: config_gen::Mode<'_>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    let launch = match (tool, mode) {
-        (Tool::Ocync | Tool::OcyncBaseline, mode) => Launch::Config(config_gen::ocync_config(
+    let launch = match (tool, tool.copier(), mode) {
+        (Tool::Ocync | Tool::OcyncBaseline, _, mode) => Launch::Config(config_gen::ocync_config(
             corpus,
             args.target,
             args.tool_selection.max_concurrent_transfers,
             mode,
         )),
-        (Tool::Dregsy, config_gen::Mode::Sync(lock)) => {
+        (Tool::Dregsy, _, config_gen::Mode::Sync(lock)) => {
             let skopeo = skopeo_shim::write_script(config_dir)?;
             Launch::Config(config_gen::dregsy_config(corpus, lock, &skopeo))
         }
-        (Tool::Regsync, config_gen::Mode::Sync(lock)) => {
+        (Tool::Regsync, _, config_gen::Mode::Sync(lock)) => {
             Launch::Config(config_gen::regsync_config(corpus, lock))
         }
-        (Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras, config_gen::Mode::Sync(lock)) => {
+        (_, Some(copier), config_gen::Mode::Sync(lock)) => {
             // Mode 0600: it holds the Docker Hub token.
-            skopeo_shim::write_file(
+            write_file(
                 &config_dir.join(config_gen::DOCKER_CONFIG_FILE),
                 &config_gen::docker_config(corpus),
                 0o600,
             )?;
-            Launch::PerTag(config_gen::per_tag_copies(tool, corpus, lock, config_dir))
+            Launch::PerTag(config_gen::per_tag_copies(copier, corpus, lock, config_dir))
         }
-        (
-            Tool::Dregsy | Tool::Regsync | Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras,
-            config_gen::Mode::Prepare,
-        ) => {
+        // Only ocync has a prepare mode, which `ensure_prepare_applies`
+        // refuses every other tool before a run starts.
+        _ => {
             return Err(
                 format!("{tool} syncs from the corpus lock and has no prepare mode").into(),
             );
@@ -1379,20 +1424,12 @@ async fn run_single_tool(
             .await?
         }
         Launch::PerTag(commands) => {
-            // regctl reads its own config before Docker's, so point it at a
-            // file that is never written and `~/.regctl` cannot leak in.
-            let regctl_config = config_dir.join("regctl.json");
-            runner::run_per_tag(
-                tool,
-                &label,
-                commands,
-                &[
-                    ("DOCKER_CONFIG", config_dir.as_os_str()),
-                    ("REGCTL_CONFIG", regctl_config.as_os_str()),
-                ],
-                proxy_url.as_deref(),
-            )
-            .await?
+            let env = per_tag_env(config_dir);
+            let env: Vec<(&str, &OsStr)> = env
+                .iter()
+                .map(|(name, path)| (*name, path.as_os_str()))
+                .collect();
+            runner::run_per_tag(tool, &label, commands, &env, proxy_url.as_deref()).await?
         }
     };
 
@@ -1443,7 +1480,11 @@ async fn run_single_tool(
 
     // Checked last so a source-registry error, which names the cause, is
     // reported first.
-    ensure_exited_zero(&label, pass, result.exit_status)?;
+    ensure_exited_zero(
+        result.failed_copy.as_deref().unwrap_or(&label),
+        pass,
+        result.exit_status,
+    )?;
 
     Ok(ToolRun {
         tool,
@@ -2655,32 +2696,65 @@ mod tests {
     }
 
     #[test]
-    fn a_per_tag_tool_has_no_prepare_mode_and_writes_nothing_before_refusing() {
-        // Catches: a per-tag tool reaching the prepare scenario and being
-        // timed on a dry run it has no equivalent of, and a Docker config
-        // written (with the Docker Hub token) for a pass that never runs.
-        let args = parse_bench(&["--tools", "crane", "prepare"]).unwrap();
+    fn a_file_is_created_with_the_mode_asked_for_and_replaced_whole() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Catches: a file holding the Docker Hub token readable by others, and
+        // a rewrite that leaves the tail of a longer earlier file behind.
         let dir = tempfile::tempdir().unwrap();
-        for tool in [Tool::Skopeo, Tool::Crane, Tool::Regctl, Tool::Oras] {
-            let refused = block_on(run_single_tool(
-                &args,
-                tool,
-                &two_image_corpus(),
-                dir.path(),
-                dir.path(),
-                Pass::Measured(ScenarioKind::Cold),
-                config_gen::Mode::Prepare,
-            ))
-            .err()
-            .map(|e| e.to_string());
+        let path = dir.path().join("config.json");
+        write_file(&path, "{\"longer\":1}", 0o600).unwrap();
+        write_file(&path, "{}", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn per_tag_copies_get_the_docker_config_and_a_regctl_config_that_is_never_written() {
+        // Catches: a variable renamed or pointed at the wrong file, so regctl
+        // reads `~/.regctl` or the tools find no credentials.
+        assert_eq!(
+            per_tag_env(Path::new("/run/dir")),
+            [
+                ("DOCKER_CONFIG", PathBuf::from("/run/dir")),
+                ("REGCTL_CONFIG", PathBuf::from("/run/dir/regctl.json")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_prepare_scenario_is_refused_for_every_tool_but_ocync_by_name() {
+        // Catches: a competitor named beside the prepare scenario being
+        // silently dropped, so the run reads as if it had measured it, and the
+        // refusal reaching the scenarios that do run the other tools.
+        let selection = |tools: &str, scenario: &str| {
+            parse_bench(&["--tools", tools, scenario])
+                .unwrap()
+                .tool_selection
+        };
+        assert_eq!(
+            selection("ocync", "prepare").ensure_prepare_applies(Scenario::Prepare),
+            Ok(())
+        );
+        assert_eq!(
+            selection("ocync,dregsy,crane", "prepare").ensure_prepare_applies(Scenario::Prepare),
+            Err(
+                "the prepare scenario runs ocync alone: drop dregsy, crane from --tools".to_owned()
+            )
+        );
+        for scenario in [
+            Scenario::Sync,
+            Scenario::Partial,
+            Scenario::Scale,
+            Scenario::All,
+        ] {
             assert_eq!(
-                refused,
-                Some(format!(
-                    "{tool} syncs from the corpus lock and has no prepare mode"
-                ))
+                selection("ocync,dregsy,crane", "sync").ensure_prepare_applies(scenario),
+                Ok(()),
+                "{scenario:?}"
             );
         }
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

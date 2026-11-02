@@ -37,6 +37,21 @@ pub(crate) enum Tool {
     Oras,
 }
 
+/// A tool that copies one tag per process, driven by the harness, rather than
+/// reading a config that lists every tag. `skopeo sync` cannot copy
+/// `source@digest` to `target:tag`, so these four are run once per corpus tag.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Copier {
+    /// `skopeo copy`.
+    Skopeo,
+    /// `crane copy`.
+    Crane,
+    /// `regctl image copy`.
+    Regctl,
+    /// `oras cp`.
+    Oras,
+}
+
 /// How many per-tag copies run at once. One, as a user's loop over the tags
 /// would; [`run_per_tag`] runs them one after the other, and the run record
 /// carries this next to ocync's transfer cap so runs under another value are
@@ -57,12 +72,21 @@ impl Tool {
         }
     }
 
-    /// Whether the tool copies one tag per process, driven by the harness,
-    /// rather than reading a config that lists every tag. `skopeo sync` cannot
-    /// copy `source@digest` to `target:tag`, so these four are run once per
-    /// corpus tag.
+    /// How the tool copies one tag per process, `None` for a tool that reads
+    /// a config listing every tag.
+    pub(crate) fn copier(self) -> Option<Copier> {
+        match self {
+            Tool::Skopeo => Some(Copier::Skopeo),
+            Tool::Crane => Some(Copier::Crane),
+            Tool::Regctl => Some(Copier::Regctl),
+            Tool::Oras => Some(Copier::Oras),
+            Tool::Ocync | Tool::OcyncBaseline | Tool::Dregsy | Tool::Regsync => None,
+        }
+    }
+
+    /// Whether the tool copies one tag per process, see [`Copier`].
     pub(crate) fn is_per_tag(self) -> bool {
-        matches!(self, Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras)
+        self.copier().is_some()
     }
 
     /// Whether the tool is an ocync build, run with the same config and
@@ -104,6 +128,9 @@ pub(crate) struct RunResult {
     pub(crate) peak_rss_kb: Option<u64>,
     /// Path to ocync's timing JSONL file (only set for ocync runs).
     pub(crate) timing_path: Option<PathBuf>,
+    /// The copy that ended a per-tag pass, `label n/total target`, when it did
+    /// not exit zero.
+    pub(crate) failed_copy: Option<String>,
 }
 
 /// Prefix of a recorded version where none could be determined.
@@ -244,7 +271,7 @@ fn first_line<'a>(primary: &'a str, fallback: &'a str) -> Option<&'a str> {
 /// What a binary prints as its version when it was built without one, which
 /// names no release: crane's two fallbacks. Whole lines only, so a real
 /// version that contains these words is kept.
-const VERSION_PLACEHOLDERS: [&str; 2] = ["could not determine build information", "(devel)"];
+const VERSION_PLACEHOLDERS: [&str; 2] = ["could not determine build information", DEVEL_VERSION];
 
 /// Extracts a single-line version string from a completed version probe.
 ///
@@ -707,17 +734,16 @@ pub(crate) async fn run_tool(
     dry_run: bool,
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
+    if tool.copier().is_some() {
+        return Err(format!(
+            "{tool} copies one tag per process: use run_per_tag"
+        ));
+    }
     let mut args: Vec<&str> = match tool {
-        Tool::Ocync | Tool::OcyncBaseline => {
-            vec!["sync", "--config", &config_str, "--json", "-v"]
-        }
         Tool::Dregsy => vec!["-config", &config_str],
         Tool::Regsync => vec!["once", "-c", &config_str],
-        Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras => {
-            return Err(format!(
-                "{tool} copies one tag per process: use run_per_tag"
-            ));
-        }
+        // What is left is an ocync build.
+        _ => vec!["sync", "--config", &config_str, "--json", "-v"],
     };
     // Only ocync has a mode that resolves every mapping and then stops, which
     // is what isolates the prepare phase. The scenario that asks for it runs
@@ -749,7 +775,7 @@ pub(crate) async fn run_tool(
         .iter()
         .map(|path| ("OCYNC_TIMING_FILE", path.as_os_str()))
         .collect();
-    let result = spawn_streamed(tool, label, &binary, &args, proxy_url, &env).await?;
+    let result = spawn_streamed(tool, label, OsStr::new(&*binary), &args, proxy_url, &env).await?;
     Ok(RunResult {
         timing_path,
         ..result
@@ -768,8 +794,9 @@ fn target_of(command: &[String]) -> &str {
 /// One wall clock covers the whole loop and the peak RSS is the largest of the
 /// children, since each is its own process. The loop stops at the first child
 /// that does not exit zero and returns that child's status, its stderr printed
-/// under `label n/total` and the target reference, so a pass that did less work
-/// is never timed as if it had done it all. `env` is set on every child beside
+/// and its name in [`RunResult::failed_copy`], both as `label n/total` and the
+/// target reference, so a pass that did less work is never timed as if it had
+/// done it all. `env` is set on every child beside
 /// `HTTPS_PROXY`.
 pub(crate) async fn run_per_tag(
     tool: Tool,
@@ -778,10 +805,17 @@ pub(crate) async fn run_per_tag(
     env: &[(&str, &OsStr)],
     proxy_url: Option<&str>,
 ) -> Result<RunResult, String> {
+    const {
+        assert!(
+            PER_TAG_JOBS.get() == 1,
+            "run_per_tag runs copies one at a time"
+        )
+    };
     let binary = tool_path(tool, Path::new("."));
     let start = Instant::now();
     let mut status = ExitStatus::from_raw(0);
     let mut peak_rss_kb = None;
+    let mut failed_copy = None;
     for (index, command) in commands.iter().enumerate() {
         let child_label = format!(
             "{label} {}/{} {}",
@@ -790,10 +824,19 @@ pub(crate) async fn run_per_tag(
             target_of(command)
         );
         let args: Vec<&str> = command.iter().map(String::as_str).collect();
-        let child = spawn_streamed(tool, &child_label, &binary, &args, proxy_url, env).await?;
+        let child = spawn_streamed(
+            tool,
+            &child_label,
+            OsStr::new(&*binary),
+            &args,
+            proxy_url,
+            env,
+        )
+        .await?;
         status = child.exit_status;
         peak_rss_kb = peak_rss_kb.max(child.peak_rss_kb);
         if !status.success() {
+            failed_copy = Some(child_label);
             break;
         }
     }
@@ -802,6 +845,7 @@ pub(crate) async fn run_per_tag(
         exit_status: status,
         peak_rss_kb,
         timing_path: None,
+        failed_copy,
     })
 }
 
@@ -813,7 +857,7 @@ pub(crate) async fn run_per_tag(
 async fn spawn_streamed(
     tool: Tool,
     label: &str,
-    binary: &str,
+    binary: &OsStr,
     args: &[&str],
     proxy_url: Option<&str>,
     env: &[(&str, &OsStr)],
@@ -825,8 +869,8 @@ async fn spawn_streamed(
     // line has a distinctive prefix we can parse.
     let use_gnu_time = Path::new("/usr/bin/time").exists();
     let mut cmd = if use_gnu_time {
-        let mut time_args = vec!["-v", binary];
-        time_args.extend(args.iter().copied());
+        let mut time_args = vec![OsStr::new("-v"), binary];
+        time_args.extend(args.iter().map(OsStr::new));
         let mut c = tokio::process::Command::new("/usr/bin/time");
         c.args(&time_args);
         c
@@ -910,6 +954,7 @@ async fn spawn_streamed(
         exit_status: status,
         peak_rss_kb,
         timing_path: None,
+        failed_copy: None,
     })
 }
 
@@ -1422,23 +1467,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_the_four_copy_tools_run_a_process_per_tag() {
-        // Catches: a per-tag tool handed a config it does not read, and a
-        // config tool counted as a per-tag one in the run record.
-        for tool in [Tool::Skopeo, Tool::Crane, Tool::Regctl, Tool::Oras] {
-            assert!(tool.is_per_tag(), "{tool}");
-        }
-        for tool in [
-            Tool::Ocync,
-            Tool::OcyncBaseline,
-            Tool::Dregsy,
-            Tool::Regsync,
-        ] {
-            assert!(!tool.is_per_tag(), "{tool}");
-        }
-    }
-
     /// Runs `commands` of the stub `crane` that appends `HTTPS_PROXY`,
     /// `DOCKER_CONFIG` and its arguments to a log, reports the first argument
     /// as its peak RSS and fails on a second argument starting with `fail`.
@@ -1501,14 +1529,16 @@ mod tests {
             ]
         );
         assert!(result.exit_status.success());
+        assert_eq!(result.failed_copy, None);
         assert_eq!(result.peak_rss_kb, Some(300));
     }
 
     #[test]
     fn a_failing_copy_fails_the_pass_and_the_copies_after_it_never_run() {
         // Catches: the loop going on after a failure, so a pass that did less
-        // work is timed and compared as if it had done it all, and a failure
-        // reported as the last child's success.
+        // work is timed and compared as if it had done it all, a failure
+        // reported as the last child's success, and an error that names only
+        // the tool, not which copy of how many.
         let (result, log) = run_stub_crane(&[&["100", "a:1"], &["300", "fail:2"], &["200", "c:3"]]);
         assert_eq!(
             log,
@@ -1518,6 +1548,7 @@ mod tests {
             ]
         );
         assert_eq!(result.exit_status.code(), Some(3));
+        assert_eq!(result.failed_copy.as_deref(), Some("crane 2/3 fail:2"));
     }
 
     #[test]

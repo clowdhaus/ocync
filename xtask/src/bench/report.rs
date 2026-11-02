@@ -621,11 +621,13 @@ impl BenchReport {
             .then(|| effective_transfer_cap(self.max_concurrent_transfers))
     }
 
-    /// How many copies the per-tag tools ran at once. `None` when none ran.
+    /// How many copies the per-tag tools ran at once. `None` when none ran,
+    /// however many were asked for.
     fn per_tag_jobs(&self) -> Option<NonZeroUsize> {
-        self.tool_versions
-            .keys()
-            .any(|tool| tool.is_per_tag())
+        self.scenarios
+            .iter()
+            .flat_map(|scenario| &scenario.runs)
+            .any(|run| run.tool.is_per_tag())
             .then_some(PER_TAG_JOBS)
     }
 
@@ -706,9 +708,9 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 /// tool issued referrer calls in any round.
 ///
 /// ocync issues `GET /v2/<repo>/referrers/...` to discover artifact
-/// attestations (SBOM, SLSA) and transfers any referenced artifacts. The other
-/// tools copy no referrers as configured here (regctl and oras can, and run
-/// with it off). The footnote
+/// attestations (SBOM, SLSA) and transfers any referenced artifacts, as does
+/// the ocync baseline build. The footnote names the other tools, which copy no
+/// referrers as configured here (regctl and oras can, and run with it off), and
 /// surfaces the per-tool count, the median over the rounds, so the Source blob
 /// GETs / Source blob bytes columns are not read as a fairness violation.
 ///
@@ -729,12 +731,28 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     if !calls.iter().any(|(_, n)| *n > 0) {
         return None;
     }
+    let without: Vec<String> = calls
+        .iter()
+        .filter(|(tool, _)| !tool.is_ocync())
+        .map(|&(tool, _)| report.label(tool))
+        .collect();
     let mut out = String::new();
     out.push('\n');
     out.push_str("> **Artifact sync (OCI 1.1 referrers).** ");
     out.push_str("ocync issues `GET /v2/<repo>/referrers/...` to discover ");
     out.push_str("attestations (SBOM, SLSA) and transfers any referenced ");
-    out.push_str("artifacts. The other tools copy no referrers as configured here. The ");
+    out.push_str("artifacts. ");
+    if let Some((last, rest)) = without.split_last() {
+        let named = if rest.is_empty() {
+            last.to_string()
+        } else {
+            format!("{} and {last}", rest.join(", "))
+        };
+        out.push_str(&format!(
+            "Referrers are not copied by {named} as configured here. "
+        ));
+    }
+    out.push_str("The ");
     out.push_str("Source blob GETs and Source blob bytes columns above include ");
     out.push_str("this artifact content for ocync.\n>\n> ");
     let parts: Vec<String> = calls
@@ -895,6 +913,11 @@ struct MetricRow {
     verdict_words: Option<[&'static str; 2]>,
 }
 
+/// The label of the Peak RSS row, whose cells for the per-tag tools are the
+/// largest of many processes and so do not compare with the others' whole-run
+/// peaks.
+const PEAK_RSS_LABEL: &str = "Peak RSS";
+
 fn count(n: u64) -> String {
     n.to_string()
 }
@@ -914,7 +937,7 @@ fn metric_rows() -> [MetricRow; 10] {
             verdict_words: Some(["faster", "slower"]),
         },
         MetricRow {
-            label: "Peak RSS",
+            label: PEAK_RSS_LABEL,
             rank: |r| r.peak_rss_kb,
             of: None,
             format: |kb| format_bytes(kb * 1024),
@@ -1058,7 +1081,8 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
 /// Renders a metric comparison table into `out`.
 ///
 /// Columns are tool names, rows are metrics. The best value per row is bolded
-/// when more than one tool has data for that metric, see [`is_bold`].
+/// when more than one tool has data for that metric, see [`is_bold`]. The Peak
+/// RSS row bolds nothing when a per-tag tool is a column.
 fn render_metric_table(
     report: &BenchReport,
     columns: &[Tool],
@@ -1076,7 +1100,9 @@ fn render_metric_table(
     }
     out.push('\n');
 
+    let per_process_peaks = columns.iter().any(|tool| tool.is_per_tag());
     for row in &metric_rows() {
+        let comparable = !(per_process_peaks && row.label == PEAK_RSS_LABEL);
         let cells: Vec<Option<Cell>> = columns
             .iter()
             .map(|col| by_tool.get(col).and_then(|runs| cell(row, runs)))
@@ -1085,7 +1111,7 @@ fn render_metric_table(
         out.push_str(&format!("| {} |", row.label));
         for cell in &cells {
             match cell {
-                Some(cell) if is_bold(row, cell, &cells) => {
+                Some(cell) if comparable && is_bold(row, cell, &cells) => {
                     out.push_str(&format!(" **{}** |", cell.text));
                 }
                 Some(cell) => out.push_str(&format!(" {} |", cell.text)),
@@ -1897,9 +1923,14 @@ pub(crate) mod tests {
         );
         assert!(!summary_markdown(&report).contains("per process"));
 
+        // Requested and probed but never run: nothing was measured at any count.
         let mut report = sample_report();
         for tool in [Tool::Crane, Tool::Oras] {
             report.tool_versions.insert(tool, "v1".to_owned());
+        }
+        assert_eq!(report.per_tag_jobs(), None);
+
+        for tool in [Tool::Crane, Tool::Oras] {
             report.scenarios[0].runs.push(ToolRun {
                 tool,
                 wall_clock_secs: 1.0,
@@ -2714,7 +2745,7 @@ pub(crate) mod tests {
             "footnote missing from summary.md:\n{md}"
         );
         assert!(
-            md.contains("The other tools copy no referrers as configured here."),
+            md.contains("Referrers are not copied by dregsy and regsync as configured here."),
             "{md}"
         );
         assert!(!md.contains("do not implement"), "{md}");
@@ -3042,6 +3073,53 @@ pub(crate) mod tests {
         );
         assert!(md.contains("**24s (20s..29s)**"), "{md}");
         assert!(!md.contains("Per-round ratio"), "{md}");
+    }
+
+    #[test]
+    fn peak_rss_names_no_winner_beside_a_per_process_peak() {
+        // Catches: crane's largest single process bolded against ocync's whole
+        // run, which reads as a memory win it did not have; and the rule
+        // spreading to a table of whole-run peaks.
+        let run = |tool, peak_rss_kb| ToolRun {
+            tool,
+            wall_clock_secs: 1.0,
+            peak_rss_kb: Some(peak_rss_kb),
+            proxy_metrics: None,
+            phase_timing_ms: BTreeMap::new(),
+        };
+        let report = sample_report();
+        let rss_row = |tools: &[(Tool, u64)]| {
+            let runs: Vec<ToolRun> = tools.iter().map(|&(t, kb)| run(t, kb)).collect();
+            let columns: Vec<Tool> = tools.iter().map(|&(t, _)| t).collect();
+            let by_tool = runs.iter().map(|r| (r.tool, vec![r])).collect();
+            let mut out = String::new();
+            render_metric_table(&report, &columns, &by_tool, &mut out);
+            out.lines()
+                .find(|line| line.starts_with("| Peak RSS |"))
+                .unwrap()
+                .to_owned()
+        };
+
+        assert_eq!(
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Crane, 40_000)]),
+            "| Peak RSS | 61.4 MB | 41.0 MB |"
+        );
+        assert_eq!(
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)]),
+            "| Peak RSS | **61.4 MB** | 307.2 MB |"
+        );
+    }
+
+    #[test]
+    fn the_referrer_footnote_names_the_tools_that_copy_none_and_not_the_baseline() {
+        // Catches: "the other tools" covering the ocync baseline, which issues
+        // referrer calls, and the baseline named as a tool that copies none.
+        let md = summary_markdown(&five_rounds(5));
+        assert!(
+            md.contains("Referrers are not copied by dregsy and regsync as configured here."),
+            "{md}"
+        );
+        assert!(!md.contains("The other tools"), "{md}");
     }
 
     #[test]

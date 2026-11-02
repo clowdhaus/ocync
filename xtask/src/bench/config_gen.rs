@@ -9,9 +9,9 @@ use std::path::Path;
 use ocync_distribution::Digest;
 
 use crate::bench::RegistryKind;
-use crate::bench::corpus::{Corpus, ImageEntry};
+use crate::bench::corpus::{Corpus, DockerHubAuth, ImageEntry};
 use crate::bench::lock::Lock;
-use crate::bench::runner::Tool;
+use crate::bench::runner::Copier;
 use crate::bench::skopeo_shim::PRESERVE_DIGESTS;
 use crate::bench::target::Kind;
 
@@ -32,6 +32,12 @@ fn locked_digest<'a>(lock: &'a Lock, source: &str, tag: &str) -> &'a Digest {
         .entry(source, tag)
         .expect("ensure_served refuses a ref the lock lacks")
         .digest
+}
+
+/// The `user:token` Docker Hub credentials, base64-encoded as dregsy's `auth`
+/// field and a Docker config's `auth` both take them.
+fn docker_hub_basic_auth(auth: &DockerHubAuth) -> String {
+    base64_encode(&format!("{}:{}", auth.username, auth.token))
 }
 
 /// Base64-encode a byte slice using the standard alphabet with padding.
@@ -215,7 +221,7 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> Stri
         // Docker Hub: inject base64-encoded auth to avoid 10 pulls/hr anonymous limit.
         if *registry == "docker.io" {
             if let Some(auth) = &corpus.dockerhub_auth {
-                let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
+                let encoded = docker_hub_basic_auth(auth);
                 out.push_str(&format!("      auth: {encoded}\n"));
             }
         }
@@ -334,7 +340,7 @@ const DOCKER_HUB_AUTH_KEY: &str = "https://index.docker.io/v1/";
 pub(crate) fn docker_config(corpus: &Corpus) -> String {
     let mut config = serde_json::Map::new();
     if let Some(auth) = &corpus.dockerhub_auth {
-        let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
+        let encoded = docker_hub_basic_auth(auth);
         config.insert(
             "auths".to_owned(),
             serde_json::json!({ DOCKER_HUB_AUTH_KEY: { "auth": encoded } }),
@@ -355,12 +361,8 @@ pub(crate) fn docker_config(corpus: &Corpus) -> String {
 ///
 /// Platform, referrer, digest-tag and fast flags are never passed: each copies
 /// every platform and, as configured here, no referrers.
-///
-/// # Panics
-///
-/// If `tool` is not a per-tag tool.
 pub(crate) fn per_tag_copies(
-    tool: Tool,
+    copier: Copier,
     corpus: &Corpus,
     lock: &Lock,
     config_dir: &Path,
@@ -372,8 +374,8 @@ pub(crate) fn per_tag_copies(
         for tag in &img.tags {
             let source = format!("{}@{}", img.source, locked_digest(lock, &img.source, tag));
             let target = format!("{target_ref}:{tag}");
-            let args = match tool {
-                Tool::Skopeo => vec![
+            let args = match copier {
+                Copier::Skopeo => vec![
                     "--insecure-policy".to_owned(),
                     "copy".to_owned(),
                     PRESERVE_DIGESTS.to_owned(),
@@ -384,10 +386,9 @@ pub(crate) fn per_tag_copies(
                     format!("docker://{source}"),
                     format!("docker://{target}"),
                 ],
-                Tool::Crane => vec!["copy".to_owned(), source, target],
-                Tool::Regctl => vec!["image".to_owned(), "copy".to_owned(), source, target],
-                Tool::Oras => vec!["cp".to_owned(), source, target],
-                _ => panic!("{tool} is not a per-tag tool"),
+                Copier::Crane => vec!["copy".to_owned(), source, target],
+                Copier::Regctl => vec!["image".to_owned(), "copy".to_owned(), source, target],
+                Copier::Oras => vec!["cp".to_owned(), source, target],
             };
             copies.push(args);
         }
@@ -821,7 +822,7 @@ sync:
         // target without the tag or in another repository, tags out of corpus
         // order, and a flag that narrows or widens what the other tools copy.
         let (corpus, lock) = (test_corpus(), test_lock());
-        let copies = |tool| per_tag_copies(tool, &corpus, &lock, Path::new("/run/dir"));
+        let copies = |copier| per_tag_copies(copier, &corpus, &lock, Path::new("/run/dir"));
         let (static_src, alpine_320_src, alpine_latest_src) = (
             "cgr.dev/chainguard/static@sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "docker.io/library/alpine@sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -861,32 +862,19 @@ sync:
             (alpine_latest_src, alpine_latest_tgt),
         ];
         assert_eq!(
-            copies(Tool::Skopeo),
+            copies(Copier::Skopeo),
             pairs.map(|(src, tgt)| skopeo(src, tgt))
         );
-        for (tool, head) in [
-            (Tool::Crane, &["copy"][..]),
-            (Tool::Regctl, &["image", "copy"][..]),
-            (Tool::Oras, &["cp"][..]),
+        for (copier, head) in [
+            (Copier::Crane, &["copy"][..]),
+            (Copier::Regctl, &["image", "copy"][..]),
+            (Copier::Oras, &["cp"][..]),
         ] {
             assert_eq!(
-                copies(tool),
+                copies(copier),
                 pairs.map(|(src, tgt)| plain(head, src, tgt)),
-                "{tool}"
+                "{copier:?}"
             );
-        }
-        for tool in [Tool::Skopeo, Tool::Crane, Tool::Regctl, Tool::Oras] {
-            let args = copies(tool).concat();
-            for flag in [
-                "--platform",
-                "--referrers",
-                "-r",
-                "--digest-tags",
-                "--fast",
-                "--all",
-            ] {
-                assert!(!args.iter().any(|a| a == flag), "{tool} passes {flag}");
-            }
         }
     }
 

@@ -191,9 +191,10 @@ echo "--- Installing regctl"
 retry "regctl install" go install github.com/regclient/regclient/cmd/regctl@latest
 cp /root/go/bin/regctl /usr/local/bin/regctl
 
-# sed, not head: head exits at the first line and would SIGPIPE regctl under
-# pipefail.
-REGCTL_VERSION_LINE="$(regctl version | sed -n 1p)"
+# awk, not head or sed q: they exit at the first line and would SIGPIPE regctl
+# under pipefail. The first non-blank line, since regctl's version template
+# starts blank.
+REGCTL_VERSION_LINE="$(regctl version | awk 'NF && !seen { print; seen = 1 }')"
 echo "regctl: $${REGCTL_VERSION_LINE}"
 
 # ── oras ──────────────────────────────────────────────────────────────────────
