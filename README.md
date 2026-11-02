@@ -3,7 +3,7 @@
 Sync OCI container images across registries - efficiently.
 
 <p align="center">
-  <img src="docs/public/ecr-banner.svg" alt="ocync - 2.9x faster than regsync in a cold sync to ECR, with 25% fewer requests, adaptive rate control" width="900">
+  <img src="docs/public/ecr-banner.svg" alt="ocync - 3x faster than regsync with 15% fewer bytes, 23% fewer requests, adaptive rate control" width="900">
 </p>
 
 [![CI](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml/badge.svg)](https://github.com/clowdhaus/ocync/actions/workflows/ci.yml)
