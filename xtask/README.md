@@ -32,6 +32,7 @@ A run already in progress on the instance, including one still checking out or b
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
 | `--target` | `ecr`, `artifact-registry`, `acr` | `ecr` | Registry the instance syncs into. `artifact-registry` needs `bench/terraform/gcp` applied and `gcloud` signed in on this machine; `acr` needs `bench/terraform/azure` applied (and the AWS stack's token issuer) and `az` signed in on this machine. Both run the `sync` scenario with one ocync tool, and refuse `--regression`. Each round syncs into repositories of its own, which `bench-remote` deletes when the run ends: Artifact Registry's are made first with `gcloud`, ACR's are created by the first push, under `ocync-bench-run-<run timestamp>-r<round>/`, and deleted with `az`. The instance signs in to ACR as the Entra app through a token from `aws sts get-web-identity-token`, refreshed every 30 minutes |
+| `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML, passed to `bench` only when it is not the default. Each corpus has its own lock, baseline and target prefix; only the default one writes `docs/src/content/performance.md`. Conflicts with `--fetch` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
 | `--tools` | string | `ocync` | Tools to benchmark |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios (see [Rounds](#rounds-and-the-baseline-build)) |
@@ -59,7 +60,7 @@ cargo xtask bench-lock
 | `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML |
 | `--partial-overrides` | path | `bench/corpus-partial-overrides.yaml` | Partial sync tag overrides, locked too |
 
-Re-running over unchanged sources leaves the file as it is. A new lock starts a new comparison series: run records carry its `locked_at` as `corpus_locked_at`. Records of runs that synced locked digests also carry `sync_from: digest`; `--regression` refuses a baseline recorded without it, so delete `bench/results/baseline.json` to record a new one.
+Re-running over unchanged sources leaves the file as it is. A new lock starts a new comparison series: run records carry its `locked_at` as `corpus_locked_at`. Records of runs that synced locked digests also carry `sync_from: digest`; `--regression` refuses a baseline recorded without it, so delete the baseline (`bench/results/baseline.json`, or `bench/results/baseline-<name>.json` for a corpus other than `corpus.yaml`) to record a new one.
 
 ### `cargo xtask bench`
 

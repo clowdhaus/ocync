@@ -1,16 +1,23 @@
 //! YAML corpus config parsing with environment variable expansion.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::Deserialize;
+
+/// The main corpus file, which `bench-remote` leaves to the instance's own default.
+pub(crate) const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
+
+/// The stem of the main corpus file, which carries no name in a run record.
+const MAIN_CORPUS_STEM: &str = "corpus";
 
 /// Where the corpus and its partial-sync overrides are read from, shared by
 /// `bench` and `bench-lock`.
 #[derive(Args)]
 pub(crate) struct CorpusPaths {
     /// Path to corpus YAML file. Its lock is the `.lock.json` beside it.
-    #[arg(long, default_value = "bench/corpus.yaml")]
+    #[arg(long, default_value = DEFAULT_CORPUS)]
     corpus: String,
 
     /// Path to partial sync overrides YAML, applied on top of the corpus for
@@ -34,6 +41,13 @@ impl CorpusPaths {
     /// `bench/corpus.lock.json`.
     pub(crate) fn lock_path(&self) -> PathBuf {
         PathBuf::from(&self.corpus).with_extension("lock.json")
+    }
+
+    /// The corpus file's stem, which names its lock, baseline and records;
+    /// `None` for the main corpus, whose stem is [`MAIN_CORPUS_STEM`].
+    pub(crate) fn corpus_name(&self) -> Option<String> {
+        let stem = Path::new(&self.corpus).file_stem()?.to_str()?;
+        (stem != MAIN_CORPUS_STEM).then(|| stem.to_owned())
     }
 }
 
@@ -219,7 +233,20 @@ fn validate(corpus: &Corpus) -> Result<(), String> {
     if corpus.settings.target_prefix.is_empty() {
         return Err("corpus target_prefix must not be empty".into());
     }
-    validate_images(&corpus.images)
+    validate_images(&corpus.images)?;
+    // Two sources sharing a target repository would sync into, reset and verify
+    // one repository as if it were two.
+    let mut sources_by_repo = BTreeMap::new();
+    for img in &corpus.images {
+        let repo = corpus.target_repo(&img.source);
+        if let Some(first) = sources_by_repo.insert(repo.clone(), &img.source) {
+            return Err(format!(
+                "corpus sources {first} and {} both map to target repository {repo}",
+                img.source
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates that there are images and that each names a tag.
@@ -273,6 +300,8 @@ fn expand_env_vars(input: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn sample_yaml() -> &'static str {
@@ -308,6 +337,23 @@ images:
                 partial_overrides: String::new(),
             };
             assert_eq!(paths.lock_path(), PathBuf::from(want), "{corpus}");
+        }
+    }
+
+    #[test]
+    fn a_corpus_is_named_by_its_file_stem_and_the_main_corpus_by_none() {
+        // Catches: a shape corpus's records, baseline and refusals carrying no
+        // name, and the main corpus gaining one.
+        for (corpus, want) in [
+            (DEFAULT_CORPUS, None),
+            ("bench/corpus-small.yaml", Some("corpus-small")),
+            ("elsewhere/corpus.yml", None),
+        ] {
+            let paths = CorpusPaths {
+                corpus: corpus.into(),
+                partial_overrides: String::new(),
+            };
+            assert_eq!(paths.corpus_name().as_deref(), want, "{corpus}");
         }
     }
 
@@ -424,6 +470,21 @@ images:
     tags: []
 "#,
                 "corpus image 0 (cgr.dev/chainguard/static) has no tags",
+            ),
+            (
+                "two sources flatten to one target repository",
+                r#"
+corpus:
+  target_registry: "123.dkr.ecr.us-east-1.amazonaws.com"
+  target_prefix: "bench"
+images:
+  - source: "docker.io/nvidia/cuda"
+    tags: ["12.6.2-base-ubuntu22.04"]
+  - source: "nvcr.io/nvidia/cuda"
+    tags: ["13.4.3-base-ubuntu24.04"]
+"#,
+                "corpus sources docker.io/nvidia/cuda and nvcr.io/nvidia/cuda both map to \
+                 target repository bench/nvidia-cuda",
             ),
         ] {
             let corpus: Corpus = serde_yaml::from_str(yaml).unwrap();
@@ -596,6 +657,58 @@ images:
             "every prepare-corpus tag must be a wildcard or the tag listing is \
              never issued; these are literals: {literal:?}"
         );
+    }
+
+    /// The path of a tracked file under `bench/`, from the workspace root or
+    /// from `xtask/`.
+    fn tracked(file: &str) -> String {
+        let from_xtask = format!("../bench/{file}");
+        if Path::new(&from_xtask).exists() {
+            from_xtask
+        } else {
+            format!("bench/{file}")
+        }
+    }
+
+    #[test]
+    fn the_shape_corpora_are_locked_off_docker_hub_and_apart_from_the_main_one() {
+        // Catches: a shape corpus edited without re-locking, so its first run
+        // is refused; a Docker Hub source spending its pull budget; and a
+        // prefix shared with another corpus, which would reset its
+        // repositories.
+        unsafe { std::env::set_var(crate::bench::target::ENV_REGISTRY, "example.invalid") };
+        load(&tracked("corpus.yaml")).expect("the main corpus has no repeated target repository");
+        let mut prefixes = BTreeSet::from(["bench".to_owned()]);
+        for name in ["corpus-small", "corpus-large"] {
+            let corpus = load(&tracked(&format!("{name}.yaml"))).expect("the corpus parses");
+            let lock =
+                crate::bench::lock::Lock::load(Path::new(&tracked(&format!("{name}.lock.json"))))
+                    .expect("the lock parses");
+
+            let unlocked: Vec<String> = crate::bench::lock::refs_of(&corpus.images)
+                .into_iter()
+                .filter(|image| lock.entry(&image.source, &image.tag).is_err())
+                .map(|image| image.to_string())
+                .collect();
+            assert!(unlocked.is_empty(), "{name}: not in its lock: {unlocked:?}");
+
+            let hub: Vec<&str> = corpus
+                .images
+                .iter()
+                .map(|img| img.source.as_str())
+                .filter(|source| {
+                    crate::bench::registry::split_source(source)
+                        .is_some_and(|repo| repo.host == crate::bench::registry::Host::DockerHub)
+                })
+                .collect();
+            assert!(hub.is_empty(), "{name}: Docker Hub sources: {hub:?}");
+
+            assert!(
+                prefixes.insert(corpus.settings.target_prefix.clone()),
+                "{name}: prefix {} is another corpus's",
+                corpus.settings.target_prefix
+            );
+        }
     }
 
     #[test]

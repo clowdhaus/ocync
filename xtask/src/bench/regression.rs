@@ -67,8 +67,8 @@ pub(crate) struct RegressionResult {
     pub(crate) regressed: bool,
 }
 
-/// Refuses when `current` and `baseline` were recorded under different corpus
-/// locks, the baseline under none, from different sources (a tag or its locked
+/// Refuses when `current` and `baseline` were recorded for different corpora,
+/// under different corpus locks, the baseline under none, from different sources (a tag or its locked
 /// digest), or over a different number of images or
 /// tags: they synced different content, so a delta is not a regression. Refuses
 /// a different cap on concurrent transfers or number of rounds too.
@@ -85,13 +85,15 @@ pub(crate) fn ensure_comparable(
         return Err(refusal(
             baseline_path,
             &format!(
-                "under corpus lock {} over {} images and {} tags",
+                "for {} under corpus lock {} over {} images and {} tags",
+                baseline.corpus.label(),
                 show(&baseline.corpus_locked_at),
                 baseline.corpus.images,
                 baseline.corpus.tags
             ),
             &format!(
-                "under {} over {} images and {} tags",
+                "for {} under {} over {} images and {} tags",
+                current.corpus.label(),
                 show(&current.corpus_locked_at),
                 current.corpus.images,
                 current.corpus.tags
@@ -279,6 +281,7 @@ mod tests {
             corpus_locked_at: None,
             sync_from: None,
             corpus: CorpusInfo {
+                name: None,
                 images: 40,
                 tags: 55,
             },
@@ -403,6 +406,7 @@ mod tests {
             corpus_locked_at: Some(locked_at("2026-10-30-214340")),
             sync_from: Some(SyncFrom::Digest),
             corpus: CorpusInfo {
+                name: None,
                 images: 40,
                 tags: 55,
             },
@@ -430,6 +434,7 @@ mod tests {
         // regression, and a refusal that does not say which file to replace.
         let this_run = Some(locked_at("2026-10-30-214340"));
         let full = CorpusInfo {
+            name: None,
             images: 40,
             tags: 55,
         };
@@ -438,6 +443,7 @@ mod tests {
             (
                 Some(locked_at("2026-09-01-000000")),
                 CorpusInfo {
+                    name: None,
                     images: 40,
                     tags: 55,
                 },
@@ -446,6 +452,7 @@ mod tests {
             (
                 None,
                 CorpusInfo {
+                    name: None,
                     images: 40,
                     tags: 55,
                 },
@@ -453,7 +460,11 @@ mod tests {
             ),
             (
                 Some(locked_at("2026-10-30-214340")),
-                CorpusInfo { images: 5, tags: 5 },
+                CorpusInfo {
+                    name: None,
+                    images: 5,
+                    tags: 5,
+                },
                 false,
             ),
         ];
@@ -479,6 +490,40 @@ mod tests {
                 assert!(e.contains("deleting results/b.json"), "{e}");
             }
         }
+    }
+
+    #[test]
+    fn a_named_corpus_is_not_compared_with_the_main_corpus() {
+        // Catches: a small-corpus run judged against the main corpus's
+        // baseline, and a refusal that does not name both corpora.
+        let named = |name: Option<&str>| Baseline {
+            corpus: CorpusInfo {
+                name: name.map(str::to_owned),
+                images: 40,
+                tags: 55,
+            },
+            ..baseline(1.0, 1, 1)
+        };
+        let refused = ensure_comparable(
+            &named(Some("corpus-small")),
+            &named(None),
+            Path::new("results/b.json"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            "results/b.json was recorded for the main corpus under corpus lock (none) over 40 \
+             images and 55 tags, this run for corpus-small under (none) over 40 images and 55 \
+             tags; record a new baseline by deleting results/b.json and rerunning"
+        );
+        assert_eq!(
+            ensure_comparable(
+                &named(Some("corpus-small")),
+                &named(Some("corpus-small")),
+                Path::new("b")
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -530,7 +575,11 @@ mod tests {
         let path = dir.path().join("baseline.json");
         let key = |cap: usize, images: usize| Baseline {
             max_concurrent_transfers: NonZeroUsize::new(cap),
-            corpus: CorpusInfo { images, tags: 55 },
+            corpus: CorpusInfo {
+                name: None,
+                images,
+                tags: 55,
+            },
             ..baseline(0.0, 0, 0)
         };
 
@@ -549,8 +598,9 @@ mod tests {
         assert_eq!(
             ensure_baseline_comparable(&path, &key(10, 3)),
             Err(format!(
-                "{shown} was recorded under corpus lock (none) over 40 images and 55 tags, \
-                 this run under (none) over 3 images and 55 tags; record a new baseline by \
+                "{shown} was recorded for the main corpus under corpus lock (none) over 40 \
+                 images and 55 tags, this run for the main corpus under (none) over 3 images \
+                 and 55 tags; record a new baseline by \
                  deleting {shown} and rerunning"
             ))
         );

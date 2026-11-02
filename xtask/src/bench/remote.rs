@@ -15,6 +15,7 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::acr::ENV_TOKEN_FILE;
+use super::corpus::DEFAULT_CORPUS;
 use super::gar::ENV_CREDENTIALS;
 use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
@@ -72,6 +73,11 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: Kind,
 
+    /// Corpus YAML the instance syncs, passed through to `cargo xtask bench`
+    /// only when it is not the default. Its lock is the `.lock.json` beside it.
+    #[arg(long, default_value = DEFAULT_CORPUS)]
+    pub(crate) corpus: String,
+
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
     /// started; before that they are the previous run's. Conflicts with every
@@ -82,6 +88,7 @@ pub(crate) struct BenchRemoteArgs {
             "force",
             "git_ref",
             "target",
+            "corpus",
             "tools",
             "baseline_ref",
             "rounds",
@@ -392,6 +399,10 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     // `--git-ref` whose `bench` has no such option.
     if args.target != Kind::Ecr {
         bench_args.extend(["--target".to_string(), value_name(&args.target)]);
+    }
+    // Only for another corpus, for the same reason.
+    if args.corpus != DEFAULT_CORPUS {
+        bench_args.extend(["--corpus".to_string(), args.corpus.clone()]);
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
@@ -1330,6 +1341,7 @@ mod tests {
             &["--force"][..],
             &["--git-ref", "main"][..],
             &["--target", "ecr"][..],
+            &["--corpus", "bench/corpus-small.yaml"][..],
             &["--tools", "ocync"][..],
             &["--rounds", "3"][..],
             &["--max-concurrent-transfers", "20"][..],
@@ -1554,6 +1566,30 @@ mod tests {
             (true, Kind::ArtifactRegistry)
         );
         assert_eq!(passed(&["--target", "acr"]), (true, Kind::Acr));
+    }
+
+    #[test]
+    fn a_corpus_reaches_the_benchmark_only_when_it_is_not_the_default() {
+        // Catches: a shape corpus run on the instance against the main corpus,
+        // and an option a `--git-ref` older than it does not know sent on
+        // every run.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            bench_args(&args, &timestamp)
+        };
+        assert!(!passed(&[]).contains(&"--corpus".to_owned()));
+        assert!(!passed(&["--corpus", "bench/corpus.yaml"]).contains(&"--corpus".to_owned()));
+        let small = passed(&["--corpus", "bench/corpus-small.yaml"]);
+        let at = small.iter().position(|a| a == "--corpus").unwrap();
+        assert_eq!(small[at + 1], "bench/corpus-small.yaml");
+        let argv: Vec<&str> = small.iter().map(String::as_str).collect();
+        let parsed = crate::bench::parse_bench(&argv).unwrap();
+        assert_eq!(parsed.paths.corpus(), "bench/corpus-small.yaml");
     }
 
     #[test]

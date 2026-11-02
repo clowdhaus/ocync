@@ -137,6 +137,7 @@ impl RunRecord {
             relays: Some(report.relay_versions.clone()),
             prewarm: report.prewarm.clone(),
             corpus: CorpusInfo {
+                name: report.corpus_name.clone(),
                 images: report.corpus_size,
                 tags: report.total_tags,
             },
@@ -272,10 +273,21 @@ fn imds_or_unknown(path: &str) -> String {
 /// Corpus size metadata.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
+    /// The corpus file's stem; absent for the main corpus and for records
+    /// written before corpora were named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
     /// Number of distinct images.
     pub(crate) images: usize,
     /// Total tags across all images.
     pub(crate) tags: usize,
+}
+
+impl CorpusInfo {
+    /// The corpus as a person reads it: its name, or the main corpus.
+    pub(crate) fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or("the main corpus")
+    }
 }
 
 /// One scenario's results in the compact run record.
@@ -565,6 +577,8 @@ pub(crate) struct BenchReport {
     pub(crate) timestamp: String,
     /// Instance metadata (hardware, region).
     pub(crate) instance: InstanceInfo,
+    /// The corpus file's stem; `None` for the main corpus.
+    pub(crate) corpus_name: Option<String>,
     /// Number of distinct images in the corpus.
     pub(crate) corpus_size: usize,
     /// Total number of tags across all images.
@@ -758,8 +772,13 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push('\n');
 
     out.push_str(&format!(
-        "Corpus: {} images, {} total tags\n\n",
-        report.corpus_size, report.total_tags
+        "Corpus: {}{} images, {} total tags\n\n",
+        report
+            .corpus_name
+            .as_ref()
+            .map_or(String::new(), |name| format!("{name}, ")),
+        report.corpus_size,
+        report.total_tags
     ));
     if let Some(cap) = report.ocync_transfer_cap() {
         out.push_str(&format!("ocync ran with `max_concurrent_transfers: {cap}`"));
@@ -1293,9 +1312,11 @@ pub(crate) struct PageBlocks {
 impl PageBlocks {
     /// The blocks `report` produces. A run whose transfer cap is not ocync's
     /// default produces none: the page shows ocync as it runs out of the box.
+    /// Nor does a run of a named corpus: the page is the main corpus's.
     pub(crate) fn of(report: &BenchReport) -> Self {
-        if effective_transfer_cap(report.max_concurrent_transfers)
-            != DEFAULT_MAX_CONCURRENT_TRANSFERS
+        if report.corpus_name.is_some()
+            || effective_transfer_cap(report.max_concurrent_transfers)
+                != DEFAULT_MAX_CONCURRENT_TRANSFERS
         {
             return Self::default();
         }
@@ -1509,6 +1530,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -1580,6 +1602,11 @@ pub(crate) mod tests {
         assert!(md.contains("- **CPU**: AWS (arm64, 4 vCPUs)"));
         assert!(md.contains("- **Network**: Up to 12.5 Gigabit"));
         assert!(md.contains("Corpus: 28 images, 40 total tags"));
+        let mut named = sample_report();
+        named.corpus_name = Some("corpus-small".into());
+        assert!(
+            summary_markdown(&named).contains("Corpus: corpus-small, 28 images, 40 total tags")
+        );
         assert!(md.contains("## Tool Versions\n"));
         assert!(md.contains("- **dregsy**: 0.5.0"));
         assert!(md.contains("- **ocync**: 0.1.0"));
@@ -1645,6 +1672,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2060,6 +2088,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2107,6 +2136,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2189,6 +2219,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2285,6 +2316,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2345,6 +2377,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 42,
             total_tags: 55,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2428,6 +2461,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 39,
             total_tags: 51,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2486,6 +2520,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 39,
             total_tags: 51,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2521,6 +2556,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2579,6 +2615,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Dregsy, "0.5.0".into())]),
@@ -2614,6 +2651,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".into())]),
@@ -2655,6 +2693,7 @@ pub(crate) mod tests {
             instance: test_instance(),
             corpus_size: 28,
             total_tags: 40,
+            corpus_name: None,
             tool_versions: tools
                 .iter()
                 .map(|&(tool, _)| (tool, "1.0".into()))

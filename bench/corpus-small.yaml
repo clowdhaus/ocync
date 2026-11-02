@@ -1,0 +1,189 @@
+# Small-image benchmark corpus.
+#
+# Shape: many small images, so cost is counted in requests rather than bytes.
+# 53 sources and 72 tags, about 3.3 GB after blob sharing. The main corpus
+# (corpus.yaml) is a few GB-sized images chosen for blob sharing and says
+# nothing about per-manifest and per-blob overhead.
+#
+# Selection rule: about 20 MB or less on linux/amd64, summed over config and
+# layers. Entries over the rule are listed only where a comment says why.
+# Floating tags are left out: every tag is a release the source keeps.
+#
+# Sources: registry.k8s.io, Quay.io, GitHub Container Registry (ghcr.io),
+# Microsoft Container Registry, gcr.io and AWS Public ECR. All are anonymous
+# and none is Docker Hub, so a run spends no Docker Hub pull budget.
+#
+# public.ecr.aws is the rate-limit risk: its 10 tags are 31% of the manifest
+# requests. If 429s dominate a run, drop busybox:1.36.1, alpine:3.23.7 and
+# registry:3.1.2.
+#
+# Content is fixed by bench/corpus-small.lock.json, written by
+# `cargo xtask bench-lock --corpus bench/corpus-small.yaml`. A tag that moves
+# is refused at the start of a run. Its records carry `corpus.name`
+# `corpus-small`, its baseline is bench/results/baseline-corpus-small.json, and
+# it writes no block to the performance page.
+#
+# Run it with `bench-remote --corpus bench/corpus-small.yaml`. The default
+# partial overrides name none of this corpus's sources, so `--scenario all`
+# skips the partial scenario with a warning and `--scenario partial` is
+# refused. `bench-remote` cannot pass `--partial-overrides`; `bench` can.
+
+corpus:
+  target_registry: "${BENCH_TARGET_REGISTRY}"
+  target_prefix: "bench-small"
+
+images:
+
+  # ── registry.k8s.io ───────────────────────────────────────────────────────
+  # Three adjacent minors of one repository, about 5 MB shared between them.
+  - source: "registry.k8s.io/kube-scheduler"
+    tags: ["v1.37.2", "v1.36.6", "v1.35.9"]
+  # Over the size rule on purpose: byte-identical to quay.io/coreos/etcd:v3.6.16,
+  # so a whole image can be mounted across sources.
+  - source: "registry.k8s.io/etcd"
+    tags: ["3.6.16-0"]
+  # Distinct content.
+  - source: "registry.k8s.io/kube-state-metrics/kube-state-metrics"
+    tags: ["v2.20.0"]
+  # Distinct content.
+  - source: "registry.k8s.io/cpa/cluster-proportional-autoscaler"
+    tags: ["v1.11.0"]
+  # Three repositories and two releases over a small shared base.
+  - source: "registry.k8s.io/autoscaling/vpa-recommender"
+    tags: ["1.8.1", "1.8.0"]
+  # Same base as its sibling vpa images, two releases.
+  - source: "registry.k8s.io/autoscaling/vpa-updater"
+    tags: ["1.8.1", "1.8.0"]
+  - source: "registry.k8s.io/autoscaling/vpa-admission-controller"
+    tags: ["1.8.1", "1.8.0"]
+  # Tiny image, 26 blobs over its platforms.
+  - source: "registry.k8s.io/build-image/go-runner"
+    tags: ["v2.4.0-go1.27.3-bookworm.0"]
+  # Distinct content.
+  - source: "registry.k8s.io/networking/ip-masq-agent"
+    tags: ["v2.12.0"]
+
+  # ── Quay.io Prometheus ────────────────────────────────────────────────────
+  # The platform count changes between releases (6, 4, 5), so the manifest count does too.
+  - source: "quay.io/prometheus/node-exporter"
+    tags: ["v1.12.1", "v1.11.1", "v1.10.2"]
+  # The ten exporters below share a 2 to 10 MB Prometheus base: cross-repository
+  # mount candidates.
+  - source: "quay.io/prometheus/blackbox-exporter"
+    tags: ["v0.29.1"]
+  - source: "quay.io/prometheus/pushgateway"
+    tags: ["v1.11.5"]
+  - source: "quay.io/prometheus/statsd-exporter"
+    tags: ["v0.31.0"]
+  - source: "quay.io/prometheus/mysqld-exporter"
+    tags: ["v0.21.0"]
+  - source: "quay.io/prometheus/memcached-exporter"
+    tags: ["v0.18.0"]
+  - source: "quay.io/prometheus/snmp-exporter"
+    tags: ["v0.31.0"]
+  - source: "quay.io/prometheus/consul-exporter"
+    tags: ["v0.13.0"]
+  - source: "quay.io/prometheus/graphite-exporter"
+    tags: ["v0.17.0"]
+  - source: "quay.io/prometheus/influxdb-exporter"
+    tags: ["v0.12.1"]
+  - source: "quay.io/prometheus/collectd-exporter"
+    tags: ["v0.7.1"]
+  # The five community exporters below are mostly distinct, with some shared layers.
+  - source: "quay.io/prometheuscommunity/postgres-exporter"
+    tags: ["v0.20.1"]
+  - source: "quay.io/prometheuscommunity/bind-exporter"
+    tags: ["v0.8.0"]
+  - source: "quay.io/prometheuscommunity/elasticsearch-exporter"
+    tags: ["v1.11.0"]
+  - source: "quay.io/prometheuscommunity/json-exporter"
+    tags: ["v0.8.0"]
+  - source: "quay.io/prometheuscommunity/smartctl-exporter"
+    tags: ["v0.15.0"]
+
+  # ── Quay.io operators and proxies ─────────────────────────────────────────
+  # Two releases of one component, 37 blobs per tag.
+  - source: "quay.io/jetstack/cert-manager-webhook"
+    tags: ["v1.21.3", "v1.20.5"]
+  # Two releases, same shape as the other cert-manager images.
+  - source: "quay.io/jetstack/cert-manager-cainjector"
+    tags: ["v1.21.3", "v1.20.5"]
+  - source: "quay.io/jetstack/cert-manager-acmesolver"
+    tags: ["v1.21.3", "v1.20.5"]
+  # Shares 8.8 MB with the Prometheus images.
+  - source: "quay.io/prometheus-operator/prometheus-config-reloader"
+    tags: ["v0.94.2"]
+  # Distinct content.
+  - source: "quay.io/brancz/kube-rbac-proxy"
+    tags: ["v0.23.1"]
+  # The cross-source duplicate of registry.k8s.io/etcd: 0.7 MB new, the rest should mount.
+  - source: "quay.io/coreos/etcd"
+    tags: ["v3.6.16"]
+
+  # ── GitHub Container Registry ─────────────────────────────────────────────
+  # 8 platforms each, so many small manifests.
+  - source: "ghcr.io/regclient/regctl"
+    tags: ["v0.11.7", "v0.11.6"]
+  # 8 platforms, like regctl.
+  - source: "ghcr.io/regclient/regsync"
+    tags: ["v0.11.7"]
+  - source: "ghcr.io/regclient/regbot"
+    tags: ["v0.11.7"]
+  # Carries attestation children, 10 manifests beyond the platforms.
+  - source: "ghcr.io/oras-project/oras"
+    tags: ["v1.3.6"]
+  # The smallest image here, 8 platforms.
+  - source: "ghcr.io/jqlang/jq"
+    tags: ["1.8.2", "1.8.1"]
+  # Two platforms, two adjacent patch releases.
+  - source: "ghcr.io/hadolint/hadolint"
+    tags: ["v2.15.1", "v2.15.0"]
+  # Distinct content, near the size rule.
+  - source: "ghcr.io/kube-vip/kube-vip"
+    tags: ["v1.3.1"]
+  # Distinct content.
+  - source: "ghcr.io/stakater/reloader"
+    tags: ["v1.4.23"]
+  - source: "ghcr.io/spegel-org/spegel"
+    tags: ["v0.8.1"]
+  # Distinct content, tiny.
+  - source: "ghcr.io/static-web-server/static-web-server"
+    tags: ["2.44.1"]
+
+  # ── Microsoft Container Registry ──────────────────────────────────────────
+  # The Alpine layer (11.3 MB) is shared with public.ecr.aws alpine 3.24.3 across sources.
+  - source: "mcr.microsoft.com/dotnet/runtime-deps"
+    tags: ["10.0.14-alpine3.24", "9.0.22-alpine3.24", "10.0.14-azurelinux3.0-distroless"]
+  # Distinct content.
+  - source: "mcr.microsoft.com/azurelinux/distroless/base"
+    tags: ["3.0.20261027"]
+  # The first tag is contained in the runtime-deps distroless image.
+  - source: "mcr.microsoft.com/azurelinux/distroless/minimal"
+    tags: ["3.0.20261027", "3.0.20261022"]
+
+  # ── gcr.io ────────────────────────────────────────────────────────────────
+  # Distinct content.
+  - source: "gcr.io/go-containerregistry/crane"
+    tags: ["v0.22.1"]
+  # Distinct content, a sibling of crane.
+  - source: "gcr.io/go-containerregistry/gcrane"
+    tags: ["v0.22.1"]
+
+  # ── AWS Public ECR ────────────────────────────────────────────────────────
+  # The common base layer many other entries share.
+  - source: "public.ecr.aws/docker/library/alpine"
+    tags: ["3.24.3", "3.23.7"]
+  # 9 platforms; three tags, two of them identical in size.
+  - source: "public.ecr.aws/docker/library/busybox"
+    tags: ["1.37.0", "1.37.0-musl", "1.36.1"]
+  # The five images below share the Alpine base layer, 14.7 to 22.8 MB each.
+  - source: "public.ecr.aws/docker/library/memcached"
+    tags: ["1.6.45-alpine"]
+  - source: "public.ecr.aws/docker/library/nginx"
+    tags: ["1.29.8-alpine-slim"]
+  - source: "public.ecr.aws/docker/library/eclipse-mosquitto"
+    tags: ["2.0.22"]
+  - source: "public.ecr.aws/docker/library/registry"
+    tags: ["3.1.2"]
+  - source: "public.ecr.aws/docker/library/haproxy"
+    tags: ["3.4.7-alpine"]
