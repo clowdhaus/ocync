@@ -12,6 +12,7 @@ use url::Url;
 use crate::aimd::{AimdController, GooglePacing, RegistryAction};
 use crate::auth::detect::ProviderKind;
 use crate::auth::{AuthProvider, Presents, Scope, Token};
+use crate::blob::acr_held_bytes;
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -66,12 +67,12 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: NonZeroUsize = DEFAULT_BLOB_UPLOAD_CONC
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
-/// The fallback upload paths (GHCR single-PATCH, ACR chunked PATCH) buffer
-/// the whole blob because the target cannot accept a streaming body. With
-/// [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`] uploads and no byte cap, 1 GB layers
-/// (common for CUDA/ML images) would hold ~64 GB resident. 512 MB is ~32x a typical 16 MB
-/// layer, so modest layers do not serialise, while a single oversized layer
-/// (e.g. 2 GB GPU runtime) runs alone.
+/// The fallback upload paths hold a blob's bytes in memory because the target
+/// cannot accept a streaming body. With [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]
+/// uploads and no byte cap, 1 GB layers (common for CUDA/ML images) would
+/// hold ~64 GB resident. 512 MB is ~32x a typical 16 MB layer, so modest
+/// layers do not serialise, while a single oversized GHCR layer (e.g. 2 GB
+/// GPU runtime) runs alone.
 const DEFAULT_BUFFERED_BLOB_BYTES: NonZeroUsize = NonZeroUsize::new(512 * 1024 * 1024).unwrap();
 
 /// Fallback acquisition size when a fallback upload has no `known_size`
@@ -334,7 +335,8 @@ pub(crate) enum UploadPath {
     /// Buffered single PATCH: GHCR keeps only the last chunk of a multi-PATCH
     /// upload.
     Ghcr,
-    /// Buffered chunked PATCH: ACR rejects a streaming PUT above ~20 MB.
+    /// Chunked PATCH, two chunks per upload in memory (one sending, one
+    /// filling): ACR rejects a streaming PUT above ~20 MB.
     Acr,
 }
 
@@ -350,9 +352,8 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 impl RegistryClient {
     /// Wait for one of this client's upload slots (64 by default, set by
     /// [`RegistryClientBuilder::blob_upload_concurrency`]), then for GHCR and
-    /// ACR, which buffer the whole blob, the byte-budget permit sized by
-    /// `known_size`. The slot holds both
-    /// until it is dropped or spent.
+    /// ACR a byte-budget permit for the bytes the upload holds, sized by
+    /// `known_size`. The slot holds both until it is dropped or spent.
     ///
     /// Take it before the source download opens: a copy then holds its slot
     /// and waits on the download cap, never the other way round.
@@ -375,9 +376,16 @@ impl RegistryClient {
         };
         let bytes = match path {
             UploadPath::Streaming => None,
-            UploadPath::Ghcr | UploadPath::Acr => {
-                Some(self.acquire_buffered_bytes_permit(known_size).await)
-            }
+            UploadPath::Ghcr => Some(
+                self.acquire_buffered_bytes_permit(
+                    known_size.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE),
+                )
+                .await,
+            ),
+            UploadPath::Acr => Some(
+                self.acquire_buffered_bytes_permit(acr_held_bytes(known_size) as u64)
+                    .await,
+            ),
         };
         UploadSlot {
             _bytes: bytes,
@@ -394,24 +402,16 @@ impl RegistryClient {
         acquire_permit(&self.blob_download_sem).await
     }
 
-    /// Acquire a byte-budget permit for a fallback (buffered) blob upload.
-    ///
-    /// `expected` is the manifest-declared blob size, `None` for an opaque
-    /// stream.
-    ///
-    /// - `Some(n)`: acquire `min(n, budget)` permits, at least one, so an
-    ///   empty blob still counts against the budget. An oversized blob
-    ///   takes the whole budget and others queue until it completes, though
-    ///   its memory exceeds the budget.
-    /// - `None`: acquire [`BUFFERED_BLOB_BYTES_FALLBACK_RESERVE`], also
-    ///   capped at the budget. The blob may buffer more; the upload slots
-    ///   still bound how many.
-    async fn acquire_buffered_bytes_permit(&self, expected: Option<u64>) -> OwnedSemaphorePermit {
-        let request = expected.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE);
+    /// Acquire a byte-budget permit for the `held` bytes a fallback upload
+    /// keeps in memory: `min(held, budget)` permits, at least one, so an
+    /// empty blob still counts against the budget. A request above the budget
+    /// takes all of it and others queue until it completes, though its
+    /// memory exceeds the budget.
+    async fn acquire_buffered_bytes_permit(&self, held: u64) -> OwnedSemaphorePermit {
         let budget = self.buffered_blob_bytes_budget as u64;
         // Above the budget the semaphore could never grant the request.
         // `acquire_many_owned` takes a u32.
-        let permits: u32 = request.min(budget).min(u32::MAX as u64).max(1) as u32;
+        let permits: u32 = held.min(budget).min(u32::MAX as u64).max(1) as u32;
         Arc::clone(&self.buffered_blob_bytes_sem)
             .acquire_many_owned(permits)
             .await
@@ -904,6 +904,30 @@ mod tests {
         );
         crate::aimd::drain_burst(&gcr.aimd).await;
         assert!(crate::aimd::is_paced(&gar.aimd).await);
+    }
+
+    /// A 1 GB blob takes two 16 MiB chunks of the byte budget on ACR, and the
+    /// whole budget on GHCR, which buffers it. Breaks if ACR reserves the
+    /// whole blob (serialising its uploads) or GHCR reserves less (unbounded
+    /// memory).
+    #[tokio::test]
+    async fn a_one_gb_blob_reserves_two_chunks_on_acr_and_the_whole_budget_on_ghcr() {
+        const BUDGET: usize = 512 * 1024 * 1024;
+        let available = |url: &str| {
+            let client = RegistryClient::builder(Url::parse(url).unwrap())
+                .buffered_blob_bytes(NonZeroUsize::new(BUDGET).unwrap())
+                .build()
+                .unwrap();
+            async move {
+                let _slot = client.reserve_upload_slot(Some(1 << 30)).await;
+                client.buffered_blob_bytes_sem.available_permits()
+            }
+        };
+        assert_eq!(
+            available("https://myacr.azurecr.io").await,
+            BUDGET - 32 * 1024 * 1024
+        );
+        assert_eq!(available("https://ghcr.io").await, 0);
     }
 
     #[test]

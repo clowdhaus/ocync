@@ -1,6 +1,6 @@
 //! Blob operations - existence checks, pull, push, mount, and upload management.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 use http::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, LOCATION};
@@ -22,6 +22,24 @@ const OCTET_STREAM: &str = "application/octet-stream";
 /// Per-PATCH chunk size for the ACR upload fallback, under ACR's ~20 MB
 /// limit on a streaming PUT body.
 const ACR_PATCH_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Bytes reserved from the byte budget for one ACR upload: the blob's size
+/// when it is under one chunk, otherwise two chunks, one sending and one
+/// filling. An upper bound on what [`acr_buffer_capacity`] allocates.
+pub(crate) fn acr_held_bytes(known_size: Option<u64>) -> usize {
+    match known_size {
+        Some(size) if size < ACR_PATCH_CHUNK_SIZE as u64 => size as usize,
+        _ => 2 * ACR_PATCH_CHUNK_SIZE,
+    }
+}
+
+/// Capacity for the buffer holding the bytes from `offset` on: one chunk, or
+/// what remains of the blob when its size is known and smaller.
+fn acr_buffer_capacity(known_size: Option<u64>, offset: u64) -> usize {
+    known_size.map_or(ACR_PATCH_CHUNK_SIZE, |size| {
+        size.saturating_sub(offset).min(ACR_PATCH_CHUNK_SIZE as u64) as usize
+    })
+}
 
 /// Upper bound on the `Vec::with_capacity` hint used by [`buffer_stream`].
 ///
@@ -88,7 +106,7 @@ async fn buffer_stream(
 impl UploadSlot<'_> {
     /// Push a blob with a streaming upload: a POST, then a PUT whose body is
     /// the stream, unbuffered, with the digest for the registry to verify.
-    /// GHCR and ACR take buffered fallbacks instead.
+    /// GHCR takes a buffered single PATCH and ACR a chunked PATCH instead.
     ///
     /// Spends the slot, which is held until the upload ends.
     pub async fn push_stream<E>(
@@ -370,9 +388,17 @@ impl RegistryClient {
     /// ACR fallback: chunked PATCH under Azure Container Registry's
     /// ~20 MB streaming-PUT body limit.
     ///
-    /// Buffers the stream so the digest is verified before any PATCH is
-    /// sent, then sends it in [`ACR_PATCH_CHUNK_SIZE`] chunks and a finalize PUT,
-    /// each to the `Location` the previous response named.
+    /// Holds two buffers of at most [`ACR_PATCH_CHUNK_SIZE`] per upload (see
+    /// [`acr_held_bytes`]): while one chunk's PATCH is in flight the next
+    /// fills from the stream, so a network source is not left unread for the
+    /// length of a PATCH. A source that fills at once, such as a staged file
+    /// read from local disk, gains nothing: its chunks go out one after
+    /// another. Each request goes to the `Location` the previous response
+    /// named. The digest is hashed as the bytes pass and checked once the
+    /// stream ends, before the finalize PUT. A mismatch, a stream error (no
+    /// replay, as on the other streaming paths) or a failed PATCH returns
+    /// the error without finalizing, so nothing is committed; the registry
+    /// expires the abandoned session.
     async fn blob_push_stream_acr(
         &self,
         repository: &RepositoryName,
@@ -380,59 +406,25 @@ impl RegistryClient {
         known_size: Option<u64>,
         stream: impl Stream<Item = Result<Bytes, Error>>,
     ) -> Result<Digest, Error> {
-        warn!(
+        debug!(
             repository = repository.as_str(),
-            "ACR rejects streaming PUT above ~20 MB; buffering blob for chunked PATCH upload"
+            "ACR rejects streaming PUT above ~20 MB; sending chunked PATCH upload"
         );
-
-        let raw = buffer_stream(stream, known_size).await?;
-        let actual_digest = Digest::from_sha256(Sha256::digest(&raw));
-        if &actual_digest != expected_digest {
-            return Err(Error::DigestMismatch {
-                expected: expected_digest.clone(),
-                actual: actual_digest,
-            });
-        }
-        let total_len = raw.len() as u64;
-        let body = Bytes::from(raw);
 
         let scopes = [Scope::pull_push(repository.as_str())];
         let mut upload_url = self
             .initiate_blob_upload(repository, &scopes, "blob push acr initiate")
             .await?;
-        // Each next URL is an `UploadUrl`, which only `extract_location`
-        // makes. An empty blob sends no PATCH: the OCI distribution spec
-        // accepts the finalize PUT alone.
-        let mut offset: u64 = 0;
-        while offset < total_len {
-            let chunk_len = (ACR_PATCH_CHUNK_SIZE as u64).min(total_len - offset);
-            let chunk = body.slice((offset as usize)..((offset + chunk_len) as usize));
-            let range_end = offset + chunk_len - 1;
-            // OCI spec Content-Range format: `{start}-{end}` (NOT RFC 7233).
-            let range_header = format!("{offset}-{range_end}");
-            let chunk_len_str = chunk_len.to_string();
 
-            let resp = self
-                .send_with_aimd(
-                    RegistryAction::BlobUploadChunk,
-                    &scopes,
-                    "blob push acr patch",
-                    |headers| {
-                        self.http
-                            .patch(upload_url.to_url())
-                            .headers(headers)
-                            .header(CONTENT_LENGTH, &chunk_len_str)
-                            .header(CONTENT_RANGE, &range_header)
-                            .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
-                            .body(chunk.clone())
-                    },
-                )
-                .await?;
-            let resp =
-                expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
-            upload_url = extract_location(&resp, &self.base_url)?;
-            offset += chunk_len;
-        }
+        self.acr_send_chunks(
+            repository,
+            expected_digest,
+            known_size,
+            stream,
+            &scopes,
+            &mut upload_url,
+        )
+        .await?;
 
         let digest_str = expected_digest.to_string();
         let resp = self
@@ -454,6 +446,114 @@ impl RegistryClient {
 
         Ok(expected_digest.clone())
     }
+
+    /// Send the whole stream as PATCH chunks, leaving `upload_url` at the
+    /// `Location` the last PATCH named, then check the digest of the bytes
+    /// sent. An empty blob sends no PATCH: the OCI distribution spec accepts
+    /// the finalize PUT alone.
+    async fn acr_send_chunks(
+        &self,
+        repository: &RepositoryName,
+        expected_digest: &Digest,
+        known_size: Option<u64>,
+        stream: impl Stream<Item = Result<Bytes, Error>>,
+        scopes: &[Scope],
+        upload_url: &mut UploadUrl,
+    ) -> Result<(), Error> {
+        futures_util::pin_mut!(stream);
+        let mut hasher = Sha256::new();
+        let mut carry = Bytes::new();
+        let mut offset: u64 = 0;
+        let mut buf = BytesMut::with_capacity(acr_buffer_capacity(known_size, 0));
+        acr_fill_chunk(&mut stream, &mut carry, &mut hasher, &mut buf).await?;
+        // A short buffer means the stream ended.
+        while buf.len() == ACR_PATCH_CHUNK_SIZE {
+            let chunk = buf.split().freeze();
+            buf.reserve(acr_buffer_capacity(
+                known_size,
+                offset + ACR_PATCH_CHUNK_SIZE as u64,
+            ));
+            futures_util::future::try_join(
+                self.acr_patch_chunk(repository, scopes, upload_url, &mut offset, chunk),
+                acr_fill_chunk(&mut stream, &mut carry, &mut hasher, &mut buf),
+            )
+            .await?;
+        }
+        if !buf.is_empty() {
+            self.acr_patch_chunk(repository, scopes, upload_url, &mut offset, buf.freeze())
+                .await?;
+        }
+
+        let actual_digest = Digest::from_sha256(hasher.finalize());
+        if &actual_digest != expected_digest {
+            return Err(Error::DigestMismatch {
+                expected: expected_digest.clone(),
+                actual: actual_digest,
+            });
+        }
+        Ok(())
+    }
+
+    /// Send one non-empty ACR PATCH at `offset`, then advance `offset` by the
+    /// chunk's length and replace `upload_url` with the `Location` the
+    /// response names (each next URL is an `UploadUrl`, which only
+    /// `extract_location` makes).
+    async fn acr_patch_chunk(
+        &self,
+        repository: &RepositoryName,
+        scopes: &[Scope],
+        upload_url: &mut UploadUrl,
+        offset: &mut u64,
+        chunk: Bytes,
+    ) -> Result<(), Error> {
+        let chunk_len = chunk.len() as u64;
+        // OCI spec Content-Range format: `{start}-{end}` (NOT RFC 7233).
+        let range_header = format!("{}-{}", *offset, *offset + chunk_len - 1);
+
+        let resp = self
+            .send_with_aimd(
+                RegistryAction::BlobUploadChunk,
+                scopes,
+                "blob push acr patch",
+                |headers| {
+                    self.http
+                        .patch(upload_url.to_url())
+                        .headers(headers)
+                        .header(CONTENT_RANGE, &range_header)
+                        .header(CONTENT_TYPE, HeaderValue::from_static(OCTET_STREAM))
+                        .body(chunk.clone())
+                },
+            )
+            .await?;
+        let resp = expect_status(resp, StatusCode::ACCEPTED, &self.base_url, repository).await?;
+        *upload_url = extract_location(&resp, &self.base_url)?;
+        *offset += chunk_len;
+        Ok(())
+    }
+}
+
+/// Move bytes from `carry`, then from `stream`, into `buf` until it holds
+/// [`ACR_PATCH_CHUNK_SIZE`] bytes or the stream ends, hashing each byte once.
+/// An item that crosses the boundary is split, and its rest stays in `carry`
+/// for the next call, so `buf` never exceeds one chunk.
+async fn acr_fill_chunk(
+    stream: &mut (impl Stream<Item = Result<Bytes, Error>> + Unpin),
+    carry: &mut Bytes,
+    hasher: &mut Sha256,
+    buf: &mut BytesMut,
+) -> Result<(), Error> {
+    while buf.len() < ACR_PATCH_CHUNK_SIZE {
+        if carry.is_empty() {
+            match stream.next().await {
+                Some(item) => *carry = item?,
+                None => break,
+            }
+        }
+        let part = carry.split_to((ACR_PATCH_CHUNK_SIZE - buf.len()).min(carry.len()));
+        hasher.update(&part);
+        buf.extend_from_slice(&part);
+    }
+    Ok(())
 }
 
 /// The URL of the next request in an upload chain.
@@ -895,6 +995,10 @@ mod tests {
                 "content-range",
                 expected_range.as_str(),
             ))
+            .and(wiremock::matchers::header(
+                "content-length",
+                data.len().to_string().as_str(),
+            ))
             .respond_with(wiremock::ResponseTemplate::new(202).append_header(
                 "Location",
                 "/v2/myreg/myimg/blobs/uploads/acr-uuid?after-patch",
@@ -918,82 +1022,6 @@ mod tests {
         let slot = client.reserve_upload_slot(None).await;
         let result = slot
             .push_stream(&repo, &digest, data_stream(data, 4))
-            .await
-            .unwrap();
-        assert_eq!(result, digest);
-    }
-
-    /// ACR: blob larger than `ACR_PATCH_CHUNK_SIZE` splits into multiple
-    /// `PATCHes`, each under the 20 MB ceiling, with increasing
-    /// `Content-Range` offsets.
-    #[tokio::test]
-    async fn blob_push_stream_acr_large_blob_splits_into_chunks() {
-        // 17 MB -- just over the 16 MB chunk size, so we get 2 PATCHes
-        // (one full 16 MB chunk + one 1 MB tail).
-        let data = vec![0xABu8; 17 * 1024 * 1024];
-        let total_len = data.len() as u64;
-        let server = wiremock::MockServer::start().await;
-        let digest = test_digest(&data);
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-1"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // First chunk: 16 MB at offset 0. Content-Range: 0-16777215.
-        let first_end = ACR_PATCH_CHUNK_SIZE as u64 - 1;
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-1"))
-            .and(wiremock::matchers::header(
-                "content-range",
-                format!("0-{first_end}").as_str(),
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-2"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        // Second chunk: 1 MB at offset 16 MB.
-        let total_end = total_len - 1;
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-2"))
-            .and(wiremock::matchers::header(
-                "content-range",
-                format!("{}-{total_end}", ACR_PATCH_CHUNK_SIZE).as_str(),
-            ))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/proj/img/blobs/uploads/acr-3"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/v2/proj/img/blobs/uploads/acr-3"))
-            .and(wiremock::matchers::query_param(
-                "digest",
-                digest.to_string(),
-            ))
-            .respond_with(wiremock::ResponseTemplate::new(201))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = build_test_client("myacr.azurecr.io", port);
-        let repo = RepositoryName::new("proj/img").unwrap();
-        let slot = client.reserve_upload_slot(Some(total_len)).await;
-        let result = slot
-            .push_stream(&repo, &digest, data_stream(&data, 65536))
             .await
             .unwrap();
         assert_eq!(result, digest);
@@ -1108,6 +1136,189 @@ mod tests {
             msg.contains("differs from registry origin"),
             "expected same-origin rejection error, got: {msg}"
         );
+    }
+
+    /// ACR: bytes that hash to another digest are sent as PATCH requests
+    /// while streaming but never finalized. Breaks if the digest check is
+    /// dropped or moves after the finalize PUT.
+    #[tokio::test]
+    async fn blob_push_stream_acr_digest_mismatch_sends_no_finalize() {
+        let server = wiremock::MockServer::start().await;
+        let data = b"acr bytes that do not match the digest";
+        let expected = test_digest(b"some other blob");
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-1"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-2"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("r/i").unwrap();
+        let slot = client.reserve_upload_slot(None).await;
+        let err = slot
+            .push_stream(&repo, &expected, data_stream(data, 4))
+            .await
+            .expect_err("a digest mismatch must fail the push");
+        match err {
+            Error::DigestMismatch {
+                expected: e,
+                actual,
+            } => {
+                assert_eq!(e, expected);
+                assert_eq!(actual, test_digest(data));
+            }
+            other => panic!("expected DigestMismatch, got {other}"),
+        }
+    }
+
+    /// ACR: the first PATCH goes out once one chunk has been read, while the
+    /// stream still has bytes to yield, and an item that crosses the chunk
+    /// boundary is split there. The first item is a chunk plus 5 bytes; the
+    /// second waits for the mock to see the first PATCH and fails the push
+    /// after 5 s otherwise. Breaks if the blob is buffered whole before the
+    /// first PATCH, or if a buffer grows past one chunk (the first range
+    /// would not end at the chunk).
+    #[tokio::test]
+    async fn blob_push_stream_acr_sends_first_chunk_before_stream_ends() {
+        let first = Bytes::from(vec![0xCDu8; ACR_PATCH_CHUNK_SIZE + 5]);
+        let tail = Bytes::from_static(b"tail");
+        let digest = test_digest(&[first.as_ref(), tail.as_ref()].concat());
+        let first_patch_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = wiremock::MockServer::start().await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-1"),
+            )
+            .mount(&server)
+            .await;
+        let seen = std::sync::Arc::clone(&first_patch_seen);
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/acr-1"))
+            .and(wiremock::matchers::header("content-range", "0-16777215"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen.notify_one();
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-2")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/acr-2"))
+            .and(wiremock::matchers::header(
+                "content-range",
+                "16777216-16777224",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-3"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/v2/r/i/blobs/uploads/acr-3"))
+            .and(wiremock::matchers::query_param(
+                "digest",
+                digest.to_string(),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stream = futures_util::stream::iter([Ok::<_, Error>(first)]).chain(
+            futures_util::stream::once(async move {
+                tokio::time::timeout(Duration::from_secs(5), first_patch_seen.notified())
+                    .await
+                    .map_err(|_| Error::UploadProtocol {
+                        reason: "first PATCH not sent before the stream ended".into(),
+                    })?;
+                Ok(tail)
+            }),
+        );
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("r/i").unwrap();
+        let slot = client.reserve_upload_slot(None).await;
+        let result = slot.push_stream(&repo, &digest, stream).await.unwrap();
+        assert_eq!(result, digest);
+    }
+
+    /// ACR: the next chunk is read while the previous PATCH is in flight.
+    /// The first PATCH's response is held for 60 s, far past the 20 s the
+    /// test allows; the stream's second item, read only after the mock has
+    /// the PATCH, must arrive first. Breaks if a PATCH is awaited before the
+    /// source is read again.
+    #[tokio::test]
+    async fn blob_push_stream_acr_reads_the_next_chunk_while_a_patch_is_in_flight() {
+        let first_patch_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let tail_read = std::sync::Arc::new(tokio::sync::Notify::new());
+        let server = wiremock::MockServer::start().await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-1"),
+            )
+            .mount(&server)
+            .await;
+        let seen = std::sync::Arc::clone(&first_patch_seen);
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen.notify_one();
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/r/i/blobs/uploads/acr-2")
+                    .set_delay(Duration::from_secs(60))
+            })
+            .mount(&server)
+            .await;
+
+        let read = std::sync::Arc::clone(&tail_read);
+        let stream = futures_util::stream::iter([Ok::<_, Error>(Bytes::from(vec![
+            0xCDu8;
+            ACR_PATCH_CHUNK_SIZE
+        ]))])
+        .chain(futures_util::stream::once(async move {
+            first_patch_seen.notified().await;
+            read.notify_one();
+            Ok(Bytes::from_static(b"tail"))
+        }));
+        let client = build_test_client("myacr.azurecr.io", port);
+        let repo = RepositoryName::new("r/i").unwrap();
+        let slot = client.reserve_upload_slot(None).await;
+        let digest = test_digest(b"unused");
+        tokio::select! {
+            () = tail_read.notified() => {}
+            pushed = slot.push_stream(&repo, &digest, stream) => {
+                panic!("the push ended before the tail was read: {pushed:?}")
+            }
+            () = tokio::time::sleep(Duration::from_secs(20)) => {
+                panic!("the tail was not read while the first PATCH was in flight")
+            }
+        }
     }
 
     /// `blob_pull` follows 3xx redirects through reqwest's default policy.
