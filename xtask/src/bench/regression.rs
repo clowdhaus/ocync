@@ -86,14 +86,14 @@ pub(crate) fn ensure_comparable(
             baseline_path,
             &format!(
                 "for {} under corpus lock {} over {} images and {} tags",
-                baseline.corpus.label(),
+                baseline.corpus.id.label(),
                 show(&baseline.corpus_locked_at),
                 baseline.corpus.images,
                 baseline.corpus.tags
             ),
             &format!(
                 "for {} under {} over {} images and {} tags",
-                current.corpus.label(),
+                current.corpus.id.label(),
                 show(&current.corpus_locked_at),
                 current.corpus.images,
                 current.corpus.tags
@@ -271,6 +271,7 @@ fn format_metric_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::corpus::{self, CorpusName};
     use crate::bench::lock::fixtures::locked_at;
 
     fn baseline(wall_clock_secs: f64, requests: u64, total_bytes: u64) -> Baseline {
@@ -281,7 +282,7 @@ mod tests {
             corpus_locked_at: None,
             sync_from: None,
             corpus: CorpusInfo {
-                name: None,
+                id: corpus::Id::Main,
                 images: 40,
                 tags: 55,
             },
@@ -406,7 +407,7 @@ mod tests {
             corpus_locked_at: Some(locked_at("2026-10-30-214340")),
             sync_from: Some(SyncFrom::Digest),
             corpus: CorpusInfo {
-                name: None,
+                id: corpus::Id::Main,
                 images: 40,
                 tags: 55,
             },
@@ -434,7 +435,7 @@ mod tests {
         // regression, and a refusal that does not say which file to replace.
         let this_run = Some(locked_at("2026-10-30-214340"));
         let full = CorpusInfo {
-            name: None,
+            id: corpus::Id::Main,
             images: 40,
             tags: 55,
         };
@@ -443,7 +444,7 @@ mod tests {
             (
                 Some(locked_at("2026-09-01-000000")),
                 CorpusInfo {
-                    name: None,
+                    id: corpus::Id::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -452,7 +453,7 @@ mod tests {
             (
                 None,
                 CorpusInfo {
-                    name: None,
+                    id: corpus::Id::Main,
                     images: 40,
                     tags: 55,
                 },
@@ -461,7 +462,7 @@ mod tests {
             (
                 Some(locked_at("2026-10-30-214340")),
                 CorpusInfo {
-                    name: None,
+                    id: corpus::Id::Main,
                     images: 5,
                     tags: 5,
                 },
@@ -496,17 +497,18 @@ mod tests {
     fn a_named_corpus_is_not_compared_with_the_main_corpus() {
         // Catches: a small-corpus run judged against the main corpus's
         // baseline, and a refusal that does not name both corpora.
-        let named = |name: Option<&str>| Baseline {
+        let small = corpus::Id::Named(CorpusName::new("corpus-small"));
+        let baseline_for = |id: &corpus::Id| Baseline {
             corpus: CorpusInfo {
-                name: name.map(crate::bench::corpus::CorpusName::new),
+                id: id.clone(),
                 images: 40,
                 tags: 55,
             },
             ..baseline(1.0, 1, 1)
         };
         let refused = ensure_comparable(
-            &named(Some("corpus-small")),
-            &named(None),
+            &baseline_for(&small),
+            &baseline_for(&corpus::Id::Main),
             Path::new("results/b.json"),
         )
         .unwrap_err();
@@ -517,11 +519,7 @@ mod tests {
              tags; record a new baseline by deleting results/b.json and rerunning"
         );
         assert_eq!(
-            ensure_comparable(
-                &named(Some("corpus-small")),
-                &named(Some("corpus-small")),
-                Path::new("b")
-            ),
+            ensure_comparable(&baseline_for(&small), &baseline_for(&small), Path::new("b")),
             Ok(())
         );
     }
@@ -576,7 +574,7 @@ mod tests {
         let key = |cap: usize, images: usize| Baseline {
             max_concurrent_transfers: NonZeroUsize::new(cap),
             corpus: CorpusInfo {
-                name: None,
+                id: corpus::Id::Main,
                 images,
                 tags: 55,
             },
