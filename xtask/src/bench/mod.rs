@@ -32,7 +32,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use ocync_distribution::Digest;
 use serde::{Deserialize, Serialize};
 
-use corpus::Corpus;
+use corpus::{Corpus, CorpusName};
 use regression::Baseline;
 use remote::CommitSha;
 use report::{BenchReport, Prewarm, ScenarioKind, ScenarioResult, ToolRun, rounds_of};
@@ -521,6 +521,8 @@ fn git_ref() -> String {
 pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    let corpus_name = args.paths.corpus_name()?;
+    let prepare = runs_prepare(args.scenario, corpus_name.as_ref())?;
     let bench_target = Target::from_env(
         args.target,
         &|name| std::env::var(name).ok(),
@@ -555,6 +557,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         Some(n) => filtered.limit(n),
         None => filtered,
     };
+    let corpus_info = report::CorpusInfo {
+        name: corpus_name,
+        images: corpus.images.len(),
+        tags: corpus.total_tags(),
+    };
 
     corpus.dockerhub_auth = docker_hub_auth();
 
@@ -566,7 +573,6 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         args.paths.partial_overrides(),
         args.tool_selection.rounds,
     )?;
-    let prepare = matches!(args.scenario, Scenario::Prepare | Scenario::All);
     let lock = (!transfers.is_empty())
         .then(|| lock::Lock::load(&args.paths.lock_path()))
         .transpose()?;
@@ -574,9 +580,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     ensure_baseline_comparable(
         &args,
         &transfers,
-        &corpus,
+        &corpus_info,
         corpus_locked_at.as_ref(),
-        &baseline_path(),
+        &baseline_path(corpus_info.name.as_ref()),
     )?;
     let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
@@ -710,8 +716,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     let mut report = BenchReport {
         timestamp: timestamp.to_string(),
         instance,
-        corpus_size: corpus.images.len(),
-        total_tags: corpus.total_tags(),
+        corpus: corpus_info,
         tool_versions,
         relay_versions,
         prewarm,
@@ -980,9 +985,27 @@ impl std::fmt::Display for Transfer {
     }
 }
 
+/// The image counts the scale scenario runs at for a corpus of `total` images:
+/// 10, 25 and 50 where the corpus is at least that large, and the whole corpus.
+fn scale_sizes(total: usize) -> Vec<usize> {
+    let mut sizes: Vec<usize> = [10, 25, 50, total]
+        .into_iter()
+        .filter(|&size| size <= total)
+        .collect();
+    sizes.dedup();
+    sizes
+}
+
 /// The passes a run executes, in order, that sync from the lock: every round of
 /// the sync scenario, then of the partial one, then scale once. The overrides
 /// are read once, and only for a run that has a partial scenario.
+///
+/// Two passes that would measure nothing new are refused when asked for and
+/// skipped with a warning by `all`. Overrides that change no tag of the
+/// corpus, by naming no source of it or by repeating its own tags, would re-sync
+/// unchanged tags and be recorded as an incremental sync.
+/// A corpus of at most 10 images scales at one size, its whole self, which
+/// repeats a cold sync.
 fn plan(
     requested: Scenario,
     corpus: &Corpus,
@@ -994,18 +1017,71 @@ fn plan(
     let partial = || {
         let overrides = corpus::load_overrides(overrides_path)?;
         let changed = Rc::new(corpus.with_overrides(&overrides.overrides));
-        Ok::<_, String>(rounds.clone().map(move |round| Transfer::Partial {
-            round,
-            corpus: Rc::clone(&changed),
+        Ok::<_, String>((changed.images != corpus.images).then(|| {
+            rounds.clone().map(move |round| Transfer::Partial {
+                round,
+                corpus: Rc::clone(&changed),
+            })
         }))
+    };
+    let unchanged = || {
+        format!(
+            "the overrides in {overrides_path} change no tag of the corpus (after \
+             --skip-registries and --limit, if given); name overrides for this corpus with \
+             --partial-overrides"
+        )
     };
     Ok(match requested {
         Scenario::Sync => sync().collect(),
-        Scenario::Partial => partial()?.collect(),
+        Scenario::Partial => partial()?.ok_or_else(unchanged)?.collect(),
         Scenario::Scale => vec![Transfer::Scale],
         Scenario::Prepare => Vec::new(),
-        Scenario::All => sync().chain(partial()?).chain([Transfer::Scale]).collect(),
+        Scenario::All => {
+            let partial = partial()?
+                .map(Iterator::collect::<Vec<_>>)
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "bench: WARNING: {}; skipping the partial scenario",
+                        unchanged()
+                    );
+                    Vec::new()
+                });
+            let scale = if scale_sizes(corpus.images.len()).len() > 1 {
+                vec![Transfer::Scale]
+            } else {
+                eprintln!(
+                    "bench: WARNING: the corpus has {} images, so scale would run one size, \
+                     a repeat of the cold sync; skipping the scale scenario",
+                    corpus.images.len()
+                );
+                Vec::new()
+            };
+            sync().chain(partial).chain(scale).collect()
+        }
     })
+}
+
+/// Whether the run executes the prepare scenario. Prepare reads its own
+/// wildcard corpus whatever corpus is named, so a run of a named corpus that
+/// asked for it would be recorded under that corpus with another's
+/// measurement: an explicit `prepare` is refused, and `all` skips it with a
+/// warning.
+fn runs_prepare(requested: Scenario, corpus_name: Option<&CorpusName>) -> Result<bool, String> {
+    match (requested, corpus_name) {
+        (Scenario::Prepare, None) | (Scenario::All, None) => Ok(true),
+        (Scenario::Prepare, Some(name)) => Err(format!(
+            "the prepare scenario runs bench/corpus-prepare.yaml, not {name}, and would be \
+             recorded under {name}; run it without --corpus"
+        )),
+        (Scenario::All, Some(name)) => {
+            eprintln!(
+                "bench: WARNING: skipping the prepare scenario for {name}: it runs \
+                 bench/corpus-prepare.yaml whatever the corpus"
+            );
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Every (source, tag) a scenario syncs.
@@ -1091,7 +1167,7 @@ fn cold_ocync_median(
 fn ensure_baseline_comparable(
     args: &BenchArgs,
     transfers: &[Transfer],
-    corpus: &Corpus,
+    corpus: &report::CorpusInfo,
     corpus_locked_at: Option<&lock::LockedAt>,
     baseline_path: &Path,
 ) -> Result<(), String> {
@@ -1112,10 +1188,7 @@ fn ensure_baseline_comparable(
         total_bytes: 0,
         corpus_locked_at: corpus_locked_at.cloned(),
         sync_from: lock::SyncFrom::of(corpus_locked_at),
-        corpus: report::CorpusInfo {
-            images: corpus.images.len(),
-            tags: corpus.total_tags(),
-        },
+        corpus: corpus.clone(),
         max_concurrent_transfers: Some(report::effective_transfer_cap(
             args.tool_selection.max_concurrent_transfers,
         )),
@@ -1124,9 +1197,14 @@ fn ensure_baseline_comparable(
     regression::ensure_baseline_comparable(baseline_path, &key)
 }
 
-/// Where the stored baseline of `--regression` lives.
-fn baseline_path() -> PathBuf {
-    PathBuf::from("bench/results/baseline.json")
+/// Where the stored baseline of `--regression` lives: one per corpus, so a run
+/// of a named corpus is never compared with the main corpus's.
+fn baseline_path(corpus_name: Option<&CorpusName>) -> PathBuf {
+    let dir = Path::new(report::ARCHIVE_DIR);
+    match corpus_name {
+        None => dir.join("baseline.json"),
+        Some(name) => dir.join(format!("baseline-{name}.json")),
+    }
 }
 
 /// Compare the current ocync run against a stored baseline.
@@ -1137,15 +1215,11 @@ fn check_regression(
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = baseline_path();
+    let baseline_path = baseline_path(report.corpus.name.as_ref());
 
-    let corpus = report::CorpusInfo {
-        images: report.corpus_size,
-        tags: report.total_tags,
-    };
     if let Some(current) = cold_ocync_median(
         &report.scenarios,
-        corpus,
+        report.corpus.clone(),
         report.ocync_transfer_cap(),
         corpus_locked_at,
     ) {
@@ -1550,13 +1624,7 @@ async fn run_scale(
     output_dir: &Path,
 ) -> Result<Finished, Box<dyn std::error::Error>> {
     progress("bench: running scale scenario");
-    let total = corpus.images.len();
-    let mut sizes: Vec<usize> = [10, 25, 50, total]
-        .iter()
-        .copied()
-        .filter(|&s| s <= total)
-        .collect();
-    sizes.dedup();
+    let sizes = scale_sizes(corpus.images.len());
 
     let mut scale_results = Vec::new();
 
@@ -2720,7 +2788,11 @@ mod tests {
     fn a_regression_run_is_refused_before_its_rounds_only_when_its_comparison_would_be() {
         // Catches: the refusal coming after the rounds, and a refusal for a run
         // whose comparison is skipped (proxy off, no ocync, no cold sync).
-        let corpus = two_image_corpus();
+        let corpus = report::CorpusInfo {
+            name: None,
+            images: 2,
+            tags: 2,
+        };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("baseline.json");
         let cold = |rounds: usize| -> Vec<Transfer> {
@@ -2732,10 +2804,7 @@ mod tests {
             total_bytes: 1,
             corpus_locked_at: None,
             sync_from: None,
-            corpus: report::CorpusInfo {
-                images: corpus.images.len(),
-                tags: corpus.total_tags(),
-            },
+            corpus: corpus.clone(),
             max_concurrent_transfers: NonZeroUsize::new(20),
             rounds: 3,
         };
@@ -2806,7 +2875,11 @@ mod tests {
         // Catches: a run that syncs locked digests being compared with a
         // baseline recorded when tools followed the tags, which the same
         // `locked_at` does not tell apart.
-        let corpus = two_image_corpus();
+        let corpus = report::CorpusInfo {
+            name: None,
+            images: 2,
+            tags: 2,
+        };
         let at = lock::fixtures::locked_at("2026-10-30-214340");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("baseline.json");
@@ -2818,10 +2891,7 @@ mod tests {
             total_bytes: 1,
             corpus_locked_at: Some(at.clone()),
             sync_from,
-            corpus: report::CorpusInfo {
-                images: corpus.images.len(),
-                tags: corpus.total_tags(),
-            },
+            corpus: corpus.clone(),
             max_concurrent_transfers: Some(report::effective_transfer_cap(None)),
             rounds: 5,
         };
@@ -2844,7 +2914,7 @@ mod tests {
     fn rounds_repeat_sync_and_partial_and_leave_scale_and_prepare_at_one_pass() {
         // Catches: scale repeating, which multiplies its four corpus sizes, and
         // a sync with fewer rounds than asked for.
-        let corpus = two_image_corpus();
+        let corpus = corpus_of(11);
         let dir = tempfile::tempdir().unwrap();
         let overrides = dir.path().join("overrides.yaml");
         std::fs::write(
@@ -2921,7 +2991,11 @@ mod tests {
             round(2, 50.0, 900),
             round(3, 20.0, 300),
         ];
-        let corpus = || report::CorpusInfo { images: 2, tags: 2 };
+        let corpus = || report::CorpusInfo {
+            name: None,
+            images: 2,
+            tags: 2,
+        };
 
         let median = cold_ocync_median(&scenarios, corpus(), NonZeroUsize::new(20), None).unwrap();
 
@@ -2947,7 +3021,11 @@ mod tests {
             round: Some(1),
             ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![tool_run(Tool::Ocync, 10.0)])
         };
-        let corpus = report::CorpusInfo { images: 2, tags: 2 };
+        let corpus = report::CorpusInfo {
+            name: None,
+            images: 2,
+            tags: 2,
+        };
 
         assert!(cold_ocync_median(&[scenario], corpus, None, None).is_none());
     }
@@ -3090,6 +3168,18 @@ mod tests {
         assert_eq!(one, [Tool::Ocync]);
     }
 
+    /// The two-image corpus with filler images added up to `images`.
+    fn corpus_of(images: usize) -> Corpus {
+        let mut corpus = two_image_corpus();
+        corpus
+            .images
+            .extend((2..images).map(|n| corpus::ImageEntry {
+                source: format!("public.ecr.aws/filler/image-{n}"),
+                tags: vec!["1".to_owned()],
+            }));
+        corpus
+    }
+
     fn two_image_corpus() -> Corpus {
         serde_yaml::from_str(
             r#"
@@ -3114,7 +3204,7 @@ images:
              - source: \"public.ecr.aws/amazoncorretto/amazoncorretto\"\n    tags: [\"11\"]\n",
         )
         .unwrap();
-        let corpus = two_image_corpus();
+        let corpus = corpus_of(11);
         let rounds = "3".parse().unwrap();
         let transfers = plan(Scenario::All, &corpus, overrides.to_str().unwrap(), rounds).unwrap();
         let names: Vec<String> = transfers.iter().map(ToString::to_string).collect();
@@ -3249,6 +3339,179 @@ images:
         }
         let transfers = plan(Scenario::Prepare, &corpus, missing, Rounds::DEFAULT).unwrap();
         assert!(transfers.is_empty(), "prepare reads no lock");
+    }
+
+    #[test]
+    fn a_partial_scenario_whose_overrides_change_no_tag_is_refused_and_all_skips_it() {
+        // Catches: a partial run that changes no tag re-syncing unchanged tags
+        // and being recorded as an incremental sync, whether its overrides name
+        // no source of the corpus or repeat the corpus's own tags; `all`
+        // refusing a corpus it could still sync and scale; a refusal that does
+        // not say how to name overrides for this corpus; and a real override
+        // not planned.
+        let corpus = corpus_of(11);
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let other_source = write(
+            "other.yaml",
+            "overrides:\n  - source: \"quay.io/jupyter/base-notebook\"\n    tags: [\"2026-10-28\"]\n",
+        );
+        let same_tags = write(
+            "same.yaml",
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.12\"]\n",
+        );
+        let real = write(
+            "real.yaml",
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.10\"]\n",
+        );
+        let rounds = "3".parse().unwrap();
+        let names = |requested, overrides: &str| -> Result<Vec<String>, String> {
+            plan(requested, &corpus, overrides, rounds)
+                .map(|planned| planned.iter().map(ToString::to_string).collect())
+        };
+
+        for overrides in [&other_source, &same_tags] {
+            let refusal = names(Scenario::Partial, overrides).unwrap_err();
+            assert_eq!(
+                refusal,
+                format!(
+                    "the overrides in {overrides} change no tag of the corpus (after \
+                     --skip-registries and --limit, if given); name overrides for this \
+                     corpus with --partial-overrides"
+                )
+            );
+            assert_eq!(
+                names(Scenario::All, overrides).unwrap(),
+                ["Sync round 1", "Sync round 2", "Sync round 3", "Scale"],
+                "{overrides}"
+            );
+        }
+        assert_eq!(
+            names(Scenario::Partial, &real).unwrap(),
+            ["Partial round 1", "Partial round 2", "Partial round 3"]
+        );
+    }
+
+    #[test]
+    fn an_explicit_prepare_is_refused_for_a_named_corpus() {
+        // Catches: prepare, which runs corpus-prepare.yaml whatever the corpus
+        // is, recorded and compared under a named corpus's name.
+        let named = CorpusName::new("corpus-small");
+        assert_eq!(
+            runs_prepare(Scenario::Prepare, Some(&named)),
+            Err(
+                "the prepare scenario runs bench/corpus-prepare.yaml, not corpus-small, and \
+                 would be recorded under corpus-small; run it without --corpus"
+                    .to_owned()
+            )
+        );
+        assert_eq!(runs_prepare(Scenario::Prepare, None), Ok(true));
+    }
+
+    #[test]
+    fn all_skips_what_would_repeat_a_measurement_and_a_named_scenario_always_runs() {
+        // Catches: `all` on a shape corpus running prepare, which reads its own
+        // corpus whatever is named, and scale at a single size, which repeats
+        // the cold sync; and an explicit scale skipped as well.
+        let dir = tempfile::tempdir().unwrap();
+        let overrides = dir.path().join("overrides.yaml");
+        std::fs::write(
+            &overrides,
+            "overrides:\n  - source: \"public.ecr.aws/lambda/python\"\n    tags: [\"3.10\"]\n",
+        )
+        .unwrap();
+        let overrides = overrides.to_str().unwrap();
+        let rounds = "3".parse().unwrap();
+        let sync = ["Sync round 1", "Sync round 2", "Sync round 3"];
+        let partial = ["Partial round 1", "Partial round 2", "Partial round 3"];
+        let named = Some(CorpusName::new("corpus-small"));
+        for (label, requested, images, name, passes, prepare) in [
+            (
+                "all, main corpus, 11 images",
+                Scenario::All,
+                11,
+                None,
+                [&sync[..], &partial, &["Scale"]].concat(),
+                true,
+            ),
+            (
+                "all, named corpus, 11 images",
+                Scenario::All,
+                11,
+                named.clone(),
+                [&sync[..], &partial, &["Scale"]].concat(),
+                false,
+            ),
+            (
+                "all, 10 images: scale would run one size",
+                Scenario::All,
+                10,
+                None,
+                [&sync[..], &partial].concat(),
+                true,
+            ),
+            (
+                "scale alone, 6 images",
+                Scenario::Scale,
+                6,
+                named.clone(),
+                vec!["Scale"],
+                false,
+            ),
+            (
+                "prepare alone, main corpus",
+                Scenario::Prepare,
+                6,
+                None,
+                Vec::new(),
+                true,
+            ),
+            (
+                "sync, named corpus",
+                Scenario::Sync,
+                6,
+                named,
+                sync.to_vec(),
+                false,
+            ),
+        ] {
+            let corpus = corpus_of(images);
+            let planned: Vec<String> = plan(requested, &corpus, overrides, rounds)
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(planned, passes, "{label}");
+            assert_eq!(
+                runs_prepare(requested, name.as_ref()),
+                Ok(prepare),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_corpus_has_its_own_baseline_file() {
+        // Catches: a shape corpus compared with, or overwriting, the main
+        // corpus's baseline.
+        for (name, path) in [
+            (None, "bench/results/baseline.json"),
+            (
+                Some("corpus-small"),
+                "bench/results/baseline-corpus-small.json",
+            ),
+        ] {
+            let name = name.map(CorpusName::new);
+            assert_eq!(
+                baseline_path(name.as_ref()),
+                PathBuf::from(path),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

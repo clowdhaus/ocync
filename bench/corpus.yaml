@@ -53,10 +53,11 @@ images:
     tags: ["2026-10-28"]
 
   # ── NVIDIA CUDA (chunked-upload stress + intra-repo blob sharing) ─────────
-  # NGC's nvcr.io requires auth; the docker.io/nvidia/cuda mirror is
-  # anonymously pullable. 12.6.2 runtime/devel share ~1.5 GB across tags
-  # (same target repo, so this exercises intra-repo dedup, not cross-repo
-  # mount -- included for large-blob chunked-upload throughput).
+  # NGC's nvcr.io serves anonymously; this entry uses the docker.io/nvidia/cuda
+  # mirror because the lock pins that mirror's digests. 12.6.2 runtime/devel
+  # share ~1.5 GB across tags (same target repo, so this exercises intra-repo
+  # dedup, not cross-repo mount -- included for large-blob chunked-upload
+  # throughput).
   - source: "docker.io/nvidia/cuda"
     tags:
       - "12.6.2-base-ubuntu22.04"         # ~92 MB
