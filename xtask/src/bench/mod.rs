@@ -1369,20 +1369,13 @@ async fn run_single_tool(
             )?;
             Launch::PerTag(config_gen::per_tag_copies(copier, corpus, lock, config_dir))
         }
-        // Only ocync has a prepare mode, which `ensure_prepare_applies`
-        // refuses every other tool before a run starts.
+        // Only ocync has a prepare mode, and `run_prepare` runs ocync alone.
         _ => {
             return Err(
                 format!("{tool} syncs from the corpus lock and has no prepare mode").into(),
             );
         }
     };
-
-    let config_path = config_dir.join(format!("{}.yaml", tool));
-    if let Launch::Config(content) = &launch {
-        std::fs::write(&config_path, content)
-            .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
-    }
 
     // The proxy log lives under `output_dir`, not the auto-cleaned tempdir, so
     // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly which
@@ -1411,7 +1404,10 @@ async fn run_single_tool(
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let label = args.tool_selection.label(tool);
     let result = match &launch {
-        Launch::Config(_) => {
+        Launch::Config(content) => {
+            // Mode 0600: regsync's and dregsy's configs hold the Docker Hub token.
+            let config_path = config_dir.join(format!("{tool}.yaml"));
+            write_file(&config_path, content, 0o600)?;
             runner::run_tool(
                 tool,
                 &label,

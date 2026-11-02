@@ -84,8 +84,8 @@ pub(crate) struct RunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) baseline_max_concurrent_transfers: Option<BaselineCap>,
     /// How many copies the per-tag tools (skopeo, crane, regctl, oras) ran at
-    /// once. Runs under another value are another series; absent when none of
-    /// them ran and from records written before they were benchmarked.
+    /// once, fixed at 1 by `runner::PER_TAG_JOBS`; absent when none of them
+    /// ran and from records written before they were benchmarked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) per_tag_jobs: Option<NonZeroUsize>,
     /// How many rounds were asked for and finished; absent for a run with no
@@ -733,7 +733,7 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     }
     let without: Vec<String> = calls
         .iter()
-        .filter(|(tool, _)| !tool.is_ocync())
+        .filter(|&&(tool, n)| !tool.is_ocync() && n == 0)
         .map(|&(tool, _)| report.label(tool))
         .collect();
     let mut out = String::new();
@@ -3120,6 +3120,23 @@ pub(crate) mod tests {
             "{md}"
         );
         assert!(!md.contains("The other tools"), "{md}");
+
+        // Catches: a competitor that made referrer calls still named as
+        // copying none, beside its own nonzero count.
+        let mut report = five_rounds(5);
+        for run in report
+            .scenarios
+            .iter_mut()
+            .flat_map(|s| s.runs.iter_mut())
+            .filter(|r| r.tool == Tool::Regsync)
+        {
+            run.proxy_metrics.as_mut().unwrap().referrer_calls = 3;
+        }
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("Referrers are not copied by dregsy as configured here."),
+            "{md}"
+        );
     }
 
     #[test]

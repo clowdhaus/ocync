@@ -734,16 +734,15 @@ pub(crate) async fn run_tool(
     dry_run: bool,
 ) -> Result<RunResult, String> {
     let config_str = config_path.to_string_lossy();
-    if tool.copier().is_some() {
-        return Err(format!(
-            "{tool} copies one tag per process: use run_per_tag"
-        ));
-    }
     let mut args: Vec<&str> = match tool {
         Tool::Dregsy => vec!["-config", &config_str],
         Tool::Regsync => vec!["once", "-c", &config_str],
-        // What is left is an ocync build.
-        _ => vec!["sync", "--config", &config_str, "--json", "-v"],
+        Tool::Ocync | Tool::OcyncBaseline => vec!["sync", "--config", &config_str, "--json", "-v"],
+        Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras => {
+            return Err(format!(
+                "{tool} copies one tag per process: use run_per_tag"
+            ));
+        }
     };
     // Only ocync has a mode that resolves every mapping and then stops, which
     // is what isolates the prepare phase. The scenario that asks for it runs
@@ -782,12 +781,6 @@ pub(crate) async fn run_tool(
     })
 }
 
-/// The tag a per-tag copy writes, shown beside its position when it fails:
-/// the last argument of every per-tag command line is the target reference.
-fn target_of(command: &[String]) -> &str {
-    command.last().map_or("", String::as_str)
-}
-
 /// Runs a per-tag tool's copies one after the other, `commands` being the
 /// arguments after its binary, one list per corpus tag.
 ///
@@ -821,14 +814,14 @@ pub(crate) async fn run_per_tag(
             "{label} {}/{} {}",
             index + 1,
             commands.len(),
-            target_of(command)
+            // The last argument of every per-tag command is the target reference.
+            command.last().map_or("", String::as_str)
         );
-        let args: Vec<&str> = command.iter().map(String::as_str).collect();
         let child = spawn_streamed(
             tool,
             &child_label,
             OsStr::new(&*binary),
-            &args,
+            command,
             proxy_url,
             env,
         )
@@ -858,7 +851,7 @@ async fn spawn_streamed(
     tool: Tool,
     label: &str,
     binary: &OsStr,
-    args: &[&str],
+    args: &[impl AsRef<OsStr>],
     proxy_url: Option<&str>,
     env: &[(&str, &OsStr)],
 ) -> Result<RunResult, String> {
@@ -870,7 +863,7 @@ async fn spawn_streamed(
     let use_gnu_time = Path::new("/usr/bin/time").exists();
     let mut cmd = if use_gnu_time {
         let mut time_args = vec![OsStr::new("-v"), binary];
-        time_args.extend(args.iter().map(OsStr::new));
+        time_args.extend(args.iter().map(AsRef::as_ref));
         let mut c = tokio::process::Command::new("/usr/bin/time");
         c.args(&time_args);
         c
