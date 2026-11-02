@@ -11,11 +11,9 @@
 # through CloudFront, ghcr.io's through Fastly: none belongs on the pre-warm's
 # no-blob-cache list.
 #
-# Cost: a cold pass is about 5 minutes for ocync and about 16 for a tool that
-# does not mount. Staging needs at least 3.2 minutes each way on the 400 MB/s
-# volume, and the 256 GB disk holds one pass. Pre-warm downloads about 75 GB
-# against its 8 minute deadline: read the first run's `prewarm.unwarmed` before
-# trusting its numbers.
+# The 256 GB disk holds one pass. Pre-warm downloads about 75 GB against its 8
+# minute deadline: read the first run's `prewarm.unwarmed` before trusting its
+# numbers.
 #
 # Content is fixed by bench/corpus-large.lock.json, written by
 # `cargo xtask bench-lock --corpus bench/corpus-large.yaml`. A tag that moves
@@ -27,7 +25,8 @@
 # partial overrides name none of this corpus's sources, so `--scenario all`
 # skips the partial scenario with a warning and `--scenario partial` is
 # refused. `bench-remote` cannot pass `--partial-overrides`; `bench` can.
-# Scale collapses to one size at six images.
+# Scale collapses to one size at six images, so `all` skips it too; ask for
+# `--scenario scale` to run it. `all` also skips prepare for this corpus.
 
 corpus:
   target_registry: "${BENCH_TARGET_REGISTRY}"

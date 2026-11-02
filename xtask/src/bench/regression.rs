@@ -498,7 +498,7 @@ mod tests {
         // baseline, and a refusal that does not name both corpora.
         let named = |name: Option<&str>| Baseline {
             corpus: CorpusInfo {
-                name: name.map(str::to_owned),
+                name: name.map(crate::bench::corpus::CorpusName::new),
                 images: 40,
                 tags: 55,
             },

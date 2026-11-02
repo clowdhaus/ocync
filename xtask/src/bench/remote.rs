@@ -15,7 +15,6 @@ use clap::Args;
 use serde::Deserialize;
 
 use super::acr::ENV_TOKEN_FILE;
-use super::corpus::DEFAULT_CORPUS;
 use super::gar::ENV_CREDENTIALS;
 use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
@@ -74,9 +73,10 @@ pub(crate) struct BenchRemoteArgs {
     pub(crate) target: Kind,
 
     /// Corpus YAML the instance syncs, passed through to `cargo xtask bench`
-    /// only when it is not the default. Its lock is the `.lock.json` beside it.
-    #[arg(long, default_value = DEFAULT_CORPUS)]
-    pub(crate) corpus: String,
+    /// when given; the instance's own default otherwise. The file and its
+    /// `.lock.json` beside it must be committed in the commit that runs.
+    #[arg(long)]
+    pub(crate) corpus: Option<PathBuf>,
 
     /// Copy the newest results on the instance instead of starting a run.
     /// They are a live run's partial results only once its benchmark has
@@ -218,6 +218,14 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         None => current_branch()?,
     };
 
+    // The remote script checks out this SHA, not the branch name, so a
+    // force-push landing between our push and the instance's fetch cannot
+    // change what is built.
+    let git_sha = resolve_commit(Path::new("."), &git_ref)?;
+    if let Some(corpus) = &args.corpus {
+        ensure_corpus_committed(Path::new("."), &git_sha, corpus)?;
+    }
+
     eprintln!("bench-remote: pushing {git_ref}...");
     let push = Command::new("git")
         .args(["push", "origin", &git_ref])
@@ -225,11 +233,6 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     if !push.success() {
         return Err("git push failed".into());
     }
-
-    // The remote script checks out this SHA, not the branch name, so a
-    // force-push landing between our push and the instance's fetch cannot
-    // change what is built.
-    let git_sha = resolve_commit(Path::new("."), &git_ref)?;
     eprintln!("bench-remote: pinned to {git_sha} ({git_ref})");
 
     // This run's start time, chosen here: it names the results directory the
@@ -400,9 +403,9 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     if args.target != Kind::Ecr {
         bench_args.extend(["--target".to_string(), value_name(&args.target)]);
     }
-    // Only for another corpus, for the same reason.
-    if args.corpus != DEFAULT_CORPUS {
-        bench_args.extend(["--corpus".to_string(), args.corpus.clone()]);
+    // Only when given, for the same reason.
+    if let Some(corpus) = &args.corpus {
+        bench_args.extend(["--corpus".to_string(), corpus.display().to_string()]);
     }
     if let Some(commit) = &args.tool_selection.baseline_ref {
         bench_args.extend(["--baseline-ref".to_string(), commit.to_string()]);
@@ -1111,6 +1114,29 @@ fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Fails unless `commit` holds `corpus` and the lock beside it, which the
+/// instance reads from its checkout of that commit: a file only the working
+/// tree has would fail the run after the push and the build.
+fn ensure_corpus_committed(
+    repo: &Path,
+    commit: &CommitSha,
+    corpus: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for path in [corpus.to_owned(), corpus.with_extension("lock.json")] {
+        let named = path
+            .to_str()
+            .ok_or_else(|| format!("corpus path {} is not UTF-8", path.display()))?;
+        if git(repo, &["cat-file", "-e", &format!("{commit}:{named}")]).is_err() {
+            return Err(format!(
+                "{named} is not in commit {commit}, which the instance checks out; commit it \
+                 first"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// A full commit object name: 40 lowercase hex digits, safe to place in a
 /// shell command unescaped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1311,6 +1337,47 @@ mod tests {
             &["update-ref", "refs/heads/main", pushed_ref],
         );
         assert_eq!(refused(&local), not_on_origin(&local));
+    }
+
+    #[test]
+    fn a_corpus_and_its_lock_must_be_committed_before_the_run_is_pushed() {
+        // Catches: a corpus or lock that exists only in the working tree, which
+        // the instance's checkout lacks, failing after the push and the build,
+        // and a refusal that does not name the missing file.
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir(repo.path().join("bench")).unwrap();
+        let write = |file: &str| std::fs::write(repo.path().join(file), "x").unwrap();
+        write("bench/corpus-small.yaml");
+        git_in(repo.path(), &["add", "bench/corpus-small.yaml"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "corpus only"]);
+        let corpus_only = resolve_commit(repo.path(), "HEAD").unwrap();
+        write("bench/corpus-small.lock.json");
+        git_in(repo.path(), &["add", "bench/corpus-small.lock.json"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "lock"]);
+        let both = resolve_commit(repo.path(), "HEAD").unwrap();
+        write("bench/corpus-new.yaml");
+        write("bench/corpus-new.lock.json");
+
+        let check = |commit: &CommitSha, corpus: &str| {
+            ensure_corpus_committed(repo.path(), commit, Path::new(corpus))
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(check(&both, "bench/corpus-small.yaml"), Ok(()));
+        assert_eq!(
+            check(&corpus_only, "bench/corpus-small.yaml"),
+            Err(format!(
+                "bench/corpus-small.lock.json is not in commit {corpus_only}, which the \
+                 instance checks out; commit it first"
+            ))
+        );
+        assert_eq!(
+            check(&both, "bench/corpus-new.yaml"),
+            Err(format!(
+                "bench/corpus-new.yaml is not in commit {both}, which the instance checks \
+                 out; commit it first"
+            ))
+        );
     }
 
     #[test]
@@ -1569,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corpus_reaches_the_benchmark_only_when_it_is_not_the_default() {
+    fn a_corpus_reaches_the_benchmark_only_when_it_is_given() {
         // Catches: a shape corpus run on the instance against the main corpus,
         // and an option a `--git-ref` older than it does not know sent on
         // every run.
@@ -1583,7 +1650,6 @@ mod tests {
             bench_args(&args, &timestamp)
         };
         assert!(!passed(&[]).contains(&"--corpus".to_owned()));
-        assert!(!passed(&["--corpus", "bench/corpus.yaml"]).contains(&"--corpus".to_owned()));
         let small = passed(&["--corpus", "bench/corpus-small.yaml"]);
         let at = small.iter().position(|a| a == "--corpus").unwrap();
         assert_eq!(small[at + 1], "bench/corpus-small.yaml");

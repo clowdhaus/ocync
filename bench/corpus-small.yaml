@@ -26,7 +26,8 @@
 # Run it with `bench-remote --corpus bench/corpus-small.yaml`. The default
 # partial overrides name none of this corpus's sources, so `--scenario all`
 # skips the partial scenario with a warning and `--scenario partial` is
-# refused. `bench-remote` cannot pass `--partial-overrides`; `bench` can.
+# refused. `bench-remote` cannot pass `--partial-overrides`; `bench` can. `all`
+# also skips prepare for this corpus.
 
 corpus:
   target_registry: "${BENCH_TARGET_REGISTRY}"
