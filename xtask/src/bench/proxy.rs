@@ -335,8 +335,7 @@ pub(crate) fn aggregate(entries: &[ProxyEntry], target_registry: &str) -> ProxyM
             }
         }
 
-        // OCI 1.1 referrer-artifact discovery -- marks artifact-sync calls.
-        // Comparable tools (dregsy, regsync) do not implement this API.
+        // OCI 1.1 referrer-artifact discovery: marks artifact-sync calls.
         if entry.method == "GET" && entry.url.contains("/referrers/") {
             referrer_calls += 1;
         }

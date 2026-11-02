@@ -13,7 +13,7 @@ use crate::bench::corpus;
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
-use crate::bench::runner::Tool;
+use crate::bench::runner::{PER_TAG_JOBS, Tool};
 use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
@@ -83,6 +83,11 @@ pub(crate) struct RunRecord {
     /// The cap the baseline build ran with; absent without a baseline build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) baseline_max_concurrent_transfers: Option<BaselineCap>,
+    /// How many copies the per-tag tools (skopeo, crane, regctl, oras) ran at
+    /// once. Runs under another value are another series; absent when none of
+    /// them ran and from records written before they were benchmarked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_tag_jobs: Option<NonZeroUsize>,
     /// How many rounds were asked for and finished; absent for a run with no
     /// repeated scenario and for records written before rounds existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,6 +145,7 @@ impl RunRecord {
             corpus: report.corpus.clone(),
             max_concurrent_transfers: report.ocync_transfer_cap(),
             baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
+            per_tag_jobs: report.per_tag_jobs(),
             rounds: report.round_count(),
             scenarios: report
                 .scenarios
@@ -615,6 +621,14 @@ impl BenchReport {
             .then(|| effective_transfer_cap(self.max_concurrent_transfers))
     }
 
+    /// How many copies the per-tag tools ran at once. `None` when none ran.
+    fn per_tag_jobs(&self) -> Option<NonZeroUsize> {
+        self.tool_versions
+            .keys()
+            .any(|tool| tool.is_per_tag())
+            .then_some(PER_TAG_JOBS)
+    }
+
     /// The cap the baseline build ran with. `None` without a baseline build.
     fn baseline_transfer_cap(&self) -> Option<BaselineCap> {
         self.baseline.as_ref().map(|_| {
@@ -692,8 +706,9 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 /// tool issued referrer calls in any round.
 ///
 /// ocync issues `GET /v2/<repo>/referrers/...` to discover artifact
-/// attestations (SBOM, SLSA) and transfers any referenced artifacts.
-/// Comparable tools do not implement this OCI 1.1 endpoint. The footnote
+/// attestations (SBOM, SLSA) and transfers any referenced artifacts. The other
+/// tools copy no referrers as configured here (regctl and oras can, and run
+/// with it off). The footnote
 /// surfaces the per-tool count, the median over the rounds, so the Source blob
 /// GETs / Source blob bytes columns are not read as a fairness violation.
 ///
@@ -719,7 +734,7 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     out.push_str("> **Artifact sync (OCI 1.1 referrers).** ");
     out.push_str("ocync issues `GET /v2/<repo>/referrers/...` to discover ");
     out.push_str("attestations (SBOM, SLSA) and transfers any referenced ");
-    out.push_str("artifacts. Comparable tools do not implement this. The ");
+    out.push_str("artifacts. The other tools copy no referrers as configured here. The ");
     out.push_str("Source blob GETs and Source blob bytes columns above include ");
     out.push_str("this artifact content for ocync.\n>\n> ");
     let parts: Vec<String> = calls
@@ -728,6 +743,36 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
         .collect();
     out.push_str(&format!("Referrers calls -- {}.\n", parts.join(", ")));
     Some(out)
+}
+
+/// The footnote on the Peak RSS row for the per-tag tools among the runs, or
+/// `None` without one. They run a process per tag, so the cell is the largest
+/// process, not what the run held at once. Leads with a newline like
+/// [`referrer_footnote`].
+fn per_process_rss_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option<String> {
+    let tools: Vec<String> = rounds_by_tool(rounds)
+        .into_keys()
+        .filter(|tool| tool.is_per_tag())
+        .map(|tool| report.label(tool))
+        .collect();
+    (!tools.is_empty()).then(|| {
+        format!(
+            "\n> **Peak RSS of {} is per process.** Each copies one tag per \
+             process, so its cell is the largest of those processes.\n",
+            tools.join(", ")
+        )
+    })
+}
+
+/// The footnotes under a scenario's tables, each with a leading newline.
+fn footnotes(report: &BenchReport, rounds: &[&ScenarioResult]) -> String {
+    [
+        referrer_footnote(report, rounds),
+        per_process_rss_footnote(report, rounds),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Generates a Markdown summary of the benchmark report.
@@ -804,9 +849,7 @@ fn summary_markdown(report: &BenchReport) -> String {
             .collect();
         render_metric_table(report, &ran, &by_tool, &mut out);
         render_comparison(report, &rounds, &mut out);
-        if let Some(footnote) = referrer_footnote(report, &rounds) {
-            out.push_str(&footnote);
-        }
+        out.push_str(&footnotes(report, &rounds));
         out.push('\n');
     }
 
@@ -1215,9 +1258,7 @@ fn scenario_markdown(
     let columns = tool_columns(report);
     render_metric_table(report, &columns, &rounds_by_tool(rounds), &mut out);
     render_comparison(report, rounds, &mut out);
-    if let Some(footnote) = referrer_footnote(report, rounds) {
-        out.push_str(&footnote);
-    }
+    out.push_str(&footnotes(report, rounds));
 
     out
 }
@@ -1839,6 +1880,47 @@ pub(crate) mod tests {
         assert_eq!(record.max_concurrent_transfers, None);
         assert_eq!(record.baseline_max_concurrent_transfers, None);
         assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
+    }
+
+    #[test]
+    fn per_tag_tools_record_their_job_count_and_mark_their_peak_rss_as_per_process() {
+        // Catches: a record that does not name the per-tag job count a number
+        // was measured at, one written for a run without those tools, and a
+        // per-process peak read as the run's total.
+        let report = sample_report();
+        let record = RunRecord::of(&report, "abc1234".into(), None);
+        assert_eq!(record.per_tag_jobs, None);
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("per_tag_jobs")
+        );
+        assert!(!summary_markdown(&report).contains("per process"));
+
+        let mut report = sample_report();
+        for tool in [Tool::Crane, Tool::Oras] {
+            report.tool_versions.insert(tool, "v1".to_owned());
+            report.scenarios[0].runs.push(ToolRun {
+                tool,
+                wall_clock_secs: 1.0,
+                peak_rss_kb: Some(1),
+                proxy_metrics: None,
+                phase_timing_ms: BTreeMap::new(),
+            });
+        }
+        let record = RunRecord::of(&report, "abc1234".into(), None);
+        assert_eq!(record.per_tag_jobs, NonZeroUsize::new(1));
+        assert!(
+            serde_json::to_string(&record)
+                .unwrap()
+                .contains(r#""per_tag_jobs":1"#)
+        );
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("> **Peak RSS of crane, oras is per process.**"),
+            "{md}"
+        );
+        assert!(!md.contains("Peak RSS of ocync"), "{md}");
     }
 
     #[test]
@@ -2631,6 +2713,11 @@ pub(crate) mod tests {
             md.contains("OCI 1.1 referrers"),
             "footnote missing from summary.md:\n{md}"
         );
+        assert!(
+            md.contains("The other tools copy no referrers as configured here."),
+            "{md}"
+        );
+        assert!(!md.contains("do not implement"), "{md}");
         assert!(md.contains("ocync: 79"), "ocync count missing:\n{md}");
         assert!(md.contains("dregsy: 0"), "dregsy count missing:\n{md}");
         assert!(md.contains("regsync: 0"), "regsync count missing:\n{md}");

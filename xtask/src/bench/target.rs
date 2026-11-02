@@ -99,7 +99,7 @@ pub(crate) fn ensure_target_applies(
         .find(|tool| !matches!(tool, Tool::Ocync | Tool::OcyncBaseline))
     {
         return Err(format!(
-            "{tool} cannot sync into {name}: its config hardcodes ECR credentials"
+            "{tool} cannot sync into {name}: its sign-in is written for ECR only"
         ));
     }
     if tools.len() != 1 {
@@ -739,7 +739,15 @@ mod tests {
                 GAR_ENV.to_vec(),
                 Scenario::Sync,
                 vec![Tool::Regsync],
-                "regsync cannot sync into Artifact Registry: its config hardcodes ECR credentials",
+                "regsync cannot sync into Artifact Registry: its sign-in is written for ECR only",
+            ),
+            (
+                "per-tag competitor tool",
+                Kind::ArtifactRegistry,
+                GAR_ENV.to_vec(),
+                Scenario::Sync,
+                vec![Tool::Crane],
+                "crane cannot sync into Artifact Registry: its sign-in is written for ECR only",
             ),
             (
                 "ocync beside a competitor",
@@ -811,7 +819,15 @@ mod tests {
                 FULL_ENV.to_vec(),
                 Scenario::Sync,
                 vec![Tool::Regsync],
-                "regsync cannot sync into ACR: its config hardcodes ECR credentials",
+                "regsync cannot sync into ACR: its sign-in is written for ECR only",
+            ),
+            (
+                "ACR per-tag competitor tool",
+                Kind::Acr,
+                FULL_ENV.to_vec(),
+                Scenario::Sync,
+                vec![Tool::Crane],
+                "crane cannot sync into ACR: its sign-in is written for ECR only",
             ),
             (
                 "ACR ocync beside its baseline",

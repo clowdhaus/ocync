@@ -1,4 +1,5 @@
-//! Benchmark suite for comparing ocync against dregsy and regsync.
+//! Benchmark suite for comparing ocync against dregsy, regsync, skopeo, crane,
+//! regctl and oras.
 
 pub(crate) mod acr;
 pub(crate) mod az;
@@ -1281,6 +1282,14 @@ fn round_dir(output_dir: &Path, round: usize) -> PathBuf {
     output_dir.join(format!("round-{round}"))
 }
 
+/// What a pass hands its tool, written before the proxy starts.
+enum Launch {
+    /// The text of the config file the tool reads, one process for the pass.
+    Config(String),
+    /// The arguments of each copy of a per-tag tool, one process per tag.
+    PerTag(Vec<Vec<String>>),
+}
+
 /// Run a single tool against the corpus and return a `ToolRun`.
 async fn run_single_tool(
     args: &BenchArgs,
@@ -1291,19 +1300,33 @@ async fn run_single_tool(
     pass: Pass,
     mode: config_gen::Mode<'_>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
-    let config_content = match (tool, mode) {
-        (Tool::Ocync | Tool::OcyncBaseline, mode) => config_gen::ocync_config(
+    let launch = match (tool, mode) {
+        (Tool::Ocync | Tool::OcyncBaseline, mode) => Launch::Config(config_gen::ocync_config(
             corpus,
             args.target,
             args.tool_selection.max_concurrent_transfers,
             mode,
-        ),
+        )),
         (Tool::Dregsy, config_gen::Mode::Sync(lock)) => {
             let skopeo = skopeo_shim::write_script(config_dir)?;
-            config_gen::dregsy_config(corpus, lock, &skopeo)
+            Launch::Config(config_gen::dregsy_config(corpus, lock, &skopeo))
         }
-        (Tool::Regsync, config_gen::Mode::Sync(lock)) => config_gen::regsync_config(corpus, lock),
-        (Tool::Dregsy | Tool::Regsync, config_gen::Mode::Prepare) => {
+        (Tool::Regsync, config_gen::Mode::Sync(lock)) => {
+            Launch::Config(config_gen::regsync_config(corpus, lock))
+        }
+        (Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras, config_gen::Mode::Sync(lock)) => {
+            // Mode 0600: it holds the Docker Hub token.
+            skopeo_shim::write_file(
+                &config_dir.join(config_gen::DOCKER_CONFIG_FILE),
+                &config_gen::docker_config(corpus),
+                0o600,
+            )?;
+            Launch::PerTag(config_gen::per_tag_copies(tool, corpus, lock, config_dir))
+        }
+        (
+            Tool::Dregsy | Tool::Regsync | Tool::Skopeo | Tool::Crane | Tool::Regctl | Tool::Oras,
+            config_gen::Mode::Prepare,
+        ) => {
             return Err(
                 format!("{tool} syncs from the corpus lock and has no prepare mode").into(),
             );
@@ -1311,8 +1334,10 @@ async fn run_single_tool(
     };
 
     let config_path = config_dir.join(format!("{}.yaml", tool));
-    std::fs::write(&config_path, &config_content)
-        .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
+    if let Launch::Config(content) = &launch {
+        std::fs::write(&config_path, content)
+            .map_err(|e| format!("write config {}: {e}", config_path.display()))?;
+    }
 
     // The proxy log lives under `output_dir`, not the auto-cleaned tempdir, so
     // post-run analysis (`grep mount= …proxy.jsonl`) can inspect exactly which
@@ -1340,16 +1365,36 @@ async fn run_single_tool(
     // update-ca-trust on AL2023) so that rustls-native-certs and OpenSSL
     // both trust the MITM'd connections. HTTPS_PROXY alone is sufficient.
     let label = args.tool_selection.label(tool);
-    let result = runner::run_tool(
-        tool,
-        &label,
-        &config_path,
-        proxy_url.as_deref(),
-        &args.tool_selection.root(tool),
-        // Prepare resolves mappings and stops, so it is the only dry run.
-        matches!(mode, config_gen::Mode::Prepare),
-    )
-    .await?;
+    let result = match &launch {
+        Launch::Config(_) => {
+            runner::run_tool(
+                tool,
+                &label,
+                &config_path,
+                proxy_url.as_deref(),
+                &args.tool_selection.root(tool),
+                // Prepare resolves mappings and stops, so it is the only dry run.
+                matches!(mode, config_gen::Mode::Prepare),
+            )
+            .await?
+        }
+        Launch::PerTag(commands) => {
+            // regctl reads its own config before Docker's, so point it at a
+            // file that is never written and `~/.regctl` cannot leak in.
+            let regctl_config = config_dir.join("regctl.json");
+            runner::run_per_tag(
+                tool,
+                &label,
+                commands,
+                &[
+                    ("DOCKER_CONFIG", config_dir.as_os_str()),
+                    ("REGCTL_CONFIG", regctl_config.as_os_str()),
+                ],
+                proxy_url.as_deref(),
+            )
+            .await?
+        }
+    };
 
     let proxy_metrics = if let Some(handle) = proxy_handle {
         let entries = proxy::stop(handle).await?;
@@ -2588,10 +2633,16 @@ mod tests {
         );
         assert!(matches!(ok.scenario, Scenario::Prepare));
 
+        let per_tag = parse_bench(&["--tools", "skopeo,crane,regctl,oras", "sync"]).unwrap();
+        assert_eq!(
+            per_tag.tool_selection.tools,
+            [Tool::Skopeo, Tool::Crane, Tool::Regctl, Tool::Oras]
+        );
+
         for (name, argv, kind) in [
             (
                 "tool",
-                &["--tools", "ocync,skopeo", "sync"][..],
+                &["--tools", "ocync,kaniko", "sync"][..],
                 ErrorKind::InvalidValue,
             ),
             ("scenario", &["cold"][..], ErrorKind::InvalidSubcommand),
@@ -2601,6 +2652,35 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: accepted"));
             assert_eq!(err.kind(), kind, "{name}");
         }
+    }
+
+    #[test]
+    fn a_per_tag_tool_has_no_prepare_mode_and_writes_nothing_before_refusing() {
+        // Catches: a per-tag tool reaching the prepare scenario and being
+        // timed on a dry run it has no equivalent of, and a Docker config
+        // written (with the Docker Hub token) for a pass that never runs.
+        let args = parse_bench(&["--tools", "crane", "prepare"]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for tool in [Tool::Skopeo, Tool::Crane, Tool::Regctl, Tool::Oras] {
+            let refused = block_on(run_single_tool(
+                &args,
+                tool,
+                &two_image_corpus(),
+                dir.path(),
+                dir.path(),
+                Pass::Measured(ScenarioKind::Cold),
+                config_gen::Mode::Prepare,
+            ))
+            .err()
+            .map(|e| e.to_string());
+            assert_eq!(
+                refused,
+                Some(format!(
+                    "{tool} syncs from the corpus lock and has no prepare mode"
+                ))
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

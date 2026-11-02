@@ -7,7 +7,8 @@
 //! source content. With it skopeo fails a copy that cannot keep the digest.
 //! dregsy builds skopeo's command line from fixed flags and its config can set
 //! only the binary, so the binary it is given is a script that runs this
-//! module's subcommand, which runs skopeo.
+//! module's subcommand, which runs skopeo. The flag is also on the command line
+//! of skopeo as a benchmarked tool, and [`write_file`] writes its Docker config.
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The skopeo flag that keeps the source digest or fails the copy.
-const PRESERVE_DIGESTS: &str = "--preserve-digests";
+pub(crate) const PRESERVE_DIGESTS: &str = "--preserve-digests";
 
 /// `args` for skopeo, with [`PRESERVE_DIGESTS`] right after a `copy`
 /// subcommand. The subcommand is the first argument that is not a flag: dregsy
@@ -46,19 +47,24 @@ fn script(xtask: &Path) -> String {
     format!("#!/bin/sh\nexec '{quoted}' bench-skopeo \"$@\"\n")
 }
 
+/// Write `contents` to `path`, replacing it, created with `mode`.
+pub(crate) fn write_file(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 /// Write the script dregsy is given as its skopeo into `dir`, running this
 /// binary, and return its path.
 pub(crate) fn write_script(dir: &Path) -> Result<PathBuf, String> {
     let xtask = std::env::current_exe().map_err(|e| format!("find this binary: {e}"))?;
     let path = dir.join("skopeo");
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o755)
-        .open(&path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, script(&xtask).as_bytes()));
-    written.map_err(|e| format!("write {}: {e}", path.display()))?;
+    write_file(&path, &script(&xtask), 0o755)?;
     Ok(path)
 }
 
@@ -107,6 +113,21 @@ mod tests {
         for (args, want) in cases {
             assert_eq!(rewritten(args), want, "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_file_is_created_with_the_mode_asked_for_and_replaced_whole() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Catches: a file holding the Docker Hub token readable by others, and
+        // a rewrite that leaves the tail of a longer earlier file behind.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        write_file(&path, "{\"longer\":1}", 0o600).unwrap();
+        write_file(&path, "{}", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # xtask
 
-Workspace automation via `cargo xtask`. Provides benchmark orchestration for comparing ocync against dregsy and regsync.
+Workspace automation via `cargo xtask`. Provides benchmark orchestration for comparing ocync against dregsy, regsync, skopeo, crane, regctl and oras.
 
 ## Prerequisites
 
@@ -34,7 +34,7 @@ A run already in progress on the instance, including one still checking out or b
 | `--target` | `ecr`, `artifact-registry`, `acr` | `ecr` | Registry the instance syncs into. `artifact-registry` needs `bench/terraform/gcp` applied and `gcloud` signed in on this machine; `acr` needs `bench/terraform/azure` applied (and the AWS stack's token issuer) and `az` signed in on this machine. Both run the `sync` scenario with one ocync tool, and refuse `--regression`. Each round syncs into repositories of its own, which `bench-remote` deletes when the run ends: Artifact Registry's are made first with `gcloud`, ACR's are created by the first push, under `ocync-bench-run-<run timestamp>-r<round>/`, and deleted with `az`. The instance signs in to ACR as the Entra app through a token from `aws sts get-web-identity-token`, refreshed every 30 minutes |
 | `--corpus` | path | the instance's default, `bench/corpus.yaml` | Image corpus YAML, passed to `bench` when given. The file and its lock must be committed in the commit that runs, which is checked before the push. Each corpus has its own lock, baseline and target prefix; only `bench/corpus.yaml` writes `docs/src/content/performance.md`. Conflicts with `--fetch` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
-| `--tools` | string | `ocync` | Tools to benchmark |
+| `--tools` | string | `ocync` | Tools to benchmark: `ocync`, `dregsy`, `regsync`, `skopeo`, `crane`, `regctl`, `oras` |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios (see [Rounds](#rounds-and-the-baseline-build)) |
 | `--baseline-ref` | commit | | Also run the ocync built from this commit (see [Rounds](#rounds-and-the-baseline-build)) |
 | `--max-concurrent-transfers` | integer, at least 1 | ocync default | Cap on images ocync transfers at once (passed through to `bench`). Refused when no ocync build runs |
@@ -73,7 +73,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `<SCENARIO>` | subcommand | (required) | `sync`, `partial`, `scale`, `prepare`, or `all` |
-| `--tools` | comma-separated | `ocync` | Tools to benchmark: `ocync`, `dregsy`, `regsync`. The baseline build is added by `--baseline-ref`, never named here |
+| `--tools` | comma-separated | `ocync` | Tools to benchmark: `ocync`, `dregsy`, `regsync`, `skopeo`, `crane`, `regctl`, `oras`. The last four run one process per corpus tag and have no `prepare` mode. The baseline build is added by `--baseline-ref`, never named here |
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios, each running every tool once in a fresh random order |
 | `--baseline-ref` | hex commit id | | Also run the ocync built from this commit in every round, and compare it with the current one. Refused for `scale` and `prepare` |
 | `--max-concurrent-transfers` | integer, at least 1 | ocync default | Write `global.max_concurrent_transfers` to the ocync config, the baseline build's too. The run record and `summary.md` state the cap ocync ran with, its default's value when none is given; a capped run writes no performance-page blocks. `--regression` refuses, before any round runs, a baseline taken under another cap. Refused when no ocync build runs |
