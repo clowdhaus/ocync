@@ -1,0 +1,62 @@
+# Large multi-arch benchmark corpus.
+#
+# Shape: six images of 9 to 25 GB each, every one with linux/amd64 and
+# linux/arm64: 94.9 GB without blob sharing, 77.5 GB after it, 363 blobs, the
+# largest 4.0 GB. The main corpus (corpus.yaml) tops out at a few GB per image;
+# this one measures sustained throughput, very large blobs and a platform
+# fan-out that doubles the bytes.
+#
+# Sources: nvcr.io, ghcr.io and Quay.io. All serve anonymously and none is
+# Docker Hub, so a run spends no Docker Hub pull budget. nvcr.io's blobs come
+# through CloudFront, ghcr.io's through Fastly: none belongs on the pre-warm's
+# no-blob-cache list.
+#
+# The 256 GB disk holds one pass. Pre-warm downloads about 75 GB against its 8
+# minute deadline: read the first run's `prewarm.unwarmed` before trusting its
+# numbers.
+#
+# Content is fixed by bench/corpus-large.lock.json, written by
+# `cargo xtask bench-lock --corpus bench/corpus-large.yaml`. A tag that moves
+# is refused at the start of a run. Its records carry `corpus.name`
+# `corpus-large`, its baseline is bench/results/baseline-corpus-large.json, and
+# it writes no block to the performance page.
+#
+# Run it with `bench-remote --corpus bench/corpus-large.yaml`. The default
+# partial overrides name none of this corpus's sources, so `--scenario all`
+# skips the partial scenario with a warning and `--scenario partial` is
+# refused. `bench-remote` cannot pass `--partial-overrides`; `bench` can.
+# Scale collapses to one size at six images, so `all` skips it too; ask for
+# `--scenario scale` to run it. `all` also skips prepare for this corpus.
+
+corpus:
+  target_registry: "${BENCH_TARGET_REGISTRY}"
+  target_prefix: "bench-large"
+
+images:
+  # PyTorch; 24.7 GB over both platforms, blobs up to 3.09 GB.
+  - source: "nvcr.io/nvidia/pytorch"
+    tags: ["26.10-py3"]
+
+  # JAX; 21.1 GB. Shares 14.7 GB with the PyTorch image above across registries.
+  # Daily tags are kept, so the date tag stays pullable.
+  - source: "ghcr.io/nvidia/jax"
+    tags: ["jax-2026-11-01"]
+
+  # CUDA devel with cuDNN; 10.5 GB in 15 layers, a few of them very large (up to
+  # 2.65 GB).
+  - source: "nvcr.io/nvidia/cuda"
+    tags: ["13.4.3-cudnn-devel-ubuntu24.04"]
+
+  # TensorFlow; 9.4 GB. Shares 2.59 GB with the PyTorch notebook below, across
+  # repositories in one registry.
+  - source: "quay.io/jupyter/tensorflow-notebook"
+    tags: ["cuda-2026-10-28"]
+
+  # PyTorch; 10.2 GB, with the largest blob of the set at 4.0 GB.
+  - source: "quay.io/jupyter/pytorch-notebook"
+    tags: ["cuda12-2026-10-28"]
+
+  # Triton Inference Server; 19.0 GB. Shares nothing with the rest of the set, so
+  # it is the no-sharing control.
+  - source: "nvcr.io/nvidia/tritonserver"
+    tags: ["26.09-py3"]

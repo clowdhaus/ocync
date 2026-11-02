@@ -646,12 +646,10 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
 
     // An override for a source outside the corpus is ignored by the run.
     let mut refs = refs_of(&entries);
-    refs.extend(refs_of(
-        overrides
-            .overrides
-            .iter()
-            .filter(|o| entries.iter().any(|e| e.source == o.source)),
-    ));
+    refs.extend(refs_of(corpus::overrides_naming(
+        &entries,
+        &overrides.overrides,
+    )));
 
     let auth = crate::bench::docker_hub_auth();
     eprintln!("bench-lock: resolving {} source refs...", refs.len());

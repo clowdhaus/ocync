@@ -1,6 +1,7 @@
 //! Registry access shared by the CDN pre-warm and the corpus lock: hostname
 //! normalization, repository keys, and [`Access`], which sends requests with
-//! an OCI bearer token and retries what is transient.
+//! an OCI bearer token, or none for a registry that asks for none, and retries
+//! what is transient.
 //!
 //! Independent of ocync's own registry client on purpose: the harness checks
 //! the tool under test, so a bug in that client must not also be in the check.
@@ -179,8 +180,36 @@ pub(crate) fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("build HTTP client: {e}"))
 }
 
-/// The client, credentials and bearer tokens requests go through. Tokens are
-/// kept by repository, so a repository with several tags is authorized once.
+/// What a repository's requests are authorized with.
+#[derive(Clone, PartialEq, Eq)]
+enum Grant {
+    /// A bearer token from the registry's token service.
+    Bearer(String),
+    /// The registry answered `/v2/` without a challenge: it asks for no
+    /// credential, so none is sent and a 401 is a refusal, not an expiry.
+    Anonymous,
+}
+
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer(_) => f.write_str("Bearer([REDACTED])"),
+            Self::Anonymous => f.write_str("Anonymous"),
+        }
+    }
+}
+
+/// `request`, authorized with `grant`: a bearer token for [`Grant::Bearer`],
+/// no `Authorization` header for [`Grant::Anonymous`].
+fn authorize(request: reqwest::RequestBuilder, grant: &Grant) -> reqwest::RequestBuilder {
+    match grant {
+        Grant::Bearer(token) => request.bearer_auth(token),
+        Grant::Anonymous => request,
+    }
+}
+
+/// The client, credentials and grants requests go through. Grants are kept by
+/// repository, so a repository with several tags is authorized once.
 /// Built for one check or one pre-warm and dropped with it: a token is only
 /// renewed when the registry answers 401, and one held for hours may be
 /// answered with another status. Shared by reference, because blob tasks run
@@ -192,12 +221,12 @@ pub(crate) struct Access<'a> {
     auth: Option<&'a DockerHubAuth>,
     /// Latest exchange for each repository; a failure is kept so it is
     /// reported for every tag and not retried at once.
-    tokens: Tokens,
+    grants: Grants,
 }
 
-/// The token exchange of each repository, one cell per repository so that
-/// requests made together share one exchange.
-type Tokens = RefCell<HashMap<RepoKey, Rc<OnceCell<Result<String, String>>>>>;
+/// The exchange of each repository, one cell per repository so that requests
+/// made together share one exchange.
+type Grants = RefCell<HashMap<RepoKey, Rc<OnceCell<Result<Grant, String>>>>>;
 
 impl<'a> Access<'a> {
     /// Access through `client`, with Docker Hub credentials if given.
@@ -205,21 +234,25 @@ impl<'a> Access<'a> {
         Self {
             client,
             auth,
-            tokens: RefCell::default(),
+            grants: RefCell::default(),
         }
     }
 
-    /// The token for `repo`, exchanged for the first time it is asked, or when
+    /// The grant for `repo`, exchanged for the first time it is asked, or when
     /// the one held is `rejected`, which the registry refused.
-    async fn token(&self, repo: &Repository<'_>, rejected: Option<&str>) -> Result<String, String> {
-        cached_token(&self.tokens, RepoKey::from(repo), rejected, async || {
-            oci_token(self.client, repo, self.auth).await
+    async fn grant(
+        &self,
+        repo: &Repository<'_>,
+        rejected: Option<&Grant>,
+    ) -> Result<Grant, String> {
+        cached_grant(&self.grants, RepoKey::from(repo), rejected, async || {
+            oci_grant(self.client, repo, self.auth).await
         })
         .await
     }
 
-    /// Send the request `build` makes on the shared client, with the bearer
-    /// token for `repo`. A transient failure is retried by [`send_retrying`],
+    /// Send the request `build` makes on the shared client, authorized with the
+    /// grant for `repo`. A transient failure is retried by [`send_retrying`],
     /// and `what` names the request in its retry notice.
     pub(crate) async fn send(
         &self,
@@ -228,28 +261,28 @@ impl<'a> Access<'a> {
         build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
         send_renewing(
-            async || self.token(repo, None).await,
-            async |old| self.token(repo, Some(old)).await,
-            async |token| send_retrying(what, || build(self.client).bearer_auth(token)).await,
+            async || self.grant(repo, None).await,
+            async |old| self.grant(repo, Some(old)).await,
+            async |grant| send_retrying(what, || authorize(build(self.client), grant)).await,
         )
         .await
     }
 }
 
-/// The token for `key`: the one held, or the one `exchange` yields. Requests
+/// The grant for `key`: the one held, or the one `exchange` yields. Requests
 /// that ask before any is held share one exchange, and if the task running it
-/// is dropped the next to ask runs it. A held token that is `rejected` is
+/// is dropped the next to ask runs it. A held grant that is `rejected` is
 /// replaced; one another request already replaced is returned as it is.
-async fn cached_token(
-    held: &Tokens,
+async fn cached_grant(
+    held: &Grants,
     key: RepoKey,
-    rejected: Option<&str>,
-    exchange: impl AsyncFnOnce() -> Result<String, String>,
-) -> Result<String, String> {
+    rejected: Option<&Grant>,
+    exchange: impl AsyncFnOnce() -> Result<Grant, String>,
+) -> Result<Grant, String> {
     let cell = {
         let mut held = held.borrow_mut();
         let cell = Rc::clone(held.entry(key.clone()).or_default());
-        let refused = rejected.is_some() && cell.get().and_then(|t| t.as_deref().ok()) == rejected;
+        let refused = rejected.is_some() && cell.get().and_then(|t| t.as_ref().ok()) == rejected;
         if refused {
             let fresh = Rc::<OnceCell<_>>::default();
             held.insert(key, Rc::clone(&fresh));
@@ -261,52 +294,91 @@ async fn cached_token(
     cell.get_or_init(|| exchange()).await.clone()
 }
 
-/// Send with the current token. A 401 means the token expired, so exchange for
-/// another once and send again; whatever that answers is returned, so a
-/// registry that still refuses is reported, not asked again.
+/// Send with the current grant. A 401 under a bearer token means it expired, so
+/// exchange for another once and send again; whatever that answers is returned,
+/// so a registry that still refuses is reported, not asked again. A 401 under
+/// [`Grant::Anonymous`] has nothing to renew and is returned as it is.
 async fn send_renewing<E>(
-    token: impl AsyncFn() -> Result<String, E>,
-    renew: impl AsyncFn(&str) -> Result<String, E>,
-    send: impl AsyncFn(&str) -> Result<reqwest::Response, E>,
+    grant: impl AsyncFn() -> Result<Grant, E>,
+    renew: impl AsyncFn(&Grant) -> Result<Grant, E>,
+    send: impl AsyncFn(&Grant) -> Result<reqwest::Response, E>,
 ) -> Result<reqwest::Response, E> {
-    let used = token().await?;
+    let used = grant().await?;
     let response = send(&used).await?;
-    if response.status() != StatusCode::UNAUTHORIZED {
+    if response.status() != StatusCode::UNAUTHORIZED || used == Grant::Anonymous {
         return Ok(response);
     }
     send(&renew(&used).await?).await
 }
 
+/// Reads the challenges, or the lack of them, in the answer to `GET /v2/`: the
+/// Bearer `WWW-Authenticate` value among `challenges` to answer, `None` for a
+/// success without any (the registry asks for no credential), and an error when
+/// none is Bearer, naming the schemes seen, or for any other answer without a
+/// challenge.
+fn read_challenge<'a>(
+    registry: &str,
+    status: StatusCode,
+    challenges: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<&'a str>, String> {
+    let challenges: Vec<&str> = challenges.into_iter().collect();
+    let scheme = |header: &str| {
+        header
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    if let Some(bearer) = challenges
+        .iter()
+        .find(|header| scheme(header).eq_ignore_ascii_case("Bearer"))
+    {
+        return Ok(Some(bearer));
+    }
+    if !challenges.is_empty() {
+        let seen: Vec<String> = challenges.iter().map(|header| scheme(header)).collect();
+        return Err(format!(
+            "{registry} challenged with {}, and only Bearer is answered",
+            seen.join(", ")
+        ));
+    }
+    if status.is_success() {
+        Ok(None)
+    } else {
+        Err(format!(
+            "{registry} answered /v2/ with {status} and no WWW-Authenticate challenge"
+        ))
+    }
+}
+
 /// OCI token exchange for a single repository scope.
 ///
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
-/// request a bearer token from the auth realm. For Docker Hub, includes
-/// basic auth credentials if given. The error says which step failed.
-async fn oci_token(
+/// request a bearer token from the auth realm. A registry that answers `/v2/` with success and no
+/// challenge is [`Grant::Anonymous`]. For Docker Hub, includes basic auth
+/// credentials if given. The error says which step failed.
+async fn oci_grant(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
-) -> Result<String, String> {
+) -> Result<Grant, String> {
     let registry = repo.host.api_host();
 
     // Step 1: challenge the registry to get the auth parameters.
     let challenge_url = format!("https://{registry}/v2/");
-    let challenge = send_retrying(&format!("{registry} challenge"), || {
+    let answer = send_retrying(&format!("{registry} challenge"), || {
         client.get(&challenge_url)
     })
     .await
     .map_err(|e| format!("challenge to {registry} {e}"))?;
-
-    let www_auth = challenge
+    let challenges = answer
         .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            format!(
-                "{registry} answered /v2/ with {} and no WWW-Authenticate challenge",
-                challenge.status()
-            )
-        })?;
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let Some(www_auth) = read_challenge(registry, answer.status(), challenges)? else {
+        return Ok(Grant::Anonymous);
+    };
 
     // Parse: Bearer realm="https://...",service="...",scope="..."
     let realm = parse_auth_param(www_auth, "realm")
@@ -347,7 +419,7 @@ async fn oci_token(
     body.get("token")
         .or_else(|| body.get("access_token"))
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
+        .map(|token| Grant::Bearer(token.to_owned()))
         .ok_or_else(|| format!("token response for {repo} holds no token"))
 }
 
@@ -368,13 +440,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requests_made_together_share_one_token_exchange() {
+    fn requests_made_together_share_one_grant_exchange() {
         // Catches: every task of a registry running its own exchange before the
         // first has stored a token.
-        let held = Tokens::default();
+        let held = Grants::default();
         let exchanges = Cell::new(0);
-        let ask = |rejected: Option<&'static str>| {
-            cached_token(
+        let bearer = |token: &str| Grant::Bearer(token.to_owned());
+        let t1 = bearer("t1");
+        let ask = |rejected| {
+            cached_grant(
                 &held,
                 RepoKey {
                     host: "r.example".into(),
@@ -385,7 +459,7 @@ mod tests {
                     exchanges.set(exchanges.get() + 1);
                     // Let the others ask while this exchange is in flight.
                     tokio::task::yield_now().await;
-                    Ok(format!("t{}", exchanges.get()))
+                    Ok(bearer(&format!("t{}", exchanges.get())))
                 },
             )
         };
@@ -396,12 +470,12 @@ mod tests {
             runtime.block_on(futures_util::future::join3(ask(None), ask(None), ask(None)));
         assert_eq!(
             (a, b, c),
-            (Ok("t1".into()), Ok("t1".into()), Ok("t1".into()))
+            (Ok(bearer("t1")), Ok(bearer("t1")), Ok(bearer("t1")))
         );
         assert_eq!(exchanges.get(), 1);
         // Rejected: replaced once, however many requests found it refused.
-        let (a, b) = runtime.block_on(futures_util::future::join(ask(Some("t1")), ask(Some("t1"))));
-        assert_eq!((a, b), (Ok("t2".into()), Ok("t2".into())));
+        let (a, b) = runtime.block_on(futures_util::future::join(ask(Some(&t1)), ask(Some(&t1))));
+        assert_eq!((a, b), (Ok(bearer("t2")), Ok(bearer("t2"))));
         assert_eq!(exchanges.get(), 2);
     }
 
@@ -489,19 +563,19 @@ mod tests {
         assert_eq!(parse_auth_param(header, "scope"), None);
     }
 
-    /// Run `send_renewing` with a send that answers `statuses` in turn, and
-    /// report the final status, the sends made and the exchanges made.
-    fn renewing(statuses: &[u16]) -> (u16, usize, usize) {
+    /// Run `send_renewing` under `grant` with a send that answers `statuses` in
+    /// turn, and report the final status, the sends made and the exchanges made.
+    fn renewing_under(grant: Grant, statuses: &[u16]) -> (u16, usize, usize) {
         let sends = Cell::new(0);
         let exchanges = Cell::new(0);
         let response = send_renewing(
-            async || Ok::<_, String>("old".to_owned()),
-            async |rejected: &str| {
-                assert_eq!(rejected, "old", "the refused token is what is replaced");
+            async || Ok::<_, String>(grant.clone()),
+            async |rejected: &Grant| {
+                assert_eq!(rejected, &grant, "the refused grant is what is replaced");
                 exchanges.set(exchanges.get() + 1);
-                Ok("new".to_owned())
+                Ok(Grant::Bearer("new".to_owned()))
             },
-            async |_token: &str| {
+            async |_grant: &Grant| {
                 let status = statuses[sends.get().min(statuses.len() - 1)];
                 sends.set(sends.get() + 1);
                 let response = http::Response::builder().status(status).body("");
@@ -515,12 +589,82 @@ mod tests {
     }
 
     #[test]
-    fn a_401_renews_the_token_once_and_a_second_401_is_returned() {
+    fn a_401_renews_a_bearer_grant_once_and_never_an_anonymous_one() {
+        let old = || Grant::Bearer("old".to_owned());
         // Catches: exchanging a token for a request that was accepted.
-        assert_eq!(renewing(&[200]), (200, 1, 0));
+        assert_eq!(renewing_under(old(), &[200]), (200, 1, 0));
         // Catches: reporting an expired token as a refused source.
-        assert_eq!(renewing(&[401, 200]), (200, 2, 1));
+        assert_eq!(renewing_under(old(), &[401, 200]), (200, 2, 1));
         // Catches: asking again and again of a registry that keeps refusing.
-        assert_eq!(renewing(&[401, 401, 200]), (401, 2, 1));
+        assert_eq!(renewing_under(old(), &[401, 401, 200]), (401, 2, 1));
+        // Catches: an exchange attempted against a registry with no token service.
+        assert_eq!(renewing_under(Grant::Anonymous, &[401, 200]), (401, 1, 0));
+    }
+
+    #[test]
+    fn only_a_bearer_grant_sends_an_authorization_header() {
+        // Catches: an anonymous registry sent an empty or made-up bearer token,
+        // which some registries answer with a 401.
+        let header = |grant: &Grant| {
+            let request = authorize(reqwest::Client::new().get("https://r.example/v2/"), grant)
+                .build()
+                .unwrap();
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(header(&Grant::Anonymous), None);
+        // Catches: a token reaching a log through a `Debug` of the grant.
+        assert_eq!(
+            format!("{:?}", Grant::Bearer("t0k".into())),
+            "Bearer([REDACTED])"
+        );
+        assert_eq!(
+            header(&Grant::Bearer("t0k".into())).as_deref(),
+            Some("Bearer t0k")
+        );
+    }
+
+    #[test]
+    fn a_v2_answer_is_anonymous_only_on_success_without_a_challenge() {
+        // Catches: a registry answering 401 or 5xx with no challenge being
+        // treated as open, a success without one still being an error, a
+        // Basic challenge answered as if it were Bearer, and a Bearer header
+        // missed because a Basic one came first.
+        let bearer = r#"Bearer realm="https://auth.example/token",service="r""#;
+        let basic = r#"Basic realm="r""#;
+        let no_challenge = |status: &str| {
+            format!("r.example answered /v2/ with {status} and no WWW-Authenticate challenge")
+        };
+        let cases = [
+            (200, vec![bearer], Ok(Some(bearer))),
+            (401, vec![bearer], Ok(Some(bearer))),
+            (
+                401,
+                vec!["bearer realm=\"x\""],
+                Ok(Some("bearer realm=\"x\"")),
+            ),
+            (401, vec![basic, bearer], Ok(Some(bearer))),
+            (200, vec![], Ok(None)),
+            (401, vec![], Err(no_challenge("401 Unauthorized"))),
+            (503, vec![], Err(no_challenge("503 Service Unavailable"))),
+            (
+                401,
+                vec![basic, "Negotiate"],
+                Err(
+                    "r.example challenged with Basic, Negotiate, and only Bearer is answered"
+                        .to_owned(),
+                ),
+            ),
+        ];
+        for (code, headers, want) in cases {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                read_challenge("r.example", status, headers.iter().copied()),
+                want,
+                "{code} {headers:?}"
+            );
+        }
     }
 }

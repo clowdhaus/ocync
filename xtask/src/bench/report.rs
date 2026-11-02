@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use ocync_sync::engine::DEFAULT_MAX_CONCURRENT_TRANSFERS;
 use serde::{Deserialize, Serialize};
 
+use crate::bench::corpus::CorpusName;
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
@@ -136,10 +137,7 @@ impl RunRecord {
             },
             relays: Some(report.relay_versions.clone()),
             prewarm: report.prewarm.clone(),
-            corpus: CorpusInfo {
-                images: report.corpus_size,
-                tags: report.total_tags,
-            },
+            corpus: report.corpus.clone(),
             max_concurrent_transfers: report.ocync_transfer_cap(),
             baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
             rounds: report.round_count(),
@@ -269,13 +267,25 @@ fn imds_or_unknown(path: &str) -> String {
     })
 }
 
-/// Corpus size metadata.
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Corpus name and size metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusInfo {
+    /// The corpus file's stem; absent for the main corpus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<CorpusName>,
     /// Number of distinct images.
     pub(crate) images: usize,
     /// Total tags across all images.
     pub(crate) tags: usize,
+}
+
+impl CorpusInfo {
+    /// The corpus as a person reads it: its name, or the main corpus.
+    pub(crate) fn label(&self) -> String {
+        self.name
+            .as_ref()
+            .map_or("the main corpus".to_owned(), ToString::to_string)
+    }
 }
 
 /// One scenario's results in the compact run record.
@@ -565,10 +575,8 @@ pub(crate) struct BenchReport {
     pub(crate) timestamp: String,
     /// Instance metadata (hardware, region).
     pub(crate) instance: InstanceInfo,
-    /// Number of distinct images in the corpus.
-    pub(crate) corpus_size: usize,
-    /// Total number of tags across all images.
-    pub(crate) total_tags: usize,
+    /// The corpus the run synced: its name, images and tags.
+    pub(crate) corpus: CorpusInfo,
     /// Tool version strings keyed by tool name.
     pub(crate) tool_versions: BTreeMap<Tool, String>,
     /// Versions of binaries a tool relays its transfers through, keyed by
@@ -758,8 +766,10 @@ fn summary_markdown(report: &BenchReport) -> String {
     out.push('\n');
 
     out.push_str(&format!(
-        "Corpus: {} images, {} total tags\n\n",
-        report.corpus_size, report.total_tags
+        "Corpus: {}, {} images, {} total tags\n\n",
+        report.corpus.label(),
+        report.corpus.images,
+        report.corpus.tags
     ));
     if let Some(cap) = report.ocync_transfer_cap() {
         out.push_str(&format!("ocync ran with `max_concurrent_transfers: {cap}`"));
@@ -1196,8 +1206,8 @@ fn scenario_markdown(
         vcpus = inst.vcpus,
         mem = memory_gib,
         net = inst.network_performance,
-        images = report.corpus_size,
-        tags = report.total_tags,
+        images = report.corpus.images,
+        tags = report.corpus.tags,
         region = inst.region,
         round_note = if rounds[0].round.is_some() {
             format!(
@@ -1293,9 +1303,11 @@ pub(crate) struct PageBlocks {
 impl PageBlocks {
     /// The blocks `report` produces. A run whose transfer cap is not ocync's
     /// default produces none: the page shows ocync as it runs out of the box.
+    /// Nor does a run of a named corpus: the page is the main corpus's.
     pub(crate) fn of(report: &BenchReport) -> Self {
-        if effective_transfer_cap(report.max_concurrent_transfers)
-            != DEFAULT_MAX_CONCURRENT_TRANSFERS
+        if report.corpus.name.is_some()
+            || effective_transfer_cap(report.max_concurrent_transfers)
+                != DEFAULT_MAX_CONCURRENT_TRANSFERS
         {
             return Self::default();
         }
@@ -1507,8 +1519,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -1579,7 +1594,12 @@ pub(crate) mod tests {
         assert!(md.contains("- **Type**: c7g.xlarge"));
         assert!(md.contains("- **CPU**: AWS (arm64, 4 vCPUs)"));
         assert!(md.contains("- **Network**: Up to 12.5 Gigabit"));
-        assert!(md.contains("Corpus: 28 images, 40 total tags"));
+        assert!(md.contains("Corpus: the main corpus, 28 images, 40 total tags"));
+        let mut named = sample_report();
+        named.corpus.name = Some(CorpusName::new("corpus-small"));
+        assert!(
+            summary_markdown(&named).contains("Corpus: corpus-small, 28 images, 40 total tags")
+        );
         assert!(md.contains("## Tool Versions\n"));
         assert!(md.contains("- **dregsy**: 0.5.0"));
         assert!(md.contains("- **ocync**: 0.1.0"));
@@ -1643,8 +1663,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -1736,6 +1759,23 @@ pub(crate) mod tests {
         let json = |at| serde_json::to_string(&RunRecord::of(&sample_report(), "abc".into(), at));
         assert!(json(at()).unwrap().contains(r#""sync_from":"digest""#));
         assert!(!json(None).unwrap().contains("sync_from"));
+    }
+
+    #[test]
+    fn a_named_corpus_is_recorded_by_name_and_writes_no_page_blocks() {
+        // Catches: a run of a shape corpus overwriting the main corpus's cold
+        // and warm blocks on the performance page, a named run recorded as the
+        // main corpus, and a main-corpus record gaining a name.
+        let mut report = sample_report();
+        let record = |report: &BenchReport| {
+            serde_json::to_value(RunRecord::of(report, "abc1234".into(), None)).unwrap()
+        };
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
+        assert_eq!(record(&report)["corpus"].get("name"), None);
+
+        report.corpus.name = Some(CorpusName::new("corpus-small"));
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+        assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
     }
 
     #[test]
@@ -2058,8 +2098,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2105,8 +2148,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-15-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2187,8 +2233,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 42,
-            total_tags: 55,
+            corpus: CorpusInfo {
+                name: None,
+                images: 42,
+                tags: 55,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2283,8 +2332,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 42,
-            total_tags: 55,
+            corpus: CorpusInfo {
+                name: None,
+                images: 42,
+                tags: 55,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2343,8 +2395,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-18-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 42,
-            total_tags: 55,
+            corpus: CorpusInfo {
+                name: None,
+                images: 42,
+                tags: 55,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2426,8 +2481,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 39,
-            total_tags: 51,
+            corpus: CorpusInfo {
+                name: None,
+                images: 39,
+                tags: 51,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2484,8 +2542,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-19-100000".to_string(),
             instance: test_instance(),
-            corpus_size: 39,
-            total_tags: 51,
+            corpus: CorpusInfo {
+                name: None,
+                images: 39,
+                tags: 51,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
@@ -2519,8 +2580,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([
@@ -2577,8 +2641,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Dregsy, "0.5.0".into())]),
@@ -2612,8 +2679,11 @@ pub(crate) mod tests {
             repeated: Vec::new(),
             timestamp: "2026-04-26-100000".into(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             relay_versions: BTreeMap::new(),
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".into())]),
@@ -2653,8 +2723,11 @@ pub(crate) mod tests {
             repeated: vec![ScenarioKind::Cold],
             timestamp: "2026-10-30-100000".into(),
             instance: test_instance(),
-            corpus_size: 28,
-            total_tags: 40,
+            corpus: CorpusInfo {
+                name: None,
+                images: 28,
+                tags: 40,
+            },
             tool_versions: tools
                 .iter()
                 .map(|&(tool, _)| (tool, "1.0".into()))
