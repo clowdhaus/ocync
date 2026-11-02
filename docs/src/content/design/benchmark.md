@@ -76,7 +76,16 @@ Each published number names the source kind it came from.
 
 ### Competitors at their best
 
-> **Status: Planned.** Today regsync and dregsy run at their default concurrency, and the generated regsync configuration sets `repoAuth: true` on every source without the results saying so.
+> **Status: Planned.** Today every competitor runs at its default concurrency, and the generated regsync configuration sets `repoAuth: true` on every source without the results saying so.
+
+The defaults the sweep starts from, which the harness documents and never sets:
+
+| Tool | Inner concurrency default |
+|---|---|
+| skopeo | 6 parallel downloads (containers/image `maxParallelDownloads`) |
+| crane | `-j` effectively 4 (pflag overwrites the GOMAXPROCS default with 0, which crane ignores) |
+| regctl | 3 requests per host (`reqConcurrent`) |
+| oras | `--concurrency` 3 |
 
 Before a published comparison, each tool's concurrency is swept once over a few values on the controlled source, and its fastest setting is used and recorded. A competitor's failure or quirk is reported in the results, not worked around silently in the generated configuration.
 
@@ -97,9 +106,20 @@ Each run record carries the instance type, region and image ID, every tool's ver
 
 `bench/CLAUDE.md` lists the operational details.
 
+## Per-tag tools
+
+skopeo, crane, regctl and oras are compared too. Each copies one tag per process, driven by the harness, because `skopeo sync` cannot copy `source@digest` to `target:tag`. Every copy keeps the source digest:
+
+- **skopeo** runs `copy --preserve-digests --multi-arch all`: without the first flag it recompresses an uncompressed layer on push and the digest changes, and with it a copy that cannot keep the digest fails instead.
+- **crane** `copy` pushes the manifest and blobs as fetched, every platform of an index.
+- **regctl** `image copy` does the same, with no platform, referrer or digest-tag option given.
+- **oras** `cp` copies the whole index and every blob unchanged, without `--recursive`, which would add referrers.
+
+Fairness to ocync is not automatic for them. They run one copy at a time, as a user's loop over the tags would, and the run record names that (`per_tag_jobs`). Each process pays its own ping and token per registry and a warm pass re-fetches each source manifest, so their request counts include that per-process cost. The target's ECR token is not paid per process, since `docker-credential-ecr-login` caches it in `~/.ecr/cache.json` for 12 hours across processes, tools and rounds, so only the run's first copy fetches it. Their peak RSS is the largest single process, not a total, and the reports say so. The loop stops at the first copy that fails, naming it as `n/total` and the target repository and tag, never the registry host. Tuning their parallelism is a later item, under [Competitors at their best](#competitors-at-their-best).
+
 ## Referrers
 
-ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the compared tools do not. Its source bytes therefore include content the others never fetch: about 117 MB on the main corpus. The harness counts `referrers` requests per tool, and the summary and the performance page carry a footnote whenever a count is non-zero, so the byte columns are read with that difference in mind.
+ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the other tools copy none as configured here: regctl and oras support referrers and run with them off, so no competitor does extra work that ocync's numbers are compared against. Its source bytes therefore include content the others never fetch: about 117 MB on the main corpus. The harness counts `referrers` requests per tool, and the summary and the performance page carry a footnote whenever a count is non-zero, so the byte columns are read with that difference in mind.
 
 ## What a published claim looks like
 

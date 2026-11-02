@@ -1,4 +1,6 @@
-//! Generate equivalent config files for ocync, dregsy, and regsync from a corpus.
+//! Generate equivalent config files for ocync, dregsy, and regsync from a corpus,
+//! and the Docker config and per-tag command lines of the tools that copy one tag
+//! per process.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -7,8 +9,10 @@ use std::path::Path;
 use ocync_distribution::Digest;
 
 use crate::bench::RegistryKind;
-use crate::bench::corpus::{Corpus, ImageEntry};
+use crate::bench::corpus::{Corpus, DockerHubAuth, ImageEntry};
 use crate::bench::lock::Lock;
+use crate::bench::runner::Copier;
+use crate::bench::skopeo_shim::PRESERVE_DIGESTS;
 use crate::bench::target::Kind;
 
 /// What a generated config syncs.
@@ -30,10 +34,16 @@ fn locked_digest<'a>(lock: &'a Lock, source: &str, tag: &str) -> &'a Digest {
         .digest
 }
 
+/// The `user:token` Docker Hub credentials, base64-encoded as dregsy's `auth`
+/// field and a Docker config's `auth` both take them.
+fn docker_hub_basic_auth(auth: &DockerHubAuth) -> String {
+    base64_encode(&format!("{}:{}", auth.username, auth.token))
+}
+
 /// Base64-encode a byte slice using the standard alphabet with padding.
 ///
-/// Hand-rolled to avoid adding a `base64` crate dependency for a single
-/// call site (dregsy auth field).
+/// Hand-rolled to avoid adding a `base64` crate dependency for two call
+/// sites (the dregsy auth field and the Docker config's `auth`).
 pub(crate) fn base64_encode(input: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = input.as_bytes();
@@ -211,7 +221,7 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> Stri
         // Docker Hub: inject base64-encoded auth to avoid 10 pulls/hr anonymous limit.
         if *registry == "docker.io" {
             if let Some(auth) = &corpus.dockerhub_auth {
-                let encoded = base64_encode(&format!("{}:{}", auth.username, auth.token));
+                let encoded = docker_hub_basic_auth(auth);
                 out.push_str(&format!("      auth: {encoded}\n"));
             }
         }
@@ -313,6 +323,77 @@ pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
     }
 
     out
+}
+
+/// The file name of the Docker-format config the per-tag tools sign in with,
+/// in the run's config directory.
+pub(crate) const DOCKER_CONFIG_FILE: &str = "config.json";
+
+/// The key Docker Hub credentials are stored under in a Docker config, which
+/// every per-tag tool maps to `docker.io`.
+const DOCKER_HUB_AUTH_KEY: &str = "https://index.docker.io/v1/";
+
+/// The Docker-format config the per-tag tools sign in with: Docker Hub
+/// credentials when the corpus has them, and the ECR credential helper for the
+/// target registry. Credentials go here, never on a command line, since the
+/// stderr of a failed run is printed.
+pub(crate) fn docker_config(corpus: &Corpus) -> String {
+    let mut config = serde_json::Map::new();
+    if let Some(auth) = &corpus.dockerhub_auth {
+        let encoded = docker_hub_basic_auth(auth);
+        config.insert(
+            "auths".to_owned(),
+            serde_json::json!({ DOCKER_HUB_AUTH_KEY: { "auth": encoded } }),
+        );
+    }
+    config.insert(
+        "credHelpers".to_owned(),
+        serde_json::json!({ &corpus.settings.target_registry: "ecr-login" }),
+    );
+    serde_json::Value::Object(config).to_string()
+}
+
+/// The arguments after the binary of every copy a per-tag tool makes, one list
+/// per corpus tag in corpus order (image, then tag). Each copies the locked
+/// digest from `lock` to the corpus tag, so a moved source tag cannot change
+/// what is copied. `config_dir` holds the [`DOCKER_CONFIG_FILE`] skopeo is told
+/// to sign in with; the other tools find it through `DOCKER_CONFIG`.
+///
+/// Platform, referrer, digest-tag and fast flags are never passed: each copies
+/// every platform and, as configured here, no referrers.
+pub(crate) fn per_tag_copies(
+    copier: Copier,
+    corpus: &Corpus,
+    lock: &Lock,
+    config_dir: &Path,
+) -> Vec<Vec<String>> {
+    let authfile = config_dir.join(DOCKER_CONFIG_FILE).display().to_string();
+    let mut copies = Vec::new();
+    for img in &corpus.images {
+        let target_ref = corpus.target_ref(&img.source);
+        for tag in &img.tags {
+            let source = format!("{}@{}", img.source, locked_digest(lock, &img.source, tag));
+            let target = format!("{target_ref}:{tag}");
+            let args = match copier {
+                Copier::Skopeo => vec![
+                    "--insecure-policy".to_owned(),
+                    "copy".to_owned(),
+                    PRESERVE_DIGESTS.to_owned(),
+                    "--multi-arch".to_owned(),
+                    "all".to_owned(),
+                    "--authfile".to_owned(),
+                    authfile.clone(),
+                    format!("docker://{source}"),
+                    format!("docker://{target}"),
+                ],
+                Copier::Crane => vec!["copy".to_owned(), source, target],
+                Copier::Regctl => vec!["image".to_owned(), "copy".to_owned(), source, target],
+                Copier::Oras => vec!["cp".to_owned(), source, target],
+            };
+            copies.push(args);
+        }
+    }
+    copies
 }
 
 #[cfg(test)]
@@ -710,6 +791,90 @@ sync:
             ),
         ] {
             assert_eq!(config, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn docker_config_signs_in_to_docker_hub_when_it_has_a_token_and_to_ecr_by_helper() {
+        use crate::bench::corpus::DockerHubAuth;
+
+        // Catches: Docker Hub credentials under a key the tools do not map to
+        // docker.io, a token or an `auths` key written without credentials, and
+        // the helper named for another registry than the target.
+        let mut with_auth = test_corpus();
+        with_auth.dockerhub_auth = Some(DockerHubAuth {
+            username: "ocync-bench".to_string(),
+            token: "dkr_pat_abc123".to_string(),
+        });
+        assert_eq!(
+            docker_config(&with_auth),
+            r#"{"auths":{"https://index.docker.io/v1/":{"auth":"b2N5bmMtYmVuY2g6ZGtyX3BhdF9hYmMxMjM="}},"credHelpers":{"111111111111.dkr.ecr.us-east-1.amazonaws.com":"ecr-login"}}"#
+        );
+        assert_eq!(
+            docker_config(&test_corpus()),
+            r#"{"credHelpers":{"111111111111.dkr.ecr.us-east-1.amazonaws.com":"ecr-login"}}"#
+        );
+    }
+
+    #[test]
+    fn per_tag_copies_copy_each_locked_digest_to_its_tag_in_corpus_order() {
+        // Catches: a tag-based source (a moved tag changes what is copied), a
+        // target without the tag or in another repository, tags out of corpus
+        // order, and a flag that narrows or widens what the other tools copy.
+        let (corpus, lock) = (test_corpus(), test_lock());
+        let copies = |copier| per_tag_copies(copier, &corpus, &lock, Path::new("/run/dir"));
+        let (static_src, alpine_320_src, alpine_latest_src) = (
+            "cgr.dev/chainguard/static@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "docker.io/library/alpine@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "docker.io/library/alpine@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        );
+        let (static_tgt, alpine_320_tgt, alpine_latest_tgt) = (
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/chainguard-static:latest",
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:3.20",
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com/bench/library-alpine:latest",
+        );
+        let skopeo = |src: &str, tgt: &str| {
+            vec![
+                "--insecure-policy",
+                "copy",
+                "--preserve-digests",
+                "--multi-arch",
+                "all",
+                "--authfile",
+                "/run/dir/config.json",
+                &format!("docker://{src}"),
+                &format!("docker://{tgt}"),
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<String>>()
+        };
+        let plain = |head: &[&str], src: &str, tgt: &str| {
+            head.iter()
+                .copied()
+                .chain([src, tgt])
+                .map(str::to_owned)
+                .collect::<Vec<String>>()
+        };
+        let pairs = [
+            (static_src, static_tgt),
+            (alpine_320_src, alpine_320_tgt),
+            (alpine_latest_src, alpine_latest_tgt),
+        ];
+        assert_eq!(
+            copies(Copier::Skopeo),
+            pairs.map(|(src, tgt)| skopeo(src, tgt))
+        );
+        for (copier, head) in [
+            (Copier::Crane, &["copy"][..]),
+            (Copier::Regctl, &["image", "copy"][..]),
+            (Copier::Oras, &["cp"][..]),
+        ] {
+            assert_eq!(
+                copies(copier),
+                pairs.map(|(src, tgt)| plain(head, src, tgt)),
+                "{copier:?}"
+            );
         }
     }
 

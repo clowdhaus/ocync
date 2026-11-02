@@ -1,6 +1,6 @@
 # bench/
 
-Benchmark infrastructure for comparing ocync against dregsy and regsync.
+Benchmark infrastructure for comparing ocync against dregsy, regsync, skopeo, crane, regctl and oras.
 
 ## Prerequisites
 
@@ -19,6 +19,9 @@ Single command for the full benchmark cycle.
 ```bash
 # Full 3-tool cold+warm comparison (--tools defaults to ocync only)
 cargo xtask bench-remote --provider aws --scenario sync --tools ocync,dregsy,regsync
+
+# The four per-tag tools beside ocync (see "Per-tag tools")
+cargo xtask bench-remote --provider aws --scenario sync --tools ocync,skopeo,crane,regctl,oras
 
 # Quick smoke test
 cargo xtask bench-remote --provider aws --scenario sync \
@@ -45,7 +48,7 @@ cargo xtask bench-remote --provider aws --force --scenario sync
 **`--target artifact-registry` syncs from the AWS instance into Google Artifact Registry.** Artifact Registry keeps a blob after the image that held it is deleted, so a used repository is no longer cold; every round therefore syncs into a repository of its own, made fresh. The bench service account can write to a repository but not create one, and the instance has no Google access to the repository API, so `bench-remote` makes and deletes the repositories on this machine with your `gcloud` sign-in:
 
 - It needs `bench/terraform/gcp` applied (its `repository`, `service_account` and `credentials_file` outputs name the project, location, service account and federation file) and `gcloud` signed in with rights to create repositories and set their IAM policy. The outputs are read, and a lock on this machine is taken, before the push, so a missing apply is refused before anything leaves it.
-- Before the push it refuses anything but `--provider aws`, `--scenario sync` and ocync alone (no `--baseline-ref`, which adds a second build; `--regression` is refused on the instance, since the one stored baseline is ECR's): regsync and dregsy configs hardcode ECR credentials, partial and scale are not built for it, and two builds would share one repository.
+- Before the push it refuses anything but `--provider aws`, `--scenario sync` and ocync alone (no `--baseline-ref`, which adds a second build; `--regression` is refused on the instance, since the one stored baseline is ECR's): the other tools sign in to ECR only (a generated config or Docker config written for it), partial and scale are not built for it, and two builds would share one repository.
 - After the push it deletes every repository whose id starts with `ocync-bench-run-` (an earlier run that was killed), creates `ocync-bench-run-<run timestamp>-r<round>` for each round, grants the service account `roles/artifactregistry.writer` on each, and copies the federation file to the instance (mode 0600). It then deletes them all when the run ends, on success and on failure (one already gone counts as deleted), except when the end is unknown: if `ssh` drops (exit 255 or a stream error) the detached benchmark may still be pushing, so the repositories are kept and the next `--target artifact-registry` run deletes them once the instance is free. A process killed outright leaves them for the next run's sweep. The sweep would delete a live run's repositories, so two guards stand before it: an exclusive lock (`ocync-bench-gar.lock` in the temp directory) held for the whole local life of an Artifact Registry or ACR run refuses a second one on this machine by name, and a probe of the instance's run lock refuses (without `--force`) a run whose local process died but whose benchmark still goes on the instance. The probe treats only `flock` exit 75 as held and any other failure as an error. `--force` kills that run, so its repositories go with it.
 - The instance runs `cargo xtask bench --target artifact-registry` (`bench-remote` passes `--target` through for Artifact Registry and ACR only, so an ECR run still works on an older `--git-ref`; the default is `ecr`; a `--git-ref` for an Artifact Registry run needs this option), reads `BENCH_TARGET_REGISTRY`, `BENCH_GAR_PROJECT`, `BENCH_GAR_REPOSITORIES` and `GOOGLE_APPLICATION_CREDENTIALS` (all required, an empty one counts as unset; an ECR run reads none of the last three), creates and deletes nothing, writes the ocync registry as `auth_type: gar`, syncs round N into `<project>/<repository N>/bench/...`, and checks each pass with manifest HEADs (the tag's digest, then each locked index child) through ocync's own Google sign-in, outside the proxy window. One HEAD of a tag that cannot exist, in repository 1, runs first so a broken federation file or a missing grant fails before the build.
 - Its records go to `bench/results/gcr.json` and carry the machine's cloud (`aws`), never the project, repositories or host. It writes no block to `docs/src/content/performance.md`, which is the ECR comparison.
@@ -70,6 +73,24 @@ cargo xtask bench-remote --provider aws --force --scenario sync
 **Output:**
 - `bench/results/<timestamp>/summary.md` - human-readable comparison table with winners bolded
 - `bench/results/{registry}.json` - compact per-registry run record archive (tracked in git)
+
+## Per-tag tools
+
+`skopeo`, `crane`, `regctl` and `oras` are benchmarked beside the config-driven tools. `skopeo sync` cannot copy `source@digest` to `target:tag` (its destination name comes from the source name), so none of the four reads a config that lists the corpus: xtask runs one process per corpus tag, in corpus order (image, then tag), each copying the locked digest to the corpus tag.
+
+| Tool | Command after the binary |
+|---|---|
+| skopeo | `--insecure-policy copy --preserve-digests --multi-arch all --authfile <config dir>/config.json docker://<src>@<digest> docker://<target>:<tag>` |
+| crane | `copy <src>@<digest> <target>:<tag>` |
+| regctl | `image copy <src>@<digest> <target>:<tag>` |
+| oras | `cp <src>@<digest> <target>:<tag>` |
+
+- **One copy at a time.** `PER_TAG_JOBS = 1` in `runner.rs`; the run record carries it as `per_tag_jobs` whenever one of the four ran, and `run_per_tag` fails to compile if the constant is not 1.
+- **Never** `--platform`, `--referrers`/`-r`, `--digest-tags`, `--fast` or `--all` (skopeo rejects `--all` with `--multi-arch`). Referrers are off for every competitor; regctl and oras can copy them and run with it off.
+- **Auth is one Docker-format file**, `<config dir>/config.json`, mode 0600: Docker Hub credentials under `https://index.docker.io/v1/` when the corpus has them, and `credHelpers` naming the target registry as `ecr-login`. Credentials are never on a command line, since a failed run prints its stderr. Every child gets `DOCKER_CONFIG=<config dir>` and `REGCTL_CONFIG=<config dir>/regctl.json` (never written, so `~/.regctl` cannot leak in), and `HTTPS_PROXY` when the proxy is on. The file does not name `public.ecr.aws`, which the instance's own `~/.docker/config.json` maps to the helper: the four pull it anonymously, as ocync does.
+- **What the metrics mean for them** and their inner concurrency defaults: [per-tag tools](/design/benchmark#per-tag-tools) and [competitors at their best](/design/benchmark#competitors-at-their-best) in the benchmark design.
+- **No prepare mode.** `prepare` is ocync-only; `--tools` naming any other tool with the `prepare` scenario is refused by name before the run starts, as `ensure_prepare_applies` checks (`--scenario all` runs prepare with ocync alone).
+- **Versions.** crane's `could not determine build information` and `(devel)` count as no version, so its version comes from `go version -m` as for dregsy.
 
 ## The prepare scenario
 
@@ -159,7 +180,9 @@ Managed by Terraform in `bench/terraform/aws/`. `user_data_replace_on_change = t
 
 A benchmark run is a point in time, not a fixed rig. Nothing is pinned: competitor tools install at `@latest` and the image is the current AL2023 default release. What makes two runs comparable is the record of what each used, so the run record carries the tool versions, the relay versions and the image id.
 
-**Versions are fixed at instance creation, not per run.** The `go install` calls live in user-data, and `bench-remote` only rebuilds ocync. An instance built in March still runs March's dregsy in September. To benchmark against current competitor releases, replace the instance. Read the versions out of the run record rather than assuming they match what is current today.
+**Versions are fixed at instance creation, not per run.** The `go install` calls live in user-data, and `bench-remote` only rebuilds ocync. An instance built in March still runs March's dregsy in September. To benchmark against current competitor releases, replace the instance. An instance built before crane, regctl and oras were added lacks them until it is replaced, and `--tools` naming one fails at the version check with a spawn error.
+
+The install sets `GOTOOLCHAIN=local`, so a Go older than a tool's `go.mod` fails loudly inside `retry` instead of downloading a toolchain outside it. `GO_VERSION` is 1.26.10 (go.dev's current 1.26 release; oras's `go.mod` needs 1.26.7 or later); raise it when a tool's `go.mod` outruns it. Read the versions out of the run record rather than assuming they match what is current today.
 
 Three resolution details are easy to get wrong. skopeo's module path is `go.podman.io/skopeo` since v1.23.0, and the old `github.com/containers/skopeo` path still serves tags whose `go.mod` declares the new path, so installing from it fails on a path mismatch rather than a missing version. `@latest` never crosses a major version boundary under semantic import versioning, so when one of these tags v2 the install silently sticks on the highest v1 until the path gains a `/v2` suffix. And dregsy tags releases without a `v` prefix, so the proxy reads no valid semver and `@latest` resolves to a pseudo-version off the default branch rather than to a release.
 
@@ -227,6 +250,10 @@ Each record includes: timestamp, git ref, machine metadata (instance type, arch,
 
 ## Competitor config gotchas
 
+- **`skopeo sync` cannot tag a digest source.** Its destination name comes from the source name, so skopeo is driven with `skopeo copy` per tag.
+- **crane's real `-j` default is 4**, not the GOMAXPROCS its help text implies: pflag overwrites the default with 0, which crane ignores.
+- **skopeo needs `--insecure-policy`**, so it does not depend on a signature policy file, and `--preserve-digests`; without the latter it recompresses an uncompressed layer and the target digest differs from the source's. The `--preserve-digests` flag also goes on dregsy's skopeo through the shim.
+- **The Docker Hub key is exactly `https://index.docker.io/v1/`**, the key the Docker config format uses for `docker.io`; all four read the file that way.
 - **regsync `type: image` resolves `:latest` first**: When the source has no tag (e.g. `docker.io/nvidia/cuda`), regsync does a manifest HEAD on `:latest` before checking the `tags.allow` list. Images without a `latest` tag (nvidia/cuda, pytorch/pytorch) produce 404 errors in the log. Non-fatal but adds wasted requests to the benchmark metrics.
 - **regsync `repoAuth: true`**: Required for registries that issue per-scope tokens (cgr.dev, gcr.io, nvcr.io). Without it, regsync silently fails auth on the second repo from the same registry.
 - **dregsy `auth-refresh: 12h`**: Required for ECR targets. Without it, dregsy's ECR token expires mid-run on large corpora. The 12h matches ECR token lifetime.

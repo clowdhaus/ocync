@@ -13,7 +13,7 @@ use crate::bench::corpus;
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
-use crate::bench::runner::Tool;
+use crate::bench::runner::{PER_TAG_JOBS, Tool};
 use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
@@ -74,6 +74,10 @@ pub(crate) struct RunRecord {
     pub(crate) prewarm: Option<Prewarm>,
     /// Corpus size context.
     pub(crate) corpus: CorpusInfo,
+    /// Whether the run synced all of the corpus; absent when it did, and from
+    /// records written before it was recorded.
+    #[serde(default, skip_serializing_if = "Coverage::is_whole")]
+    pub(crate) coverage: Coverage,
     /// The cap on concurrent image transfers the current ocync ran with, the
     /// default's value when none was given. Runs under different caps are
     /// different series; absent when no ocync ran and from records written
@@ -83,6 +87,11 @@ pub(crate) struct RunRecord {
     /// The cap the baseline build ran with; absent without a baseline build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) baseline_max_concurrent_transfers: Option<BaselineCap>,
+    /// How many copies the per-tag tools (skopeo, crane, regctl, oras) ran at
+    /// once, fixed at 1 by `runner::PER_TAG_JOBS`; absent when none of them
+    /// ran and from records written before they were benchmarked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_tag_jobs: Option<NonZeroUsize>,
     /// How many rounds were asked for and finished; absent for a run with no
     /// repeated scenario and for records written before rounds existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -138,8 +147,10 @@ impl RunRecord {
             relays: Some(report.relay_versions.clone()),
             prewarm: report.prewarm.clone(),
             corpus: report.corpus.clone(),
+            coverage: report.coverage,
             max_concurrent_transfers: report.ocync_transfer_cap(),
             baseline_max_concurrent_transfers: report.baseline_transfer_cap(),
+            per_tag_jobs: report.per_tag_jobs(),
             rounds: report.round_count(),
             scenarios: report
                 .scenarios
@@ -559,6 +570,36 @@ fn read_imds(path: &str) -> Option<String> {
     ]))
 }
 
+/// How much of the corpus a run synced.
+///
+/// Kept apart from [`CorpusInfo`], which baselines compare for equality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Coverage {
+    /// Every image of the corpus.
+    #[default]
+    Whole,
+    /// Fewer images than the corpus holds, by `--limit` or `--skip-registries`.
+    Subset,
+}
+
+impl Coverage {
+    /// What a run that synced `synced` covers of a corpus of `whole` images. A
+    /// `--limit` past the end still covers it all.
+    pub(crate) fn of(whole: usize, synced: &CorpusInfo) -> Self {
+        if synced.images < whole {
+            Self::Subset
+        } else {
+            Self::Whole
+        }
+    }
+
+    /// Whether this is [`Self::Whole`], which a record leaves unwritten.
+    fn is_whole(&self) -> bool {
+        *self == Self::Whole
+    }
+}
+
 /// Full benchmark report.
 #[derive(Debug)]
 pub(crate) struct BenchReport {
@@ -568,6 +609,8 @@ pub(crate) struct BenchReport {
     pub(crate) instance: InstanceInfo,
     /// The corpus the run synced: its name, images and tags.
     pub(crate) corpus: CorpusInfo,
+    /// Whether the run synced all of that corpus.
+    pub(crate) coverage: Coverage,
     /// Tool version strings keyed by tool name.
     pub(crate) tool_versions: BTreeMap<Tool, String>,
     /// Versions of binaries a tool relays its transfers through, keyed by
@@ -613,6 +656,16 @@ impl BenchReport {
         self.tool_versions
             .contains_key(&Tool::Ocync)
             .then(|| effective_transfer_cap(self.max_concurrent_transfers))
+    }
+
+    /// How many copies the per-tag tools ran at once. `None` when none ran,
+    /// however many were asked for.
+    fn per_tag_jobs(&self) -> Option<NonZeroUsize> {
+        self.scenarios
+            .iter()
+            .flat_map(|scenario| &scenario.runs)
+            .any(|run| run.tool.is_per_tag())
+            .then_some(PER_TAG_JOBS)
     }
 
     /// The cap the baseline build ran with. `None` without a baseline build.
@@ -692,8 +745,9 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 /// tool issued referrer calls in any round.
 ///
 /// ocync issues `GET /v2/<repo>/referrers/...` to discover artifact
-/// attestations (SBOM, SLSA) and transfers any referenced artifacts.
-/// Comparable tools do not implement this OCI 1.1 endpoint. The footnote
+/// attestations (SBOM, SLSA) and transfers any referenced artifacts, as does
+/// the ocync baseline build. The footnote names the other tools, which copy no
+/// referrers as configured here (regctl and oras can, and run with it off), and
 /// surfaces the per-tool count, the median over the rounds, so the Source blob
 /// GETs / Source blob bytes columns are not read as a fairness violation.
 ///
@@ -714,12 +768,28 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     if !calls.iter().any(|(_, n)| *n > 0) {
         return None;
     }
+    let without: Vec<String> = calls
+        .iter()
+        .filter(|&&(tool, n)| !tool.is_ocync() && n == 0)
+        .map(|&(tool, _)| report.label(tool))
+        .collect();
     let mut out = String::new();
     out.push('\n');
     out.push_str("> **Artifact sync (OCI 1.1 referrers).** ");
     out.push_str("ocync issues `GET /v2/<repo>/referrers/...` to discover ");
     out.push_str("attestations (SBOM, SLSA) and transfers any referenced ");
-    out.push_str("artifacts. Comparable tools do not implement this. The ");
+    out.push_str("artifacts. ");
+    if let Some((last, rest)) = without.split_last() {
+        let named = if rest.is_empty() {
+            last.to_string()
+        } else {
+            format!("{} and {last}", rest.join(", "))
+        };
+        out.push_str(&format!(
+            "Referrers are not copied by {named} as configured here. "
+        ));
+    }
+    out.push_str("The ");
     out.push_str("Source blob GETs and Source blob bytes columns above include ");
     out.push_str("this artifact content for ocync.\n>\n> ");
     let parts: Vec<String> = calls
@@ -728,6 +798,36 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
         .collect();
     out.push_str(&format!("Referrers calls -- {}.\n", parts.join(", ")));
     Some(out)
+}
+
+/// The footnote on the Peak RSS row for the per-tag tools among the runs, or
+/// `None` without one. They run a process per tag, so the cell is the largest
+/// process, not what the run held at once. Leads with a newline like
+/// [`referrer_footnote`].
+fn per_process_rss_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option<String> {
+    let tools: Vec<String> = rounds_by_tool(rounds)
+        .into_keys()
+        .filter(|tool| tool.is_per_tag())
+        .map(|tool| report.label(tool))
+        .collect();
+    (!tools.is_empty()).then(|| {
+        format!(
+            "\n> **Peak RSS of {} is per process.** Each copies one tag per \
+             process, so its cell is the largest of those processes.\n",
+            tools.join(", ")
+        )
+    })
+}
+
+/// The footnotes under a scenario's tables, each with a leading newline.
+fn footnotes(report: &BenchReport, rounds: &[&ScenarioResult]) -> String {
+    [
+        referrer_footnote(report, rounds),
+        per_process_rss_footnote(report, rounds),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Generates a Markdown summary of the benchmark report.
@@ -804,9 +904,7 @@ fn summary_markdown(report: &BenchReport) -> String {
             .collect();
         render_metric_table(report, &ran, &by_tool, &mut out);
         render_comparison(report, &rounds, &mut out);
-        if let Some(footnote) = referrer_footnote(report, &rounds) {
-            out.push_str(&footnote);
-        }
+        out.push_str(&footnotes(report, &rounds));
         out.push('\n');
     }
 
@@ -852,6 +950,11 @@ struct MetricRow {
     verdict_words: Option<[&'static str; 2]>,
 }
 
+/// The label of the Peak RSS row, whose cells for the per-tag tools are the
+/// largest of many processes and so do not compare with the others' whole-run
+/// peaks.
+const PEAK_RSS_LABEL: &str = "Peak RSS";
+
 fn count(n: u64) -> String {
     n.to_string()
 }
@@ -871,7 +974,7 @@ fn metric_rows() -> [MetricRow; 10] {
             verdict_words: Some(["faster", "slower"]),
         },
         MetricRow {
-            label: "Peak RSS",
+            label: PEAK_RSS_LABEL,
             rank: |r| r.peak_rss_kb,
             of: None,
             format: |kb| format_bytes(kb * 1024),
@@ -1015,7 +1118,9 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
 /// Renders a metric comparison table into `out`.
 ///
 /// Columns are tool names, rows are metrics. The best value per row is bolded
-/// when more than one tool has data for that metric, see [`is_bold`].
+/// when more than one tool has data for that metric, see [`is_bold`]. The Peak
+/// RSS row bolds nothing when a per-tag tool ran, as [`per_process_rss_footnote`]
+/// explains.
 fn render_metric_table(
     report: &BenchReport,
     columns: &[Tool],
@@ -1033,7 +1138,10 @@ fn render_metric_table(
     }
     out.push('\n');
 
+    // The tools that ran, as the footnote names them, not the probed columns.
+    let per_process_peaks = by_tool.keys().any(|tool| tool.is_per_tag());
     for row in &metric_rows() {
+        let comparable = !(per_process_peaks && row.label == PEAK_RSS_LABEL);
         let cells: Vec<Option<Cell>> = columns
             .iter()
             .map(|col| by_tool.get(col).and_then(|runs| cell(row, runs)))
@@ -1042,7 +1150,7 @@ fn render_metric_table(
         out.push_str(&format!("| {} |", row.label));
         for cell in &cells {
             match cell {
-                Some(cell) if is_bold(row, cell, &cells) => {
+                Some(cell) if comparable && is_bold(row, cell, &cells) => {
                     out.push_str(&format!(" **{}** |", cell.text));
                 }
                 Some(cell) => out.push_str(&format!(" {} |", cell.text)),
@@ -1215,9 +1323,7 @@ fn scenario_markdown(
     let columns = tool_columns(report);
     render_metric_table(report, &columns, &rounds_by_tool(rounds), &mut out);
     render_comparison(report, rounds, &mut out);
-    if let Some(footnote) = referrer_footnote(report, rounds) {
-        out.push_str(&footnote);
-    }
+    out.push_str(&footnotes(report, rounds));
 
     out
 }
@@ -1294,11 +1400,12 @@ pub(crate) struct PageBlocks {
 impl PageBlocks {
     /// The blocks `report` produces. A run whose transfer cap is not ocync's
     /// default produces none: the page shows ocync as it runs out of the box.
-    /// Nor does a run of a named corpus: the page is the main corpus's.
+    /// Nor does a run without ocync, a run of a named corpus (the page is the
+    /// main corpus's), or a run of part of the corpus.
     pub(crate) fn of(report: &BenchReport) -> Self {
         if !report.corpus.id.is_main()
-            || effective_transfer_cap(report.max_concurrent_transfers)
-                != DEFAULT_MAX_CONCURRENT_TRANSFERS
+            || report.coverage != Coverage::Whole
+            || report.ocync_transfer_cap() != Some(DEFAULT_MAX_CONCURRENT_TRANSFERS)
         {
             return Self::default();
         }
@@ -1541,6 +1648,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            coverage: Coverage::Whole,
         }
     }
 
@@ -1664,6 +1772,7 @@ pub(crate) mod tests {
             prewarm: None,
             tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
             scenarios: vec![],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(!md.contains("## Cold"));
@@ -1754,20 +1863,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_named_corpus_is_recorded_by_name_and_writes_no_page_blocks() {
-        // Catches: a run of a shape corpus overwriting the main corpus's cold
-        // and warm blocks on the performance page, a named run recorded as the
-        // main corpus, and a main-corpus record gaining a name.
+    fn a_named_or_partial_run_writes_no_page_blocks_and_is_recorded_as_such() {
+        // Catches: a run of a shape corpus, or a `--limit` or
+        // `--skip-registries` run, overwriting the main corpus's cold and warm
+        // blocks on the performance page; a named run recorded as the main
+        // corpus; a main-corpus record gaining a name; a partial run recorded
+        // as whole; and a whole run's record gaining a coverage.
         let mut report = sample_report();
         let record = |report: &BenchReport| {
             serde_json::to_value(RunRecord::of(report, "abc1234".into(), None)).unwrap()
         };
         assert_ne!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"].get("name"), None);
+        assert_eq!(record(&report).get("coverage"), None);
 
+        report.coverage = Coverage::Subset;
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+        assert_eq!(record(&report)["coverage"], "subset");
+
+        report.coverage = Coverage::Whole;
         report.corpus.id = corpus::Id::Named(CorpusName::new("corpus-small"));
         assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
+    }
+
+    #[test]
+    fn coverage_is_a_subset_only_when_images_were_dropped() {
+        // Catches: a `--limit` that drops images read as the whole corpus, and
+        // a `--limit` past the end, which syncs it all, read as a subset.
+        let synced = |images| CorpusInfo {
+            images,
+            ..CorpusInfo::default()
+        };
+        assert_eq!(Coverage::of(40, &synced(3)), Coverage::Subset);
+        assert_eq!(Coverage::of(40, &synced(40)), Coverage::Whole);
     }
 
     #[test]
@@ -1839,6 +1968,54 @@ pub(crate) mod tests {
         assert_eq!(record.max_concurrent_transfers, None);
         assert_eq!(record.baseline_max_concurrent_transfers, None);
         assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
+        // Catches: a run of only other tools replacing ocync's row on the page.
+        assert_eq!(PageBlocks::of(&no_ocync), PageBlocks::default());
+    }
+
+    #[test]
+    fn per_tag_tools_record_their_job_count_and_mark_their_peak_rss_as_per_process() {
+        // Catches: a record that does not name the per-tag job count a number
+        // was measured at, one written for a run without those tools, and a
+        // per-process peak read as the run's total.
+        let report = sample_report();
+        let record = RunRecord::of(&report, "abc1234".into(), None);
+        assert_eq!(record.per_tag_jobs, None);
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("per_tag_jobs")
+        );
+        assert!(!summary_markdown(&report).contains("per process"));
+
+        // Requested and probed but never run: nothing was measured at any count.
+        let mut report = sample_report();
+        for tool in [Tool::Crane, Tool::Oras] {
+            report.tool_versions.insert(tool, "v1".to_owned());
+        }
+        assert_eq!(report.per_tag_jobs(), None);
+
+        for tool in [Tool::Crane, Tool::Oras] {
+            report.scenarios[0].runs.push(ToolRun {
+                tool,
+                wall_clock_secs: 1.0,
+                peak_rss_kb: Some(1),
+                proxy_metrics: None,
+                phase_timing_ms: BTreeMap::new(),
+            });
+        }
+        let record = RunRecord::of(&report, "abc1234".into(), None);
+        assert_eq!(record.per_tag_jobs, NonZeroUsize::new(1));
+        assert!(
+            serde_json::to_string(&record)
+                .unwrap()
+                .contains(r#""per_tag_jobs":1"#)
+        );
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("> **Peak RSS of crane, oras is per process.**"),
+            "{md}"
+        );
+        assert!(!md.contains("Peak RSS of ocync"), "{md}");
     }
 
     #[test]
@@ -2120,6 +2297,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         // Single tool -- nothing should be bolded.
@@ -2170,6 +2348,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let warm = rounds_of(&report.scenarios, ScenarioKind::Warm);
         let md = scenario_markdown(&report, &warm, "Warm sync (no changes)");
@@ -2285,6 +2464,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         }
     }
 
@@ -2375,6 +2555,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
 
@@ -2435,6 +2616,7 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
 
@@ -2515,6 +2697,7 @@ pub(crate) mod tests {
                     }],
                 ),
             ],
+            ..sample_report()
         };
         PageBlocks::of(&report).apply(&path).unwrap();
 
@@ -2564,6 +2747,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         PageBlocks::of(&report).apply(&path).unwrap();
 
@@ -2625,12 +2809,18 @@ pub(crate) mod tests {
                     },
                 ],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(
             md.contains("OCI 1.1 referrers"),
             "footnote missing from summary.md:\n{md}"
         );
+        assert!(
+            md.contains("Referrers are not copied by dregsy and regsync as configured here."),
+            "{md}"
+        );
+        assert!(!md.contains("do not implement"), "{md}");
         assert!(md.contains("ocync: 79"), "ocync count missing:\n{md}");
         assert!(md.contains("dregsy: 0"), "dregsy count missing:\n{md}");
         assert!(md.contains("regsync: 0"), "regsync count missing:\n{md}");
@@ -2663,6 +2853,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let md = summary_markdown(&report);
         assert!(
@@ -2704,6 +2895,7 @@ pub(crate) mod tests {
                     phase_timing_ms: BTreeMap::new(),
                 }],
             )],
+            ..sample_report()
         };
         let scenario = &report.scenarios[0];
         let md = scenario_markdown(&report, &[scenario], "Cold sync");
@@ -2766,6 +2958,7 @@ pub(crate) mod tests {
                     )
                 })
                 .collect(),
+            ..sample_report()
         }
     }
 
@@ -2955,6 +3148,82 @@ pub(crate) mod tests {
         );
         assert!(md.contains("**24s (20s..29s)**"), "{md}");
         assert!(!md.contains("Per-round ratio"), "{md}");
+    }
+
+    #[test]
+    fn peak_rss_names_no_winner_beside_a_per_process_peak() {
+        // Catches: crane's largest single process bolded against ocync's whole
+        // run, which reads as a memory win it did not have; the rule
+        // spreading to a table of whole-run peaks; and a per-tag tool that was
+        // probed but never ran suppressing the bold with no footnote to say why.
+        let run = |tool, peak_rss_kb| ToolRun {
+            tool,
+            wall_clock_secs: 1.0,
+            peak_rss_kb: Some(peak_rss_kb),
+            proxy_metrics: None,
+            phase_timing_ms: BTreeMap::new(),
+        };
+        let report = sample_report();
+        let rss_row = |tools: &[(Tool, u64)], idle: &[Tool]| {
+            let runs: Vec<ToolRun> = tools.iter().map(|&(t, kb)| run(t, kb)).collect();
+            let columns: Vec<Tool> = tools
+                .iter()
+                .map(|&(t, _)| t)
+                .chain(idle.iter().copied())
+                .collect();
+            let by_tool = runs.iter().map(|r| (r.tool, vec![r])).collect();
+            let mut out = String::new();
+            render_metric_table(&report, &columns, &by_tool, &mut out);
+            out.lines()
+                .find(|line| line.starts_with("| Peak RSS |"))
+                .unwrap()
+                .to_owned()
+        };
+
+        assert_eq!(
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Crane, 40_000)], &[]),
+            "| Peak RSS | 61.4 MB | 41.0 MB |"
+        );
+        assert_eq!(
+            rss_row(&[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)], &[]),
+            "| Peak RSS | **61.4 MB** | 307.2 MB |"
+        );
+        assert_eq!(
+            rss_row(
+                &[(Tool::Ocync, 60_000), (Tool::Dregsy, 300_000)],
+                &[Tool::Crane]
+            ),
+            "| Peak RSS | **61.4 MB** | 307.2 MB | -- |"
+        );
+    }
+
+    #[test]
+    fn the_referrer_footnote_names_the_tools_that_copy_none_and_not_the_baseline() {
+        // Catches: "the other tools" covering the ocync baseline, which issues
+        // referrer calls, and the baseline named as a tool that copies none.
+        let md = summary_markdown(&five_rounds(5));
+        assert!(
+            md.contains("Referrers are not copied by dregsy and regsync as configured here."),
+            "{md}"
+        );
+        assert!(!md.contains("The other tools"), "{md}");
+
+        // Catches: a competitor that made referrer calls still named as
+        // copying none, beside its own nonzero count.
+        let mut report = five_rounds(5);
+        for run in report
+            .scenarios
+            .iter_mut()
+            .flat_map(|s| s.runs.iter_mut())
+            .filter(|r| r.tool == Tool::Regsync)
+        {
+            run.proxy_metrics.as_mut().unwrap().referrer_calls = 3;
+        }
+        let md = summary_markdown(&report);
+        assert!(
+            md.contains("Referrers are not copied by dregsy as configured here."),
+            "{md}"
+        );
     }
 
     #[test]
