@@ -302,12 +302,12 @@ impl BucketConfig {
 /// GAR/GCR: 60,000 RPM total (~1000 RPS) and 18,000 RPM writes (~300 RPS)
 /// per project per region. 240 TPS shared keeps 20% margin under the write
 /// ceiling, the tighter of the two.
-/// ACR's per-identity per-registry DataplaneRead limit for Basic and
+/// ACR's per-identity per-registry `DataplaneRead` limit for Basic and
 /// Standard registries, in requests per minute (Microsoft "SKU features and
 /// limits", 2026-10-15). Premium doubles it. GET and HEAD count here.
 const ACR_STANDARD_READS_PER_MINUTE: f64 = 5_000.0;
 
-/// ACR's per-identity per-registry DataplaneWrite limit for Basic and
+/// ACR's per-identity per-registry `DataplaneWrite` limit for Basic and
 /// Standard registries, in requests per minute (same source). Premium doubles
 /// it. PUT, PATCH and POST count here.
 const ACR_STANDARD_WRITES_PER_MINUTE: f64 = 1_000.0;
