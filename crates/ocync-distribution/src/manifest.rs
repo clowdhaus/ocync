@@ -177,13 +177,7 @@ impl RegistryClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let retry_after = crate::retry::retry_after(&resp);
-            let message = crate::json::error_body(resp).await;
-            return Err(Error::RegistryError {
-                status,
-                message,
-                retry_after,
-            });
+            return Err(Error::from_response(resp, None).await);
         }
 
         Ok(digest)
@@ -235,15 +229,7 @@ async fn classify_referrers_response(resp: reqwest::Response) -> Result<Option<I
             Ok(Some(index))
         }
         StatusCode::NOT_FOUND => Ok(None),
-        _ => {
-            let retry_after = crate::retry::retry_after(&resp);
-            let message = crate::json::error_body(resp).await;
-            Err(Error::RegistryError {
-                status,
-                message,
-                retry_after,
-            })
-        }
+        _ => Err(Error::from_response(resp, None).await),
     }
 }
 

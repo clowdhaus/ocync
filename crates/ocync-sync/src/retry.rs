@@ -205,18 +205,20 @@ where
                 // A 429's Retry-After lengthens the wait, or surfaces the
                 // error when it is longer than a sync waits out.
                 let wait = retryable
-                    .then(|| ocync_distribution::retry::wait_for(&e, config.backoff_for(attempt)))
+                    .then(|| {
+                        ocync_distribution::retry::retry_delay(&e, config.backoff_for(attempt))
+                    })
                     .flatten();
 
-                if let Some(backoff) = wait {
+                if let Some(delay) = wait {
                     tracing::warn!(
                         operation,
                         attempt,
                         error = %e,
-                        backoff_ms = backoff.as_millis(),
+                        delay_ms = delay.as_millis(),
                         "retrying"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                     record_retry();
                     continue;

@@ -412,6 +412,35 @@ impl Error {
         }
     }
 
+    /// The [`RegistryError`](Self::RegistryError) for a registry's failing
+    /// `response`, with its `Retry-After` and body. `place` is the registry
+    /// and repository the message names, when the caller has them. The only
+    /// production constructor, so no failing answer drops its `Retry-After`.
+    pub(crate) async fn from_response(
+        response: reqwest::Response,
+        place: Option<(&url::Url, &str)>,
+    ) -> Self {
+        let status = response.status();
+        let retry_after = crate::retry::retry_after(&response);
+        let body = crate::json::error_body(response).await;
+        let message = match place {
+            None => body,
+            Some((base_url, repository)) => {
+                let registry = base_url.host_str().unwrap_or("unknown");
+                if body.is_empty() {
+                    format!("{registry}/{repository}")
+                } else {
+                    format!("{registry}/{repository}: {body}")
+                }
+            }
+        };
+        Self::RegistryError {
+            status,
+            message,
+            retry_after,
+        }
+    }
+
     /// Extract the HTTP status code from this error, if applicable.
     pub fn status_code(&self) -> Option<http::StatusCode> {
         match self {

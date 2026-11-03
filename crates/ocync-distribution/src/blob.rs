@@ -53,19 +53,7 @@ async fn expect_status(
     if status == expected {
         Ok(resp)
     } else {
-        let registry = base_url.host_str().unwrap_or("unknown");
-        let retry_after = crate::retry::retry_after(&resp);
-        let body = crate::json::error_body(resp).await;
-        let message = if body.is_empty() {
-            format!("{registry}/{repository}")
-        } else {
-            format!("{registry}/{repository}: {body}")
-        };
-        Err(Error::RegistryError {
-            status,
-            message,
-            retry_after,
-        })
+        Err(Error::from_response(resp, Some((base_url, repository))).await)
     }
 }
 
@@ -430,21 +418,7 @@ async fn classify_mount_response(
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
         StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
-        _ => {
-            let registry = base_url.host_str().unwrap_or("unknown");
-            let retry_after = crate::retry::retry_after(&resp);
-            let body = crate::json::error_body(resp).await;
-            let message = if body.is_empty() {
-                format!("{registry}/{repository}")
-            } else {
-                format!("{registry}/{repository}: {body}")
-            };
-            Err(Error::RegistryError {
-                status,
-                message,
-                retry_after,
-            })
-        }
+        _ => Err(Error::from_response(resp, Some((base_url, repository))).await),
     }
 }
 

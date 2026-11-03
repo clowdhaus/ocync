@@ -33,7 +33,7 @@ pub const MAX_LISTING_RETRIES: u32 = 32;
 /// A longer one is a quota that will not recover within a sync (Docker Hub's
 /// pull limit answers with hours), so the 429 surfaces at once instead of
 /// holding the run open.
-pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
+pub(crate) const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Delay before the first retry.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -78,11 +78,21 @@ pub(crate) fn is_transient(error: &Error) -> bool {
     }
 }
 
-/// The delta-seconds form of a `Retry-After` value. The HTTP-date form, a
-/// negative number and anything else are `None`, and the caller backs off as
-/// it would without the header.
-fn delta_seconds(value: &str) -> Option<Duration> {
-    value.trim().parse().ok().map(Duration::from_secs)
+/// The wait a `Retry-After` value names, in either of its forms (RFC 9110
+/// section 10.2.3): delta seconds, or an HTTP date, which a past date makes
+/// zero. A number too large to hold is [`Duration::MAX`], so the cap refuses
+/// it. Anything else is `None`, and the caller backs off as it would without
+/// the header.
+fn retry_after_value(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(value.parse().map_or(Duration::MAX, Duration::from_secs));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(
+        date.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// How long a 429 `response` asked to be left alone, from its `Retry-After`
@@ -91,7 +101,7 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
-    delta_seconds(
+    retry_after_value(
         response
             .headers()
             .get(http::header::RETRY_AFTER)?
@@ -100,25 +110,35 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     )
 }
 
-/// The wait before re-sending after `error`, given the `backoff` a retry loop
-/// would use: the longer of the two when the registry named a `Retry-After`,
-/// or `None` when it named one over [`MAX_HONORED_RETRY_AFTER`] and the error
-/// should surface. The single definition both retry loops share.
-pub fn wait_for(error: &Error, backoff: Duration) -> Option<Duration> {
+/// The wait before re-sending after `error`, given the jittered `backoff` a
+/// retry loop would use, or `None` when the error should surface. See
+/// [`capped_delay`]. The single definition every registry retry loop shares.
+pub fn retry_delay(error: &Error, backoff: Duration) -> Option<Duration> {
     let asked = match error {
         Error::RegistryError { retry_after, .. } => *retry_after,
         _ => None,
     };
-    honored(asked, backoff)
+    capped_delay(asked, backoff)
 }
 
-/// The longer of `backoff` and a registry's `asked` wait, or `None` when
-/// `asked` is over [`MAX_HONORED_RETRY_AFTER`].
-fn honored(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
-    match asked {
-        Some(asked) => (asked <= MAX_HONORED_RETRY_AFTER).then(|| backoff.max(asked)),
-        None => Some(backoff),
+/// `backoff` when the registry `asked` for no wait, and `asked` plus
+/// `backoff` when it did. The registry counts `Retry-After` down to the end
+/// of its quota window, so the jittered `backoff` on top keeps every request
+/// it throttled from re-sending at the same instant. `None`, with a WARN,
+/// when `asked` is over [`MAX_HONORED_RETRY_AFTER`].
+fn capped_delay(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
+    let Some(asked) = asked else {
+        return Some(backoff);
+    };
+    if asked > MAX_HONORED_RETRY_AFTER {
+        tracing::warn!(
+            retry_after_s = asked.as_secs(),
+            max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
+            "registry asked for a longer wait than a sync waits out; not retrying"
+        );
+        return None;
     }
+    Some(asked.saturating_add(backoff))
 }
 
 /// Exponential backoff for attempt `attempt` (0-indexed), jittered.
@@ -163,7 +183,7 @@ impl Policy<Error> for Budgeted<'_> {
         if self.0.get() == 0 {
             return None;
         }
-        let delay = wait_for(error, Bounded(is_transient).retry(attempt, error)?)?;
+        let delay = retry_delay(error, Bounded(is_transient).retry(attempt, error)?)?;
         self.0.set(self.0.get() - 1);
         Some(delay)
     }
@@ -253,7 +273,7 @@ pub(crate) async fn send_retrying(
             return Ok(outcome?);
         }
         let asked = outcome.as_ref().ok().and_then(retry_after);
-        let Some(delay) = honored(asked, backoff(attempt)) else {
+        let Some(delay) = capped_delay(asked, backoff(attempt)) else {
             return Ok(outcome?);
         };
         tracing::debug!(
@@ -417,58 +437,57 @@ mod tests {
         assert!(logs.contains("empty host"), "{logs}");
     }
 
-    /// Only delta-seconds is read. Breaks if a date, a negative number or
-    /// garbage is taken as a wait, or if a plain number is ignored.
+    /// Both forms are read. Breaks if a negative number or garbage is taken
+    /// as a wait, if a number or a date is ignored, or if a number too large
+    /// to hold slips under the cap as no header.
     #[test]
-    fn retry_after_reads_only_delta_seconds() {
+    fn retry_after_reads_seconds_and_dates() {
+        let in_an_hour =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3600));
         let cases = [
             ("7", Some(Duration::from_secs(7))),
             (" 60 ", Some(Duration::from_secs(60))),
             ("0", Some(Duration::ZERO)),
+            ("99999999999999999999", Some(Duration::MAX)),
+            ("Wed, 21 Oct 2015 07:28:00 GMT", Some(Duration::ZERO)),
+            ("+5", None),
             ("-5", None),
             ("soon", None),
             ("", None),
-            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
         ];
         for (value, expected) in cases {
-            assert_eq!(delta_seconds(value), expected, "{value:?}");
+            assert_eq!(retry_after_value(value), expected, "{value:?}");
         }
+        let ahead = retry_after_value(&in_an_hour).expect("a future date is read");
+        assert!(
+            ahead > Duration::from_secs(3590) && ahead <= Duration::from_secs(3600),
+            "{ahead:?}"
+        );
     }
 
-    /// A throttle that names `Retry-After: 30` is not re-sent sooner than 30
-    /// s, though the backoff alone is about 250 ms. Breaks if the header is
-    /// ignored.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn retrying_waits_out_a_retry_after() {
-        let calls = Cell::new(0u32);
-        let started = tokio::time::Instant::now();
-        let result: Result<(), Error> = retrying(
-            "throttled",
-            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
-            |_| {
-                calls.set(calls.get() + 1);
-                let first = calls.get() == 1;
-                async move {
-                    if first {
-                        Err(Error::RegistryError {
-                            status: http::StatusCode::TOO_MANY_REQUESTS,
-                            message: "slow down".into(),
-                            retry_after: Some(Duration::from_secs(30)),
-                        })
-                    } else {
-                        Ok(())
-                    }
-                }
-            },
-        )
-        .await;
-        result.expect("the second answer succeeds");
-        assert_eq!(calls.get(), 2);
-        assert!(
-            started.elapsed() >= Duration::from_secs(30),
-            "re-sent after {:?}",
-            started.elapsed()
-        );
+    /// Breaks if the wait drops the backoff on top of a `Retry-After` (every
+    /// throttled request would wake together), ignores the header, or moves
+    /// the cap's edge.
+    #[test]
+    fn capped_delay_adds_the_backoff_up_to_the_cap() {
+        let backoff = Duration::from_millis(250);
+        let cases = [
+            (None, Some(Duration::from_millis(250))),
+            (Some(Duration::ZERO), Some(Duration::from_millis(250))),
+            (
+                Some(Duration::from_secs(119)),
+                Some(Duration::from_millis(119_250)),
+            ),
+            (
+                Some(Duration::from_secs(120)),
+                Some(Duration::from_millis(120_250)),
+            ),
+            (Some(Duration::from_secs(121)), None),
+            (Some(Duration::MAX), None),
+        ];
+        for (asked, expected) in cases {
+            assert_eq!(capped_delay(asked, backoff), expected, "{asked:?}");
+        }
     }
 
     #[tokio::test]
