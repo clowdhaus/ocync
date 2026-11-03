@@ -898,17 +898,12 @@ mod tests {
     #[tokio::test]
     async fn a_one_gb_blob_reserves_the_whole_budget_on_ghcr() {
         const BUDGET: usize = 512 * 1024 * 1024;
-        let available = |url: &str| {
-            let client = RegistryClient::builder(Url::parse(url).unwrap())
-                .buffered_blob_bytes(NonZeroUsize::new(BUDGET).unwrap())
-                .build()
-                .unwrap();
-            async move {
-                let _slot = client.reserve_upload_slot(Some(1 << 30)).await;
-                client.buffered_blob_bytes_sem.available_permits()
-            }
-        };
-        assert_eq!(available("https://ghcr.io").await, 0);
+        let client = RegistryClient::builder(Url::parse("https://ghcr.io").unwrap())
+            .buffered_blob_bytes(NonZeroUsize::new(BUDGET).unwrap())
+            .build()
+            .unwrap();
+        let _slot = client.reserve_upload_slot(Some(1 << 30)).await;
+        assert_eq!(client.buffered_blob_bytes_sem.available_permits(), 0);
     }
 
     #[test]

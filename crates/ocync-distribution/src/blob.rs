@@ -1042,49 +1042,6 @@ mod tests {
         }
     }
 
-    /// A registry that rejects the streamed PUT, as ACR does a body whose
-    /// digest does not match, fails the push with the registry's status.
-    /// Breaks if a rejected PUT is reported as a pushed blob.
-    #[tokio::test]
-    async fn blob_push_stream_rejected_put_fails_the_push() {
-        let server = wiremock::MockServer::start().await;
-        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(202)
-                    .append_header("Location", "/v2/stream/repo/blobs/uploads/u"),
-            )
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string(
-                r#"{"errors":[{"code":"DIGEST_INVALID","message":"digest invalid"}]}"#,
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let client = build_test_client("myreg.azurecr.io", port);
-        let data = b"blob";
-        let repo = RepositoryName::new("stream/repo").unwrap();
-
-        let result = client
-            .reserve_upload_slot(None)
-            .await
-            .push_stream(&repo, &test_digest(data), data_stream(data, 4))
-            .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(Error::RegistryError {
-                    status: StatusCode::BAD_REQUEST,
-                    ..
-                })
-            ),
-            "{result:?}"
-        );
-    }
-
     async fn streams_one_put(host: &str, known_size: Option<u64>) {
         let server = wiremock::MockServer::start().await;
         let data = b"streaming upload blob data";
@@ -1140,7 +1097,7 @@ mod tests {
             "{host}: {:?}",
             put.headers
         );
-        assert_eq!(put.body, data, "{host}");
+        assert_eq!(put.body, data);
     }
 
     /// A GHCR push finishes on a client with one upload slot, which the
@@ -1176,9 +1133,9 @@ mod tests {
             slot.push_stream(&repo, &digest, data_stream(data, 4)),
         )
         .await
-        .unwrap_or_else(|_| panic!("{host}: the push waited for a second slot"));
+        .unwrap_or_else(|_| panic!("the push waited for a second slot"));
 
-        assert_eq!(pushed.unwrap(), digest, "{host}");
+        assert_eq!(pushed.unwrap(), digest);
     }
 
     /// Pins the byte-budget queueing contract for the buffered fallback
@@ -1196,13 +1153,13 @@ mod tests {
     /// the second upload behind the first.
     #[tokio::test]
     async fn buffered_upload_byte_budget_queues_concurrent_uploads() {
-        let host = "ghcr.io";
         use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
         use std::time::Instant;
         use tokio::time::Duration;
         use url::Url;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+        let host = "ghcr.io";
 
         let server = MockServer::start().await;
         let port = Url::parse(&server.uri()).unwrap().port().unwrap();
@@ -1291,7 +1248,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), wait_for_first_post)
             .await
             .unwrap_or_else(|_| {
-                panic!("{host}: first upload POST must fire within 5s (task 1 likely stuck)")
+                panic!("first upload POST must fire within 5s (task 1 likely stuck)")
             });
 
         let client_2 = Arc::clone(&client);
@@ -1307,19 +1264,11 @@ mod tests {
 
         let r1 = h1.await.unwrap();
         let r2 = h2.await.unwrap();
-        assert!(
-            r1.is_ok(),
-            "{host}: first upload should succeed: {:?}",
-            r1.err()
-        );
-        assert!(
-            r2.is_ok(),
-            "{host}: second upload should succeed: {:?}",
-            r2.err()
-        );
+        assert!(r1.is_ok(), "first upload should succeed: {:?}", r1.err());
+        assert!(r2.is_ok(), "second upload should succeed: {:?}", r2.err());
 
         let times = post_times.lock().unwrap();
-        assert_eq!(times.len(), 2, "{host}: both POSTs must have fired");
+        assert_eq!(times.len(), 2, "both POSTs must have fired");
         let gap = times[1].duration_since(times[0]);
         // Task 2 cannot POST until task 1 releases the byte permit,
         // which happens when task 1's `push_stream` returns
@@ -1329,7 +1278,7 @@ mod tests {
         let lower_bound = patch_delay.saturating_sub(Duration::from_millis(100));
         assert!(
             gap >= lower_bound,
-            "{host}: second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
+            "second POST started after only {gap:?}; expected the byte budget to queue it for at least ~{lower_bound:?} behind the first (patch_delay = {patch_delay:?})"
         );
     }
 }

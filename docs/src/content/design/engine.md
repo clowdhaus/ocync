@@ -328,7 +328,7 @@ Each registry has different upload protocol requirements. The engine detects the
 | Docker Hub | POST + streaming PUT | 2 | Same streaming path as ECR |
 | GHCR | POST + single PATCH + PUT | 3 | Multi-PATCH broken (last PATCH overwrites previous chunks). Single PATCH without `Content-Range` headers. Blob size from source manifest descriptor sets `Content-Length` on the streaming body |
 | GAR | POST + streaming PUT | 2 | Same streaming path as ECR. A second PATCH in one session answers 405 and a monolithic POST answers 502 |
-| ACR | POST + streaming PUT | 2 | Same streaming path as ECR. A streamed PUT was accepted up to 256 MiB on 2026-11-03; an earlier ~20 MB limit did not reproduce |
+| ACR | POST + streaming PUT | 2 | Same streaming path as ECR. A streamed PUT was accepted up to 2 GiB on 2026-11-03; an earlier ~20 MB limit did not reproduce |
 
 The GHCR fallback is a correctness fix, not an optimization. GHCR's chunked upload implementation is broken: the last PATCH overwrites all previous chunks. Any blob larger than `chunk_size` pushed via multi-PATCH produces silently corrupt data because `CompleteLayerUpload` succeeds but the blob contains only the final chunk. This is a documented conformance gap.
 
