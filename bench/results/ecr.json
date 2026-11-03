@@ -373,7 +373,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-19T19:36:00Z\" level=info msg=\"dregsy \"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 72.276732446,
             "peak_rss_kb": 35148,
             "requests": 1046,
@@ -466,7 +466,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-19T19:43:31Z\" level=info msg=\"dregsy \"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 1935.753007219,
             "peak_rss_kb": 286660,
             "requests": 11604,
@@ -559,7 +559,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-20T01:32:55Z\" level=info msg=\"dregsy \"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 103.764420814,
             "peak_rss_kb": 33080,
             "requests": 3145,
@@ -675,7 +675,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T00:06:54Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 1156.102257413,
             "peak_rss_kb": 305312,
             "requests": 11291,
@@ -749,7 +749,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T00:06:54Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 100.627212002,
             "peak_rss_kb": 33388,
             "requests": 3145,
@@ -796,7 +796,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T02:13:52Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 1094.799679749,
             "peak_rss_kb": 312344,
             "requests": 11631,
@@ -870,7 +870,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T02:13:52Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 109.68968546,
             "peak_rss_kb": 33368,
             "requests": 3145,
@@ -986,7 +986,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T12:11:25Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 1127.286506765,
             "peak_rss_kb": 387948,
             "requests": 11299,
@@ -1060,7 +1060,7 @@
           },
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-22T12:11:25Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 100.366697158,
             "peak_rss_kb": 33400,
             "requests": 3145,
@@ -1503,7 +1503,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-25T21:43:16Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 1272.886356196,
             "peak_rss_kb": 363136,
             "requests": 11303,
@@ -1591,7 +1591,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-25T21:43:16Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 97.345743231,
             "peak_rss_kb": 33456,
             "requests": 3145,
@@ -1695,7 +1695,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-26T13:17:46Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 916.310607094,
             "peak_rss_kb": 323212,
             "requests": 11301,
@@ -1780,7 +1780,7 @@
         "tools": [
           {
             "tool": "dregsy",
-            "version": "time=\"2026-04-26T13:17:46Z\" level=error msg=\"flag provided but not defined: -version\"",
+            "version": "unknown (the probe printed a log line, not a version)",
             "wall_clock_secs": 124.350207111,
             "peak_rss_kb": 33364,
             "requests": 3145,

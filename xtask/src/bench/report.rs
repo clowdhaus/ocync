@@ -1818,6 +1818,10 @@ pub(crate) mod tests {
         let archive = include_str!("../../../bench/results/ecr.json");
         let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
         assert!(!records.is_empty());
+        // Catches: a version probe's label or log line archived as the version.
+        for label in ["\"VCSTag:", "\"Version:", "\"time="] {
+            assert!(!archive.contains(label), "archive holds {label}");
+        }
         // Catches: a record that does not rewrite as it was read, as when a
         // field an old run never had is written as an empty value. Compared
         // as values because the archive spells one float longer than Rust's

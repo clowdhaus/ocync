@@ -239,7 +239,8 @@ enum VersionOutput {
 /// `regctl version` prints `VCSTag:` first, aligned by a tab writer (regclient
 /// `internal/version/version.go`), and `oras version` prints `Version:` then
 /// `Go version:`, padded to a common column (oras `cmd/oras/root/version.go`),
-/// so those are keyed. `regsync version` prints the same block as `regctl`.
+/// so those are keyed. `regsync version` prints the same block as `regctl`,
+/// after a blank line.
 fn version_output(tool: Tool) -> VersionOutput {
     match tool {
         Tool::Dregsy => VersionOutput::Quiet,
@@ -1671,13 +1672,7 @@ mod tests {
         // falling through to the module version.
         for (name, tool, stdout, expected) in [
             ("regctl full", Tool::Regctl, REGCTL_PROBE, Some("v0.11.7")),
-            // regsync precedes the block with a blank line.
-            (
-                "regsync full",
-                Tool::Regsync,
-                "\nVCSTag:     v0.11.5\nVCSRef:     \n",
-                Some("v0.11.5"),
-            ),
+            ("regsync full", Tool::Regsync, REGCTL_PROBE, Some("v0.11.7")),
             ("oras full", Tool::Oras, ORAS_PROBE, Some("1.3.6")),
             (
                 "empty VCSTag",
