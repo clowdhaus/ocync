@@ -3540,6 +3540,7 @@ mod tests {
             source: ocync_distribution::Error::RegistryError {
                 status: http::StatusCode::NOT_FOUND,
                 message: "blob unknown".into(),
+                retry_after: None,
             },
         };
         assert!(

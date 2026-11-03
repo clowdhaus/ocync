@@ -69,7 +69,10 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 /// removes this race in the common case. Retrying on it stays as the
 /// fallback for a wait that times out and for targets without a batch checker.
 pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
-    let ocync_distribution::Error::RegistryError { status, message } = error else {
+    let ocync_distribution::Error::RegistryError {
+        status, message, ..
+    } = error
+    else {
         return false;
     };
     if *status != StatusCode::NOT_FOUND {
@@ -199,8 +202,13 @@ where
                     attempt < config.max_retries && should_retry_transport(&e)
                 };
 
-                if retryable {
-                    let backoff = config.backoff_for(attempt);
+                // A 429's Retry-After lengthens the wait, or surfaces the
+                // error when it is longer than a sync waits out.
+                let wait = retryable
+                    .then(|| ocync_distribution::retry::wait_for(&e, config.backoff_for(attempt)))
+                    .flatten();
+
+                if let Some(backoff) = wait {
                     tracing::warn!(
                         operation,
                         attempt,
@@ -305,6 +313,7 @@ mod tests {
         let registry = |status, message: &str| ocync_distribution::Error::RegistryError {
             status,
             message: message.into(),
+            retry_after: None,
         };
         let digest = |c: char| -> ocync_distribution::Digest {
             format!("sha256:{}", c.to_string().repeat(64))
@@ -373,6 +382,7 @@ mod tests {
                 ocync_distribution::Error::RegistryError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     message: "broke".into(),
+                    retry_after: None,
                 },
             ),
             (
@@ -421,6 +431,7 @@ mod tests {
                     Unavailable => ocync_distribution::Error::RegistryError {
                         status: StatusCode::SERVICE_UNAVAILABLE,
                         message: "registry/repo".into(),
+                        retry_after: None,
                     },
                 });
                 async move { failure.map_or(Ok(()), Err) }
@@ -429,6 +440,44 @@ mod tests {
             assert_eq!(result.is_ok(), succeeds, "{failures:?}");
             assert_eq!(calls.get(), expected_calls, "{failures:?}");
             assert_eq!(started.elapsed() > Duration::ZERO, waits, "{failures:?}");
+        }
+    }
+
+    /// The engine's retry waits out a 429's `Retry-After` and surfaces one
+    /// longer than a sync waits. Breaks if the header is ignored (the
+    /// retry comes after about a second) or the cap is dropped (the 3600 s
+    /// case is retried).
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_is_waited_out_unless_too_long() {
+        let config = RetryConfig::default();
+        // (Retry-After, calls made, succeeds)
+        let cases = [(30u64, 2, true), (3600, 1, false)];
+        for (asked, expected_calls, succeeds) in cases {
+            let calls = Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let result = with_retry(&config, "blob transfer", || {
+                calls.set(calls.get() + 1);
+                let first = calls.get() == 1;
+                async move {
+                    if first {
+                        Err(ocync_distribution::Error::RegistryError {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                            message: "registry/repo".into(),
+                            retry_after: Some(Duration::from_secs(asked)),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}");
+            assert_eq!(calls.get(), expected_calls, "Retry-After {asked}");
+            if succeeds {
+                assert!(started.elapsed() >= Duration::from_secs(asked), "{asked}");
+            } else {
+                assert_eq!(started.elapsed(), Duration::ZERO, "{asked}");
+            }
         }
     }
 
@@ -492,6 +541,7 @@ mod tests {
                     Err(ocync_distribution::Error::RegistryError {
                         status: StatusCode::SERVICE_UNAVAILABLE,
                         message: "busy".into(),
+                        retry_after: None,
                     })
                 } else {
                     Ok(())

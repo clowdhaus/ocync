@@ -28,6 +28,13 @@ pub const MAX_TRANSIENT_RETRIES: u32 = 4;
 /// registry that has stopped serving the listing.
 pub const MAX_LISTING_RETRIES: u32 = 32;
 
+/// The longest `Retry-After` a retry loop waits out.
+///
+/// A longer one is a quota that will not recover within a sync (Docker Hub's
+/// pull limit answers with hours), so the 429 surfaces at once instead of
+/// holding the run open.
+pub const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
+
 /// Delay before the first retry.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -68,6 +75,49 @@ pub(crate) fn is_transient(error: &Error) -> bool {
     match error {
         Error::Http(e) => is_transient_transport(e),
         other => other.status_code() == Some(http::StatusCode::TOO_MANY_REQUESTS),
+    }
+}
+
+/// The delta-seconds form of a `Retry-After` value. The HTTP-date form, a
+/// negative number and anything else are `None`, and the caller backs off as
+/// it would without the header.
+fn delta_seconds(value: &str) -> Option<Duration> {
+    value.trim().parse().ok().map(Duration::from_secs)
+}
+
+/// How long a 429 `response` asked to be left alone, from its `Retry-After`
+/// header. Only a throttle's header is read.
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    delta_seconds(
+        response
+            .headers()
+            .get(http::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?,
+    )
+}
+
+/// The wait before re-sending after `error`, given the `backoff` a retry loop
+/// would use: the longer of the two when the registry named a `Retry-After`,
+/// or `None` when it named one over [`MAX_HONORED_RETRY_AFTER`] and the error
+/// should surface. The single definition both retry loops share.
+pub fn wait_for(error: &Error, backoff: Duration) -> Option<Duration> {
+    let asked = match error {
+        Error::RegistryError { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+    honored(asked, backoff)
+}
+
+/// The longer of `backoff` and a registry's `asked` wait, or `None` when
+/// `asked` is over [`MAX_HONORED_RETRY_AFTER`].
+fn honored(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
+    match asked {
+        Some(asked) => (asked <= MAX_HONORED_RETRY_AFTER).then(|| backoff.max(asked)),
+        None => Some(backoff),
     }
 }
 
@@ -113,7 +163,7 @@ impl Policy<Error> for Budgeted<'_> {
         if self.0.get() == 0 {
             return None;
         }
-        let delay = Bounded(is_transient).retry(attempt, error)?;
+        let delay = wait_for(error, Bounded(is_transient).retry(attempt, error)?)?;
         self.0.set(self.0.get() - 1);
         Some(delay)
     }
@@ -202,8 +252,10 @@ pub(crate) async fn send_retrying(
         if attempt >= MAX_TRANSIENT_RETRIES {
             return Ok(outcome?);
         }
-
-        let delay = backoff(attempt);
+        let asked = outcome.as_ref().ok().and_then(retry_after);
+        let Some(delay) = honored(asked, backoff(attempt)) else {
+            return Ok(outcome?);
+        };
         tracing::debug!(
             what,
             attempt,
@@ -302,6 +354,7 @@ mod tests {
         let throttled = Error::RegistryError {
             status: http::StatusCode::TOO_MANY_REQUESTS,
             message: "Rate exceeded".into(),
+            retry_after: None,
         };
         assert!(is_transient(&throttled));
 
@@ -313,6 +366,7 @@ mod tests {
             let err = Error::RegistryError {
                 status,
                 message: "no".into(),
+                retry_after: None,
             };
             assert!(!is_transient(&err), "{status} must not be re-sent");
         }
@@ -330,6 +384,7 @@ mod tests {
                     Err(Error::RegistryError {
                         status: http::StatusCode::TOO_MANY_REQUESTS,
                         message: "Rate exceeded".into(),
+                        retry_after: None,
                     })
                 }
             },
@@ -362,6 +417,60 @@ mod tests {
         assert!(logs.contains("empty host"), "{logs}");
     }
 
+    /// Only delta-seconds is read. Breaks if a date, a negative number or
+    /// garbage is taken as a wait, or if a plain number is ignored.
+    #[test]
+    fn retry_after_reads_only_delta_seconds() {
+        let cases = [
+            ("7", Some(Duration::from_secs(7))),
+            (" 60 ", Some(Duration::from_secs(60))),
+            ("0", Some(Duration::ZERO)),
+            ("-5", None),
+            ("soon", None),
+            ("", None),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(delta_seconds(value), expected, "{value:?}");
+        }
+    }
+
+    /// A throttle that names `Retry-After: 30` is not re-sent sooner than 30
+    /// s, though the backoff alone is about 250 ms. Breaks if the header is
+    /// ignored.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retrying_waits_out_a_retry_after() {
+        let calls = Cell::new(0u32);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), Error> = retrying(
+            "throttled",
+            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
+            |_| {
+                calls.set(calls.get() + 1);
+                let first = calls.get() == 1;
+                async move {
+                    if first {
+                        Err(Error::RegistryError {
+                            status: http::StatusCode::TOO_MANY_REQUESTS,
+                            message: "slow down".into(),
+                            retry_after: Some(Duration::from_secs(30)),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        result.expect("the second answer succeeds");
+        assert_eq!(calls.get(), 2);
+        assert!(
+            started.elapsed() >= Duration::from_secs(30),
+            "re-sent after {:?}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn retrying_does_not_re_run_a_permanent_failure() {
         let calls = Cell::new(0u32);
@@ -374,11 +483,48 @@ mod tests {
                     Err(Error::RegistryError {
                         status: http::StatusCode::NOT_FOUND,
                         message: "absent".into(),
+                        retry_after: None,
                     })
                 }
             },
         )
         .await;
         assert_eq!(calls.get(), 1, "a 404 must be surfaced on the first answer");
+    }
+
+    #[tokio::test]
+    async fn send_retrying_waits_out_a_retry_after_unless_too_long() {
+        // Catches: the auth requests (ping, token endpoint, ACR OAuth)
+        // re-sending inside a throttle, or sleeping out an hours-long one.
+        for (asked, requests, at_least) in [
+            ("1", 2, Duration::from_secs(1)),
+            ("3600", 1, Duration::ZERO),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(429).insert_header("Retry-After", asked),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let started = std::time::Instant::now();
+
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                send_retrying(crate::test_http_client().get(server.uri()), "test"),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Retry-After {asked}: still waiting after 10 s"))
+            .unwrap();
+
+            let sent = server.received_requests().await.unwrap().len();
+            assert_eq!(sent, requests, "Retry-After {asked}: {response:?}");
+            assert!(started.elapsed() >= at_least, "Retry-After {asked}");
+        }
     }
 }

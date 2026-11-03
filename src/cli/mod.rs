@@ -468,6 +468,7 @@ mod tests {
             CliError::Registry(DistError::RegistryError {
                 status,
                 message: message.into(),
+                retry_after: None,
             })
         };
         let cases = [
