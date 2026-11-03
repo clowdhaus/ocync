@@ -175,6 +175,9 @@ pub enum RegistryAction {
     BlobUploadComplete,
     /// `GET /v2/{name}/tags/list` - separate from manifest reads
     TagList,
+    /// `GET /v2/{name}/referrers/{digest}` - ACR meters it apart from
+    /// manifest reads; every other registry treats it as one
+    Referrers,
 }
 
 /// Identifies a per-action AIMD window within an [`AimdController`], at
@@ -194,7 +197,8 @@ pub(crate) enum WindowKey {
     /// GHCR: a single 2000 RPM aggregate cap per authenticated principal,
     /// shared across reads and writes.
     GhcrShared,
-    /// ACR: separate `ReadOps` and `WriteOps` quotas per registry.
+    /// ACR: `DataplaneRead`, `MetadataRead`, `ListReferrers` and
+    /// `DataplaneWrite` quotas, each per identity per registry.
     Acr(AcrGroup),
     /// Coarse fallback for registries with no documented per-action cap
     /// (Chainguard, Quay, generic). AIMD discovers capacity from 429s.
@@ -229,12 +233,17 @@ pub(crate) enum DockerHubGroup {
     Other,
 }
 
-/// Action grouping for ACR.
+/// Action grouping for ACR, one group per quota it meters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AcrGroup {
-    /// Reads + heads + tag list (`ReadOps`).
+    /// Manifest and blob reads and heads (`DataplaneRead`). Tag listing and
+    /// referrers count here as well as against their own group.
     Read,
-    /// Manifest writes + blob upload phases (`WriteOps`).
+    /// Tag listing (`MetadataRead`).
+    TagList,
+    /// The referrers API (`ListReferrers`).
+    Referrers,
+    /// Manifest writes + blob upload phases (`DataplaneWrite`).
     Write,
 }
 
@@ -253,9 +262,15 @@ pub(crate) enum UnknownGroup {
 fn window_key_for_provider(provider: Option<ProviderKind>, action: RegistryAction) -> WindowKey {
     use RegistryAction::*;
     match provider {
-        Some(ProviderKind::Ecr) => WindowKey::Ecr(action),
+        // ECR meters referrers as the manifest read it is.
+        Some(ProviderKind::Ecr) => WindowKey::Ecr(match action {
+            Referrers => ManifestRead,
+            _ => action,
+        }),
         Some(ProviderKind::EcrPublic) => WindowKey::EcrPublic(match action {
-            ManifestHead | ManifestRead | BlobHead | BlobRead | TagList => EcrPublicGroup::Read,
+            ManifestHead | ManifestRead | BlobHead | BlobRead | TagList | Referrers => {
+                EcrPublicGroup::Read
+            }
             ManifestWrite => EcrPublicGroup::ManifestWrite,
             BlobUploadInit => EcrPublicGroup::BlobUploadInit,
             BlobUploadChunk => EcrPublicGroup::BlobUploadChunk,
@@ -263,21 +278,23 @@ fn window_key_for_provider(provider: Option<ProviderKind>, action: RegistryActio
         }),
         Some(ProviderKind::DockerHub) => WindowKey::DockerHub(match action {
             ManifestHead | BlobHead => DockerHubGroup::Heads,
-            ManifestRead => DockerHubGroup::ManifestRead,
+            ManifestRead | Referrers => DockerHubGroup::ManifestRead,
             _ => DockerHubGroup::Other,
         }),
         // GCR is an alias for GAR.
         Some(ProviderKind::Gar | ProviderKind::Gcr) => WindowKey::GarShared,
         Some(ProviderKind::Ghcr) => WindowKey::GhcrShared,
         Some(ProviderKind::Acr) => WindowKey::Acr(match action {
-            ManifestHead | ManifestRead | BlobHead | BlobRead | TagList => AcrGroup::Read,
+            ManifestHead | ManifestRead | BlobHead | BlobRead => AcrGroup::Read,
+            TagList => AcrGroup::TagList,
+            Referrers => AcrGroup::Referrers,
             ManifestWrite | BlobUploadInit | BlobUploadChunk | BlobUploadComplete => {
                 AcrGroup::Write
             }
         }),
         _ => WindowKey::Unknown(match action {
             ManifestHead | BlobHead => UnknownGroup::Heads,
-            ManifestRead | BlobRead => UnknownGroup::Reads,
+            ManifestRead | BlobRead | Referrers => UnknownGroup::Reads,
             BlobUploadInit | BlobUploadChunk | BlobUploadComplete => UnknownGroup::Uploads,
             ManifestWrite => UnknownGroup::ManifestWrite,
             TagList => UnknownGroup::TagList,
@@ -302,6 +319,11 @@ impl BucketConfig {
 /// GAR/GCR: 60,000 RPM total (~1000 RPS) and 18,000 RPM writes (~300 RPS)
 /// per project per region. 240 TPS shared keeps 20% margin under the write
 /// ceiling, the tighter of the two.
+const GAR_BUCKET: BucketConfig = BucketConfig {
+    rate_per_sec: 240.0,
+    burst: 30.0,
+};
+
 /// ACR's per-identity per-registry `DataplaneRead` limit for Basic and
 /// Standard registries, in requests per minute (Microsoft "SKU features and
 /// limits", 2026-10-15). Premium doubles it. GET and HEAD count here.
@@ -312,34 +334,82 @@ const ACR_STANDARD_READS_PER_MINUTE: f64 = 5_000.0;
 /// it. PUT, PATCH and POST count here.
 const ACR_STANDARD_WRITES_PER_MINUTE: f64 = 1_000.0;
 
-/// Fraction of a documented cap a bucket refills at, leaving 20% for tail
-/// bursts.
-const CAP_MARGIN: f64 = 0.8;
+/// ACR's per-identity per-registry `MetadataRead` limit for Basic and
+/// Standard registries, in requests per minute (same source). Premium doubles
+/// it. Tag listing counts here, and against `DataplaneRead` too.
+const ACR_STANDARD_TAG_LISTS_PER_MINUTE: f64 = 2_000.0;
 
-const GAR_BUCKET: BucketConfig = BucketConfig {
-    rate_per_sec: 240.0,
-    burst: 30.0,
-};
+/// ACR's per-identity per-registry `ListReferrers` limit for Basic and
+/// Standard registries, in requests per minute (same source). Premium doubles
+/// it. Referrers queries count here, and against `DataplaneRead` too.
+const ACR_STANDARD_REFERRERS_PER_MINUTE: f64 = 250.0;
 
-/// The GAR/GCR rate buckets of one run, one per Google location, so every
-/// host drawing on a location's quota (`gcr.io`, `us.gcr.io` and
-/// `us-docker.pkg.dev` all draw on `us`) is paced together. Create one per
-/// run, like the Google token. Quota is per project too, so a run spanning
-/// several projects in one location is paced more slowly than needed.
+/// Fraction of ACR's documented limits the ACR buckets refill at, leaving
+/// 20% for tail bursts.
+const ACR_CAP_MARGIN: f64 = 0.8;
+
+/// Whose quota a shared bucket paces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Quota {
+    /// GAR/GCR: per project per region, so per Google location.
+    GoogleLocation(GoogleLocation),
+    /// ACR: per identity per registry, so per registry host.
+    Host(String),
+}
+
+/// The rate buckets of one run that more than one client draws on, so
+/// clients sharing a quota are paced together. Create one per run, like the
+/// Google token.
+///
+/// - Google: one bucket per location, so every host drawing on it
+///   (`gcr.io`, `us.gcr.io` and `us-docker.pkg.dev` all draw on `us`) is
+///   paced together. Quota is per project too, so a run spanning several
+///   projects in one location is paced more slowly than needed.
+/// - ACR: one bucket per limit per registry host. A run signs in as one
+///   identity per registry, so every client of a host shares its limits.
 #[derive(Debug, Clone, Default)]
-pub struct GooglePacing(Rc<RefCell<HashMap<GoogleLocation, Arc<TokenBucket>>>>);
+pub struct Pacing(Rc<RefCell<SharedBuckets>>);
 
-impl GooglePacing {
-    /// The bucket of `host`'s location, created on first use, or `None` for
-    /// a host with no location.
-    pub(crate) fn bucket(&self, host: &str) -> Option<Arc<TokenBucket>> {
-        let location = GoogleLocation::of_host(host)?;
-        let mut buckets = self.0.borrow_mut();
-        Some(Arc::clone(
-            buckets
-                .entry(location)
-                .or_insert_with(|| GAR_BUCKET.bucket()),
-        ))
+/// One bucket per quota and window.
+type SharedBuckets = HashMap<(Quota, WindowKey), Arc<TokenBucket>>;
+
+/// The buckets one request draws from, in order.
+type Buckets = Arc<[Arc<TokenBucket>]>;
+
+impl Pacing {
+    /// The shared buckets for each of `host`'s windows that has them,
+    /// created on first use. A window absent from the map is paced by its
+    /// own bucket, if it has one.
+    fn buckets_of(&self, host: &str) -> HashMap<WindowKey, Buckets> {
+        let mut shared = self.0.borrow_mut();
+        let mut draw = |quota: Quota, key: WindowKey| {
+            Arc::clone(shared.entry((quota, key)).or_insert_with(|| {
+                bucket_config_for_window(key)
+                    .expect("a shared window is paced")
+                    .bucket()
+            }))
+        };
+        let mut windows = HashMap::new();
+        if let Some(location) = GoogleLocation::of_host(host) {
+            let key = WindowKey::GarShared;
+            windows.insert(
+                key,
+                Buckets::from([draw(Quota::GoogleLocation(location), key)]),
+            );
+        }
+        if detect_provider_kind(host) == Some(ProviderKind::Acr) {
+            let quota = || Quota::Host(host.to_owned());
+            let read = draw(quota(), WindowKey::Acr(AcrGroup::Read));
+            for group in [AcrGroup::TagList, AcrGroup::Referrers] {
+                let key = WindowKey::Acr(group);
+                // Nested limits: the request counts against both.
+                windows.insert(key, Buckets::from([draw(quota(), key), Arc::clone(&read)]));
+            }
+            windows.insert(WindowKey::Acr(AcrGroup::Read), Buckets::from([read]));
+            let write = WindowKey::Acr(AcrGroup::Write);
+            windows.insert(write, Buckets::from([draw(quota(), write)]));
+        }
+        windows
     }
 }
 
@@ -386,12 +456,21 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         // ACR, paced to the Basic and Standard per-identity limits: the tier
         // is not visible to a client, and a sustained rate above them draws
         // 429s (measured 2026-11-03 on a Standard registry). Premium runs at
-        // half its limits.
+        // 40% of its limits. Tag listing and referrers also draw on the Read
+        // bucket; see `Pacing::buckets_of`.
         WindowKey::Acr(AcrGroup::Read) => {
-            cfg(ACR_STANDARD_READS_PER_MINUTE / 60.0 * CAP_MARGIN, 30.0)
+            cfg(ACR_STANDARD_READS_PER_MINUTE / 60.0 * ACR_CAP_MARGIN, 30.0)
         }
+        WindowKey::Acr(AcrGroup::TagList) => cfg(
+            ACR_STANDARD_TAG_LISTS_PER_MINUTE / 60.0 * ACR_CAP_MARGIN,
+            10.0,
+        ),
+        WindowKey::Acr(AcrGroup::Referrers) => cfg(
+            ACR_STANDARD_REFERRERS_PER_MINUTE / 60.0 * ACR_CAP_MARGIN,
+            4.0,
+        ),
         WindowKey::Acr(AcrGroup::Write) => {
-            cfg(ACR_STANDARD_WRITES_PER_MINUTE / 60.0 * CAP_MARGIN, 10.0)
+            cfg(ACR_STANDARD_WRITES_PER_MINUTE / 60.0 * ACR_CAP_MARGIN, 10.0)
         }
         // All other windows: AIMD only.
         WindowKey::Ecr(_) | WindowKey::DockerHub(_) | WindowKey::Unknown(_) => return None,
@@ -414,28 +493,28 @@ struct WindowState {
     /// Permits still to retire after a shrink, taken as their holders
     /// release them. Total permits minus `owed` equals the window limit.
     owed: usize,
-    /// Optional token bucket for hard TPS ceilings (None = AIMD only).
-    bucket: Option<Arc<TokenBucket>>,
+    /// Token buckets for hard TPS ceilings, all drawn from per request
+    /// (empty = AIMD only).
+    buckets: Buckets,
 }
 
 impl WindowState {
     /// Build a fresh window for `key` capped at `max_concurrent`, paced by
-    /// `shared_bucket` when it has one, else by the key's own bucket.
-    fn new_for(
-        key: WindowKey,
-        max_concurrent: usize,
-        shared_bucket: Option<Arc<TokenBucket>>,
-    ) -> Self {
+    /// `shared` when it has buckets, else by the key's own bucket.
+    fn new_for(key: WindowKey, max_concurrent: usize, shared: Option<&Buckets>) -> Self {
         let initial = DEFAULT_INITIAL_WINDOW.min(max_concurrent as f64);
         let window = AimdWindow::new(initial, max_concurrent);
         let limit = window.limit();
-        let bucket =
-            shared_bucket.or_else(|| bucket_config_for_window(key).map(BucketConfig::bucket));
+        let buckets = shared.cloned().unwrap_or_else(|| {
+            bucket_config_for_window(key)
+                .map(|cfg| Buckets::from([cfg.bucket()]))
+                .unwrap_or_default()
+        });
         Self {
             window,
             semaphore: Arc::new(Semaphore::new(limit)),
             owed: 0,
-            bucket,
+            buckets,
         }
     }
 
@@ -490,26 +569,21 @@ pub struct AimdController {
     aggregate: Arc<Semaphore>,
     windows: Mutex<HashMap<WindowKey, WindowState>>,
     max_concurrent: usize,
-    /// The run's bucket for this host's Google location, which paces its
-    /// window in place of one of its own (a host with a location has only
-    /// the `GarShared` window). Only the rate is shared: the window and its
-    /// semaphore stay per host.
-    google_bucket: Option<Arc<TokenBucket>>,
+    /// The run's buckets for this host's shared quotas, which pace their
+    /// windows in place of buckets of their own. Only the rate is shared:
+    /// the windows and their semaphores stay per host.
+    shared: HashMap<WindowKey, Buckets>,
 }
 
 impl AimdController {
     /// A controller for `host` with `max_concurrent` as the aggregate limit.
     pub fn new(host: &str, max_concurrent: NonZeroUsize) -> Self {
-        Self::with_google_bucket(host, max_concurrent, None)
+        Self::with_pacing(host, max_concurrent, &Pacing::default())
     }
 
-    /// A controller whose `GarShared` window is paced by `google_bucket`,
-    /// the run's bucket for the host's Google location.
-    pub(crate) fn with_google_bucket(
-        host: &str,
-        max_concurrent: NonZeroUsize,
-        google_bucket: Option<Arc<TokenBucket>>,
-    ) -> Self {
+    /// A controller whose windows share `pacing`'s buckets with the run's
+    /// other controllers of the same quota.
+    pub(crate) fn with_pacing(host: &str, max_concurrent: NonZeroUsize, pacing: &Pacing) -> Self {
         let max_concurrent = max_concurrent.get();
         Self {
             host: host.to_owned(),
@@ -517,7 +591,7 @@ impl AimdController {
             aggregate: Arc::new(Semaphore::new(max_concurrent)),
             windows: Mutex::new(HashMap::new()),
             max_concurrent,
-            google_bucket,
+            shared: pacing.buckets_of(host),
         }
     }
 
@@ -531,18 +605,18 @@ impl AimdController {
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_provider(self.provider, op);
 
-        let (action_semaphore, bucket) = {
+        let (action_semaphore, buckets) = {
             let mut map = self.windows.lock().expect("aimd lock poisoned");
             let state = map.entry(key).or_insert_with(|| {
-                WindowState::new_for(key, self.max_concurrent, self.google_bucket.clone())
+                WindowState::new_for(key, self.max_concurrent, self.shared.get(&key))
             });
-            (Arc::clone(&state.semaphore), state.bucket.clone())
+            (Arc::clone(&state.semaphore), Arc::clone(&state.buckets))
         };
 
         // Paced before any permit, so a paced action holds no slot another
         // window could use.
-        if let Some(b) = &bucket {
-            b.acquire().await;
+        for bucket in buckets.iter() {
+            bucket.acquire().await;
         }
 
         // Per-action first, then aggregate: a request queued on a throttled
@@ -650,21 +724,30 @@ impl Drop for AimdPermit<'_> {
 /// Drain the Google burst of `ctrl`.
 #[cfg(test)]
 pub(crate) async fn drain_burst(ctrl: &AimdController) {
-    for _ in 0..GAR_BUCKET.burst as usize {
-        ctrl.acquire(RegistryAction::BlobUploadInit).await.success();
+    drain(
+        ctrl,
+        RegistryAction::BlobUploadInit,
+        GAR_BUCKET.burst as usize,
+    )
+    .await;
+}
+
+/// Take `count` requests of `op` from `ctrl`, each finished at once.
+#[cfg(test)]
+async fn drain(ctrl: &AimdController, op: RegistryAction, count: usize) {
+    for _ in 0..count {
+        ctrl.acquire(op).await.success();
     }
 }
 
-/// Whether the next request of `ctrl` is held by its rate bucket: the
-/// refill of one token takes 4ms at 240/s, so 1ms is not enough.
+/// Whether the next request of `ctrl` for `op` is held by a rate bucket: the
+/// refill of one token takes 4ms at the fastest bucket tested (240/s), so
+/// 1ms is not enough.
 #[cfg(test)]
-pub(crate) async fn is_paced(ctrl: &AimdController) -> bool {
-    tokio::time::timeout(
-        Duration::from_millis(1),
-        ctrl.acquire(RegistryAction::BlobUploadInit),
-    )
-    .await
-    .is_err()
+pub(crate) async fn is_paced(ctrl: &AimdController, op: RegistryAction) -> bool {
+    tokio::time::timeout(Duration::from_millis(1), ctrl.acquire(op))
+        .await
+        .is_err()
 }
 
 #[cfg(test)]
@@ -689,34 +772,6 @@ mod tests {
     // ---------------------------------------------------------------------------
     // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
     // ---------------------------------------------------------------------------
-
-    #[test]
-    fn acr_buckets_stay_under_the_standard_per_identity_limits() {
-        // Catches: pacing ACR above what a Basic or Standard registry allows
-        // one identity, which a long sync turns into a stream of 429s.
-        for (key, per_minute) in [
-            (WindowKey::Acr(AcrGroup::Read), 5_000.0),
-            (WindowKey::Acr(AcrGroup::Write), 1_000.0),
-        ] {
-            let cfg = bucket_config_for_window(key).unwrap();
-            assert!(
-                cfg.rate_per_sec <= per_minute / 60.0 * 0.8,
-                "{key:?}: {} per second",
-                cfg.rate_per_sec
-            );
-        }
-    }
-
-    #[test]
-    fn window_limit_is_ceiling_of_value() {
-        // Initial value 1.5 → ceiling = 2
-        let mut w = AimdWindow::with_epoch(1.5, 16, Duration::from_millis(1));
-        assert_eq!(w.limit(), 2);
-
-        // After one success: 1.5 + 1/1.5 ≈ 2.167 → ceiling = 3
-        w.on_success();
-        assert_eq!(w.limit(), 3);
-    }
 
     #[test]
     fn window_limit_capped_at_cap() {
@@ -903,10 +958,11 @@ mod tests {
     /// Each registry meters actions by its own published quotas: ECR per
     /// action, ECR Public by its five groups, Docker Hub with HEADs and
     /// manifest reads apart, GAR and GHCR as one shared cap (`mirror.gcr.io`
-    /// too, a Google host), ACR as reads
-    /// and writes, and an unknown registry by five coarse groups. Breaks if
-    /// an action lands in another window, so its throttling slows actions
-    /// the registry meters apart, or escapes a shared cap.
+    /// too, a Google host), ACR as reads, tag lists, referrers and writes,
+    /// and an unknown registry by five coarse groups. Referrers land where
+    /// manifest reads do on every registry but ACR. Breaks if an action
+    /// lands in another window, so its throttling slows actions the registry
+    /// meters apart, or escapes a shared cap.
     #[test]
     fn window_keys_follow_each_registry_quota() {
         use AcrGroup as Acr;
@@ -927,12 +983,13 @@ mod tests {
             "mirror.gcr.io",
         ];
         #[rustfmt::skip]
-        let rows: [(RegistryAction, [WindowKey; 9]); 9] = [
+        let rows: [(RegistryAction, [WindowKey; 9]); 10] = [
             (ManifestHead, [K::Ecr(ManifestHead), K::Ecr(ManifestHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads), K::GarShared]),
             (BlobHead, [K::Ecr(BlobHead), K::Ecr(BlobHead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Heads), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Heads), K::GarShared]),
             (ManifestRead, [K::Ecr(ManifestRead), K::Ecr(ManifestRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::ManifestRead), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads), K::GarShared]),
             (BlobRead, [K::Ecr(BlobRead), K::Ecr(BlobRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::Reads), K::GarShared]),
-            (TagList, [K::Ecr(TagList), K::Ecr(TagList), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Read), K::Unknown(Other::TagList), K::GarShared]),
+            (TagList, [K::Ecr(TagList), K::Ecr(TagList), K::EcrPublic(Public::Read), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::TagList), K::Unknown(Other::TagList), K::GarShared]),
+            (Referrers, [K::Ecr(ManifestRead), K::Ecr(ManifestRead), K::EcrPublic(Public::Read), K::DockerHub(Hub::ManifestRead), K::GarShared, K::GhcrShared, K::Acr(Acr::Referrers), K::Unknown(Other::Reads), K::GarShared]),
             (ManifestWrite, [K::Ecr(ManifestWrite), K::Ecr(ManifestWrite), K::EcrPublic(Public::ManifestWrite), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::ManifestWrite), K::GarShared]),
             (BlobUploadInit, [K::Ecr(BlobUploadInit), K::Ecr(BlobUploadInit), K::EcrPublic(Public::BlobUploadInit), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads), K::GarShared]),
             (BlobUploadChunk, [K::Ecr(BlobUploadChunk), K::Ecr(BlobUploadChunk), K::EcrPublic(Public::BlobUploadChunk), K::DockerHub(Hub::Other), K::GarShared, K::GhcrShared, K::Acr(Acr::Write), K::Unknown(Other::Uploads), K::GarShared]),
@@ -950,6 +1007,39 @@ mod tests {
     }
 
     // - bucket_config_for_window: structural invariants --
+
+    /// Each ACR bucket refills at 80% of its Basic and Standard
+    /// per-identity limit (5,000, 2,000, 250 and 1,000 requests a minute).
+    /// Breaks if one is paced above it, which a long sync turns into 429s,
+    /// or far below it, which slows every sync.
+    #[test]
+    fn acr_buckets_refill_at_eighty_percent_of_the_standard_limits() {
+        for (group, per_minute) in [
+            (AcrGroup::Read, 5_000.0),
+            (AcrGroup::TagList, 2_000.0),
+            (AcrGroup::Referrers, 250.0),
+            (AcrGroup::Write, 1_000.0),
+        ] {
+            let cfg = bucket_config_for_window(WindowKey::Acr(group)).unwrap();
+            let expected = per_minute / 60.0 * 0.8;
+            assert!(
+                (cfg.rate_per_sec - expected).abs() < 1e-9,
+                "{group:?}: {} per second, expected {expected}",
+                cfg.rate_per_sec
+            );
+        }
+    }
+
+    #[test]
+    fn window_limit_is_ceiling_of_value() {
+        // Initial value 1.5 → ceiling = 2
+        let mut w = AimdWindow::with_epoch(1.5, 16, Duration::from_millis(1));
+        assert_eq!(w.limit(), 2);
+
+        // After one success: 1.5 + 1/1.5 ≈ 2.167 → ceiling = 3
+        w.on_success();
+        assert_eq!(w.limit(), 3);
+    }
 
     #[test]
     fn bucket_table_has_all_required_ecr_upload_windows() {
@@ -1038,6 +1128,8 @@ mod tests {
             WindowKey::GhcrShared,
             WindowKey::GarShared,
             WindowKey::Acr(AcrGroup::Read),
+            WindowKey::Acr(AcrGroup::TagList),
+            WindowKey::Acr(AcrGroup::Referrers),
             WindowKey::Acr(AcrGroup::Write),
         ];
         for key in configured {
@@ -1067,13 +1159,11 @@ mod tests {
 
     // - AimdController bucket integration --
 
-    fn google_controller(host: &str, pacing: &GooglePacing) -> AimdController {
-        AimdController::with_google_bucket(
-            host,
-            NonZeroUsize::new(100).unwrap(),
-            pacing.bucket(host),
-        )
+    fn controller(host: &str, pacing: &Pacing) -> AimdController {
+        AimdController::with_pacing(host, NonZeroUsize::new(100).unwrap(), pacing)
     }
+
+    const INIT: RegistryAction = RegistryAction::BlobUploadInit;
 
     /// Hosts of one Google location, built with one run's pacing, draw on
     /// one bucket, and a host of another location or a public mirror does
@@ -1082,20 +1172,20 @@ mod tests {
     /// would wait), or if a public mirror is given a location.
     #[tokio::test(start_paused = true, flavor = "current_thread")]
     async fn hosts_of_one_google_location_share_a_bucket() {
-        let pacing = GooglePacing::default();
-        let gcr = google_controller("gcr.io", &pacing);
-        let gar = google_controller("us-docker.pkg.dev", &pacing);
-        let europe = google_controller("europe-docker.pkg.dev", &pacing);
-        let mirror = google_controller("mirror.gcr.io", &pacing);
+        let pacing = Pacing::default();
+        let gcr = controller("gcr.io", &pacing);
+        let gar = controller("us-docker.pkg.dev", &pacing);
+        let europe = controller("europe-docker.pkg.dev", &pacing);
+        let mirror = controller("mirror.gcr.io", &pacing);
 
         drain_burst(&gcr).await;
         assert!(
-            is_paced(&gar).await,
+            is_paced(&gar, INIT).await,
             "us-docker.pkg.dev must wait on the burst gcr.io drained"
         );
-        assert!(!is_paced(&europe).await, "europe has its own bucket");
+        assert!(!is_paced(&europe, INIT).await, "europe has its own bucket");
         assert!(
-            !is_paced(&mirror).await,
+            !is_paced(&mirror, INIT).await,
             "a public mirror has its own bucket"
         );
     }
@@ -1107,8 +1197,55 @@ mod tests {
         let gcr = AimdController::new("gcr.io", NonZeroUsize::new(100).unwrap());
         let gar = AimdController::new("us-docker.pkg.dev", NonZeroUsize::new(100).unwrap());
         drain_burst(&gcr).await;
-        assert!(is_paced(&gcr).await, "the drained host is paced");
-        assert!(!is_paced(&gar).await);
+        assert!(is_paced(&gcr, INIT).await, "the drained host is paced");
+        assert!(!is_paced(&gar, INIT).await);
+    }
+
+    /// Controllers of one ACR host built with one run's pacing draw on one
+    /// set of limits, and a controller of another ACR host, or one built
+    /// without the run's pacing, does not. Breaks if each controller keeps
+    /// its own buckets (the second would not wait), or if the buckets are
+    /// shared across hosts (`other` would wait).
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn controllers_of_one_acr_host_share_its_limits() {
+        const READ: RegistryAction = RegistryAction::ManifestRead;
+        let pacing = Pacing::default();
+        let first = controller("myreg.azurecr.io", &pacing);
+        let second = controller("myreg.azurecr.io", &pacing);
+        let other = controller("other.azurecr.io", &pacing);
+        let alone = AimdController::new("myreg.azurecr.io", NonZeroUsize::new(100).unwrap());
+
+        drain(&first, READ, 30).await;
+        assert!(
+            is_paced(&second, READ).await,
+            "must wait on the burst the first drained"
+        );
+        assert!(!is_paced(&other, READ).await, "another host has its own");
+        assert!(
+            !is_paced(&alone, READ).await,
+            "without the run's pacing a controller has its own"
+        );
+    }
+
+    /// A tag list or referrers request on ACR draws from its own bucket and
+    /// from the Read bucket. Breaks if it skips its own (the burst of 10 or
+    /// 4 does not pace it) or the Read bucket (reads still have all 30
+    /// tokens after the burst).
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn acr_tag_lists_and_referrers_also_draw_on_the_read_bucket() {
+        for (op, burst) in [
+            (RegistryAction::TagList, 10),
+            (RegistryAction::Referrers, 4),
+        ] {
+            let ctrl = controller("myreg.azurecr.io", &Pacing::default());
+            drain(&ctrl, op, burst).await;
+            assert!(is_paced(&ctrl, op).await, "{op:?}: own bucket is empty");
+            drain(&ctrl, RegistryAction::ManifestRead, 30 - burst).await;
+            assert!(
+                is_paced(&ctrl, RegistryAction::ManifestRead).await,
+                "{op:?}: the Read bucket must have paid for the {burst} requests"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true, flavor = "current_thread")]

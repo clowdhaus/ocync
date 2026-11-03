@@ -204,7 +204,7 @@ impl RegistryClient {
 
         let resp = self
             .send_with_aimd(
-                RegistryAction::ManifestRead,
+                RegistryAction::Referrers,
                 &scopes,
                 "referrers",
                 |mut headers| {
@@ -299,6 +299,44 @@ mod tests {
             }) => assert_eq!((expected, got), (other, actual)),
             got => panic!("expected a digest mismatch, got {got:?}"),
         }
+    }
+
+    /// A referrers query is its own action, so ACR meters it in its own
+    /// window: the Referrers window grows and the manifest read window does
+    /// not. Breaks if the query is sent as a manifest read.
+    #[tokio::test]
+    async fn referrers_are_sent_as_their_own_action() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v2/repo/referrers/"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let host = "myreg.azurecr.io";
+        let client = crate::client::RegistryClientBuilder::new(
+            url::Url::parse(&format!("http://{host}:{port}")).unwrap(),
+        )
+        .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .build()
+        .unwrap();
+        let repo = RepositoryName::new("repo").unwrap();
+        let digest = Digest::from_sha256(Sha256::digest(b"subject"));
+
+        assert!(
+            client
+                .referrers(&repo, &digest, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(client.aimd.window_limit(RegistryAction::Referrers), 2);
+        assert_eq!(client.aimd.window_limit(RegistryAction::ManifestRead), 1);
     }
 
     #[test]
