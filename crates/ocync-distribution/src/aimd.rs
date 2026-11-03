@@ -340,8 +340,8 @@ const ACR_STANDARD_WRITES_PER_MINUTE: f64 = 1_000.0;
 const ACR_STANDARD_TAG_LISTS_PER_MINUTE: f64 = 2_000.0;
 
 /// ACR's per-identity per-registry `ListReferrers` limit for Basic and
-/// Standard registries, in requests per minute (same source). Premium doubles
-/// it. Referrers queries count here, and against `DataplaneRead` too.
+/// Standard registries, in requests per minute (same source). Premium allows
+/// four times it. Referrers queries count here, and against `DataplaneRead` too.
 const ACR_STANDARD_REFERRERS_PER_MINUTE: f64 = 250.0;
 
 /// Fraction of ACR's documented limits the ACR buckets refill at, leaving
@@ -365,8 +365,10 @@ enum Quota {
 ///   (`gcr.io`, `us.gcr.io` and `us-docker.pkg.dev` all draw on `us`) is
 ///   paced together. Quota is per project too, so a run spanning several
 ///   projects in one location is paced more slowly than needed.
-/// - ACR: one bucket per limit per registry host. A run signs in as one
-///   identity per registry, so every client of a host shares its limits.
+/// - ACR: one bucket per limit per registry host, since ACR limits each
+///   identity per registry. shortcut: two aliases of one host signed in as
+///   different identities share one set of buckets and each runs at half its
+///   allowance; key by identity if such configs appear.
 #[derive(Debug, Clone, Default)]
 pub struct Pacing(Rc<RefCell<SharedBuckets>>);
 
@@ -456,7 +458,7 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         // ACR, paced to the Basic and Standard per-identity limits: the tier
         // is not visible to a client, and a sustained rate above them draws
         // 429s (measured 2026-11-03 on a Standard registry). Premium runs at
-        // 40% of its limits. Tag listing and referrers also draw on the Read
+        // 40% of its limits, and 20% of its referrers limit. Tag listing and referrers also draw on the Read
         // bucket; see `Pacing::buckets_of`.
         WindowKey::Acr(AcrGroup::Read) => {
             cfg(ACR_STANDARD_READS_PER_MINUTE / 60.0 * ACR_CAP_MARGIN, 30.0)
@@ -600,8 +602,8 @@ impl AimdController {
         self.provider
     }
 
-    /// Acquire the window's rate token, if paced, then its window and
-    /// aggregate permits.
+    /// Take a token from each of the window's rate buckets, in order, then
+    /// its window and aggregate permits.
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_provider(self.provider, op);
 
@@ -772,6 +774,17 @@ mod tests {
     // ---------------------------------------------------------------------------
     // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn window_limit_is_ceiling_of_value() {
+        // Initial value 1.5 → ceiling = 2
+        let mut w = AimdWindow::with_epoch(1.5, 16, Duration::from_millis(1));
+        assert_eq!(w.limit(), 2);
+
+        // After one success: 1.5 + 1/1.5 ≈ 2.167 → ceiling = 3
+        w.on_success();
+        assert_eq!(w.limit(), 3);
+    }
 
     #[test]
     fn window_limit_capped_at_cap() {
@@ -1031,17 +1044,6 @@ mod tests {
     }
 
     #[test]
-    fn window_limit_is_ceiling_of_value() {
-        // Initial value 1.5 → ceiling = 2
-        let mut w = AimdWindow::with_epoch(1.5, 16, Duration::from_millis(1));
-        assert_eq!(w.limit(), 2);
-
-        // After one success: 1.5 + 1/1.5 ≈ 2.167 → ceiling = 3
-        w.on_success();
-        assert_eq!(w.limit(), 3);
-    }
-
-    #[test]
     fn bucket_table_has_all_required_ecr_upload_windows() {
         // ECR private upload paths must have a bucket; the bench failure that
         // motivated this PR was 5x429s on InitiateLayerUpload under cross-repo
@@ -1193,7 +1195,7 @@ mod tests {
     /// Without the run's pacing, each host is paced by its own bucket.
     /// Breaks if the shared bucket becomes the default.
     #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn hosts_without_google_pacing_keep_their_own_bucket() {
+    async fn hosts_without_shared_pacing_keep_their_own_bucket() {
         let gcr = AimdController::new("gcr.io", NonZeroUsize::new(100).unwrap());
         let gar = AimdController::new("us-docker.pkg.dev", NonZeroUsize::new(100).unwrap());
         drain_burst(&gcr).await;

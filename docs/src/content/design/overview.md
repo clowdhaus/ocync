@@ -84,7 +84,7 @@ Window grouping is registry-specific and matches each provider's actual rate-lim
 
 ### Token-bucket layer for documented caps
 
-AIMD discovers a healthy concurrency level via 429 feedback but cannot bound TPS when one rate cap is shared across multiple windows the controller treats independently. Cross-repo aggregation under high parallelism can exceed a documented per-account cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. ECR, ECR Public, GHCR, GAR, and ACR ship with documented caps (verified against the upstream registry docs as of 2026-04-26); registries without a published cap fall back to AIMD-only.
+AIMD discovers a healthy concurrency level via 429 feedback but cannot bound TPS when one rate cap is shared across multiple windows the controller treats independently. Cross-repo aggregation under high parallelism can exceed a documented per-account cap before AIMD halves. A `TokenBucket` per `WindowKey` enforces the documented ceiling directly, gated BEFORE concurrency permits so a paced action does not occupy a slot another window could service. ECR, ECR Public, GHCR, GAR, and ACR ship with documented caps (verified against the upstream registry docs (ACR's on 2026-11-03, the others on 2026-04-26)); registries without a published cap fall back to AIMD-only.
 
 ## Cross-repo blob mounting
 
