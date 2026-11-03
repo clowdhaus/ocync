@@ -58,21 +58,23 @@ A baseline build of ocync, from a commit given with `--baseline-ref`, takes part
 
 ### Proxy overhead measured before it is trusted
 
-> **Status: Planned.**
+> **Status: Planned.** Today wall clock is taken with the proxy, in the same pass as the counts.
 
 Every request goes through `bench-proxy` unless the run passes `--no-proxy`, which records times but no traffic counts. The proxy terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: each tool runs several times with and without the proxy, interleaved, and the per-tool overhead is published.
 
 - If every tool's overhead is within the run-to-run noise, wall clock is taken with the proxy in the same pass as the counts.
 - If not, wall clock is taken in a pass without the proxy, and counts in a separate pass with it.
 
-Until the harness does this, it was measured by hand on 2026-11-03: four passes on the bench instance into ECR, with and without the proxy alternating, each 3 rounds of a cold then a warm sync of the first 5 corpus images, so 6 rounds per tool each way. With the proxy, ocync made a median 738 requests for 6.2 GB of responses, and regsync 1,571 requests for 13.2 GB, with no 429s.
+A first check by hand, on 2026-11-03, covered ocync 0.8.2 and regsync v0.11.7 syncing into ECR from the public sources (corpus locked 2026-11-01, sources pre-warmed) on the c6in.4xlarge bench instance, at commits 11bae49 and f7d0cf2, which differ only in the harness. Four passes alternated with and without the proxy, each 3 rounds of a cold then a warm sync of the first 5 corpus images, so 6 rounds per tool each way. Passes were not paired within a round, so drift between passes is not cancelled.
 
-| Median wall clock (range) | With proxy | Without proxy |
+| Median (range), cold sync | With proxy | Without proxy |
 |---|---:|---:|
-| ocync, cold | 44.6s (41s..1m 3s) | 51.5s (38s..1m 22s) |
-| regsync, cold | 3m 6s (2m 21s..3m 38s) | 3m 8s (2m 23s..3m 48s) |
+| ocync wall clock | 44.6s (41s..1m 3s) | 51.5s (38s..1m 22s) |
+| regsync wall clock | 3m 6s (2m 21s..3m 38s) | 3m 8s (2m 23s..3m 48s) |
+| ocync requests, response bytes | 738, 6.2 GB | not counted |
+| regsync requests, response bytes | 1,571, 13.2 GB | not counted |
 
-Each tool's difference is well inside its own round-to-round spread, and for ocync the proxied passes were the faster ones, so wall clock is taken with the proxy in the same pass as the counts.
+Warm syncs took a median 0.3s with the proxy and 0.2s without for ocync (6 requests), and 0.8s and 0.7s for regsync (11 requests). No pass saw a 429. Both tools' cold differences are inside their round-to-round spread, so they are reported as no measured difference. This check does not cover the other tools, the per-copy tools that open a connection per process, the small corpus, or Artifact Registry and ACR targets.
 
 ### Controlled and real-world sources
 
