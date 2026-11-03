@@ -302,6 +302,20 @@ impl BucketConfig {
 /// GAR/GCR: 60,000 RPM total (~1000 RPS) and 18,000 RPM writes (~300 RPS)
 /// per project per region. 240 TPS shared keeps 20% margin under the write
 /// ceiling, the tighter of the two.
+/// ACR's per-identity per-registry DataplaneRead limit for Basic and
+/// Standard registries, in requests per minute (Microsoft "SKU features and
+/// limits", 2026-10-15). Premium doubles it. GET and HEAD count here.
+const ACR_STANDARD_READS_PER_MINUTE: f64 = 5_000.0;
+
+/// ACR's per-identity per-registry DataplaneWrite limit for Basic and
+/// Standard registries, in requests per minute (same source). Premium doubles
+/// it. PUT, PATCH and POST count here.
+const ACR_STANDARD_WRITES_PER_MINUTE: f64 = 1_000.0;
+
+/// Fraction of a documented cap a bucket refills at, leaving 20% for tail
+/// bursts.
+const CAP_MARGIN: f64 = 0.8;
+
 const GAR_BUCKET: BucketConfig = BucketConfig {
     rate_per_sec: 240.0,
     burst: 30.0,
@@ -335,7 +349,7 @@ impl GooglePacing {
 /// Values are at least 20% under documented caps to absorb tail bursts
 /// without artificial throttling at steady state. Caps verified against
 /// official registry documentation (AWS service quotas, Google quotas
-/// page, Microsoft historical SKU table) on 2026-04-26.
+/// page) on 2026-04-26, and Microsoft's SKU limits on 2026-11-03.
 fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
     use RegistryAction::*;
     let cfg = |rate_per_sec: f64, burst: f64| BucketConfig {
@@ -369,12 +383,16 @@ fn bucket_config_for_window(key: WindowKey) -> Option<BucketConfig> {
         // principal. 20 TPS leaves 40% headroom for tail bursts.
         WindowKey::GhcrShared => cfg(20.0, 10.0),
         WindowKey::GarShared => GAR_BUCKET,
-        // ACR Premium SKU historical defaults: ~10,000 ReadOps/min (167 RPS)
-        // and ~2,000 WriteOps/min (33 RPS). Microsoft removed the explicit
-        // table in 2026-03; values preserved from the prior published
-        // numbers. Basic / Standard SKUs hit AIMD halve on first 429.
-        WindowKey::Acr(AcrGroup::Read) => cfg(130.0, 30.0),
-        WindowKey::Acr(AcrGroup::Write) => cfg(26.0, 10.0),
+        // ACR, paced to the Basic and Standard per-identity limits: the tier
+        // is not visible to a client, and a sustained rate above them draws
+        // 429s (measured 2026-11-03 on a Standard registry). Premium runs at
+        // half its limits.
+        WindowKey::Acr(AcrGroup::Read) => {
+            cfg(ACR_STANDARD_READS_PER_MINUTE / 60.0 * CAP_MARGIN, 30.0)
+        }
+        WindowKey::Acr(AcrGroup::Write) => {
+            cfg(ACR_STANDARD_WRITES_PER_MINUTE / 60.0 * CAP_MARGIN, 10.0)
+        }
         // All other windows: AIMD only.
         WindowKey::Ecr(_) | WindowKey::DockerHub(_) | WindowKey::Unknown(_) => return None,
     })
@@ -671,6 +689,23 @@ mod tests {
     // ---------------------------------------------------------------------------
     // AimdWindow arithmetic - these tests use window_value() which is cfg(test) only
     // ---------------------------------------------------------------------------
+
+    #[test]
+    fn acr_buckets_stay_under_the_standard_per_identity_limits() {
+        // Catches: pacing ACR above what a Basic or Standard registry allows
+        // one identity, which a long sync turns into a stream of 429s.
+        for (key, per_minute) in [
+            (WindowKey::Acr(AcrGroup::Read), 5_000.0),
+            (WindowKey::Acr(AcrGroup::Write), 1_000.0),
+        ] {
+            let cfg = bucket_config_for_window(key).unwrap();
+            assert!(
+                cfg.rate_per_sec <= per_minute / 60.0 * 0.8,
+                "{key:?}: {} per second",
+                cfg.rate_per_sec
+            );
+        }
+    }
 
     #[test]
     fn window_limit_is_ceiling_of_value() {
