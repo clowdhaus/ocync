@@ -191,7 +191,7 @@ Actions are fine-grained, matching the actual API action granularity of each reg
 | Docker Hub | 3 (HEAD unmetered; manifest-read separate; others shared) | HEAD and BlobHead are free (no rate limit). ManifestRead gets its own window (counted against 100-pull/6h quota). Other actions share one window |
 | GAR / GCR | 1 (all shared) | Shared per-project quota across all operation types; grows adaptively to `max_concurrent` |
 | GHCR | 1 (all shared) | GitHub enforces a single 2000 RPM aggregate cap per authenticated principal across reads and writes; separate windows would let combined traffic exceed the cap |
-| ACR | 2 (read, write) | Premium SKU exposes separate ReadOps and WriteOps quotas |
+| ACR | 4 (read, tag list, referrers, write) | `DataplaneRead` (5,000 a minute), `MetadataRead` (2,000), `ListReferrers` (250) and `DataplaneWrite` (1,000) are limited separately, per identity per registry. Tag lists and referrers also count as reads, so they draw from two buckets. The buckets are shared by every client of the host in a run |
 | Unknown (Chainguard, Quay, generic) | 5 (HEAD, READ, UPLOAD, MANIFEST_WRITE, TAG_LIST) | Coarse grouping as safe default for registries without documented per-action limits |
 
 The mapping function is ~20 lines. The window key is derived from HTTP method + URL pattern, which `ocync` already tracks in request labels.
