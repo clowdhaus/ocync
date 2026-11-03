@@ -1660,6 +1660,11 @@ mod tests {
     const REGCTL_PROBE: &str = "VCSTag:     v0.11.7\nVCSRef:     \nVCSCommit:  \nVCSState:   \n\
         VCSDate:    \nPlatform:   linux/amd64\nGoVer:      go1.25.3\nGoCompiler: gc\n";
 
+    /// `regsync version` as regsync prints it: the same block as `regctl`,
+    /// after a blank line.
+    const REGSYNC_PROBE: &str = "\nVCSTag:     v0.11.7\nVCSRef:     \nVCSCommit:  \nVCSState:   \n\
+        VCSDate:    \nPlatform:   linux/amd64\nGoVer:      go1.25.3\nGoCompiler: gc\n";
+
     /// `oras version` as oras prints it: keys padded to one column, `Version`
     /// first, then `Go version` (`cmd/oras/root/version.go` `runVersion`).
     const ORAS_PROBE: &str = "Version:    1.3.6\nGo version: go1.25.3\nOS/Arch:    linux/amd64\n";
@@ -1672,7 +1677,12 @@ mod tests {
         // falling through to the module version.
         for (name, tool, stdout, expected) in [
             ("regctl full", Tool::Regctl, REGCTL_PROBE, Some("v0.11.7")),
-            ("regsync full", Tool::Regsync, REGCTL_PROBE, Some("v0.11.7")),
+            (
+                "regsync full",
+                Tool::Regsync,
+                REGSYNC_PROBE,
+                Some("v0.11.7"),
+            ),
             ("oras full", Tool::Oras, ORAS_PROBE, Some("1.3.6")),
             (
                 "empty VCSTag",
