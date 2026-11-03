@@ -158,11 +158,14 @@ resource "local_sensitive_file" "ssh_key" {
   file_permission = "0600"
 }
 
+# The smallest size this subscription can use in eastus2, where B-series is
+# restricted. v7 sizes attach disks only through NVMe.
 resource "azurerm_linux_virtual_machine" "bench" {
   name                  = local.name
   resource_group_name   = azurerm_resource_group.bench.name
   location              = azurerm_resource_group.bench.location
-  size                  = "Standard_B2s"
+  size                  = "Standard_D2als_v7"
+  disk_controller_type  = "NVMe"
   admin_username        = "bench"
   network_interface_ids = [azurerm_network_interface.bench.id]
 
