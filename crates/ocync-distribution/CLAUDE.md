@@ -51,8 +51,8 @@ With `auth_type` unset, `cgr.dev`, `ghcr.io`, `docker.io`, and any unrecognized 
 - Default: POST + streaming PUT with `Transfer-Encoding: chunked` (2 requests/blob). Streaming PUT body is gated by a per-`RegistryClient` semaphore (`blob_upload_sem`, default cap `DEFAULT_BLOB_UPLOAD_CONCURRENCY` = 64) to stay under the per-h2-connection `SETTINGS_MAX_CONCURRENT_STREAMS` budget (100-128 across major registries probed 2026-06-01).
 - GHCR: multi-PATCH chunked broken (last PATCH overwrites previous). Client falls back to POST + single PATCH + PUT (3 requests/blob), `blob_push_stream_ghcr`.
 - GAR: the default streaming path. A second PATCH in one session answers 405 and a monolithic POST answers 502, so neither is used.
-- ACR: ~20 MB streaming PUT body limit. Client sends 16 MB PATCH chunks (OCI `{start}-{end}` Content-Range, NOT RFC 7233) as each is read, reading the next chunk while a PATCH is in flight, so an upload holds at most two chunks and reserves that much of the buffered-bytes budget. The digest is verified when the stream ends, before the finalize PUT; a mismatch or a stream error sends no PUT, and the registry expires the session. `blob_push_stream_acr`. Zero-byte blobs (e.g. signature empty-config) skip the PATCH loop and go straight to finalize PUT.
-- Every upload `Location` a registry returns (the initiate POST's and each PATCH's) must share the registry's origin (scheme, host and port), so its credentials never reach another origin: `extract_location` in `blob.rs` refuses any other. Each PATCH and the finalize PUT go to a `Location` already checked.
+- ACR: the default streaming path; a streamed PUT was accepted up to 2 GiB on 2026-11-03.
+- Every upload `Location` a registry returns (the initiate POST's and GHCR's PATCH's) must share the registry's origin (scheme, host and port), so its credentials never reach another origin: `extract_location` in `blob.rs` refuses any other. GHCR's PATCH and finalize PUT go to a `Location` already checked.
 
 ## Cross-repo mount
 

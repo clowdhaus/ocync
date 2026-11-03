@@ -1,48 +1,16 @@
 //! SHA-256 wrapper backed by aws-lc-rs, the AWS-LC FIPS module in a FIPS build.
 
-/// SHA-256 hasher.
-pub struct Sha256 {
-    inner: aws_lc_rs::digest::Context,
-}
-
-impl std::fmt::Debug for Sha256 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sha256").finish_non_exhaustive()
-    }
-}
+/// SHA-256.
+#[derive(Debug)]
+pub struct Sha256;
 
 impl Sha256 {
-    /// Create a new SHA-256 hasher.
-    pub fn new() -> Self {
-        Self {
-            inner: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
-        }
-    }
-
-    /// Feed data into the hasher.
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /// Finalize and return the 32-byte SHA-256 hash.
-    pub fn finalize(self) -> [u8; 32] {
-        let result = self.inner.finish();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(result.as_ref());
-        out
-    }
-
     /// Hash `data` in one shot.
     pub fn digest(data: &[u8]) -> [u8; 32] {
-        let mut h = Self::new();
-        h.update(data);
-        h.finalize()
-    }
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
+        let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hash.as_ref());
+        out
     }
 }
 
@@ -66,18 +34,5 @@ mod tests {
             hex::encode(hash),
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
-    }
-
-    #[test]
-    fn incremental_equals_single_shot() {
-        let data = b"hello world";
-        let single = Sha256::digest(data);
-
-        let mut hasher = Sha256::new();
-        hasher.update(b"hello ");
-        hasher.update(b"world");
-        let incremental = hasher.finalize();
-
-        assert_eq!(single, incremental);
     }
 }
