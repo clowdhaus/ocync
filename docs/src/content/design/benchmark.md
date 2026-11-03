@@ -65,6 +65,15 @@ Every request goes through `bench-proxy` unless the run passes `--no-proxy`, whi
 - If every tool's overhead is within the run-to-run noise, wall clock is taken with the proxy in the same pass as the counts.
 - If not, wall clock is taken in a pass without the proxy, and counts in a separate pass with it.
 
+Until the harness does this, it was measured by hand on 2026-11-03: four passes on the bench instance into ECR, with and without the proxy alternating, each 3 rounds of a cold then a warm sync of the first 5 corpus images, so 6 rounds per tool each way. With the proxy, ocync made a median 738 requests for 6.2 GB of responses, and regsync 1,571 requests for 13.2 GB, with no 429s.
+
+| Median wall clock (range) | With proxy | Without proxy |
+|---|---:|---:|
+| ocync, cold | 44.6s (41s..1m 3s) | 51.5s (38s..1m 22s) |
+| regsync, cold | 3m 6s (2m 21s..3m 38s) | 3m 8s (2m 23s..3m 48s) |
+
+Each tool's difference is well inside its own round-to-round spread, and for ocync the proxied passes were the faster ones, so wall clock is taken with the proxy in the same pass as the counts.
+
 ### Controlled and real-world sources
 
 > **Status: Planned.** Today every run pulls from the public registries.
