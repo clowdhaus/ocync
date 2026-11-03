@@ -12,7 +12,6 @@ use url::Url;
 use crate::aimd::{AimdController, GooglePacing, RegistryAction};
 use crate::auth::detect::ProviderKind;
 use crate::auth::{AuthProvider, Presents, Scope, Token};
-use crate::blob::acr_held_bytes;
 use crate::error::Error;
 use crate::spec::{RegistryAuthority, RepositoryName};
 
@@ -167,7 +166,7 @@ impl RegistryClientBuilder {
     }
 
     /// Set the byte budget for in-flight buffered blob bodies on the
-    /// fallback upload paths (GHCR / ACR); the streaming PUT path does not
+    /// fallback upload path (GHCR); the streaming PUT path does not
     /// buffer and is unaffected. Uploads that would exceed the budget queue.
     ///
     /// A budget below the 16 MB an unknown-size upload requests still admits
@@ -298,7 +297,7 @@ pub struct RegistryClient {
     /// deadlock if both came from one semaphore.
     pub(crate) blob_download_sem: Arc<Semaphore>,
     /// Byte budget for buffered blob bodies, one permit per byte, held by an
-    /// `UploadSlot` for GHCR and ACR.
+    /// `UploadSlot` for GHCR.
     pub(crate) buffered_blob_bytes_sem: Arc<Semaphore>,
     /// Total permits in `buffered_blob_bytes_sem`, so one oversized blob
     /// can be capped at the whole budget instead of blocking forever.
@@ -330,14 +329,12 @@ pub struct UploadSlot<'c> {
 pub(crate) enum UploadPath {
     /// POST, then a streaming PUT. Artifact Registry answers a second PATCH
     /// in one session with 405 and a monolithic POST with 502, but takes
-    /// this.
+    /// this. So does Azure Container Registry: a 2026-11-03 probe had a
+    /// streamed PUT accepted up to 256 MiB, so no ~20 MB limit applies.
     Streaming,
     /// Buffered single PATCH: GHCR keeps only the last chunk of a multi-PATCH
     /// upload.
     Ghcr,
-    /// Chunked PATCH, two chunks per upload in memory (one sending, one
-    /// filling): ACR rejects a streaming PUT above ~20 MB.
-    Acr,
 }
 
 /// Acquire a permit from one of the client's blob caps.
@@ -351,8 +348,8 @@ async fn acquire_permit(sem: &Arc<Semaphore>) -> OwnedSemaphorePermit {
 
 impl RegistryClient {
     /// Wait for one of this client's upload slots (64 by default, set by
-    /// [`RegistryClientBuilder::blob_upload_concurrency`]), then for GHCR and
-    /// ACR a byte-budget permit for the bytes the upload holds, sized by
+    /// [`RegistryClientBuilder::blob_upload_concurrency`]), then for GHCR a
+    /// byte-budget permit for the bytes the upload holds, sized by
     /// `known_size`. The slot holds both until it is dropped or spent.
     ///
     /// Take it before the source download opens: a copy then holds its slot
@@ -363,9 +360,9 @@ impl RegistryClient {
         // upload path is chosen.
         let path = match self.aimd.provider() {
             Some(ProviderKind::Ghcr) => UploadPath::Ghcr,
-            Some(ProviderKind::Acr) => UploadPath::Acr,
             Some(
-                ProviderKind::Ecr
+                ProviderKind::Acr
+                | ProviderKind::Ecr
                 | ProviderKind::EcrPublic
                 | ProviderKind::Gar
                 | ProviderKind::Gcr
@@ -381,10 +378,6 @@ impl RegistryClient {
                     known_size.unwrap_or(BUFFERED_BLOB_BYTES_FALLBACK_RESERVE),
                 )
                 .await,
-            ),
-            UploadPath::Acr => Some(
-                self.acquire_buffered_bytes_permit(acr_held_bytes(known_size) as u64)
-                    .await,
             ),
         };
         UploadSlot {
@@ -906,12 +899,12 @@ mod tests {
         assert!(crate::aimd::is_paced(&gar.aimd).await);
     }
 
-    /// A 1 GB blob takes two 16 MiB chunks of the byte budget on ACR, and the
-    /// whole budget on GHCR, which buffers it. Breaks if ACR reserves the
-    /// whole blob (serialising its uploads) or GHCR reserves less (unbounded
+    /// A 1 GB blob takes none of the byte budget on ACR, which streams it,
+    /// and the whole budget on GHCR, which buffers it. Breaks if ACR reserves
+    /// any (serialising its uploads) or GHCR reserves less (unbounded
     /// memory).
     #[tokio::test]
-    async fn a_one_gb_blob_reserves_two_chunks_on_acr_and_the_whole_budget_on_ghcr() {
+    async fn a_one_gb_blob_reserves_no_budget_on_acr_and_the_whole_budget_on_ghcr() {
         const BUDGET: usize = 512 * 1024 * 1024;
         let available = |url: &str| {
             let client = RegistryClient::builder(Url::parse(url).unwrap())
@@ -923,10 +916,7 @@ mod tests {
                 client.buffered_blob_bytes_sem.available_permits()
             }
         };
-        assert_eq!(
-            available("https://myacr.azurecr.io").await,
-            BUDGET - 32 * 1024 * 1024
-        );
+        assert_eq!(available("https://myacr.azurecr.io").await, BUDGET);
         assert_eq!(available("https://ghcr.io").await, 0);
     }
 
