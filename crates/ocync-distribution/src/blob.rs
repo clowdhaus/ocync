@@ -101,7 +101,7 @@ impl UploadSlot<'_> {
         let stream = stream.map(|r| r.map_err(Into::into));
 
         match self.path {
-            UploadPath::Ghcr => {
+            UploadPath::Ghcr(_bytes) => {
                 return client
                     .blob_push_stream_ghcr(repository, expected_digest, known_size, stream)
                     .await;
@@ -1040,6 +1040,49 @@ mod tests {
                 streams_one_put(host, known_size).await;
             }
         }
+    }
+
+    /// A registry that rejects the streamed PUT, as ACR does a body whose
+    /// digest does not match, fails the push with the registry's status.
+    /// Breaks if a rejected PUT is reported as a pushed blob.
+    #[tokio::test]
+    async fn blob_push_stream_rejected_put_fails_the_push() {
+        let server = wiremock::MockServer::start().await;
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(202)
+                    .append_header("Location", "/v2/stream/repo/blobs/uploads/u"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(400).set_body_string(
+                r#"{"errors":[{"code":"DIGEST_INVALID","message":"digest invalid"}]}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = build_test_client("myreg.azurecr.io", port);
+        let data = b"blob";
+        let repo = RepositoryName::new("stream/repo").unwrap();
+
+        let result = client
+            .reserve_upload_slot(None)
+            .await
+            .push_stream(&repo, &test_digest(data), data_stream(data, 4))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::RegistryError {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     async fn streams_one_put(host: &str, known_size: Option<u64>) {
