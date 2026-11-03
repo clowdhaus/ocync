@@ -68,7 +68,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 3.988691772,
             "peak_rss_kb": 19820,
             "requests": 71,
@@ -115,7 +115,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 1.091517898,
             "peak_rss_kb": 19324,
             "requests": 7,
@@ -162,7 +162,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 367.59028352,
             "peak_rss_kb": 21496,
             "requests": 332,
@@ -209,7 +209,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 1.084732037,
             "peak_rss_kb": 19548,
             "requests": 7,
@@ -256,7 +256,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 1.177146464,
             "peak_rss_kb": 19424,
             "requests": 7,
@@ -303,7 +303,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 85.646323668,
             "peak_rss_kb": 22656,
             "requests": 788,
@@ -396,7 +396,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 70.819123574,
             "peak_rss_kb": 22420,
             "requests": 787,
@@ -489,7 +489,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 1535.152119749,
             "peak_rss_kb": 27372,
             "requests": 9532,
@@ -582,7 +582,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 12.036633352,
             "peak_rss_kb": 20548,
             "requests": 169,
@@ -652,7 +652,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 1509.182771728,
             "peak_rss_kb": 28156,
             "requests": 9532,
@@ -726,7 +726,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 14.624605877,
             "peak_rss_kb": 20256,
             "requests": 171,
@@ -842,7 +842,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 986.337893828,
             "peak_rss_kb": 27624,
             "requests": 9527,
@@ -916,7 +916,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 18.587196803,
             "peak_rss_kb": 21032,
             "requests": 325,
@@ -1009,7 +1009,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 945.586593866,
             "peak_rss_kb": 27596,
             "requests": 9532,
@@ -1083,7 +1083,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 12.873680977,
             "peak_rss_kb": 20564,
             "requests": 170,
@@ -1557,7 +1557,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 765.109647566,
             "peak_rss_kb": 27676,
             "requests": 9532,
@@ -1642,7 +1642,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 12.461308371,
             "peak_rss_kb": 20344,
             "requests": 169,
@@ -1718,7 +1718,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 777.030404016,
             "peak_rss_kb": 27296,
             "requests": 9532,
@@ -1803,7 +1803,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.3",
+            "version": "v0.11.3",
             "wall_clock_secs": 12.8886028,
             "peak_rss_kb": 20476,
             "requests": 170,
@@ -1940,7 +1940,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 749.845501894,
             "peak_rss_kb": 26972,
             "requests": 9588,
@@ -2025,7 +2025,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 11.293697004,
             "peak_rss_kb": 20220,
             "requests": 179,
@@ -2093,7 +2093,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 729.956779894,
             "peak_rss_kb": 27876,
             "requests": 9566,
@@ -2184,7 +2184,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 12.930357412,
             "peak_rss_kb": 20636,
             "requests": 177,
@@ -2331,7 +2331,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 711.979557943,
             "peak_rss_kb": 27280,
             "requests": 9567,
@@ -2422,7 +2422,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 11.660106849,
             "peak_rss_kb": 20276,
             "requests": 177,
@@ -2457,7 +2457,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 722.266096591,
             "peak_rss_kb": 27564,
             "requests": 9565,
@@ -2548,7 +2548,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 11.694038722,
             "peak_rss_kb": 20092,
             "requests": 177,
@@ -2639,7 +2639,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 718.936829401,
             "peak_rss_kb": 27428,
             "requests": 9565,
@@ -2730,7 +2730,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 12.68567758,
             "peak_rss_kb": 20468,
             "requests": 177,
@@ -3544,7 +3544,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 643.265583443,
             "peak_rss_kb": 26808,
             "requests": 7772,
@@ -3635,7 +3635,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 7.490683023,
             "peak_rss_kb": 20028,
             "requests": 117,
@@ -3726,7 +3726,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 624.79023447,
             "peak_rss_kb": 26484,
             "requests": 7770,
@@ -3817,7 +3817,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 8.303983574,
             "peak_rss_kb": 20364,
             "requests": 117,
@@ -3964,7 +3964,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 630.244190729,
             "peak_rss_kb": 26484,
             "requests": 7772,
@@ -4055,7 +4055,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 7.109316359,
             "peak_rss_kb": 20488,
             "requests": 117,
@@ -4146,7 +4146,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 619.741051677,
             "peak_rss_kb": 26496,
             "requests": 7770,
@@ -4237,7 +4237,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 7.583907655,
             "peak_rss_kb": 20808,
             "requests": 117,
@@ -4272,7 +4272,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 623.549470981,
             "peak_rss_kb": 26788,
             "requests": 7770,
@@ -4363,7 +4363,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 6.60601345,
             "peak_rss_kb": 19684,
             "requests": 117,
@@ -5687,7 +5687,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 622.812699619,
             "peak_rss_kb": 26332,
             "requests": 7804,
@@ -5773,7 +5773,7 @@
         "tools": [
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 6.875192052,
             "peak_rss_kb": 20072,
             "requests": 117,
@@ -5910,7 +5910,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 632.914586568,
             "peak_rss_kb": 26864,
             "requests": 7803,
@@ -5996,7 +5996,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 7.011766914,
             "peak_rss_kb": 19736,
             "requests": 117,
@@ -6059,7 +6059,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 671.64567653,
             "peak_rss_kb": 27276,
             "requests": 7802,
@@ -6145,7 +6145,7 @@
           },
           {
             "tool": "regsync",
-            "version": "VCSTag:     v0.11.7",
+            "version": "v0.11.7",
             "wall_clock_secs": 6.878326156,
             "peak_rss_kb": 20116,
             "requests": 117,
