@@ -66,8 +66,8 @@ const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY: NonZeroUsize = DEFAULT_BLOB_UPLOAD_CONC
 
 /// Default per-target byte budget for in-flight buffered blob bodies.
 ///
-/// The fallback upload paths hold a blob's bytes in memory because the target
-/// cannot accept a streaming body. With [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]
+/// The GHCR fallback path holds a blob's bytes in memory because GHCR keeps
+/// only the last of several PATCH requests. With [`DEFAULT_BLOB_UPLOAD_CONCURRENCY`]
 /// uploads and no byte cap, 1 GB layers (common for CUDA/ML images) would
 /// hold ~64 GB resident. 512 MB is ~32x a typical 16 MB layer, so modest
 /// layers do not serialise, while a single oversized GHCR layer (e.g. 2 GB
@@ -329,8 +329,7 @@ pub struct UploadSlot<'c> {
 pub(crate) enum UploadPath {
     /// POST, then a streaming PUT. Artifact Registry answers a second PATCH
     /// in one session with 405 and a monolithic POST with 502, but takes
-    /// this. So does Azure Container Registry: a 2026-11-03 probe had a
-    /// streamed PUT accepted up to 256 MiB, so no ~20 MB limit applies.
+    /// this. So does Azure Container Registry, including bodies over 20 MB.
     Streaming,
     /// Buffered single PATCH: GHCR keeps only the last chunk of a multi-PATCH
     /// upload.

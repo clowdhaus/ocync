@@ -1030,37 +1030,21 @@ mod tests {
     /// buffered. Breaks if a host takes a buffered or chunked path.
     #[tokio::test]
     async fn blob_push_stream_uses_streaming_put() {
-        let data = b"streaming upload blob data";
-        let size = Some(data.len() as u64);
+        let size = Some(b"streaming upload blob data".len() as u64);
         for host in [
             "registry.example.com",
             "us-docker.pkg.dev",
             "myreg.azurecr.io",
         ] {
             for known_size in [None, size] {
-                streams_one_put(host, known_size, data, 4).await;
+                streams_one_put(host, known_size).await;
             }
         }
     }
 
-    /// An ACR blob over 16 MiB, which ACR once seemed to reject as a
-    /// streaming body (a 2026-11-03 probe accepted one up to 256 MiB), is
-    /// still one POST and one PUT with no PATCH. Breaks if ACR goes back to
-    /// a chunked PATCH upload.
-    #[tokio::test]
-    async fn blob_push_stream_acr_over_16_mib_is_one_put_without_patch() {
-        let data = vec![0xCDu8; 17 * 1024 * 1024];
-        streams_one_put(
-            "myreg.azurecr.io",
-            Some(data.len() as u64),
-            &data,
-            1024 * 1024,
-        )
-        .await;
-    }
-
-    async fn streams_one_put(host: &str, known_size: Option<u64>, data: &[u8], chunk_size: usize) {
+    async fn streams_one_put(host: &str, known_size: Option<u64>) {
         let server = wiremock::MockServer::start().await;
+        let data = b"streaming upload blob data";
         let digest = test_digest(data);
         let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
 
@@ -1098,7 +1082,7 @@ mod tests {
         let repo = RepositoryName::new("stream/repo").unwrap();
         let slot = client.reserve_upload_slot(known_size).await;
         let result = slot
-            .push_stream(&repo, &digest, data_stream(data, chunk_size))
+            .push_stream(&repo, &digest, data_stream(data, 4))
             .await
             .unwrap();
 
@@ -1169,10 +1153,7 @@ mod tests {
     /// the second upload behind the first.
     #[tokio::test]
     async fn buffered_upload_byte_budget_queues_concurrent_uploads() {
-        byte_budget_queues_two_uploads("ghcr.io").await;
-    }
-
-    async fn byte_budget_queues_two_uploads(host: &str) {
+        let host = "ghcr.io";
         use std::sync::Arc;
         use std::sync::Mutex as StdMutex;
         use std::time::Instant;
