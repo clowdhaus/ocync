@@ -239,16 +239,14 @@ enum VersionOutput {
 /// `regctl version` prints `VCSTag:` first, aligned by a tab writer (regclient
 /// `internal/version/version.go`), and `oras version` prints `Version:` then
 /// `Go version:`, padded to a common column (oras `cmd/oras/root/version.go`),
-/// so those two are keyed. `regsync` is also regclient but stays on its first
-/// line so earlier records remain comparable.
+/// so those are keyed. `regsync version` prints the same block as `regctl`,
+/// after a blank line.
 fn version_output(tool: Tool) -> VersionOutput {
     match tool {
         Tool::Dregsy => VersionOutput::Quiet,
-        Tool::Regctl => VersionOutput::Keyed("VCSTag"),
+        Tool::Regctl | Tool::Regsync => VersionOutput::Keyed("VCSTag"),
         Tool::Oras => VersionOutput::Keyed("Version"),
-        Tool::Regsync | Tool::Ocync | Tool::OcyncBaseline | Tool::Skopeo | Tool::Crane => {
-            VersionOutput::FirstLine
-        }
+        Tool::Ocync | Tool::OcyncBaseline | Tool::Skopeo | Tool::Crane => VersionOutput::FirstLine,
     }
 }
 
@@ -1642,18 +1640,6 @@ mod tests {
             .unwrap(),
             Some("ocync 0.6.0".to_string())
         );
-        // regsync pads its output and precedes the tag with a blank line.
-        assert_eq!(
-            version_from_probe(
-                "regsync",
-                version_output(Tool::Regsync),
-                true,
-                "\nVCSTag:     v0.11.5\n",
-                ""
-            )
-            .unwrap(),
-            Some("VCSTag:     v0.11.5".to_string())
-        );
         // skopeo reports cleanly on stdout with a zero exit.
         assert_eq!(
             version_from_probe(
@@ -1674,6 +1660,11 @@ mod tests {
     const REGCTL_PROBE: &str = "VCSTag:     v0.11.7\nVCSRef:     \nVCSCommit:  \nVCSState:   \n\
         VCSDate:    \nPlatform:   linux/amd64\nGoVer:      go1.25.3\nGoCompiler: gc\n";
 
+    /// `regsync version` as regsync prints it: the same block as `regctl`,
+    /// after a blank line.
+    const REGSYNC_PROBE: &str = "\nVCSTag:     v0.11.7\nVCSRef:     \nVCSCommit:  \nVCSState:   \n\
+        VCSDate:    \nPlatform:   linux/amd64\nGoVer:      go1.25.3\nGoCompiler: gc\n";
+
     /// `oras version` as oras prints it: keys padded to one column, `Version`
     /// first, then `Go version` (`cmd/oras/root/version.go` `runVersion`).
     const ORAS_PROBE: &str = "Version:    1.3.6\nGo version: go1.25.3\nOS/Arch:    linux/amd64\n";
@@ -1686,6 +1677,12 @@ mod tests {
         // falling through to the module version.
         for (name, tool, stdout, expected) in [
             ("regctl full", Tool::Regctl, REGCTL_PROBE, Some("v0.11.7")),
+            (
+                "regsync full",
+                Tool::Regsync,
+                REGSYNC_PROBE,
+                Some("v0.11.7"),
+            ),
             ("oras full", Tool::Oras, ORAS_PROBE, Some("1.3.6")),
             (
                 "empty VCSTag",
