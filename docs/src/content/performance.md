@@ -31,7 +31,11 @@ Measured 2026-11-04 (run 2026-11-04-171727, commit 75b5448) on c6in.4xlarge (x86
 > Referrers calls -- ocync: 52, dregsy: 0, regsync: 0.
 <!-- BENCH:END -->
 
+The speed figure in the description, the README and the banners is the median of each round's ratio of regsync's time to ocync's. Pairing the tools within a round cancels drift that affects every tool in that round, so it can differ from the ratio of the two medians in the table. The comparison between tools is on ECR; Artifact Registry has been measured with ocync alone.
+
 ## How tools compare
+
+dregsy transfers nothing itself: the benchmark runs it with `relay: skopeo`, so skopeo's rows below describe how dregsy moves blobs.
 
 ### Upload strategy
 
@@ -70,7 +74,7 @@ Measured 2026-11-04 (run 2026-11-04-171727, commit 75b5448) on c6in.4xlarge (x86
 
 | Metric | ocync | dregsy | regsync |
 |---|---:|---:|---:|
-| Wall clock | **0s** | 1m 37s | 5s |
+| Wall clock | **0.6s** | 1m 37s | 5.7s |
 | Peak RSS | **14.3 MB** | 37.1 MB | 20.7 MB |
 | Requests | **55** | 3301 | 110 |
 | Response bytes | 4.1 KB | 1.7 MB | **0 B** |
