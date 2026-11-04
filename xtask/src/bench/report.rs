@@ -1365,8 +1365,8 @@ fn render_proxy_overhead(report: &BenchReport, rounds: &[&ScenarioResult], out: 
 /// Writes the benchmark summary to `output_dir`.
 ///
 /// Creates `summary.md` -- the human-readable comparison table with
-/// per-scenario metrics and winners bolded. The performance page and the
-/// compact per-registry JSON archive are written separately, see
+/// per-scenario metrics and winners bolded. The compact per-registry JSON
+/// archive and the published surfaces are written separately, see
 /// [`ArchiveMode`].
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
@@ -1595,7 +1595,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A finished cold-sync report to build records and page blocks from.
+    /// A finished cold-sync report to build records from.
     pub(crate) fn sample_report() -> BenchReport {
         BenchReport {
             baseline: None,

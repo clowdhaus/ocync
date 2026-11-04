@@ -268,9 +268,9 @@ pub(crate) struct BenchArgs {
     #[arg(long)]
     pub(crate) run_timestamp: Option<RunTimestamp>,
 
-    /// Where the run record and the performance-page blocks go: `write` puts
-    /// them in the tracked archive and page, `defer` leaves both in the output
-    /// directory for whoever fetches the run (`bench-remote` does).
+    /// Where the run record and, for a published run, the surfaces go: `write`
+    /// puts them in the tracked archive and files, `defer` leaves the record in
+    /// the output directory for whoever fetches the run (`bench-remote` does).
     #[arg(long, value_enum, default_value = "write")]
     pub(crate) archive: report::ArchiveMode,
 
@@ -985,7 +985,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 .write(&output_dir)
                 .map_err(|e| with_stop_reason(e, stopped.as_deref()))?;
             eprintln!(
-                "bench: run record and page blocks left in {} for the fetch to apply",
+                "bench: run record left in {} for the fetch to apply",
                 output_dir.display()
             );
         }
@@ -2838,6 +2838,58 @@ mod tests {
         // The sample run is not the published shape, so asking to publish it
         // archives it as an experiment.
         assert_eq!(ecr["record"].get("published"), None, "{ecr}");
+    }
+
+    #[test]
+    fn a_run_is_published_only_when_it_asks_to() {
+        // Catches: the flag parsed and dropped, so a run meant to be the
+        // published one is archived as an experiment, or the reverse.
+        let publication = |argv: &[&str]| parse_bench(argv).unwrap().publication();
+        assert_eq!(
+            publication(&["--publish", "sync"]),
+            publish::Publication::Publish
+        );
+        assert_eq!(publication(&["sync"]), publish::Publication::Archive);
+    }
+
+    #[test]
+    fn only_a_run_that_asked_to_be_published_and_qualifies_is_recorded_as_published() {
+        use crate::bench::publish::tests::{fixture_report, published};
+        let host = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
+        let full = "0123456789abcdef0123456789abcdef01234567";
+        let is_published = |report: &BenchReport, git_ref: &str, publication| {
+            let deferred = deferred_output(
+                &Target::Ecr,
+                host,
+                report,
+                git_ref.into(),
+                None,
+                publication,
+            );
+            let json = serde_json::to_value(&deferred).unwrap();
+            json["record"]["published"] == serde_json::json!(true)
+        };
+        let report = fixture_report("2026-11-02-120000", [200.0; 5]);
+        assert_eq!(published(&report).git_ref, full);
+
+        assert!(is_published(&report, full, publish::Publication::Publish));
+        // Catches: a run that qualifies in every way but was not started with
+        // `--publish` writing the surfaces, as every such run once did.
+        assert!(!is_published(&report, full, publish::Publication::Archive));
+        // Catches: a published run that lost a round, or is tied to a commit by
+        // a short hash, being published anyway.
+        let mut lost_round = fixture_report("2026-11-02-120000", [200.0; 5]);
+        lost_round.scenarios.truncate(8);
+        assert!(!is_published(
+            &lost_round,
+            full,
+            publish::Publication::Publish
+        ));
+        assert!(!is_published(
+            &report,
+            "0123456",
+            publish::Publication::Publish
+        ));
     }
 
     #[test]

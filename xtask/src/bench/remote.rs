@@ -206,7 +206,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         if fetch_results(&config, &args.output, &remote_dir)? == Fetch::CopiedWithoutRecord {
             eprintln!(
                 "bench-remote: {remote_dir} holds no deferred record; copied it, \
-                 applied nothing to the archive or the performance page"
+                 applied nothing to the archive or the surfaces"
             );
         }
         return Ok(());
@@ -414,7 +414,7 @@ fn run_result(
         (0, Ok(Fetch::Copied)) => Ok(()),
         (0, Ok(Fetch::CopiedWithoutRecord)) => Err(
             "remote script exited with code 0 but its results hold no deferred record, so \
-             nothing reached the archive or the performance page"
+             nothing reached the archive or the surfaces"
                 .into(),
         ),
         (0, Ok(Fetch::NoResults)) => {
@@ -432,8 +432,7 @@ fn run_result(
 /// The arguments `cargo xtask bench` runs with on the instance, unquoted:
 /// `remote_script` quotes each one. The run starts at `timestamp`, which names
 /// its results directory, and, so that the instance writes no tracked file,
-/// defers its record and page blocks there until the fetch applies them
-/// locally.
+/// defers its record there until the fetch applies it locally.
 fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     let mut bench_args = vec![
         "--archive".to_string(),
@@ -745,8 +744,8 @@ fn fetch_run_results(
 }
 
 /// Copies the results directory `remote_dir` from the instance into
-/// `local_output`, then writes the run record and the performance-page blocks
-/// it carries into the local archive and page, as a local run does.
+/// `local_output`, then writes the run record it carries into the local
+/// archive and, for a published run, the surfaces, as a local run does.
 fn fetch_results(
     config: &BenchConfig,
     local_output: &str,

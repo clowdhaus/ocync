@@ -117,7 +117,7 @@ Before a published comparison, each tool's concurrency is swept once over a few 
 
 Each run record carries the instance type, region and image ID, every tool's version and every relay's version (dregsy moves its bytes through skopeo). It also records the order and seed of every round.
 
-> **Status: Planned.** Published runs are taken only from a commit on `main`, recorded by its full hash, so a run can be rebuilt later. Most commits behind the April 2026 runs are gone from the repository's history.
+Published runs are taken only from a commit on `main`, recorded by its full hash, so a run can be rebuilt later. Most commits behind the April 2026 runs are gone from the repository's history.
 
 ## Fairness steps already enforced
 
@@ -147,42 +147,44 @@ ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the
 
 ## Published runs
 
-> **Status: Planned.** Today any run of the whole main corpus at ocync's default cap rewrites the performance page, and the README sentence, the page description and the banner are edited by hand.
-
 Every public number comes from one run, called the published run, and from nothing else. Each surface that shows a number names that run by its timestamp.
 
 The archive shows what happens without this rule. The cold-sync figures published since April came from a 39-image corpus (`2026-04-26-131910`), a 40-image one (`2026-10-31-035712`) and a 25-image one (`2026-10-31-211851`), over 1, 4 and 5 rounds. The tools compared changed from run to run: dregsy left, ocync's own April build joined, and the per-tag tools never appeared. The banner, the README and the performance page each quote a different one of those runs.
 
 ### What a run must be to be published
 
-A run is published only through `cargo xtask bench-remote --publish`. The flag refuses to start unless all of the following hold, and checks them again before writing:
+A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below, and `bench-remote` also refuses a commit that is not on `origin/main`, before it pushes. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
-- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them. A tool that fails the content check, or fails to finish, stays in the table as a row naming the failure. It is never dropped.
+- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. The page keeps a column for each of the seven, so a tool with no run reads `--` there and never leaves the table. Today a tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
-- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults.
+- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the pre-warm run and the proxy on. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy` and `--measure-proxy-overhead` are refused.
 - **Build:** a commit on `main`, recorded by its full hash.
-- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region.
-- **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published.
+- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region. The scenario is `sync` or `all`, so the cold and the warm sync both run.
+- **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published. `--limit` and `--skip-registries` are refused with it.
+
+> **Status: Planned.** A tool that fails the content check, or fails to finish, stays in the page as a column that names the failure, and the run goes on to the rest. Today the first failure stops the run.
 
 ### What it writes
 
 From the one run record, `--publish` writes:
 
-- **Performance page tables:** one per scenario, cold and warm, between the existing markers. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line under the table gives the run timestamp, the commit, the instance, the corpus size and the round count. Ranges, per-round ratios and confidence stay in the run record and in this document. They are not on the page.
+- **Performance page tables:** one per scenario, cold and warm, between the existing markers, with a column for each of the seven tools, ocync first. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line above the table gives the date, the run timestamp, the short commit, the instance, the corpus size, the target and the round count. Ranges, per-round ratios and confidence are not on the page. They stay in the run record, and the run's `summary.md` carries them.
 - **Page description:** the `description` front matter of `docs/src/content/performance.md`.
 - **README:** the summary sentence in `README.md`, between a new pair of markers.
 - **Homepage and banners:** the speed and request figures in `docs/src/pages/index.astro`, in `docs/public/ecr-banner.svg` and `docs/public/og-image.svg`, and in the README banner's alt text. The PNG copies are rendered from the SVGs with `sharp`, which the docs site already installs.
 
-Every surface states its numbers the same way: the median ratio against regsync and the request and byte savings against it, rounded the same way. The page and the README name the run timestamp beside them. A run without `--publish` writes none of these surfaces.
+Every surface states its numbers the same way, computed once from the record. The speed is the median over the rounds of regsync's wall clock divided by ocync's, round by round, to one decimal (`2.9x` in a banner, `2.9 times faster than regsync` in prose). The request saving is the percent fewer requests than regsync from the medians, in whole percent. The byte saving is the gigabytes fewer response bytes than regsync from the medians, to one decimal, in prose only. All of it is the cold sync. A run where regsync has no value in every round, or where ocync is not ahead of it, publishes nothing, since the surfaces word the figures as gains.
+
+Each generated region sits between a pair of marker comments (`<!-- BENCH-README:START -->` and `<!-- BENCH-README:END -->` in Markdown and SVG, `// BENCH-STATS:START` in the homepage script, `# BENCH-DESCRIPTION:START` in the page's front matter) and names the run by its timestamp, in its text or in a comment line inside the markers. The banner SVGs carry it in their `<desc>`. A run without `--publish` writes none of these surfaces. The surfaces are all computed and checked before any is written, so a marker that has gone missing stops the publish before it changes a file. Fetching an older published run after a newer one leaves the surfaces on the newer one.
 
 ### Telling a published record from an experiment
 
-The archive keeps every run, experiments included. `--publish` sets `published: true` on its record. The page, the description and the README all cite the newest published record. Every other record is an experiment, whatever its corpus or rounds.
+The archive keeps every run, experiments included. `--publish` sets `published: true` on its record. Every surface cites the newest published record. Every other record is an experiment, whatever its corpus or rounds.
 
 ### The check that keeps them in line
 
-A test reads the newest published record from `bench/results/ecr.json`, computes the published numbers from it, and fails when any surface above, other than the PNG copies, differs from them or cites another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others. Until the first published run, the archive holds no published record and the surfaces keep the text they have.
+A test reads the newest published record from `bench/results/ecr.json`, computes every generated region from it, and fails when any surface above, other than the PNG copies, differs from the result or cites another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others. The PNG copies are the one thing it cannot check, so the publish step renders them and fails when it cannot. Until the first published run, the archive holds no published record and the surfaces keep the text they have. Other tests fit a stand-in run to every tracked file, so a deleted marker fails CI before the first publish does.
 
 ## What we do not do
 

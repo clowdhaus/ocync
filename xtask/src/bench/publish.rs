@@ -270,7 +270,8 @@ impl Headline {
         };
         let missing = |what: &str| {
             format!(
-                "regsync has no {what} in every cold round, so there is nothing to compare ocync with"
+                "ocync or regsync has no {what} in every cold round, so there is nothing to \
+                 compare them by"
             )
         };
 
@@ -650,7 +651,13 @@ fn render_banners(root: &Path) -> Result<(), String> {
         .args(["run", "--silent", RENDER_SCRIPT])
         .current_dir(&docs)
         .status()
-        .map_err(|e| format!("could not run npm in {}: {e}", docs.display()))?;
+        .map_err(|e| {
+            format!(
+                "the surfaces are written, but npm could not run in {} ({e}); put node on PATH \
+                 and run `npm run {RENDER_SCRIPT}` there, so the banner PNGs match their SVGs",
+                docs.display()
+            )
+        })?;
     if status.success() {
         Ok(())
     } else {
