@@ -12,13 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::bench::corpus;
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
+use crate::bench::publish::{self, Publication};
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::{PER_TAG_JOBS, Tool};
 use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
-
-/// The docs performance page, relative to the repository root.
-pub(crate) const PERFORMANCE_PAGE: &str = "docs/src/content/performance.md";
 
 /// The directory of the per-registry run archives, relative to the repository
 /// root.
@@ -44,8 +42,18 @@ fn is_zero(v: &u64) -> bool {
 pub(crate) struct RunRecord {
     /// UTC timestamp when the run started (`YYYY-MM-DD-HHMMSS`).
     pub(crate) timestamp: String,
-    /// Short git commit hash at the time of the run.
+    /// Git commit hash at the time of the run: the short hash, or for a
+    /// published run the full 40-digit hash, so the run can be rebuilt later.
     pub(crate) git_ref: String,
+    /// Whether this is the published run, the source of every public number.
+    /// Absent for an experiment and from records written before publication
+    /// existed. See `docs/src/content/design/benchmark.md`.
+    #[serde(
+        default,
+        rename = "published",
+        skip_serializing_if = "Publication::is_archive"
+    )]
+    pub(crate) publication: Publication,
     /// When the corpus lock the run synced against was written. Runs under
     /// different locks synced different content and are different series;
     /// absent from records written before the lock existed and from runs that
@@ -132,6 +140,7 @@ impl RunRecord {
         Self {
             timestamp: report.timestamp.clone(),
             git_ref,
+            publication: Publication::Archive,
             sync_from: SyncFrom::of(corpus_locked_at.as_ref()),
             corpus_locked_at,
             machine: MachineInfo {
@@ -763,7 +772,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 ///
 /// Returned string starts with a leading newline so it can be appended
 /// directly after a metric table without manual spacing.
-fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option<String> {
+fn referrer_footnote(baseline: Option<&CommitSha>, rounds: &[&ScenarioResult]) -> Option<String> {
     let calls: Vec<(Tool, u64)> = rounds_by_tool(rounds)
         .into_iter()
         .filter_map(|(tool, runs)| {
@@ -781,7 +790,7 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     let without: Vec<String> = calls
         .iter()
         .filter(|&&(tool, n)| !tool.is_ocync() && n == 0)
-        .map(|&(tool, _)| report.label(tool))
+        .map(|&(tool, _)| tool_label(tool, baseline))
         .collect();
     let mut out = String::new();
     out.push('\n');
@@ -804,7 +813,7 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
     out.push_str("this artifact content for ocync.\n>\n> ");
     let parts: Vec<String> = calls
         .iter()
-        .map(|&(tool, n)| format!("{}: {n}", report.label(tool)))
+        .map(|&(tool, n)| format!("{}: {n}", tool_label(tool, baseline)))
         .collect();
     out.push_str(&format!("Referrers calls -- {}.\n", parts.join(", ")));
     Some(out)
@@ -814,11 +823,14 @@ fn referrer_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option
 /// `None` without one. They run a process per tag, so the cell is the largest
 /// process, not what the run held at once. Leads with a newline like
 /// [`referrer_footnote`].
-fn per_process_rss_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) -> Option<String> {
+fn per_process_rss_footnote(
+    baseline: Option<&CommitSha>,
+    rounds: &[&ScenarioResult],
+) -> Option<String> {
     let tools: Vec<String> = rounds_by_tool(rounds)
         .into_keys()
         .filter(|tool| tool.is_per_tag())
-        .map(|tool| report.label(tool))
+        .map(|tool| tool_label(tool, baseline))
         .collect();
     (!tools.is_empty()).then(|| {
         format!(
@@ -830,10 +842,10 @@ fn per_process_rss_footnote(report: &BenchReport, rounds: &[&ScenarioResult]) ->
 }
 
 /// The footnotes under a scenario's tables, each with a leading newline.
-fn footnotes(report: &BenchReport, rounds: &[&ScenarioResult]) -> String {
+pub(crate) fn footnotes(baseline: Option<&CommitSha>, rounds: &[&ScenarioResult]) -> String {
     [
-        referrer_footnote(report, rounds),
-        per_process_rss_footnote(report, rounds),
+        referrer_footnote(baseline, rounds),
+        per_process_rss_footnote(baseline, rounds),
     ]
     .into_iter()
     .flatten()
@@ -912,10 +924,16 @@ fn summary_markdown(report: &BenchReport) -> String {
             .copied()
             .filter(|tool| by_tool.contains_key(tool))
             .collect();
-        render_metric_table(report, &ran, &by_tool, &mut out);
+        render_metric_table(
+            report.baseline.as_ref(),
+            &ran,
+            &by_tool,
+            Detail::Ranged,
+            &mut out,
+        );
         render_comparison(report, &rounds, &mut out);
         render_proxy_overhead(report, &rounds, &mut out);
-        out.push_str(&footnotes(report, &rounds));
+        out.push_str(&footnotes(report.baseline.as_ref(), &rounds));
         out.push('\n');
     }
 
@@ -923,7 +941,9 @@ fn summary_markdown(report: &BenchReport) -> String {
 }
 
 /// The runs of a scenario's rounds, keyed by tool.
-fn rounds_by_tool<'a>(rounds: &[&'a ScenarioResult]) -> BTreeMap<Tool, Vec<&'a ToolRun>> {
+pub(crate) fn rounds_by_tool<'a>(
+    rounds: &[&'a ScenarioResult],
+) -> BTreeMap<Tool, Vec<&'a ToolRun>> {
     let mut by_tool: BTreeMap<Tool, Vec<&ToolRun>> = BTreeMap::new();
     for run in rounds.iter().flat_map(|round| &round.runs) {
         by_tool.entry(run.tool).or_default().push(run);
@@ -948,10 +968,11 @@ fn tool_columns(report: &BenchReport) -> Vec<Tool> {
 }
 
 /// A single row in a benchmark comparison table.
-struct MetricRow {
-    label: &'static str,
+pub(crate) struct MetricRow {
+    /// The row's name in the tables.
+    pub(crate) label: &'static str,
     /// The value that decides the row's winner and that the spread is taken of.
-    rank: fn(&ToolRun) -> Option<u64>,
+    pub(crate) rank: fn(&ToolRun) -> Option<u64>,
     /// The second number of an `a/b` cell, when the row has one.
     of: Option<fn(&ToolRun) -> Option<u64>>,
     format: fn(u64) -> String,
@@ -960,6 +981,15 @@ struct MetricRow {
     /// round, for a row that is compared round by round.
     verdict_words: Option<[&'static str; 2]>,
 }
+
+/// The label of the Wall clock row.
+pub(crate) const WALL_CLOCK_LABEL: &str = "Wall clock";
+
+/// The label of the Requests row.
+pub(crate) const REQUESTS_LABEL: &str = "Requests";
+
+/// The label of the Response bytes row.
+pub(crate) const RESPONSE_BYTES_LABEL: &str = "Response bytes";
 
 /// The label of the Peak RSS row, whose cells for the per-tag tools are the
 /// largest of many processes and so do not compare with the others' whole-run
@@ -971,13 +1001,13 @@ fn count(n: u64) -> String {
 }
 
 /// The standard set of metric rows for benchmark comparison tables.
-fn metric_rows() -> [MetricRow; 10] {
+pub(crate) fn metric_rows() -> [MetricRow; 10] {
     fn proxy(r: &ToolRun, value: fn(&ProxyMetrics) -> u64) -> Option<u64> {
         r.proxy_metrics.as_ref().map(value)
     }
     [
         MetricRow {
-            label: "Wall clock",
+            label: WALL_CLOCK_LABEL,
             rank: |r| Some((r.wall_clock_secs * 1000.0) as u64),
             of: None,
             format: |ms| format_duration(Duration::from_millis(ms)),
@@ -993,7 +1023,7 @@ fn metric_rows() -> [MetricRow; 10] {
             verdict_words: None,
         },
         MetricRow {
-            label: "Requests",
+            label: REQUESTS_LABEL,
             rank: |r| proxy(r, |m| m.requests),
             of: None,
             format: count,
@@ -1001,7 +1031,7 @@ fn metric_rows() -> [MetricRow; 10] {
             verdict_words: Some(["fewer", "more"]),
         },
         MetricRow {
-            label: "Response bytes",
+            label: RESPONSE_BYTES_LABEL,
             rank: |r| proxy(r, |m| m.response_bytes),
             of: None,
             format: format_bytes,
@@ -1060,8 +1090,19 @@ fn metric_rows() -> [MetricRow; 10] {
 }
 
 /// The spread of integer values, as the statistics module takes them.
-fn spread_of(values: impl Iterator<Item = u64>) -> Option<stats::Spread> {
+pub(crate) fn spread_of(values: impl Iterator<Item = u64>) -> Option<stats::Spread> {
     stats::spread(&values.map(|v| v as f64).collect::<Vec<_>>())
+}
+
+/// How much of a row's rounds a cell shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Detail {
+    /// The median alone, with the best of the row bold. What the performance
+    /// page shows.
+    Median,
+    /// The median with the lowest and highest in brackets, and a median bold
+    /// only when its range overlaps no other tool's. What the summary shows.
+    Ranged,
 }
 
 /// A tool's cell in a row: its spread over the runs and how it reads.
@@ -1070,7 +1111,7 @@ struct Cell {
     /// How many runs the spread is over.
     runs: usize,
     /// The median, followed by the lowest and highest in brackets when there
-    /// is more than one run. For an `a/b` row the brackets hold both ranges,
+    /// is more than one run and the detail is [`Detail::Ranged`]. For an `a/b` row the brackets hold both ranges,
     /// `(a_low..a_high / b_low..b_high)`.
     text: String,
 }
@@ -1078,7 +1119,7 @@ struct Cell {
 /// A tool's cell in a row, `None` when a run has no value for it. A run with
 /// no value for the row is left out of the spread, and of the count the
 /// brackets and the bold rule depend on.
-fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
+fn cell(row: &MetricRow, runs: &[&ToolRun], detail: Detail) -> Option<Cell> {
     let values: Vec<f64> = runs
         .iter()
         .filter_map(|r| (row.rank)(r))
@@ -1095,7 +1136,7 @@ fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
     if let Some(d) = &denominator {
         text = format!("{text}/{}", shown(d.median));
     }
-    if values.len() > 1 {
+    if values.len() > 1 && detail == Detail::Ranged {
         let ranges = match &denominator {
             Some(d) => format!("{} / {}", range(&spread), range(d)),
             None => range(&spread),
@@ -1110,9 +1151,9 @@ fn cell(row: &MetricRow, runs: &[&ToolRun]) -> Option<Cell> {
 }
 
 /// Whether a cell is bolded as the best of its row: the best median, and with
-/// rounds, only when its range overlaps no other tool's, since a median that
-/// another tool's rounds reach does not separate them.
-fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
+/// [`Detail::Ranged`] rounds, only when its range overlaps no other tool's,
+/// since a median that another tool's rounds reach does not separate them.
+fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>], detail: Detail) -> bool {
     let competitors = || cells.iter().flatten().filter(|c| !std::ptr::eq(*c, cell));
     let best = competitors().all(|other| {
         if row.lower_is_better {
@@ -1123,7 +1164,8 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
     });
     let separate =
         |other: &Cell| cell.spread.min > other.spread.max || other.spread.min > cell.spread.max;
-    best && competitors().next().is_some() && (cell.runs == 1 || competitors().all(separate))
+    best && competitors().next().is_some()
+        && (detail == Detail::Median || cell.runs == 1 || competitors().all(separate))
 }
 
 /// Renders a metric comparison table into `out`.
@@ -1131,16 +1173,17 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>]) -> bool {
 /// Columns are tool names, rows are metrics. The best value per row is bolded
 /// when more than one tool has data for that metric, see [`is_bold`]. The Peak
 /// RSS row bolds nothing when a per-tag tool ran, as [`per_process_rss_footnote`]
-/// explains.
-fn render_metric_table(
-    report: &BenchReport,
+/// explains. A cell with no value reads `--`.
+pub(crate) fn render_metric_table(
+    baseline: Option<&CommitSha>,
     columns: &[Tool],
     by_tool: &BTreeMap<Tool, Vec<&ToolRun>>,
+    detail: Detail,
     out: &mut String,
 ) {
     out.push_str("| Metric |");
     for &col in columns {
-        out.push_str(&format!(" {} |", report.label(col)));
+        out.push_str(&format!(" {} |", tool_label(col, baseline)));
     }
     out.push('\n');
     out.push_str("|---|");
@@ -1155,13 +1198,13 @@ fn render_metric_table(
         let comparable = !(per_process_peaks && row.label == PEAK_RSS_LABEL);
         let cells: Vec<Option<Cell>> = columns
             .iter()
-            .map(|col| by_tool.get(col).and_then(|runs| cell(row, runs)))
+            .map(|col| by_tool.get(col).and_then(|runs| cell(row, runs, detail)))
             .collect();
 
         out.push_str(&format!("| {} |", row.label));
         for cell in &cells {
             match cell {
-                Some(cell) if comparable && is_bold(row, cell, &cells) => {
+                Some(cell) if comparable && is_bold(row, cell, &cells, detail) => {
                     out.push_str(&format!(" **{}** |", cell.text));
                 }
                 Some(cell) => out.push_str(&format!(" {} |", cell.text)),
@@ -1174,7 +1217,11 @@ fn render_metric_table(
 
 /// The ratio `other / ocync` of a row's metric in each round, `None` unless
 /// both tools have a value in every round.
-fn round_ratio(rounds: &[&ScenarioResult], other: Tool, row: &MetricRow) -> Option<Ratio> {
+pub(crate) fn round_ratio(
+    rounds: &[&ScenarioResult],
+    other: Tool,
+    row: &MetricRow,
+) -> Option<Ratio> {
     let pairs: Vec<Pair> = rounds
         .iter()
         .map(|round| {
@@ -1318,8 +1365,8 @@ fn render_proxy_overhead(report: &BenchReport, rounds: &[&ScenarioResult], out: 
 /// Writes the benchmark summary to `output_dir`.
 ///
 /// Creates `summary.md` -- the human-readable comparison table with
-/// per-scenario metrics and winners bolded. The performance page and the
-/// compact per-registry JSON archive are written separately, see
+/// per-scenario metrics and winners bolded. The compact per-registry JSON
+/// archive and the published surfaces are written separately, see
 /// [`ArchiveMode`].
 pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
@@ -1330,63 +1377,6 @@ pub(crate) fn write_report(output_dir: &Path, report: &BenchReport) -> Result<()
     std::fs::write(&md_path, md).map_err(|e| format!("write {}: {e}", md_path.display()))?;
 
     Ok(())
-}
-
-/// Generates a benchmark results snippet for one scenario.
-///
-/// Produces a context header with `description`, naming the number of rounds
-/// when there is more than one, and the scenario's comparison table (metrics
-/// as rows, tools as columns, winners bolded).
-fn scenario_markdown(
-    report: &BenchReport,
-    rounds: &[&ScenarioResult],
-    description: &str,
-) -> String {
-    let inst = &report.instance;
-    let mut out = String::new();
-
-    let proxy_note = if rounds
-        .iter()
-        .flat_map(|round| &round.runs)
-        .all(|r| r.proxy_metrics.is_none())
-    {
-        "Direct connections (proxy disabled -- no traffic metrics)."
-    } else {
-        "All traffic routed through bench-proxy for byte-accurate measurement."
-    };
-
-    let memory_gib = inst.memory_mib as f64 / 1024.0;
-    out.push_str(&format!(
-        "Measured {date} on {inst_type} ({arch}, {vcpus} vCPUs, {mem:.0} GiB, {net}). \
-         Full corpus: {images} images, {tags} tags. {description} to ECR {region}. \
-         {proxy_note}{round_note}\n\n",
-        date = report.timestamp.get(..10).unwrap_or(&report.timestamp),
-        inst_type = inst.instance_type,
-        arch = inst.arch,
-        vcpus = inst.vcpus,
-        mem = memory_gib,
-        net = inst.network_performance,
-        images = report.corpus.images,
-        tags = report.corpus.tags,
-        region = inst.region,
-        round_note = if rounds[0].round.is_some() {
-            format!(
-                " {}, the tool order shuffled in each. A cell is the median over \
-                 the rounds, with the lowest and highest in brackets; a paired cell (a/b) brackets \
-                 the range of each value, in the order shown.",
-                report.rounds_note(rounds.len())
-            )
-        } else {
-            String::new()
-        },
-    ));
-
-    let columns = tool_columns(report);
-    render_metric_table(report, &columns, &rounds_by_tool(rounds), &mut out);
-    render_comparison(report, rounds, &mut out);
-    out.push_str(&footnotes(report, rounds));
-
-    out
 }
 
 /// The results of the scenario of this kind, one per round, in the order they
@@ -1406,135 +1396,19 @@ fn kinds(scenarios: &[ScenarioResult]) -> Vec<ScenarioKind> {
     kinds
 }
 
-const BENCH_COLD_START: &str = "<!-- BENCH:START -->";
-const BENCH_COLD_END: &str = "<!-- BENCH:END -->";
-const BENCH_WARM_START: &str = "<!-- BENCH-WARM:START -->";
-const BENCH_WARM_END: &str = "<!-- BENCH-WARM:END -->";
-
-/// Replaces content between `start_marker` and `end_marker` with `snippet`.
-///
-/// Returns `Ok(true)` if markers were found and replaced, `Ok(false)` if
-/// the markers were not present (caller decides whether that is an error).
-fn replace_between_markers(
-    content: &str,
-    start_marker: &str,
-    end_marker: &str,
-    snippet: &str,
-) -> Result<Option<String>, String> {
-    let start = match content.find(start_marker) {
-        Some(pos) => pos,
-        None => return Ok(None),
-    };
-    let end = match content.find(end_marker) {
-        Some(pos) => pos,
-        None => {
-            return Err(format!(
-                "{end_marker} not found but {start_marker} is present"
-            ));
-        }
-    };
-    if start >= end {
-        return Err(format!("{start_marker} must appear before {end_marker}"));
-    }
-
-    let mut updated = String::with_capacity(content.len());
-    updated.push_str(&content[..start + start_marker.len()]);
-    updated.push('\n');
-    updated.push_str(snippet);
-    updated.push_str(&content[end..]);
-    Ok(Some(updated))
-}
-
-/// The performance-page blocks of a run: the text that replaces the content
-/// between each scenario's marker pair.
-///
-/// - `<!-- BENCH:START -->` / `<!-- BENCH:END -->` for the cold scenario
-/// - `<!-- BENCH-WARM:START -->` / `<!-- BENCH-WARM:END -->` for the warm one
-#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PageBlocks {
-    /// The cold-sync block; `None` when the run has no cold scenario.
-    cold: Option<String>,
-    /// The warm-sync block; `None` when the run has no warm scenario.
-    warm: Option<String>,
-}
-
-impl PageBlocks {
-    /// The blocks `report` produces. A run whose transfer cap is not ocync's
-    /// default produces none: the page shows ocync as it runs out of the box.
-    /// Nor does a run without ocync, a run of a named corpus (the page is the
-    /// main corpus's), a run of part of the corpus, or a run that paired each
-    /// proxied run with a direct one, which doubled the load every run met.
-    pub(crate) fn of(report: &BenchReport) -> Self {
-        if !report.corpus.id.is_main()
-            || report.coverage != Coverage::Whole
-            || report.ocync_transfer_cap() != Some(DEFAULT_MAX_CONCURRENT_TRANSFERS)
-            || report
-                .scenarios
-                .iter()
-                .flat_map(|scenario| &scenario.runs)
-                .any(|run| run.direct_wall_clock_secs.is_some())
-        {
-            return Self::default();
-        }
-        let block = |kind, description| {
-            let rounds = rounds_of(&report.scenarios, kind);
-            (!rounds.is_empty()).then(|| scenario_markdown(report, &rounds, description))
-        };
-        Self {
-            cold: block(ScenarioKind::Cold, "Cold sync"),
-            warm: block(ScenarioKind::Warm, "Warm sync (no changes)"),
-        }
-    }
-
-    /// Writes the blocks into the page at `path`, replacing what is between
-    /// each marker pair, so applying the same blocks twice leaves the page as
-    /// applying them once. A pair missing from the page is skipped with a
-    /// warning; a page with no block to write is left untouched. Returns
-    /// whether the page was written.
-    pub(crate) fn apply(&self, path: &Path) -> Result<bool, String> {
-        let mut content =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-
-        let mut updated = false;
-        for (block, start, end, name) in [
-            (&self.cold, BENCH_COLD_START, BENCH_COLD_END, "cold"),
-            (&self.warm, BENCH_WARM_START, BENCH_WARM_END, "warm"),
-        ] {
-            let Some(snippet) = block else { continue };
-            match replace_between_markers(&content, start, end, snippet)? {
-                Some(new_content) => {
-                    content = new_content;
-                    updated = true;
-                }
-                None => {
-                    eprintln!(
-                        "WARNING: {start} marker not found in {}; skipping {name} update",
-                        path.display()
-                    );
-                }
-            }
-        }
-
-        if updated {
-            std::fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-        }
-
-        Ok(updated)
-    }
-}
-
-/// Where a run's record and performance-page blocks go.
+/// Where a run's record and published surfaces go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ArchiveMode {
-    /// Append the record to the tracked archive and update the tracked page.
+    /// Append the record to the tracked archive and, for a published run,
+    /// write the tracked surfaces.
     Write,
-    /// Touch neither: write both into the run's output directory
+    /// Touch neither: write the record into the run's output directory
     /// ([`Deferred`]) for whoever fetches the run to apply.
     Defer,
 }
 
 /// What a deferred run leaves in its output directory in place of writing the
-/// tracked archive and page.
+/// tracked archive and surfaces.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Deferred {
     /// The archive the record belongs to: `{archive_key}.json`.
@@ -1542,18 +1416,15 @@ pub(crate) struct Deferred {
     /// The run's record; `None` for a run that is not comparable to the
     /// archived ones, which the archive never takes.
     record: Option<RunRecord>,
-    /// The page blocks.
-    page: PageBlocks,
 }
 
 impl Deferred {
     /// The deferred output of a run: its `record` going to the archive
-    /// `archive_key`, and the `page` blocks.
-    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>, page: PageBlocks) -> Self {
+    /// `archive_key`.
+    pub(crate) fn new(archive_key: &str, record: Option<RunRecord>) -> Self {
         Self {
             archive_key: archive_key.to_string(),
             record,
-            page,
         }
     }
 
@@ -1580,29 +1451,55 @@ impl Deferred {
             .map_err(|e| format!("parse {}: {e}", path.display()))
     }
 
-    /// Appends the record to the archive in `archive_dir` and writes the
-    /// blocks into `page`; the one step a local run and a fetched run share.
-    /// Safe to repeat, see [`append_record`]. A record that cannot be appended
-    /// is an error. A `page` that does not exist is left alone, and one that
-    /// cannot be updated (broken markers, say) is a warning, never an error.
-    pub(crate) fn apply(self, archive_dir: &Path, page: &Path) -> Result<(), String> {
-        if let Some(record) = self.record {
-            append_record(archive_dir, &self.archive_key, record)?;
+    /// Appends the record to the archive in `archive_dir` and, for a published
+    /// run, writes the surfaces under the repository at `root`; the one step a
+    /// local run and a fetched run share. Safe to repeat, see
+    /// [`append_record`]. A record that cannot be appended is an error.
+    ///
+    /// The record is appended first, since a local run has no other copy of
+    /// it. The surfaces are then all computed and checked before any file is
+    /// written, so a surface that cannot be updated (a missing marker, say) is
+    /// an error that names `cargo xtask bench-publish-surfaces` to finish once
+    /// it is fixed. A published run that an archived published run is newer
+    /// than writes no surface, so fetching an old run cannot turn the surfaces
+    /// back.
+    pub(crate) fn apply(
+        self,
+        archive_dir: &Path,
+        root: &Path,
+        banners: publish::Banners,
+    ) -> Result<(), String> {
+        let Some(record) = self.record else {
+            return Ok(());
+        };
+        let published = record.publication == Publication::Publish;
+        let timestamp = record.timestamp.clone();
+        append_record(archive_dir, &self.archive_key, record)?;
+        eprintln!(
+            "bench: run record is in {}",
+            archive_dir
+                .join(format!("{}.json", self.archive_key))
+                .display()
+        );
+        if !published {
+            return Ok(());
+        }
+        let newest = publish::newest_published(archive_dir, &self.archive_key)?
+            .filter(|newest| newest.timestamp == timestamp);
+        let Some(newest) = newest else {
             eprintln!(
-                "bench: run record is in {}",
-                archive_dir
-                    .join(format!("{}.json", self.archive_key))
-                    .display()
+                "WARNING: the archive holds a newer published run than {timestamp}, so it \
+                 writes no surface"
             );
-        }
-        if page.exists() {
-            match self.page.apply(page) {
-                Ok(true) => eprintln!("bench: updated {}", page.display()),
-                Ok(false) => {}
-                Err(e) => eprintln!("WARNING: failed to update {}: {e}", page.display()),
-            }
-        }
-        Ok(())
+            return Ok(());
+        };
+        let planned = publish::plan(root, &newest).map_err(|e| {
+            format!(
+                "{e}; the run record is in the archive, so fix the cause and run \
+                 `cargo xtask bench-publish-surfaces` to write the surfaces"
+            )
+        })?;
+        planned.write(root, banners)
     }
 }
 
@@ -1676,7 +1573,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A finished cold-sync report to build records and page blocks from.
+    /// A finished cold-sync report to build records from.
     pub(crate) fn sample_report() -> BenchReport {
         BenchReport {
             baseline: None,
@@ -1933,27 +1830,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_named_or_partial_run_writes_no_page_blocks_and_is_recorded_as_such() {
-        // Catches: a run of a shape corpus, or a `--limit` or
-        // `--skip-registries` run, overwriting the main corpus's cold and warm
-        // blocks on the performance page; a named run recorded as the main
-        // corpus; a main-corpus record gaining a name; a partial run recorded
-        // as whole; and a whole run's record gaining a coverage.
+    fn a_named_or_partial_run_is_recorded_as_such() {
+        // Catches: a named run recorded as the main corpus; a main-corpus
+        // record gaining a name; a partial run recorded as whole; and a whole
+        // run's record gaining a coverage.
         let mut report = sample_report();
         let record = |report: &BenchReport| {
             serde_json::to_value(RunRecord::of(report, "abc1234".into(), None)).unwrap()
         };
-        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"].get("name"), None);
         assert_eq!(record(&report).get("coverage"), None);
 
         report.coverage = Coverage::Subset;
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["coverage"], "subset");
 
         report.coverage = Coverage::Whole;
         report.corpus.id = corpus::Id::Named(CorpusName::new("corpus-small"));
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
         assert_eq!(record(&report)["corpus"]["name"], "corpus-small");
     }
 
@@ -1982,10 +1874,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_cap_ocync_ran_with_is_recorded_and_a_capped_run_writes_no_page_blocks() {
+    fn the_cap_ocync_ran_with_is_recorded() {
         // Catches: a run at ocync's default recorded as uncapped, so a later
-        // default sits in the same series as the old one; a capped run
-        // published on the page as ocync's out-of-the-box result; the baseline
+        // default sits in the same series as the old one; the baseline
         // build's default taken to be the current one's.
         let default = DEFAULT_MAX_CONCURRENT_TRANSFERS;
         let mut report = five_rounds(1);
@@ -2004,10 +1895,6 @@ pub(crate) mod tests {
             "ocync ran with `max_concurrent_transfers: {default}`; the baseline build ran at \
              its own default, which may differ\n"
         )));
-        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
-
-        report.max_concurrent_transfers = Some(default);
-        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
 
         report.max_concurrent_transfers = NonZeroUsize::new(30);
         let record = RunRecord::of(&report, "abc1234".into(), None);
@@ -2030,7 +1917,6 @@ pub(crate) mod tests {
         assert!(
             summary_markdown(&report).contains("ocync ran with `max_concurrent_transfers: 30`\n")
         );
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
 
         let mut no_ocync = sample_report();
         no_ocync.tool_versions.remove(&Tool::Ocync);
@@ -2038,8 +1924,6 @@ pub(crate) mod tests {
         assert_eq!(record.max_concurrent_transfers, None);
         assert_eq!(record.baseline_max_concurrent_transfers, None);
         assert!(!summary_markdown(&no_ocync).contains("max_concurrent_transfers"));
-        // Catches: a run of only other tools replacing ocync's row on the page.
-        assert_eq!(PageBlocks::of(&no_ocync), PageBlocks::default());
     }
 
     #[test]
@@ -2276,18 +2160,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_deferred_run_is_applied_once_however_often_it_is_fetched() {
+    fn a_deferred_run_is_recorded_once_however_often_it_is_fetched() {
         let run = tempfile::tempdir().unwrap();
         let local = tempfile::tempdir().unwrap();
-        let page = local.path().join("performance.md");
-        let marked = "<!-- BENCH:START -->\nold\n<!-- BENCH:END -->\n";
-        std::fs::write(&page, marked).unwrap();
 
         // A directory with no deferred output has nothing to apply.
         assert!(Deferred::read(run.path()).unwrap().is_none());
 
-        let report = sample_report();
-        Deferred::new("ecr", Some(sample_record()), PageBlocks::of(&report))
+        Deferred::new("ecr", Some(sample_record()))
             .write(run.path())
             .unwrap();
 
@@ -2295,7 +2175,7 @@ pub(crate) mod tests {
             Deferred::read(run.path())
                 .unwrap()
                 .unwrap()
-                .apply(local.path(), &page)
+                .apply(local.path(), local.path(), publish::Banners::Skip)
                 .unwrap();
         }
 
@@ -2303,42 +2183,18 @@ pub(crate) mod tests {
         let records: Vec<RunRecord> =
             serde_json::from_str(&std::fs::read_to_string(archive).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
-        let content = std::fs::read_to_string(&page).unwrap();
-        assert!(content.contains("Measured 2026-04-15"), "{content}");
-        assert!(!content.contains("\nold\n"), "{content}");
-        assert_eq!(content.matches("Measured").count(), 1);
-    }
-
-    #[test]
-    fn a_page_that_cannot_be_updated_is_a_warning_not_an_error() {
-        let local = tempfile::tempdir().unwrap();
-        let page = local.path().join("performance.md");
-        // End marker before the start marker: the page cannot take the block.
-        let broken = "<!-- BENCH:END -->\n<!-- BENCH:START -->\n";
-        std::fs::write(&page, broken).unwrap();
-
-        Deferred::new(
-            "ecr",
-            Some(sample_record()),
-            PageBlocks::of(&sample_report()),
-        )
-        .apply(local.path(), &page)
-        .unwrap();
-
-        assert_eq!(std::fs::read_to_string(&page).unwrap(), broken);
-        assert!(local.path().join("ecr.json").exists(), "the record is kept");
+        // Catches: an experiment writing a surface, which would need a file
+        // that is not here to fail.
+        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 1);
     }
 
     #[test]
     fn a_deferred_run_not_comparable_to_the_archive_appends_no_record() {
         let local = tempfile::tempdir().unwrap();
-        let page = local.path().join("performance.md");
-        Deferred::new("ecr", None, PageBlocks::of(&sample_report()))
-            .apply(local.path(), &page)
+        Deferred::new("ecr", None)
+            .apply(local.path(), local.path(), publish::Banners::Skip)
             .unwrap();
         assert!(!local.path().join("ecr.json").exists());
-        // A page that does not exist is not created.
-        assert!(!page.exists());
     }
 
     #[test]
@@ -2378,58 +2234,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scenario_markdown_context_line() {
-        let report = sample_report();
-        let cold = rounds_of(&report.scenarios, ScenarioKind::Cold);
-        let md = scenario_markdown(&report, &cold, "Cold sync");
-        assert!(md.contains("Measured 2026-04-15"));
-        assert!(md.contains("c7g.xlarge"));
-        assert!(md.contains("28 images, 40 tags"));
-        assert!(md.contains("Cold sync to ECR"));
-        // sample_report() has no proxy metrics, so the no-proxy note is shown.
-        assert!(md.contains("Direct connections (proxy disabled"));
-        // Contains the metric table.
-        assert!(md.contains("| Metric | ocync | dregsy |"));
-        assert!(md.contains("| Wall clock |"));
-    }
-
-    #[test]
-    fn scenario_markdown_warm_description() {
-        let report = BenchReport {
-            baseline: None,
-            rounds: Rounds::DEFAULT,
-            max_concurrent_transfers: None,
-            repeated: Vec::new(),
-            timestamp: "2026-04-15-100000".to_string(),
-            instance: test_instance(),
-            corpus: CorpusInfo {
-                id: corpus::Id::Main,
-                images: 28,
-                tags: 40,
-            },
-            relay_versions: BTreeMap::new(),
-            prewarm: None,
-            tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
-            scenarios: vec![ScenarioResult::unshuffled(
-                ScenarioKind::Warm,
-                vec![ToolRun {
-                    tool: Tool::Ocync,
-                    wall_clock_secs: 2.5,
-                    peak_rss_kb: Some(51200),
-                    proxy_metrics: None,
-                    phase_timing_ms: BTreeMap::new(),
-                    direct_wall_clock_secs: None,
-                }],
-            )],
-            ..sample_report()
-        };
-        let warm = rounds_of(&report.scenarios, ScenarioKind::Warm);
-        let md = scenario_markdown(&report, &warm, "Warm sync (no changes)");
-        assert!(md.contains("Warm sync (no changes) to ECR"));
-        assert!(md.contains("| Wall clock | 2s |"), "md:\n{md}");
-    }
-
-    #[test]
     fn rounds_of_selects_by_kind() {
         let mut report = sample_report();
         report.scenarios.insert(
@@ -2443,41 +2247,6 @@ pub(crate) mod tests {
         assert_eq!(cold[0].kind.label(), "Cold sync");
         assert!(rounds_of(&report.scenarios, ScenarioKind::Warm).is_empty());
         assert!(rounds_of(&report.scenarios, ScenarioKind::Scale { images: 25 }).is_empty());
-    }
-
-    #[test]
-    fn page_blocks_replaces_markers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("performance.md");
-        std::fs::write(
-            &path,
-            "# Performance\n\n<!-- BENCH:START -->\nold content\n<!-- BENCH:END -->\n\nFooter\n",
-        )
-        .unwrap();
-
-        let report = sample_report();
-        assert!(PageBlocks::of(&report).apply(&path).unwrap());
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("<!-- BENCH:START -->"));
-        assert!(content.contains("<!-- BENCH:END -->"));
-        assert!(!content.contains("old content"));
-        assert!(content.contains("Measured 2026-04-15"));
-        assert!(content.contains("Footer"));
-    }
-
-    #[test]
-    fn page_blocks_missing_markers_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("performance.md");
-        let original = "# Performance\n\nNo markers here.\n";
-        std::fs::write(&path, original).unwrap();
-
-        let report = sample_report();
-        // Missing markers warn instead of failing: both are optional.
-        PageBlocks::of(&report).apply(&path).unwrap();
-        // File should be unchanged.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     /// Report with populated proxy metrics for full table coverage.
@@ -2711,137 +2480,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn page_blocks_reversed_markers_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("performance.md");
-        std::fs::write(
-            &path,
-            "# Performance\n\n<!-- BENCH:END -->\nold\n<!-- BENCH:START -->\n",
-        )
-        .unwrap();
-
-        let report = sample_report();
-        let err = PageBlocks::of(&report).apply(&path).unwrap_err();
-        assert!(err.contains("must appear before"), "err: {err}");
-    }
-
-    #[test]
-    fn page_blocks_both_cold_and_warm() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("performance.md");
-        std::fs::write(
-            &path,
-            "# Performance\n\n\
-             <!-- BENCH:START -->\nold cold\n<!-- BENCH:END -->\n\n\
-             ## Warm\n\n\
-             <!-- BENCH-WARM:START -->\nold warm\n<!-- BENCH-WARM:END -->\n\n\
-             Footer\n",
-        )
-        .unwrap();
-
-        let report = BenchReport {
-            baseline: None,
-            rounds: Rounds::DEFAULT,
-            max_concurrent_transfers: None,
-            repeated: Vec::new(),
-            timestamp: "2026-04-19-100000".to_string(),
-            instance: test_instance(),
-            corpus: CorpusInfo {
-                id: corpus::Id::Main,
-                images: 39,
-                tags: 51,
-            },
-            relay_versions: BTreeMap::new(),
-            prewarm: None,
-            tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
-            scenarios: vec![
-                ScenarioResult::unshuffled(
-                    ScenarioKind::Cold,
-                    vec![ToolRun {
-                        tool: Tool::Ocync,
-                        wall_clock_secs: 429.0,
-                        peak_rss_kb: Some(51200),
-                        proxy_metrics: None,
-                        phase_timing_ms: BTreeMap::new(),
-                        direct_wall_clock_secs: None,
-                    }],
-                ),
-                ScenarioResult::unshuffled(
-                    ScenarioKind::Warm,
-                    vec![ToolRun {
-                        tool: Tool::Ocync,
-                        wall_clock_secs: 2.0,
-                        peak_rss_kb: Some(40960),
-                        proxy_metrics: None,
-                        phase_timing_ms: BTreeMap::new(),
-                        direct_wall_clock_secs: None,
-                    }],
-                ),
-            ],
-            ..sample_report()
-        };
-        PageBlocks::of(&report).apply(&path).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("old cold"));
-        assert!(!content.contains("old warm"));
-        assert!(content.contains("Cold sync to ECR"));
-        assert!(content.contains("Warm sync (no changes) to ECR"));
-        assert!(content.contains("Footer"));
-    }
-
-    #[test]
-    fn page_blocks_warm_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("performance.md");
-        std::fs::write(
-            &path,
-            "# Performance\n\n\
-             <!-- BENCH:START -->\nexisting cold data\n<!-- BENCH:END -->\n\n\
-             <!-- BENCH-WARM:START -->\nold warm\n<!-- BENCH-WARM:END -->\n",
-        )
-        .unwrap();
-
-        // Report with only a warm scenario.
-        let report = BenchReport {
-            baseline: None,
-            rounds: Rounds::DEFAULT,
-            max_concurrent_transfers: None,
-            repeated: Vec::new(),
-            timestamp: "2026-04-19-100000".to_string(),
-            instance: test_instance(),
-            corpus: CorpusInfo {
-                id: corpus::Id::Main,
-                images: 39,
-                tags: 51,
-            },
-            relay_versions: BTreeMap::new(),
-            prewarm: None,
-            tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".to_string())]),
-            scenarios: vec![ScenarioResult::unshuffled(
-                ScenarioKind::Warm,
-                vec![ToolRun {
-                    tool: Tool::Ocync,
-                    wall_clock_secs: 3.0,
-                    peak_rss_kb: Some(40960),
-                    proxy_metrics: None,
-                    phase_timing_ms: BTreeMap::new(),
-                    direct_wall_clock_secs: None,
-                }],
-            )],
-            ..sample_report()
-        };
-        PageBlocks::of(&report).apply(&path).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        // Cold section should be untouched.
-        assert!(content.contains("existing cold data"));
-        // Warm section should be replaced.
-        assert!(!content.contains("old warm"));
-        assert!(content.contains("Warm sync (no changes) to ECR"));
-    }
-
-    #[test]
     fn summary_markdown_includes_referrer_footnote_when_present() {
         let report = BenchReport {
             baseline: None,
@@ -2946,51 +2584,6 @@ pub(crate) mod tests {
             !md.contains("OCI 1.1 referrers"),
             "footnote should be absent when no tool has referrer_calls > 0:\n{md}"
         );
-    }
-
-    #[test]
-    fn scenario_markdown_includes_referrer_footnote_when_present() {
-        // Parity with summary.md: the docs performance.md snippet (via
-        // PageBlocks -> scenario_markdown) must also surface
-        // referrers when ocync is in the run.
-        let report = BenchReport {
-            baseline: None,
-            rounds: Rounds::DEFAULT,
-            max_concurrent_transfers: None,
-            repeated: Vec::new(),
-            timestamp: "2026-04-26-100000".into(),
-            instance: test_instance(),
-            corpus: CorpusInfo {
-                id: corpus::Id::Main,
-                images: 28,
-                tags: 40,
-            },
-            relay_versions: BTreeMap::new(),
-            prewarm: None,
-            tool_versions: BTreeMap::from([(Tool::Ocync, "0.1.0".into())]),
-            scenarios: vec![ScenarioResult::unshuffled(
-                ScenarioKind::Cold,
-                vec![ToolRun {
-                    tool: Tool::Ocync,
-                    wall_clock_secs: 250.0,
-                    peak_rss_kb: Some(60_000),
-                    proxy_metrics: Some(ProxyMetrics {
-                        referrer_calls: 79,
-                        ..Default::default()
-                    }),
-                    phase_timing_ms: BTreeMap::new(),
-                    direct_wall_clock_secs: None,
-                }],
-            )],
-            ..sample_report()
-        };
-        let scenario = &report.scenarios[0];
-        let md = scenario_markdown(&report, &[scenario], "Cold sync");
-        assert!(
-            md.contains("OCI 1.1 referrers"),
-            "footnote missing from scenario_markdown:\n{md}"
-        );
-        assert!(md.contains("ocync: 79"), "count missing:\n{md}");
     }
 
     /// What each tool did per round: `(wall clock seconds, requests)`.
@@ -3252,7 +2845,6 @@ pub(crate) mod tests {
             phase_timing_ms: BTreeMap::new(),
             direct_wall_clock_secs: None,
         };
-        let report = sample_report();
         let rss_row = |tools: &[(Tool, u64)], idle: &[Tool]| {
             let runs: Vec<ToolRun> = tools.iter().map(|&(t, kb)| run(t, kb)).collect();
             let columns: Vec<Tool> = tools
@@ -3262,7 +2854,7 @@ pub(crate) mod tests {
                 .collect();
             let by_tool = runs.iter().map(|r| (r.tool, vec![r])).collect();
             let mut out = String::new();
-            render_metric_table(&report, &columns, &by_tool, &mut out);
+            render_metric_table(None, &columns, &by_tool, Detail::Ranged, &mut out);
             out.lines()
                 .find(|line| line.starts_with("| Peak RSS |"))
                 .unwrap()
@@ -3330,7 +2922,10 @@ pub(crate) mod tests {
         let bold = |cells: &[Option<Cell>]| {
             cells
                 .iter()
-                .map(|c| c.as_ref().is_some_and(|c| is_bold(row, c, cells)))
+                .map(|c| {
+                    c.as_ref()
+                        .is_some_and(|c| is_bold(row, c, cells, Detail::Ranged))
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -3362,46 +2957,6 @@ pub(crate) mod tests {
             bold(&[Some(cell((20.0, 10.0, 30.0), 5)), None]),
             [false, false]
         );
-    }
-
-    #[test]
-    fn the_performance_page_block_states_its_round_count() {
-        // Catches: a published table that does not say how many rounds back it,
-        // or that a run stopped short, and a run of one pass claiming some.
-        let report = five_rounds(5);
-        let md = scenario_markdown(
-            &report,
-            &rounds_of(&report.scenarios, ScenarioKind::Cold),
-            "Cold sync",
-        );
-        assert!(
-            md.contains(" 5 rounds, the tool order shuffled in each."),
-            "{md}"
-        );
-        assert!(
-            md.contains("Per-round ratio of the other tool to ocync"),
-            "{md}"
-        );
-
-        let stopped = five_rounds(3);
-        let md = scenario_markdown(
-            &stopped,
-            &rounds_of(&stopped.scenarios, ScenarioKind::Cold),
-            "Cold sync",
-        );
-        assert!(
-            md.contains(" 3 of 5 rounds (stopped), the tool order"),
-            "{md}"
-        );
-
-        let once = sample_report();
-        let md = scenario_markdown(
-            &once,
-            &rounds_of(&once.scenarios, ScenarioKind::Cold),
-            "Cold sync",
-        );
-        assert!(!md.contains("rounds") && !md.contains("Per-round"), "{md}");
-        assert!(!summary_markdown(&once).contains("rounds"));
     }
 
     #[test]
@@ -3516,18 +3071,6 @@ pub(crate) mod tests {
             let md = summary_markdown(&paired_report(rounds));
             assert!(md.contains(row), "{row}\n{md}");
         }
-    }
-
-    #[test]
-    fn a_paired_run_writes_no_page_blocks() {
-        // Catches: times taken while a direct run doubled the load on the
-        // registries replacing the performance page's numbers.
-        let mut report = paired_report(&[(10.0, 8.0); 5]);
-        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
-        for scenario in &mut report.scenarios {
-            scenario.runs[0].direct_wall_clock_secs = None;
-        }
-        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
     }
 
     #[test]

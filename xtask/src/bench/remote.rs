@@ -18,7 +18,8 @@ use super::acr::ENV_TOKEN_FILE;
 use super::corpus;
 use super::gar::ENV_CREDENTIALS;
 use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
-use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
+use super::publish;
+use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred};
 use super::runner::join_tools;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{
@@ -103,6 +104,7 @@ pub(crate) struct BenchRemoteArgs {
             "skip_prewarm",
             "no_proxy",
             "measure_proxy_overhead",
+            "publish",
         ]
     )]
     pub(crate) fetch: bool,
@@ -149,6 +151,13 @@ pub(crate) struct BenchRemoteArgs {
     /// The sync scenario only; doubles its run time.
     #[arg(long, conflicts_with = "no_proxy")]
     pub(crate) measure_proxy_overhead: bool,
+
+    /// Make this the published run, the one every public number comes from
+    /// (passed through to `cargo xtask bench`). Refused unless the run is the
+    /// whole main corpus on ECR with all seven tools at their defaults for 5
+    /// rounds, and unless the commit it builds is on `origin/main`.
+    #[arg(long)]
+    pub(crate) publish: bool,
 
     /// Local directory to save fetched results.
     #[arg(long, default_value = ARCHIVE_DIR)]
@@ -197,7 +206,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         if fetch_results(&config, &args.output, &remote_dir)? == Fetch::CopiedWithoutRecord {
             eprintln!(
                 "bench-remote: {remote_dir} holds no deferred record; copied it, \
-                 applied nothing to the archive or the performance page"
+                 applied nothing to the archive or the surfaces"
             );
         }
         return Ok(());
@@ -215,6 +224,25 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
+    }
+    if args.publish {
+        publish::ensure_publishable(
+            &args.tool_selection,
+            &publish::Shape {
+                scenario: args.scenario,
+                target: args.target,
+                corpus: match &args.corpus {
+                    Some(path) => corpus::id_of(path)?,
+                    None => corpus::Id::Main,
+                },
+                limit: args.limit,
+                skips_registries: args.skip_registries.is_some(),
+                skips_prewarm: args.skip_prewarm,
+                disables_proxy: args.no_proxy,
+                measures_proxy_overhead: args.measure_proxy_overhead,
+                checks_regression: false,
+            },
+        )?;
     }
 
     // Held, with the Terraform outputs read, until this function returns,
@@ -237,6 +265,11 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     // force-push landing between our push and the instance's fetch cannot
     // change what is built.
     let git_sha = resolve_commit(Path::new("."), &git_ref)?;
+    // Before the push, so a commit that cannot be published leaves nothing on
+    // origin and costs no run.
+    if args.publish {
+        ensure_on_main(Path::new("."), &git_sha)?;
+    }
     if let Some(corpus) = &args.corpus {
         ensure_corpus_committed(Path::new("."), &git_sha, corpus)?;
     }
@@ -382,7 +415,7 @@ fn run_result(
         (0, Ok(Fetch::Copied)) => Ok(()),
         (0, Ok(Fetch::CopiedWithoutRecord)) => Err(
             "remote script exited with code 0 but its results hold no deferred record, so \
-             nothing reached the archive or the performance page"
+             nothing reached the archive or the surfaces"
                 .into(),
         ),
         (0, Ok(Fetch::NoResults)) => {
@@ -400,8 +433,7 @@ fn run_result(
 /// The arguments `cargo xtask bench` runs with on the instance, unquoted:
 /// `remote_script` quotes each one. The run starts at `timestamp`, which names
 /// its results directory, and, so that the instance writes no tracked file,
-/// defers its record and page blocks there until the fetch applies them
-/// locally.
+/// defers its record there until the fetch applies it locally.
 fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     let mut bench_args = vec![
         "--archive".to_string(),
@@ -442,6 +474,9 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     }
     if args.measure_proxy_overhead {
         bench_args.push("--measure-proxy-overhead".to_string());
+    }
+    if args.publish {
+        bench_args.push("--publish".to_string());
     }
     bench_args.push(value_name(&args.scenario));
     bench_args
@@ -710,8 +745,8 @@ fn fetch_run_results(
 }
 
 /// Copies the results directory `remote_dir` from the instance into
-/// `local_output`, then writes the run record and the performance-page blocks
-/// it carries into the local archive and page, as a local run does.
+/// `local_output`, then writes the run record it carries into the local
+/// archive and, for a published run, the surfaces, as a local run does.
 fn fetch_results(
     config: &BenchConfig,
     local_output: &str,
@@ -752,7 +787,11 @@ fn fetch_results(
     // here; applying it again is harmless.
     let fetched = match Deferred::read(&local_dir)? {
         Some(deferred) => {
-            deferred.apply(Path::new(ARCHIVE_DIR), Path::new(PERFORMANCE_PAGE))?;
+            deferred.apply(
+                Path::new(ARCHIVE_DIR),
+                Path::new("."),
+                publish::Banners::Render,
+            )?;
             Fetch::Copied
         }
         None => Fetch::CopiedWithoutRecord,
@@ -1132,6 +1171,43 @@ fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Fails unless `commit` is on `origin/main`, as of a fetch now: a published
+/// run is built from a commit anyone can check out later.
+fn ensure_on_main(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::error::Error>> {
+    git(repo, &["fetch", "origin", "main"])?;
+    git(
+        repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &commit.to_string(),
+            "origin/main",
+        ],
+    )
+    .map_err(|e| {
+        format!(
+            "--publish needs a commit on origin/main, and {commit} is not ({e}); merge it \
+             first"
+        )
+    })?;
+    Ok(())
+}
+
+/// Fails unless HEAD of `repo` is on `origin/main` and none of its tracked
+/// files is modified, so a published run is of a commit and of nothing that
+/// commit does not hold. `bench --publish` calls it on the machine that runs.
+pub(crate) fn ensure_head_publishable(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_on_main(repo, &resolve_commit(repo, "HEAD")?)?;
+    let modified = git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !modified.is_empty() {
+        return Err(format!(
+            "--publish needs a clean checkout, and these tracked files are modified:\n{modified}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Fails unless `commit` holds `corpus` and the lock beside it, which the
 /// instance reads from its checkout of that commit: a file only the working
 /// tree has would fail the run after the push and the build.
@@ -1396,6 +1472,82 @@ mod tests {
     }
 
     #[test]
+    fn a_published_commit_must_be_on_origin_main() {
+        let origin = tempfile::tempdir().unwrap();
+        git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let work = tempfile::tempdir().unwrap();
+        git_in(work.path(), &["init", "-q", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(
+            work.path(),
+            &["commit", "-q", "--allow-empty", "-m", "merged"],
+        );
+        git_in(work.path(), &["push", "-q", "origin", "main"]);
+        let merged = resolve_commit(work.path(), "HEAD").unwrap();
+        git_in(work.path(), &["checkout", "-q", "-b", "topic"]);
+        git_in(
+            work.path(),
+            &["commit", "-q", "--allow-empty", "-m", "topic"],
+        );
+        git_in(work.path(), &["push", "-q", "origin", "topic"]);
+        let topic = resolve_commit(work.path(), "HEAD").unwrap();
+
+        assert!(ensure_on_main(work.path(), &merged).is_ok());
+        // Catches: a commit on a pushed branch that is not on main, which
+        // `--baseline-ref`'s on-origin check would let through.
+        assert!(ensure_on_origin(work.path(), &topic).is_ok());
+        let err = ensure_on_main(work.path(), &topic).unwrap_err().to_string();
+        assert!(
+            err.contains("not") && err.contains(&topic.to_string()),
+            "{err}"
+        );
+
+        // Once merged, the same commit is accepted.
+        git_in(work.path(), &["checkout", "-q", "main"]);
+        git_in(work.path(), &["merge", "-q", "--ff-only", "topic"]);
+        git_in(work.path(), &["push", "-q", "origin", "main"]);
+        assert!(ensure_on_main(work.path(), &topic).is_ok());
+    }
+
+    #[test]
+    fn a_published_run_needs_a_head_on_main_and_a_clean_checkout() {
+        let origin = tempfile::tempdir().unwrap();
+        git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let work = tempfile::tempdir().unwrap();
+        git_in(work.path(), &["init", "-q", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        std::fs::write(work.path().join("tracked.txt"), "one\n").unwrap();
+        git_in(work.path(), &["add", "tracked.txt"]);
+        git_in(work.path(), &["commit", "-q", "-m", "merged"]);
+        git_in(work.path(), &["push", "-q", "origin", "main"]);
+        assert!(ensure_head_publishable(work.path()).is_ok());
+
+        // An untracked file is not part of the commit and does not matter.
+        std::fs::write(work.path().join("untracked.txt"), "x\n").unwrap();
+        assert!(ensure_head_publishable(work.path()).is_ok());
+
+        // Catches: a run of a working tree that is not the commit it records.
+        std::fs::write(work.path().join("tracked.txt"), "two\n").unwrap();
+        let err = ensure_head_publishable(work.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tracked.txt"), "{err}");
+        git_in(work.path(), &["commit", "-q", "-a", "-m", "local only"]);
+
+        // Catches: a run of a commit that is not on origin/main.
+        let err = ensure_head_publishable(work.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("origin/main"), "{err}");
+    }
+
+    #[test]
     fn resolve_commit_error_carries_gits_message() {
         let not_a_repo = tempfile::tempdir().unwrap();
 
@@ -1434,6 +1586,7 @@ mod tests {
             &["--skip-prewarm"][..],
             &["--no-proxy"][..],
             &["--measure-proxy-overhead"][..],
+            &["--publish"][..],
         ] {
             let argv = ["xtask", "--provider", "aws", "--fetch"]
                 .into_iter()
@@ -1941,6 +2094,26 @@ mod tests {
     }
 
     #[test]
+    fn the_publish_option_reaches_the_benchmark_on_the_instance_only_when_set() {
+        // Catches: `bench-remote` accepting `--publish` and dropping it, so a
+        // run meant to be the published one is archived as an experiment.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            bench_args(&args, &timestamp)
+        };
+
+        let published = passed(&["--publish"]);
+        let argv: Vec<&str> = published.iter().map(String::as_str).collect();
+        assert!(crate::bench::parse_bench(&argv).unwrap().publish);
+        assert!(!passed(&[]).iter().any(|a| a == "--publish"));
+    }
+
+    #[test]
     fn older_runs_edits_are_discarded_under_the_lock_before_the_checkout() {
         for existing in [ExistingRun::Refuse, ExistingRun::Kill] {
             let script = script_for(existing);
@@ -2053,7 +2226,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
 
     #[test]
     fn the_fetch_copies_a_present_run_once_and_an_absent_one_not_at_all() {
-        use crate::bench::report::{Deferred, PageBlocks, RunRecord, tests::sample_report};
+        use crate::bench::report::{Deferred, RunRecord, tests::sample_report};
         let work = tempfile::tempdir().unwrap();
         let archive = work.path().join("bench/results/ecr.json");
         let records = || -> usize {
@@ -2065,7 +2238,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         let record = RunRecord::of(&report, "abc1234".into(), None);
 
         let with_record = tempfile::tempdir().unwrap();
-        Deferred::new("ecr", Some(record), PageBlocks::of(&report))
+        Deferred::new("ecr", Some(record))
             .write(with_record.path())
             .unwrap();
         let without_record = tempfile::tempdir().unwrap();

@@ -23,6 +23,8 @@ enum Cli {
     BenchRemote(bench::remote::BenchRemoteArgs),
     /// Resolve the bench corpus to manifest digests and write `bench/corpus.lock.json`.
     BenchLock(bench::lock::LockArgs),
+    /// Rewrite every published surface from the newest published run in `bench/results/ecr.json`.
+    BenchPublishSurfaces,
     /// Run skopeo with `--preserve-digests` on `copy`; dregsy's skopeo in the benchmark.
     #[command(hide = true)]
     BenchSkopeo {
@@ -43,6 +45,7 @@ fn main() -> ExitCode {
         Cli::Bench(args) => rt.block_on(bench::run(args)),
         Cli::BenchRemote(args) => bench::remote::run(args),
         Cli::BenchLock(args) => rt.block_on(bench::lock::run(args)),
+        Cli::BenchPublishSurfaces => bench::publish::run(),
         Cli::BenchSkopeo { args } => bench::skopeo_shim::run(args),
     };
 
