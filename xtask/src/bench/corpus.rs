@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::bench::source::Source;
 
 /// The main corpus file. Its records carry no corpus name.
-pub(crate) const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
+const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
 
 /// The main corpus file in the workspace this binary was built from, so a path
 /// reaches it from any current directory.

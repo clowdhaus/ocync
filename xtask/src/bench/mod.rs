@@ -237,6 +237,11 @@ pub(crate) struct BenchArgs {
     #[arg(long, value_enum, default_value = "public")]
     pub(crate) source: source::Kind,
 
+    /// The AWS region of the controlled source, which must not be the target's.
+    /// Read only with `--source controlled`.
+    #[arg(long, default_value = source::REGION)]
+    pub(crate) source_region: source::Region,
+
     /// Path to the prepare-scenario corpus YAML.
     ///
     /// Separate from `--corpus` because the two measure opposite things: the
@@ -317,8 +322,9 @@ pub(crate) struct BenchArgs {
     /// Make this the published run: the one every public number comes from.
     /// Refused unless the run is the whole main corpus on ECR from the
     /// controlled source with all seven tools at their defaults for 5 rounds,
-    /// and a record that finishes short of that is archived as an experiment. A published run rewrites the
-    /// performance page, the README, the homepage and the banners.
+    /// and a record that finishes short of that is archived as an experiment.
+    /// A published run rewrites the performance page, the README, the homepage
+    /// and the banners.
     #[arg(long, conflicts_with = "regression")]
     pub(crate) publish: bool,
 }
@@ -729,7 +735,11 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
 
     // The controlled source is read with the account's ECR sign-in, and no
     // generated config names Docker Hub then.
-    corpus.source = source::Source::resolve(args.source, &corpus.settings.target_registry)?;
+    corpus.source = source::Source::resolve(
+        args.source,
+        &corpus.settings.target_registry,
+        &args.source_region,
+    )?;
     corpus.dockerhub_auth = match corpus.source {
         source::Source::Public => docker_hub_auth(),
         source::Source::Controlled(_) => None,
@@ -752,10 +762,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &transfers,
         &corpus_info,
         corpus_locked_at.as_ref(),
-        &baseline_path(&corpus_info.id),
+        &baseline_path(Path::new(report::ARCHIVE_DIR), &corpus_info.id, args.source),
     )?;
     let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
+    let source_check =
+        lock::SourceCheck::new(&http, auth, &corpus.source, args.paths.corpus()).await?;
     let refs: BTreeSet<_> = transfers
         .iter()
         .flat_map(|transfer| scenario_refs(transfer, &corpus))
@@ -763,7 +775,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a digest the source no
         // longer serves costs seconds rather than a wasted run.
-        lock::ensure_served(&http, lock, &refs, auth, &corpus.source).await?;
+        source_check.ensure_served(lock, &refs).await?;
     }
 
     let tools = args.tool_selection.run_tools();
@@ -952,8 +964,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     Ok(finished) => Ok(finished),
                     Err(error) => {
                         let refs = scenario_refs(transfer, &corpus);
-                        let recheck =
-                            lock::ensure_served(&http, lock, &refs, auth, &corpus.source).await;
+                        let recheck = source_check.ensure_served(lock, &refs).await;
                         Err(lock::explain(error.to_string(), recheck))
                     }
                 }
@@ -1030,6 +1041,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             &report,
             args.threshold_pct,
             corpus_locked_at.as_ref(),
+            Path::new(report::ARCHIVE_DIR),
             args.source,
         )?;
     }
@@ -1360,7 +1372,6 @@ fn cold_ocync_median(
     corpus: report::CorpusInfo,
     max_concurrent_transfers: Option<NonZeroUsize>,
     corpus_locked_at: Option<&lock::LockedAt>,
-    source: source::Kind,
 ) -> Option<Baseline> {
     let runs = cold_ocync_runs(scenarios);
     if runs.is_empty() {
@@ -1382,7 +1393,6 @@ fn cold_ocync_median(
         corpus,
         max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
-        source,
     })
 }
 
@@ -1419,38 +1429,44 @@ fn ensure_baseline_comparable(
             args.tool_selection.max_concurrent_transfers,
         )),
         rounds: u32::try_from(cold_rounds).expect("a run has fewer than 2^32 rounds"),
-        source: args.source,
     };
     regression::ensure_baseline_comparable(baseline_path, &key)
 }
 
-/// Where the stored baseline of `--regression` lives: one per corpus, so a run
-/// of a named corpus is never compared with the main corpus's.
-fn baseline_path(corpus: &corpus::Id) -> PathBuf {
-    let dir = Path::new(report::ARCHIVE_DIR);
-    match corpus {
-        corpus::Id::Main => dir.join("baseline.json"),
-        corpus::Id::Named(name) => dir.join(format!("baseline-{name}.json")),
-    }
+/// Where the stored baseline of `--regression` lives in `dir`: one per corpus
+/// and per kind of source, so a run of a named corpus is never compared with
+/// the main corpus's, nor one from the controlled source with one from the
+/// public registries. The public baseline keeps the name it always had.
+fn baseline_path(dir: &Path, corpus: &corpus::Id, source: source::Kind) -> PathBuf {
+    let corpus = match corpus {
+        corpus::Id::Main => String::new(),
+        corpus::Id::Named(name) => format!("-{name}"),
+    };
+    let source = match source {
+        source::Kind::Public => "",
+        source::Kind::Controlled => "-controlled",
+    };
+    dir.join(format!("baseline{corpus}{source}.json"))
 }
 
-/// Compare the current ocync run against a stored baseline.
+/// Compare the current ocync run against the baseline stored in `dir` for its
+/// corpus and kind of source.
 ///
 /// Returns an error if regression is detected.
 fn check_regression(
     report: &BenchReport,
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
+    dir: &Path,
     source: source::Kind,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = baseline_path(&report.corpus.id);
+    let baseline_path = baseline_path(dir, &report.corpus.id, source);
 
     if let Some(current) = cold_ocync_median(
         &report.scenarios,
         report.corpus.clone(),
         report.ocync_transfer_cap(),
         corpus_locked_at,
-        source,
     ) {
         if baseline_path.exists() {
             let baseline = regression::load_baseline(&baseline_path)?;
@@ -2998,6 +3014,7 @@ mod tests {
         let controlled = source::Source::resolve(
             source::Kind::Controlled,
             "111111111111.dkr.ecr.us-east-2.amazonaws.com",
+            &source::Region::default(),
         )
         .unwrap();
         let is_published_from =
@@ -3391,7 +3408,6 @@ mod tests {
             corpus: corpus.clone(),
             max_concurrent_transfers: NonZeroUsize::new(20),
             rounds: 3,
-            source: source::Kind::Public,
         };
         regression::save_baseline(&path, &saved).unwrap();
         let shown = path.display();
@@ -3479,7 +3495,6 @@ mod tests {
             corpus: corpus.clone(),
             max_concurrent_transfers: Some(report::effective_transfer_cap(None)),
             rounds: 5,
-            source: source::Kind::Public,
         };
         let check = || ensure_baseline_comparable(&args, &cold, &corpus, Some(&at), &path);
 
@@ -3494,36 +3509,6 @@ mod tests {
         );
         regression::save_baseline(&path, &saved(Some(lock::SyncFrom::Digest))).unwrap();
         assert_eq!(check(), Ok(()));
-
-        // Catches: a run compared with a baseline from the other kind of
-        // source, in either direction, after the rounds had been paid for.
-        let controlled_args =
-            parse_bench(&["--regression", "--source", "controlled", "sync"]).unwrap();
-        let into_controlled =
-            ensure_baseline_comparable(&controlled_args, &cold, &corpus, Some(&at), &path);
-        assert_eq!(
-            into_controlled,
-            Err(format!(
-                "{shown} was recorded from the public registries, this run from the \
-                 controlled source; record a new baseline by deleting {shown} and rerunning"
-            ))
-        );
-        let controlled_baseline = Baseline {
-            source: source::Kind::Controlled,
-            ..saved(Some(lock::SyncFrom::Digest))
-        };
-        regression::save_baseline(&path, &controlled_baseline).unwrap();
-        assert_eq!(
-            ensure_baseline_comparable(&controlled_args, &cold, &corpus, Some(&at), &path),
-            Ok(())
-        );
-        assert_eq!(
-            check(),
-            Err(format!(
-                "{shown} was recorded from the controlled source, this run from the public \
-                 registries; record a new baseline by deleting {shown} and rerunning"
-            ))
-        );
     }
 
     #[test]
@@ -3613,14 +3598,7 @@ mod tests {
             tags: 2,
         };
 
-        let median = cold_ocync_median(
-            &scenarios,
-            corpus(),
-            NonZeroUsize::new(20),
-            None,
-            source::Kind::Public,
-        )
-        .unwrap();
+        let median = cold_ocync_median(&scenarios, corpus(), NonZeroUsize::new(20), None).unwrap();
 
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
@@ -3631,20 +3609,9 @@ mod tests {
         // Catches: a baseline saved from a locked run that a baseline of source
         // tags cannot be told from.
         let at = lock::fixtures::locked_at("2026-10-30-120000");
-        let locked = cold_ocync_median(
-            &scenarios,
-            corpus(),
-            None,
-            Some(&at),
-            source::Kind::Controlled,
-        )
-        .unwrap();
+        let locked = cold_ocync_median(&scenarios, corpus(), None, Some(&at)).unwrap();
         assert_eq!(locked.sync_from, Some(lock::SyncFrom::Digest));
-        // Catches: a baseline saved from a controlled run that a public one
-        // cannot be told from.
-        assert_eq!(locked.source, source::Kind::Controlled);
-        assert_eq!(median.source, source::Kind::Public);
-        assert!(cold_ocync_median(&[], corpus(), None, None, source::Kind::Public).is_none());
+        assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
     }
 
     #[test]
@@ -3661,7 +3628,7 @@ mod tests {
             tags: 2,
         };
 
-        assert!(cold_ocync_median(&[scenario], corpus, None, None, source::Kind::Public).is_none());
+        assert!(cold_ocync_median(&[scenario], corpus, None, None).is_none());
     }
 
     /// What a fake pass returns for one run of `tool`.
@@ -4112,18 +4079,88 @@ images:
     }
 
     #[test]
-    fn each_corpus_has_its_own_baseline_file() {
+    fn each_corpus_and_kind_of_source_has_its_own_baseline_file() {
         // Catches: a shape corpus compared with, or overwriting, the main
-        // corpus's baseline.
-        for (id, path) in [
-            (corpus::Id::Main, "bench/results/baseline.json"),
+        // corpus's baseline; a run from the controlled source sharing the
+        // public run's file; and the public file changing its name.
+        let dir = Path::new("bench/results");
+        for (id, source, path) in [
+            (
+                corpus::Id::Main,
+                source::Kind::Public,
+                "bench/results/baseline.json",
+            ),
+            (
+                corpus::Id::Main,
+                source::Kind::Controlled,
+                "bench/results/baseline-controlled.json",
+            ),
             (
                 corpus::Id::Named(CorpusName::new("corpus-small")),
+                source::Kind::Public,
                 "bench/results/baseline-corpus-small.json",
             ),
+            (
+                corpus::Id::Named(CorpusName::new("corpus-small")),
+                source::Kind::Controlled,
+                "bench/results/baseline-corpus-small-controlled.json",
+            ),
         ] {
-            assert_eq!(baseline_path(&id), PathBuf::from(path), "{id:?}");
+            assert_eq!(
+                baseline_path(dir, &id, source),
+                PathBuf::from(path),
+                "{id:?} {source:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_controlled_run_reads_and_writes_only_the_controlled_baseline() {
+        // Catches: a controlled run judged against, or overwriting, the public
+        // baseline, whose figures the same code does not reproduce.
+        use crate::bench::report::tests::sample_report;
+
+        let mut run = tool_run(Tool::Ocync, 10.0);
+        run.proxy_metrics = Some(proxy::ProxyMetrics {
+            requests: 100,
+            response_bytes: 100_000,
+            ..Default::default()
+        });
+        let mut report = sample_report();
+        report.scenarios = vec![ScenarioResult {
+            round: Some(1),
+            ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![run])
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let public = baseline_path(dir.path(), &report.corpus.id, source::Kind::Public);
+        let controlled = baseline_path(dir.path(), &report.corpus.id, source::Kind::Controlled);
+        // A public baseline far below this run, which would be a regression.
+        let tiny = Baseline {
+            wall_clock_secs: 0.001,
+            requests: 1,
+            total_bytes: 1,
+            ..cold_ocync_median(
+                &report.scenarios,
+                report.corpus.clone(),
+                report.ocync_transfer_cap(),
+                None,
+            )
+            .unwrap()
+        };
+        regression::save_baseline(&public, &tiny).unwrap();
+        let before = std::fs::read(&public).unwrap();
+
+        check_regression(&report, 20, None, dir.path(), source::Kind::Controlled).unwrap();
+        assert_eq!(std::fs::read(&public).unwrap(), before, "public baseline");
+        assert!(controlled.exists(), "controlled baseline saved");
+
+        // Now the controlled baseline is read, and this run matches it.
+        check_regression(&report, 20, None, dir.path(), source::Kind::Controlled).unwrap();
+        assert_eq!(std::fs::read(&public).unwrap(), before, "public baseline");
+        assert!(
+            check_regression(&report, 20, None, dir.path(), source::Kind::Public).is_err(),
+            "the public baseline is still what a public run is judged against"
+        );
     }
 
     #[test]

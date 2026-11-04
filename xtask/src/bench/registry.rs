@@ -220,11 +220,22 @@ fn authorize(request: reqwest::RequestBuilder, grant: &Grant) -> reqwest::Reques
 /// A Basic credential held for one registry, which answers `/v2/` with a Basic
 /// challenge and so has no token to exchange.
 #[derive(Clone)]
-struct BasicLogin {
+pub(crate) struct BasicLogin {
     /// The registry's hostname.
     host: String,
     /// The base64 `user:password` it takes.
     credential: String,
+}
+
+impl BasicLogin {
+    /// The login for the registry `host`, with the base64 `user:password`
+    /// `credential` it takes, which ECR's `GetAuthorizationToken` returns.
+    pub(crate) fn new(host: &str, credential: String) -> Self {
+        Self {
+            host: host.to_owned(),
+            credential,
+        }
+    }
 }
 
 /// The client, credentials and grants requests go through. Grants are kept by
@@ -260,13 +271,9 @@ impl<'a> Access<'a> {
         }
     }
 
-    /// Access that signs in to the registry `host` with the base64
-    /// `user:password` `credential`, which ECR's `GetAuthorizationToken` returns.
-    pub(crate) fn signed_in_to(mut self, host: &str, credential: String) -> Self {
-        self.basic = Some(BasicLogin {
-            host: host.to_owned(),
-            credential,
-        });
+    /// Access that signs in to one registry with `login`.
+    pub(crate) fn signed_in_to(mut self, login: &BasicLogin) -> Self {
+        self.basic = Some(login.clone());
         self
     }
 
@@ -689,10 +696,7 @@ mod tests {
         // Catches: the ECR credential sent to a public registry that is not
         // ECR, and the ECR registry sent through a token exchange it does not
         // have.
-        let login = BasicLogin {
-            host: "r.example".to_owned(),
-            credential: "QVdTOnB3".to_owned(),
-        };
+        let login = BasicLogin::new("r.example", "QVdTOnB3".to_owned());
         assert_eq!(
             basic_grant(Some(&login), "r.example"),
             Some(Grant::Basic("QVdTOnB3".to_owned()))

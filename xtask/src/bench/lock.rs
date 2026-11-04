@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
 use crate::bench::ecr;
-use crate::bench::registry::{self, Access, Repository};
-use crate::bench::source::{self, Source};
+use crate::bench::registry::{self, Access, BasicLogin, Repository};
+use crate::bench::source::Source;
 
 /// The digest of `bytes`.
 fn digest_of(bytes: &[u8]) -> Digest {
@@ -333,47 +333,90 @@ pub(crate) fn explain(error: String, recheck: Result<(), NotServed>) -> String {
     }
 }
 
-/// Check that `source` still serves the locked manifest digest of every ref
-/// in `refs`, each by a HEAD of that digest and never of its tag. A tag that
-/// has moved is not a difference: the run copies the locked digest. The
-/// controlled source is read with the account's ECR sign-in.
-pub(crate) async fn ensure_served(
-    client: &reqwest::Client,
-    lock: &Lock,
-    refs: &BTreeSet<ImageRef>,
-    auth: Option<&DockerHubAuth>,
-    source: &Source,
-) -> Result<(), NotServed> {
-    let access = Access::new(client, auth);
-    let access = match source {
-        Source::Public => access,
-        Source::Controlled(controlled) => {
-            let token = ecr::registry_token(&ecr::client_in(source::REGION).await)
-                .await
-                .map_err(|e| {
-                    NotServed::Incomplete(format!(
-                        "cannot sign in to the controlled source {}: {e}",
-                        source::REGION
-                    ))
-                })?;
-            access.signed_in_to(controlled.host(), token)
-        }
-    };
-    check_served(&access, lock, refs, source, async |repo, digest| {
-        access.head_digest(repo, digest).await
-    })
-    .await
+/// What a run checks its source with: the HTTP client, the Docker Hub
+/// credentials, the source and, for the controlled source, the ECR sign-in made
+/// once for the run.
+pub(crate) struct SourceCheck<'a> {
+    /// Client for every request.
+    client: &'a reqwest::Client,
+    /// Docker Hub credentials, if any.
+    auth: Option<&'a DockerHubAuth>,
+    /// The source the tools read.
+    source: &'a Source,
+    /// The sign-in to the controlled source.
+    login: Option<BasicLogin>,
+    /// The corpus file the run reads, which the remedy names.
+    corpus: &'a str,
 }
 
-/// [`ensure_served`] with the request `head` makes for one locked digest. A ref
-/// the lock lacks is refused before any request goes out. Otherwise one request
-/// goes out per distinct repository and digest, and a failure is reported for
-/// every tag that names it.
+impl<'a> SourceCheck<'a> {
+    /// A check of `source` for a run of `corpus`. The controlled source is read
+    /// with the account's ECR sign-in, made here once for every check.
+    pub(crate) async fn new(
+        client: &'a reqwest::Client,
+        auth: Option<&'a DockerHubAuth>,
+        source: &'a Source,
+        corpus: &'a str,
+    ) -> Result<Self, NotServed> {
+        let login = match source {
+            Source::Public => None,
+            Source::Controlled(controlled) => {
+                let token =
+                    ecr::registry_token(&ecr::client_in(controlled.region().as_str()).await)
+                        .await
+                        .map_err(|e| {
+                            NotServed::Incomplete(format!(
+                                "cannot sign in to the controlled source in {}: {e}",
+                                controlled.region()
+                            ))
+                        })?;
+                Some(BasicLogin::new(controlled.host(), token))
+            }
+        };
+        Ok(Self {
+            client,
+            auth,
+            source,
+            login,
+            corpus,
+        })
+    }
+
+    /// Check that the source still serves the locked manifest digest of every
+    /// ref in `refs`, each by a HEAD of that digest and never of its tag. A tag
+    /// that has moved is not a difference: the run copies the locked digest.
+    pub(crate) async fn ensure_served(
+        &self,
+        lock: &Lock,
+        refs: &BTreeSet<ImageRef>,
+    ) -> Result<(), NotServed> {
+        let access = Access::new(self.client, self.auth);
+        let access = match &self.login {
+            Some(login) => access.signed_in_to(login),
+            None => access,
+        };
+        check_served(
+            &access,
+            lock,
+            refs,
+            self.source,
+            self.corpus,
+            async |repo, digest| access.head_digest(repo, digest).await,
+        )
+        .await
+    }
+}
+
+/// [`SourceCheck::ensure_served`] with the request `head` makes for one locked
+/// digest. A ref the lock lacks is refused before any request goes out.
+/// Otherwise one request goes out per distinct repository and digest, and a
+/// failure is reported for every tag that names it.
 async fn check_served(
     access: &Access<'_>,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
     source: &Source,
+    corpus: &str,
     head: impl AsyncFn(&Repository<'_>, &Digest) -> Result<(), FetchError>,
 ) -> Result<(), NotServed> {
     let mut missing = Vec::new();
@@ -388,7 +431,7 @@ async fn check_served(
         }
     }
     if !missing.is_empty() {
-        return judge_served(missing, &[], source.remedy());
+        return judge_served(missing, &[], &source.remedy(corpus));
     }
     let probes: BTreeSet<ImageRef> = sharing.values().map(|tags| tags[0].clone()).collect();
     eprintln!(
@@ -412,7 +455,7 @@ async fn check_served(
                 .map(move |image| ((*image).clone(), e.clone()))
         })
         .collect();
-    judge_served(Vec::new(), &failed, source.remedy())
+    judge_served(Vec::new(), &failed, &source.remedy(corpus))
 }
 
 /// The digest of a manifest body. A registry that also reports a digest must
@@ -758,6 +801,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::{digest as d, entry, lock_of, locked_at};
     use super::*;
+    use crate::bench::source::{Kind, Region};
 
     fn image(raw: &str) -> ImageRef {
         ImageRef::parse(raw).unwrap()
@@ -976,6 +1020,7 @@ mod tests {
             lock,
             &refs,
             source,
+            "bench/corpus.yaml",
             async |repo, digest| {
                 asked.borrow_mut().push(format!("{repo}@{digest}"));
                 if served.contains(digest) {
@@ -1032,8 +1077,9 @@ mod tests {
         // reported with the lock's advice (re-lock) rather than the seed's.
         let lock = lock_of(&[("docker.io/library/a:1", entry('1', &[]))]);
         let source = Source::resolve(
-            source::Kind::Controlled,
+            Kind::Controlled,
             "111.dkr.ecr.us-east-2.amazonaws.com",
+            &Region::default(),
         )
         .unwrap();
         let refs = ["docker.io/library/a:1"];

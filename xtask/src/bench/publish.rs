@@ -481,11 +481,12 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
     }
     let rounds: Vec<&ScenarioResult> = results.iter().collect();
     let machine = &record.machine;
-    let mut out = format!(
+    let mut out =
+        format!(
         "Measured {date} (run {run}, commit {commit}) on {instance} ({arch}, {vcpus} vCPUs, \
          {memory:.0} GiB, {network}). Full corpus: {images} images, {tags} tags. {description} \
-         from {source} to ECR {region}. Median of {count} rounds. {settings}All traffic routed through \
-         bench-proxy for byte-accurate measurement.\n\n",
+         from {source} to ECR {region}. Median of {count} rounds. {settings}All traffic \
+         routed through bench-proxy for byte-accurate measurement.\n\n",
         date = record.timestamp.get(..10).unwrap_or(&record.timestamp),
         run = record.timestamp,
         commit = short(&record.git_ref),
@@ -499,14 +500,12 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
         source = source_phrase(record),
         region = machine.region,
         count = rounds.len(),
-        settings = record
-            .max_concurrent_transfers
-            .map_or_else(String::new, |cap| {
-                format!(
-                    "ocync ran at its default of {cap} images at once and every other tool at its \
+        settings = record.max_concurrent_transfers.map_or_else(String::new, |cap| {
+            format!(
+                "ocync ran at its default of {cap} images at once and every other tool at its \
                  own defaults. "
-                )
-            }),
+            )
+        }),
     );
     report::render_metric_table(
         None,

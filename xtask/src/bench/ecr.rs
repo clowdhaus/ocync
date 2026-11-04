@@ -1,7 +1,6 @@
 //! ECR repository creation and deletion for benchmark isolation.
 
 use aws_sdk_ecr::Client;
-use aws_sdk_ecr::types::Tag;
 
 use crate::bench::corpus::Corpus;
 use crate::bench::lock::parse_digest;
@@ -14,9 +13,9 @@ pub(crate) async fn client() -> Client {
 }
 
 /// Create an ECR client for `region`, whatever region the environment names.
-pub(crate) async fn client_in(region: &'static str) -> Client {
+pub(crate) async fn client_in(region: &str) -> Client {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region))
+        .region(aws_config::Region::new(region.to_owned()))
         .load()
         .await;
     Client::new(&config)
@@ -52,18 +51,13 @@ pub(crate) enum RepoState {
     Existed,
 }
 
-/// Create the repository `name` with `tags`, or find it already there.
-pub(crate) async fn create_repo(
-    client: &Client,
-    name: &str,
-    tags: &[Tag],
-) -> Result<RepoState, String> {
+/// Create the repository `name`, or find it already there.
+pub(crate) async fn create_repo(client: &Client, name: &str) -> Result<RepoState, String> {
     use aws_sdk_ecr::operation::create_repository::CreateRepositoryError;
 
     match client
         .create_repository()
         .repository_name(name)
-        .set_tags((!tags.is_empty()).then(|| tags.to_vec()))
         .send()
         .await
     {
@@ -80,36 +74,6 @@ pub(crate) async fn create_repo(
     }
 }
 
-/// The value of the resource tag `key` on the repository `name`, if it has one.
-pub(crate) async fn repo_tag(
-    client: &Client,
-    name: &str,
-    key: &str,
-) -> Result<Option<String>, String> {
-    let described = client
-        .describe_repositories()
-        .repository_names(name)
-        .send()
-        .await
-        .map_err(|e| format!("failed to describe repo {name}: {e}"))?;
-    let arn = described
-        .repositories()
-        .first()
-        .and_then(|repo| repo.repository_arn())
-        .ok_or_else(|| format!("repo {name}: describe returned no ARN"))?;
-    let tags = client
-        .list_tags_for_resource()
-        .resource_arn(arn)
-        .send()
-        .await
-        .map_err(|e| format!("failed to list tags of repo {name}: {e}"))?;
-    Ok(tags
-        .tags()
-        .iter()
-        .find(|tag| tag.key() == key)
-        .map(|tag| tag.value().to_owned()))
-}
-
 /// Create all target repositories for the corpus.
 ///
 /// Each source image maps to a `{prefix}/{name}` repository in ECR.
@@ -117,7 +81,7 @@ pub(crate) async fn repo_tag(
 pub(crate) async fn create_repos(client: &Client, corpus: &Corpus) -> Result<(), String> {
     for img in &corpus.images {
         let repo_name = corpus.target_repo(&img.source);
-        match create_repo(client, &repo_name, &[]).await? {
+        match create_repo(client, &repo_name).await? {
             RepoState::Created => eprintln!("  created repo: {repo_name}"),
             RepoState::Existed => eprintln!("  repo exists: {repo_name}"),
         }

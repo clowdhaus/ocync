@@ -63,10 +63,9 @@ const REMOTE_AZURE_TOKEN: &str = ".bench-azure-token";
 
 /// The options that shape a benchmark run, which `--fetch` and `--seed` each
 /// refuse beside them since neither starts one.
-const RUN_SHAPING: [&str; 14] = [
+const RUN_SHAPING: [&str; 13] = [
     "target",
     "source",
-    "corpus",
     "tools",
     "baseline_ref",
     "rounds",
@@ -105,10 +104,17 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long, value_enum, default_value = "public")]
     pub(crate) source: source::Kind,
 
-    /// Corpus YAML the instance syncs, passed through to `cargo xtask bench`
-    /// when given; the instance's own default otherwise. The file and its
-    /// `.lock.json` beside it must be committed in the commit that runs.
-    #[arg(long)]
+    /// The AWS region of the controlled source, which must not be the
+    /// instance's. Passed through to `cargo xtask bench` with `--source
+    /// controlled`, and to `bench-seed` with `--seed`.
+    #[arg(long, default_value = source::REGION, conflicts_with = "fetch")]
+    pub(crate) source_region: source::Region,
+
+    /// Corpus YAML the instance syncs or, with `--seed`, seeds, passed through
+    /// to `cargo xtask bench` or `bench-seed` when given; the instance's own
+    /// default otherwise. The file and its `.lock.json` beside it must be
+    /// committed in the commit that runs.
+    #[arg(long, conflicts_with = "fetch")]
     pub(crate) corpus: Option<String>,
 
     /// Copy the newest results on the instance instead of starting a run.
@@ -121,8 +127,9 @@ pub(crate) struct BenchRemoteArgs {
     /// Copy every digest of the corpus lock from its public source into the
     /// controlled source instead of starting a run: runs `cargo xtask
     /// bench-seed` on the instance, which creates the repositories it needs in
-    /// the target's account. Repeating it copies nothing new. Conflicts with
-    /// every option that shapes a run.
+    /// the target's account. Repeating it copies nothing new. Takes `--corpus`
+    /// and `--source-region`, and conflicts with every other option that
+    /// shapes a run.
     #[arg(long, conflicts_with_all = RUN_SHAPING, conflicts_with = "fetch")]
     pub(crate) seed: bool,
 
@@ -213,6 +220,32 @@ fn read_config(provider: Provider) -> Result<BenchConfig, Box<dyn std::error::Er
     Ok(serde_json::from_str(&content)?)
 }
 
+/// The EC2 region an instance is in, read from its public DNS name:
+/// `ec2-<ip>.<region>.compute.amazonaws.com`, or `ec2-<ip>.compute-1.amazonaws.com`
+/// in us-east-1. `None` for any other name.
+fn instance_region(host: &str) -> Option<&str> {
+    let labels: Vec<&str> = host.split('.').collect();
+    match labels[..] {
+        [name, "compute-1", "amazonaws", "com"] if name.starts_with("ec2-") => Some("us-east-1"),
+        [name, region, "compute", ..] if name.starts_with("ec2-") => Some(region),
+        _ => None,
+    }
+}
+
+/// Refuses a controlled source in the instance's own region before the push,
+/// so it costs no instance. The instance's region is read from its host name;
+/// a host that does not carry it is left to the instance, which refuses the
+/// same thing.
+fn ensure_source_region_differs(
+    config: &BenchConfig,
+    region: &source::Region,
+) -> Result<(), String> {
+    match instance_region(&config.host) {
+        Some(instance) => source::Controlled::ensure_other_region(instance, region),
+        None => Ok(()),
+    }
+}
+
 /// Run the remote benchmark workflow.
 pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config = read_config(args.provider)?;
@@ -241,6 +274,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     args.source.ensure_applies(args.target)?;
+    if args.seed || args.source == source::Kind::Controlled {
+        ensure_source_region_differs(&config, &args.source_region)?;
+    }
     ensure_source_reads_scenario(
         args.source,
         args.scenario,
@@ -372,7 +408,7 @@ fn run_on_instance(
     }
 
     let argv = if args.seed {
-        vec![SEED_COMMAND.to_owned()]
+        seed_args(args)
     } else {
         [BENCH_COMMAND.to_owned()]
             .into_iter()
@@ -474,6 +510,20 @@ fn run_result(
     }
 }
 
+/// What the instance runs for `--seed`, unquoted: `bench-seed` with the corpus
+/// when one is given and the region of the controlled source.
+fn seed_args(args: &BenchRemoteArgs) -> Vec<String> {
+    let mut seed = vec![
+        SEED_COMMAND.to_owned(),
+        "--source-region".to_owned(),
+        args.source_region.to_string(),
+    ];
+    if let Some(corpus) = &args.corpus {
+        seed.extend(["--corpus".to_owned(), corpus.clone()]);
+    }
+    seed
+}
+
 /// The arguments `cargo xtask bench` runs with on the instance, unquoted:
 /// `remote_script` quotes each one. The run starts at `timestamp`, which names
 /// its results directory, and, so that the instance writes no tracked file,
@@ -497,6 +547,12 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     // Only for the controlled source, for the same reason.
     if args.source == source::Kind::Controlled {
         bench_args.extend(["--source".to_string(), value_name(&args.source)]);
+    }
+    if args.source == source::Kind::Controlled {
+        bench_args.extend([
+            "--source-region".to_string(),
+            args.source_region.to_string(),
+        ]);
     }
     // Only when given, for the same reason.
     if let Some(corpus) = &args.corpus {
@@ -2190,12 +2246,59 @@ mod tests {
             crate::bench::parse_bench(&argv).unwrap().source,
             source::Kind::Controlled
         );
+        assert!(
+            controlled
+                .windows(2)
+                .any(|w| w == ["--source-region", "us-east-1"])
+        );
+        let west = passed(&["--source", "controlled", "--source-region", "us-west-2"]);
+        assert!(
+            west.windows(2)
+                .any(|w| w == ["--source-region", "us-west-2"])
+        );
+        assert!(!passed(&[]).iter().any(|a| a == "--source-region"));
         assert!(!passed(&[]).iter().any(|a| a == "--source"));
         assert!(
             !passed(&["--source", "public"])
                 .iter()
                 .any(|a| a == "--source")
         );
+    }
+
+    #[test]
+    fn a_source_in_the_instances_region_is_refused_before_anything_is_pushed() {
+        // Catches: a controlled source in the target's own region, which lets a
+        // tool mount blobs from it and skip the copy, found only after the
+        // instance was reached; and a region read from a host that names none.
+        let config = |host: &str| BenchConfig {
+            host: host.into(),
+            user: "ec2-user".into(),
+            ssh_key_path: String::new(),
+        };
+        let region = |raw: &str| raw.parse::<source::Region>().unwrap();
+        let ohio = config("ec2-3-141-35-29.us-east-2.compute.amazonaws.com");
+        assert!(ensure_source_region_differs(&ohio, &region("us-east-2")).is_err());
+        assert_eq!(
+            ensure_source_region_differs(&ohio, &region("us-east-1")),
+            Ok(())
+        );
+        let virginia = config("ec2-3-141-35-29.compute-1.amazonaws.com");
+        assert!(ensure_source_region_differs(&virginia, &region("us-east-1")).is_err());
+        assert_eq!(
+            ensure_source_region_differs(&virginia, &region("us-east-2")),
+            Ok(())
+        );
+        for host in [
+            "bench.example.com",
+            "10.0.0.4",
+            "ec2-1.compute.amazonaws.com",
+        ] {
+            assert_eq!(
+                ensure_source_region_differs(&config(host), &region("us-east-1")),
+                Ok(()),
+                "{host}"
+            );
+        }
     }
 
     #[test]
@@ -2221,6 +2324,42 @@ mod tests {
             let err = Cli::try_parse_from(argv).err().unwrap();
             assert_eq!(
                 err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
+        }
+        // The seed takes the corpus and the region it seeds, which a fetch does not.
+        let seed = Cli::try_parse_from([
+            "xtask",
+            "--provider",
+            "aws",
+            "--seed",
+            "--corpus",
+            "bench/other.yaml",
+            "--source-region",
+            "us-west-2",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(
+            seed_args(&seed),
+            [
+                "bench-seed",
+                "--source-region",
+                "us-west-2",
+                "--corpus",
+                "bench/other.yaml"
+            ]
+        );
+        for extra in [
+            &["--corpus", "x.yaml"][..],
+            &["--source-region", "us-west-2"][..],
+        ] {
+            let argv = ["xtask", "--provider", "aws", "--fetch"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            assert_eq!(
+                Cli::try_parse_from(argv).err().unwrap().kind(),
                 clap::error::ErrorKind::ArgumentConflict,
                 "{extra:?}"
             );
