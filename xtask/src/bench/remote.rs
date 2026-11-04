@@ -19,7 +19,7 @@ use super::corpus;
 use super::gar::ENV_CREDENTIALS;
 use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::publish;
-use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
+use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred};
 use super::runner::join_tools;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{
@@ -787,7 +787,11 @@ fn fetch_results(
     // here; applying it again is harmless.
     let fetched = match Deferred::read(&local_dir)? {
         Some(deferred) => {
-            deferred.apply(Path::new(ARCHIVE_DIR), Path::new(PERFORMANCE_PAGE))?;
+            deferred.apply(
+                Path::new(ARCHIVE_DIR),
+                Path::new("."),
+                publish::Banners::Render,
+            )?;
             Fetch::Copied
         }
         None => Fetch::CopiedWithoutRecord,
@@ -2173,7 +2177,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
 
     #[test]
     fn the_fetch_copies_a_present_run_once_and_an_absent_one_not_at_all() {
-        use crate::bench::report::{Deferred, PageBlocks, RunRecord, tests::sample_report};
+        use crate::bench::report::{Deferred, RunRecord, tests::sample_report};
         let work = tempfile::tempdir().unwrap();
         let archive = work.path().join("bench/results/ecr.json");
         let records = || -> usize {
@@ -2185,7 +2189,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
         let record = RunRecord::of(&report, "abc1234".into(), None);
 
         let with_record = tempfile::tempdir().unwrap();
-        Deferred::new("ecr", Some(record), PageBlocks::of(&report))
+        Deferred::new("ecr", Some(record))
             .write(with_record.path())
             .unwrap();
         let without_record = tempfile::tempdir().unwrap();

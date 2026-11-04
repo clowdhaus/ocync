@@ -1,12 +1,14 @@
 ---
 title: Performance
+# BENCH-DESCRIPTION:START
 description: How ocync finishes a cold sync to ECR 2.89 to 3.07 times faster than regsync in 5 rounds, with about 25% fewer requests and about 9.6 GB fewer bytes, and cross-repo blob mounting.
+# BENCH-DESCRIPTION:END
 order: 6
 ---
 
 ## Benchmark results
 
-<!-- Auto-updated by `cargo xtask bench`; shows first scenario (cold sync) only. -->
+<!-- Written by `cargo xtask bench-remote --publish` from the published run, and by nothing else. -->
 <!-- BENCH:START -->
 Measured 2026-10-31 on c6in.4xlarge (x86_64, 16 vCPUs, 32 GiB, Up to 50 Gigabit). Full corpus: 25 images, 39 tags. Cold sync to ECR us-east-2. All traffic routed through bench-proxy for byte-accurate measurement. 5 rounds, the tool order shuffled in each. A cell is the median over the rounds, with the lowest and highest in brackets; a paired cell (a/b) brackets the range of each value, in the order shown.
 

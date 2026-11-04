@@ -617,21 +617,31 @@ impl RegistryKind {
     }
 }
 
-/// Returns the short git commit hash of HEAD.
+/// Returns the git commit hash of HEAD: the short hash, or for a published run
+/// the full one, so the run can be rebuilt later.
 ///
 /// This is the record's only anchor from numbers back to the code that
 /// produced them, so a failure is announced rather than silently recorded as
 /// `unknown`. The run log is streamed to the operator and never persisted, so
 /// this warning is the only chance to notice.
-fn git_ref() -> String {
-    command_stdout(std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]))
-        .unwrap_or_else(|| {
-            eprintln!(
-                "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
+fn git_ref(publication: publish::Publication) -> String {
+    let short = match publication {
+        publish::Publication::Archive => Some("--short"),
+        publish::Publication::Publish => None,
+    };
+    command_stdout(
+        std::process::Command::new("git")
+            .arg("rev-parse")
+            .args(short)
+            .arg("HEAD"),
+    )
+    .unwrap_or_else(|| {
+        eprintln!(
+            "WARNING: could not resolve HEAD, so this run cannot be tied to a commit. \
              Recording the git ref as \"unknown\"."
-            );
-            "unknown".into()
-        })
+        );
+        "unknown".into()
+    })
 }
 
 /// Run the benchmark suite.
@@ -957,15 +967,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &bench_target,
         &corpus.settings.target_registry,
         &report,
-        git_ref(),
+        git_ref(args.publication()),
         corpus_locked_at.clone(),
+        args.publication(),
     );
     match args.archive {
         // The step a fetch of a deferred run takes too.
         report::ArchiveMode::Write => deferred
             .apply(
                 Path::new(report::ARCHIVE_DIR),
-                Path::new(report::PERFORMANCE_PAGE),
+                Path::new("."),
+                publish::Banners::Render,
             )
             .map_err(|e| with_stop_reason(e, stopped.as_deref()))?,
         report::ArchiveMode::Defer => {
@@ -993,19 +1005,23 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// What a finished run leaves for the archive and the performance page.
+/// What a finished run leaves for the archive and, when it is the published
+/// run, for the surfaces.
 ///
 /// The machine's cloud is where the benchmark ran, whichever cloud the target
-/// registry is in. The page compares ECR runs, so a run into another registry
-/// writes no block to it.
+/// registry is in. The surfaces show the ECR comparison, so a run into another
+/// registry is never published. A run that asked to be published and is not
+/// what the design requires of one is archived as an experiment, with a
+/// warning that says why.
 fn deferred_output(
     target: &Target,
     target_registry: &str,
     report: &BenchReport,
     git_ref: String,
     corpus_locked_at: Option<lock::LockedAt>,
+    publication: publish::Publication,
 ) -> report::Deferred {
-    let record = report::RunRecord::of(report, git_ref, corpus_locked_at);
+    let mut record = report::RunRecord::of(report, git_ref, corpus_locked_at);
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
@@ -1019,17 +1035,29 @@ fn deferred_output(
         );
         None
     } else {
+        if publication == publish::Publication::Publish {
+            let published = match target {
+                Target::Ecr => {
+                    record.publication = publication;
+                    publish::verify(&record)
+                }
+                Target::ArtifactRegistry(_) | Target::Acr(_) => {
+                    Err("the target is not ECR".to_owned())
+                }
+            };
+            if let Err(why) = published {
+                eprintln!(
+                    "WARNING: this run is archived as an experiment and writes no surface: {why}"
+                );
+                record.publication = publish::Publication::Archive;
+            }
+        }
         Some(record)
     };
-    let page = match target {
-        Target::Ecr => report::PageBlocks::of(report),
-        Target::ArtifactRegistry(_) | Target::Acr(_) => report::PageBlocks::default(),
-    };
-    report::Deferred::new(
-        RegistryKind::of(target_registry).archive_stem(),
-        record,
-        page,
-    )
+    if publication == publish::Publication::Publish && record.is_none() {
+        eprintln!("WARNING: this run cannot be published, and writes no surface");
+    }
+    report::Deferred::new(RegistryKind::of(target_registry).archive_stem(), record)
 }
 
 /// The scenarios a pass finished, with each one's runs.
@@ -2746,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn a_google_or_azure_target_runs_on_the_machine_it_ran_on_and_leaves_the_page_and_names_out() {
+    fn a_google_or_azure_target_runs_on_the_machine_it_ran_on_is_never_published_and_names_out() {
         use crate::bench::acr::{FULL_ENV, Scope};
         use crate::bench::gar::ArtifactRegistryTarget;
         use crate::bench::report::tests::sample_report;
@@ -2760,7 +2788,14 @@ mod tests {
         let azure = Target::Acr(Scope::parse(&env_of(&FULL_ENV), rounds("3")).unwrap());
         let report = sample_report();
         let output = |target: &Target, host: &str| {
-            let deferred = deferred_output(target, host, &report, "abc1234".into(), None);
+            let deferred = deferred_output(
+                target,
+                host,
+                &report,
+                "abc1234".into(),
+                None,
+                publish::Publication::Publish,
+            );
             let text = serde_json::to_string(&deferred).unwrap();
             (
                 serde_json::from_str::<serde_json::Value>(&text).unwrap(),
@@ -2790,11 +2825,9 @@ mod tests {
             // Catches: the target registry's cloud written as the machine's.
             assert_eq!(record["record"]["machine"]["provider"], "aws", "{key}");
             assert_eq!(record["archive_key"], key);
-            // Catches: a non-ECR run rewriting the ECR comparison page.
-            assert_eq!(
-                record["page"],
-                serde_json::json!({"cold": null, "warm": null})
-            );
+            // Catches: a non-ECR run asking to be published, which would
+            // rewrite the ECR comparison everywhere it is quoted.
+            assert_eq!(record["record"].get("published"), None, "{key}");
             for name in names {
                 assert!(!text.contains(name), "{name} in {text}");
             }
@@ -2802,7 +2835,9 @@ mod tests {
 
         let (ecr, _) = output(&Target::Ecr, "111111111111.dkr.ecr.us-east-1.amazonaws.com");
         assert_eq!(ecr["archive_key"], "ecr");
-        assert!(ecr["page"]["cold"].is_string(), "{ecr}");
+        // The sample run is not the published shape, so asking to publish it
+        // archives it as an experiment.
+        assert_eq!(ecr["record"].get("published"), None, "{ecr}");
     }
 
     #[test]
