@@ -145,9 +145,44 @@ Fairness to ocync is not automatic for them. They run one copy at a time, as a u
 
 ocync syncs OCI 1.1 referrer artifacts (SBOMs, attestations) by default, and the other tools copy none as configured here: regctl and oras support referrers and run with them off, so no competitor does extra work that ocync's numbers are compared against. Its source bytes therefore include content the others never fetch: about 117 MB on the main corpus. The harness counts `referrers` requests per tool, and the summary and the performance page carry a footnote whenever a count is non-zero, so the byte columns are read with that difference in mind.
 
-## What a published claim looks like
+## Published runs
 
-One sentence that names the comparison, the source kind, the statistic, the round count, the instance, the target and the commit, in this form: "ocync finished a cold sync of the locked corpus `<ratio>` times faster than `<tool>` (median of `<n>` per-round ratios, range `<low>` to `<high>`, `<confidence>`% confidence), `<source kind>` source, `<instance type>`, `<registry and region>`, commit `<hash>`."
+> **Status: Planned.** Today any run of the whole main corpus at ocync's default cap rewrites the performance page, and the README sentence, the page description and the banner are edited by hand.
+
+Every public number comes from one run, called the published run, and from nothing else. Each surface that shows a number names that run by its timestamp.
+
+The archive shows what happens without this rule. The cold-sync figures published since April came from a 39-image corpus (`2026-04-26-131910`), a 40-image one (`2026-10-31-035712`) and a 25-image one (`2026-10-31-211851`), over 1, 4 and 5 rounds. The tools compared changed from run to run: dregsy left, ocync's own April build joined, and the per-tag tools never appeared. The banner, the README and the performance page each quote a different one of those runs.
+
+### What a run must be to be published
+
+A run is published only through `cargo xtask bench-remote --publish`. The flag refuses to start unless all of the following hold, and checks them again before writing:
+
+- **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
+- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them. A tool that fails the content check, or fails to finish, stays in the table as a row naming the failure. It is never dropped.
+- **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
+- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults.
+- **Build:** a commit on `main`, recorded by its full hash.
+- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region.
+- **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published.
+
+### What it writes
+
+From the one run record, `--publish` writes:
+
+- **Performance page tables:** one per scenario, cold and warm, between the existing markers. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line under the table gives the run timestamp, the commit, the instance, the corpus size and the round count. Ranges, per-round ratios and confidence stay in the run record and in this document. They are not on the page.
+- **Page description:** the `description` front matter of `docs/src/content/performance.md`.
+- **README:** the summary sentence in `README.md`, between a new pair of markers.
+- **Banner:** the banner carries no numbers. Its image and alt text name what ocync does, and the numbers live only in text the publish step writes.
+
+Every surface states its numbers the same way: the median ratio against regsync and the request and byte savings against it, rounded the same way, with the run timestamp beside them. A run without `--publish` writes none of these surfaces.
+
+### Telling a published record from an experiment
+
+The archive keeps every run, experiments included. `--publish` sets `published: true` on its record. The page, the description and the README all cite the newest published record. Every other record is an experiment, whatever its corpus or rounds.
+
+### The check that keeps them in line
+
+A test reads the newest published record from `bench/results/ecr.json`, computes the published numbers from it, and fails when the page tables, the page description or the README sentence differ from them or cite another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others.
 
 ## What we do not do
 
