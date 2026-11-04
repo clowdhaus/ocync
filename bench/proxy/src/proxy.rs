@@ -23,7 +23,7 @@ use http::header::{
     TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::Authority;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
@@ -322,6 +322,62 @@ impl ResolvesServerCert for DynamicResolver {
     }
 }
 
+/// Whether the proxy may send a request again after its first send fails
+/// before any response arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replay {
+    /// A GET or HEAD without a body: sending it twice repeats no side
+    /// effect, so a send that dies on a pooled connection the origin had
+    /// already closed is sent once more instead of failing the tool.
+    Once,
+    /// Anything else, which the proxy forwards exactly once.
+    Never,
+}
+
+impl Replay {
+    /// The replay rule for a request with this method and these headers.
+    fn of(method: &Method, content_length: Option<u64>, headers: &http::HeaderMap) -> Self {
+        let bodiless = content_length.unwrap_or(0) == 0 && !headers.contains_key(TRANSFER_ENCODING);
+        if bodiless && (method == Method::GET || method == Method::HEAD) {
+            Self::Once
+        } else {
+            Self::Never
+        }
+    }
+}
+
+/// Sends `request`, and once more when `replay` allows and the first send
+/// fails before a response. The client sent one request, so the failed
+/// attempt is logged as a warning and never as a request of its own.
+async fn send(
+    request: reqwest::RequestBuilder,
+    replay: Replay,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let again = match replay {
+        Replay::Once => request.try_clone(),
+        Replay::Never => None,
+    };
+    match (request.send().await, again) {
+        (Err(e), Some(again)) => {
+            warn!(error = %error_chain(&e.without_url()), "upstream send failed; sending once more");
+            again.send().await
+        }
+        (result, _) => result,
+    }
+}
+
+/// `error` and every cause beneath it, joined by `: `.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        chain.push_str(": ");
+        chain.push_str(&next.to_string());
+        cause = next.source();
+    }
+    chain
+}
+
 /// Process one HTTP/1.1 request arriving on a MITM'd connection:
 /// forward it to the origin, stream the response back, and log.
 async fn handle_request(
@@ -351,6 +407,7 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
+    let replay = Replay::of(&method, content_length, req.headers());
     let mut headers = forward_request_headers(req.headers(), &host);
 
     // Strip Content-Length from forwarded headers. We set it explicitly
@@ -373,16 +430,17 @@ async fn handle_request(
             .map_err(|e| e.to_string())
     });
 
-    let mut upstream_req = upstream
-        .request(method.clone(), &url)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body_stream));
-
-    if let Some(len) = content_length {
-        upstream_req = upstream_req.header(CONTENT_LENGTH, len);
+    let mut upstream_req = upstream.request(method.clone(), &url).headers(headers);
+    // A replayable request has no body, and a builder without a streamed
+    // body is the only kind `try_clone` can copy for the second send.
+    if replay == Replay::Never {
+        upstream_req = upstream_req.body(reqwest::Body::wrap_stream(body_stream));
+        if let Some(len) = content_length {
+            upstream_req = upstream_req.header(CONTENT_LENGTH, len);
+        }
     }
 
-    let upstream_resp = match upstream_req.send().await {
+    let upstream_resp = match send(upstream_req, replay).await {
         Ok(r) => r,
         Err(e) => {
             // Log the failed hop too so benchmark analytics see the miss.
@@ -401,7 +459,10 @@ async fn handle_request(
             log.write_entry(&entry).await;
             return Ok(error_response(
                 502,
-                format!("upstream request to {url}: {e}"),
+                format!(
+                    "upstream request to {url}: {}",
+                    error_chain(&e.without_url())
+                ),
             ));
         }
     };
@@ -729,6 +790,67 @@ mod tests {
         let out = forward_request_headers(&incoming, "registry.example.com");
         assert_eq!(out.get(HOST).unwrap(), "registry.example.com");
         assert!(out.contains_key("accept"));
+    }
+
+    /// A local origin whose first connection is closed as soon as a request
+    /// arrives, as an origin closing an idle pooled connection does, and
+    /// whose later connections answer 200. Returns its URL and a count of
+    /// the connections it accepted.
+    async fn origin_dropping_first_connection() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v2/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let nth = counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                if nth > 0 {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                }
+            }
+        });
+        (url, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_bodiless_get_is_sent_again_after_a_dropped_connection() {
+        let (url, accepted) = origin_dropping_first_connection().await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        let response = send(client.get(&url), Replay::Once).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_may_not_be_replayed_is_sent_once() {
+        // Catches: an upload replayed after a failure, which would repeat
+        // its side effect at the registry.
+        let (url, accepted) = origin_dropping_first_connection().await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        assert!(send(client.post(&url), Replay::Never).await.is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_a_bodiless_get_or_head_may_be_replayed() {
+        let none = http::HeaderMap::new();
+        let mut chunked = http::HeaderMap::new();
+        chunked.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+
+        assert_eq!(Replay::of(&Method::GET, None, &none), Replay::Once);
+        assert_eq!(Replay::of(&Method::HEAD, Some(0), &none), Replay::Once);
+        assert_eq!(Replay::of(&Method::GET, Some(5), &none), Replay::Never);
+        assert_eq!(Replay::of(&Method::GET, None, &chunked), Replay::Never);
+        assert_eq!(Replay::of(&Method::PUT, None, &none), Replay::Never);
+        assert_eq!(Replay::of(&Method::POST, None, &none), Replay::Never);
     }
 
     #[tokio::test]
