@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::error::Error;
 
@@ -28,11 +28,13 @@ pub const MAX_TRANSIENT_RETRIES: u32 = 4;
 /// registry that has stopped serving the listing.
 pub const MAX_LISTING_RETRIES: u32 = 32;
 
-/// The longest `Retry-After` a retry loop waits out.
+/// The most `Retry-After` time one operation waits out, summed over its
+/// retries (a tag listing's pages share one sum).
 ///
-/// A longer one is a quota that will not recover within a sync (Docker Hub's
-/// pull limit answers with hours), so the 429 surfaces at once instead of
-/// holding the run open.
+/// More is a quota that will not recover within a sync (Docker Hub's pull
+/// limit answers with hours), so the 429 surfaces at once instead of holding
+/// the run open. Kept under the engine's 180 s wait for a leader's blob, so a
+/// throttled leader still lands before its followers give up on mounting.
 const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Delay before the first retry.
@@ -80,76 +82,80 @@ pub(crate) fn is_transient(error: &Error) -> bool {
 
 /// The wait a `Retry-After` value names, in either of its forms (RFC 9110
 /// section 10.2.3): delta seconds, or an HTTP date in the IMF-fixdate form
-/// senders must use, which a past date makes zero. A number too large to
+/// senders must use, measured from the registry's own clock `now`, so a past
+/// date is zero. A number too large to
 /// hold counts as one second over [`MAX_HONORED_RETRY_AFTER`], so the cap
 /// refuses it. Anything else is `None`, and the caller backs off as it
 /// would without the header.
-fn retry_after_value(value: &str) -> Option<Duration> {
+fn retry_after_value(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
         let beyond_cap = MAX_HONORED_RETRY_AFTER + Duration::from_secs(1);
         return Some(value.parse().map_or(beyond_cap, Duration::from_secs));
     }
     let date = crate::aws::calendar::parse_imf_fixdate(value)?;
-    Some(
-        date.duration_since(std::time::SystemTime::now())
-            .unwrap_or(Duration::ZERO),
-    )
+    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 /// How long a 429 `response` asked to be left alone, from its `Retry-After`
-/// header. Only a throttle's header is read.
+/// header. Only a throttle's header is read. A date is measured against the
+/// response's `Date`, when it has one, so local clock skew does not change
+/// the wait.
 pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
-    retry_after_value(
-        response
-            .headers()
-            .get(http::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?,
-    )
+    let header = |name| response.headers().get(name)?.to_str().ok();
+    let now = header(http::header::DATE)
+        .and_then(crate::aws::calendar::parse_imf_fixdate)
+        .unwrap_or_else(SystemTime::now);
+    retry_after_value(header(http::header::RETRY_AFTER)?, now)
 }
 
 /// The wait before re-sending after `error`, given the jittered `backoff` a
 /// retry loop would use: `backoff`, plus the registry's `Retry-After` when
-/// it named one. `None`, with a WARN naming `error`, when that `Retry-After`
-/// is longer than a sync waits out and the error should surface. The single
-/// definition every registry retry loop shares.
-pub fn retry_delay(error: &Error, backoff: Duration) -> Option<Duration> {
+/// it named one. `honored` is the `Retry-After` time this operation has
+/// already waited out, and grows by this one. `None`, with a WARN naming
+/// `error`, when the sum would pass [`MAX_HONORED_RETRY_AFTER`] and the error
+/// should surface. The single definition every registry retry loop shares.
+pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> Option<Duration> {
     let asked = match error {
         Error::RegistryError { retry_after, .. } => *retry_after,
         _ => None,
     };
-    let delay = delay_unless_over_cap(asked, backoff);
+    let delay = delay_unless_over_cap(asked, backoff, honored);
     if delay.is_none() {
-        warn_beyond_cap(asked, &error.to_string());
+        tracing::warn!(
+            error = %error,
+            retry_after_s = asked.unwrap_or_default().as_secs(),
+            already_waited_s = honored.as_secs(),
+            max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
+            "registry asked for a longer wait than a sync waits out; not retrying"
+        );
     }
     delay
 }
 
-/// Report that a registry asked `subject` to wait longer than
-/// [`MAX_HONORED_RETRY_AFTER`], so it surfaces instead of retrying.
-fn warn_beyond_cap(asked: Option<Duration>, subject: &str) {
-    tracing::warn!(
-        subject,
-        retry_after_s = asked.unwrap_or_default().as_secs(),
-        max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
-        "registry asked for a longer wait than a sync waits out; not retrying"
-    );
-}
-
 /// `backoff` when the registry `asked` for no wait, and `asked` plus
-/// `backoff` when it did. The registry counts `Retry-After` down to the end
-/// of its quota window, so the jittered `backoff` on top keeps every request
-/// it throttled from re-sending at the same instant. `None` when `asked` is
-/// over [`MAX_HONORED_RETRY_AFTER`]: the wait is refused, not shortened.
-fn delay_unless_over_cap(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
+/// `backoff` when it did, adding `asked` to `honored`. The registry counts
+/// `Retry-After` down to the end of its quota window, so the jittered
+/// `backoff` on top keeps every request it throttled from re-sending at the
+/// same instant. `None` when `honored` plus `asked` is over
+/// [`MAX_HONORED_RETRY_AFTER`]: the wait is refused, not shortened.
+fn delay_unless_over_cap(
+    asked: Option<Duration>,
+    backoff: Duration,
+    honored: &mut Duration,
+) -> Option<Duration> {
     let Some(asked) = asked else {
         return Some(backoff);
     };
-    (asked <= MAX_HONORED_RETRY_AFTER).then(|| asked + backoff)
+    let total = honored.saturating_add(asked);
+    if total > MAX_HONORED_RETRY_AFTER {
+        return None;
+    }
+    *honored = total;
+    Some(asked + backoff)
 }
 
 /// Exponential backoff for attempt `attempt` (0-indexed), jittered.
@@ -183,19 +189,42 @@ pub(crate) trait Policy<E> {
     fn succeeded(&mut self) {}
 }
 
+/// The retries one operation may still spend and the `Retry-After` time it
+/// has waited out, shared across its calls (see [`MAX_LISTING_RETRIES`]).
+pub(crate) struct RetryBudget {
+    retries: Cell<u32>,
+    honored: Cell<Duration>,
+}
+
+impl RetryBudget {
+    /// A budget of `retries`, with no `Retry-After` waited out yet.
+    pub(crate) fn new(retries: u32) -> Self {
+        Self {
+            retries: Cell::new(retries),
+            honored: Cell::new(Duration::ZERO),
+        }
+    }
+}
+
 /// The crate's policy: an [`is_transient`] failure is sent again on the jittered
 /// schedule, at most [`MAX_TRANSIENT_RETRIES`] times per call, and each retry
-/// is drawn from the budget, which may be shared across the calls of one
-/// operation (see [`MAX_LISTING_RETRIES`]).
-pub(crate) struct Budgeted<'a>(pub(crate) &'a Cell<u32>);
+/// and each `Retry-After` wait is drawn from the budget.
+pub(crate) struct Budgeted<'a>(pub(crate) &'a RetryBudget);
 
 impl Policy<Error> for Budgeted<'_> {
     fn retry(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
-        if self.0.get() == 0 {
+        let budget = self.0;
+        if budget.retries.get() == 0 {
             return None;
         }
-        let delay = retry_delay(error, Bounded(is_transient).retry(attempt, error)?)?;
-        self.0.set(self.0.get() - 1);
+        let mut honored = budget.honored.get();
+        let delay = retry_delay(
+            error,
+            Bounded(is_transient).retry(attempt, error)?,
+            &mut honored,
+        )?;
+        budget.honored.set(honored);
+        budget.retries.set(budget.retries.get() - 1);
         Some(delay)
     }
 }
@@ -283,11 +312,18 @@ pub(crate) async fn send_retrying(
         if attempt >= MAX_TRANSIENT_RETRIES {
             return Ok(outcome?);
         }
-        let asked = outcome.as_ref().ok().and_then(retry_after);
-        let Some(delay) = delay_unless_over_cap(asked, backoff(attempt)) else {
-            warn_beyond_cap(asked, what);
+        // Callers hold a request permit, and for a push an upload slot, while
+        // they sign in, so sitting out a registry's wait here would starve
+        // every other request to it. The throttle surfaces instead.
+        if let Some(asked) = outcome.as_ref().ok().and_then(retry_after) {
+            tracing::warn!(
+                what,
+                retry_after_s = asked.as_secs(),
+                "registry asked a sign-in request to wait; not retrying while holding a request slot"
+            );
             return Ok(outcome?);
-        };
+        }
+        let delay = backoff(attempt);
         tracing::debug!(
             what,
             attempt,
@@ -409,7 +445,7 @@ mod tests {
         let attempts = std::cell::RefCell::new(Vec::new());
         let result: Result<(), Error> = retrying(
             "always throttled",
-            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
+            &mut Budgeted(&RetryBudget::new(MAX_TRANSIENT_RETRIES)),
             |attempt| {
                 attempts.borrow_mut().push(attempt);
                 async {
@@ -449,56 +485,108 @@ mod tests {
         assert!(logs.contains("empty host"), "{logs}");
     }
 
-    /// Both forms are read. Breaks if a negative number or garbage is taken
-    /// as a wait, if a number or a date is ignored, or if a number too large
-    /// to hold slips under the cap as no header.
+    /// Both forms are read, a date against the registry's clock. Breaks if
+    /// a sign or garbage is taken as a wait, if a number or a date is
+    /// ignored, or if a number too large to hold slips under the cap.
     #[test]
     fn retry_after_reads_seconds_and_dates() {
-        let in_an_hour =
-            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3600));
+        let now = crate::aws::calendar::parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT")
+            .expect("a valid date");
         let cases = [
             ("7", Some(Duration::from_secs(7))),
             (" 60 ", Some(Duration::from_secs(60))),
             ("0", Some(Duration::ZERO)),
             ("99999999999999999999", Some(Duration::from_secs(121))),
-            ("Wed, 21 Oct 2015 07:28:00 GMT", Some(Duration::ZERO)),
+            (
+                "Wed, 21 Oct 2015 07:28:30 GMT",
+                Some(Duration::from_secs(30)),
+            ),
+            ("Wed, 21 Oct 2015 07:27:00 GMT", Some(Duration::ZERO)),
             ("+5", None),
             ("-5", None),
             ("soon", None),
             ("", None),
         ];
         for (value, expected) in cases {
-            assert_eq!(retry_after_value(value), expected, "{value:?}");
+            assert_eq!(retry_after_value(value, now), expected, "{value:?}");
         }
-        let ahead = retry_after_value(&in_an_hour).expect("a future date is read");
-        assert!(
-            ahead > Duration::from_secs(3590) && ahead <= Duration::from_secs(3600),
-            "{ahead:?}"
-        );
+    }
+
+    /// A date is measured from the answer's `Date`, not the local clock,
+    /// and only a 429's header counts. Breaks if the local clock is used
+    /// (a 2015 date reads as zero) or a 503's header is taken.
+    #[test]
+    fn retry_after_measures_a_date_from_the_answer() {
+        let answer = |status: u16| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(status)
+                    .header(http::header::DATE, "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .header(http::header::RETRY_AFTER, "Wed, 21 Oct 2015 07:28:30 GMT")
+                    .body(Vec::<u8>::new())
+                    .expect("a valid response"),
+            )
+        };
+        assert_eq!(retry_after(&answer(429)), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after(&answer(503)), None);
     }
 
     /// Breaks if the wait drops the backoff on top of a `Retry-After` (every
-    /// throttled request would wake together), ignores the header, or moves
-    /// the cap's edge.
+    /// throttled request would wake together), ignores the header, moves the
+    /// cap's edge, or caps each wait instead of an operation's sum.
     #[test]
     fn delay_adds_the_backoff_up_to_the_cap() {
         let backoff = Duration::from_millis(250);
+        let secs = Duration::from_secs;
+        // (already waited out, asked, delay, waited out after)
         let cases = [
-            (None, Some(Duration::from_millis(250))),
-            (Some(Duration::ZERO), Some(Duration::from_millis(250))),
-            (
-                Some(Duration::from_secs(119)),
-                Some(Duration::from_millis(119_250)),
-            ),
-            (
-                Some(Duration::from_secs(120)),
-                Some(Duration::from_millis(120_250)),
-            ),
-            (Some(Duration::from_secs(121)), None),
+            (0, None, Some(Duration::from_millis(250)), 0),
+            (0, Some(0), Some(Duration::from_millis(250)), 0),
+            (0, Some(120), Some(Duration::from_millis(120_250)), 120),
+            (0, Some(121), None, 0),
+            (60, Some(60), Some(Duration::from_millis(60_250)), 120),
+            (60, Some(61), None, 60),
         ];
-        for (asked, expected) in cases {
-            assert_eq!(delay_unless_over_cap(asked, backoff), expected, "{asked:?}");
+        for (before, asked, expected, after) in cases {
+            let mut honored = secs(before);
+            let delay = delay_unless_over_cap(asked.map(secs), backoff, &mut honored);
+            assert_eq!(delay, expected, "{before} s then {asked:?}");
+            assert_eq!(honored, secs(after), "{before} s then {asked:?}");
         }
+    }
+
+    /// The calls of one operation share its `Retry-After` allowance: a
+    /// second page asked to wait 70 s after a first page waited 70 s
+    /// surfaces. Breaks if the sum is kept per call, which lets a listing
+    /// wait 120 s on every page.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_shared_budget_caps_the_total_retry_after() {
+        let budget = RetryBudget::new(MAX_LISTING_RETRIES);
+        let page = || {
+            let calls = Cell::new(0u32);
+            let budget = &budget;
+            async move {
+                let result: Result<(), Error> = retrying("page", &mut Budgeted(budget), |_| {
+                    calls.set(calls.get() + 1);
+                    let first = calls.get() == 1;
+                    async move {
+                        if first {
+                            Err(Error::RegistryError {
+                                status: http::StatusCode::TOO_MANY_REQUESTS,
+                                message: "slow down".into(),
+                                retry_after: Some(Duration::from_secs(70)),
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .await;
+                (result.is_ok(), calls.get())
+            }
+        };
+        assert_eq!(page().await, (true, 2), "the first wait is within the cap");
+        assert_eq!(page().await, (false, 1), "the second would pass the cap");
     }
 
     #[tokio::test]
@@ -506,7 +594,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let _: Result<(), Error> = retrying(
             "not found",
-            &mut Budgeted(&Cell::new(MAX_TRANSIENT_RETRIES)),
+            &mut Budgeted(&RetryBudget::new(MAX_TRANSIENT_RETRIES)),
             |_| {
                 calls.set(calls.get() + 1);
                 async {
@@ -523,38 +611,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_retrying_waits_out_a_retry_after_unless_too_long() {
-        // Catches: the auth requests (ping, token endpoint, ACR OAuth)
-        // re-sending inside a throttle, or sleeping out an hours-long one.
-        for (asked, requests, at_least) in [
-            ("1", 2, Duration::from_secs(1)),
-            ("3600", 1, Duration::ZERO),
-        ] {
-            let server = wiremock::MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(429).insert_header("Retry-After", asked),
-                )
-                .up_to_n_times(1)
-                .mount(&server)
-                .await;
-            wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .respond_with(wiremock::ResponseTemplate::new(200))
-                .mount(&server)
-                .await;
-            let started = std::time::Instant::now();
+    async fn send_retrying_surfaces_a_throttle_that_names_a_wait() {
+        // Catches: a sign-in request (ping, token endpoint, ACR OAuth)
+        // sleeping out a registry's wait while its caller holds a request
+        // permit, or re-sending into the throttle.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
 
-            let response = tokio::time::timeout(
-                Duration::from_secs(10),
-                send_retrying(crate::test_http_client().get(server.uri()), "test"),
-            )
+        let response = send_retrying(crate::test_http_client().get(server.uri()), "test")
             .await
-            .unwrap_or_else(|_| panic!("Retry-After {asked}: still waiting after 10 s"))
             .unwrap();
 
-            let sent = server.received_requests().await.unwrap().len();
-            assert_eq!(sent, requests, "Retry-After {asked}: {response:?}");
-            assert!(started.elapsed() >= at_least, "Retry-After {asked}");
-        }
+        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

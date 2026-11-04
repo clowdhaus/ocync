@@ -1,13 +1,11 @@
 //! Tag listing with pagination for OCI repositories.
 
-use std::cell::Cell;
-
 use serde::Deserialize;
 
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
-use crate::retry::{Budgeted, MAX_LISTING_RETRIES, retrying};
+use crate::retry::{Budgeted, MAX_LISTING_RETRIES, RetryBudget, retrying};
 use crate::spec::RepositoryName;
 
 /// Maximum number of tag list pages to follow before treating the pagination
@@ -84,7 +82,7 @@ impl RegistryClient {
         let mut path = "tags/list".to_owned();
         let mut page_count: usize = 0;
         // One budget for the whole walk; see MAX_LISTING_RETRIES.
-        let retry_budget = Cell::new(MAX_LISTING_RETRIES);
+        let retry_budget = RetryBudget::new(MAX_LISTING_RETRIES);
 
         loop {
             page_count += 1;

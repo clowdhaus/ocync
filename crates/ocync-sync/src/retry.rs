@@ -184,6 +184,7 @@ where
 {
     let mut attempt = 0;
     let mut refusal = TokenRetry::Available;
+    let mut honored = Duration::ZERO;
     loop {
         match f().await {
             Ok(val) => return Ok(val),
@@ -206,7 +207,11 @@ where
                 // error when it is longer than a sync waits out.
                 let wait = retryable
                     .then(|| {
-                        ocync_distribution::retry::retry_delay(&e, config.backoff_for(attempt))
+                        ocync_distribution::retry::retry_delay(
+                            &e,
+                            config.backoff_for(attempt),
+                            &mut honored,
+                        )
                     })
                     .flatten();
 
@@ -452,16 +457,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_retry_after_is_waited_out_unless_too_long() {
         let config = RetryConfig::default();
-        // (Retry-After, calls made, succeeds)
-        let cases = [(30u64, 2, true), (3600, 1, false)];
-        for (asked, expected_calls, succeeds) in cases {
+        // (Retry-After, throttled answers before success, calls made,
+        // succeeds, time waited). Two 70 s waits pass the 120 s an operation
+        // waits out in all, so the second throttle surfaces.
+        let cases = [
+            (30u64, 1, 2, true, 30),
+            (70, 2, 2, false, 70),
+            (3600, 1, 1, false, 0),
+        ];
+        for (asked, throttles, expected_calls, succeeds, waited) in cases {
             let calls = Cell::new(0);
             let started = tokio::time::Instant::now();
             let result = with_retry(&config, "blob transfer", || {
                 calls.set(calls.get() + 1);
-                let first = calls.get() == 1;
+                let throttled = calls.get() <= throttles;
                 async move {
-                    if first {
+                    if throttled {
                         Err(ocync_distribution::Error::RegistryError {
                             status: StatusCode::TOO_MANY_REQUESTS,
                             message: "registry/repo".into(),
@@ -475,11 +486,12 @@ mod tests {
             .await;
             assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}");
             assert_eq!(calls.get(), expected_calls, "Retry-After {asked}");
-            if succeeds {
-                assert!(started.elapsed() >= Duration::from_secs(asked), "{asked}");
-            } else {
-                assert_eq!(started.elapsed(), Duration::ZERO, "{asked}");
-            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(waited)
+                    && elapsed < Duration::from_secs(waited) + Duration::from_secs(2),
+                "Retry-After {asked}: waited {elapsed:?}"
+            );
         }
     }
 
