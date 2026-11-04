@@ -22,15 +22,8 @@ use crate::bench::{Scenario, ToolSelection, corpus, source, target, value_name};
 pub(crate) const PUBLISHED_ROUNDS: usize = 5;
 
 /// The tools a published run compares, in the order of the page's columns.
-pub(crate) const PUBLISHED_TOOLS: [Tool; 7] = [
-    Tool::Ocync,
-    Tool::Dregsy,
-    Tool::Regsync,
-    Tool::Skopeo,
-    Tool::Crane,
-    Tool::Regctl,
-    Tool::Oras,
-];
+/// A tool joins only after it has finished a full benchmark run.
+pub(crate) const PUBLISHED_TOOLS: [Tool; 3] = [Tool::Ocync, Tool::Dregsy, Tool::Regsync];
 
 /// Whether a run is the published one or an archived experiment.
 ///
@@ -1504,9 +1497,7 @@ pub(crate) mod tests {
             "{block}"
         );
         assert!(
-            block.contains(
-                "| Metric | ocync | dregsy | regsync | skopeo | crane | regctl | oras |\n"
-            ),
+            block.contains("| Metric | ocync | dregsy | regsync |\n"),
             "{block}"
         );
         assert!(
@@ -1525,10 +1516,8 @@ pub(crate) mod tests {
         );
         assert!(!block.contains("Per-round ratio"), "{block}");
         assert!(block.contains("Referrers calls -- ocync: 37"), "{block}");
-        assert!(
-            block.contains("Peak RSS of skopeo, crane, regctl, oras is per process"),
-            "{block}"
-        );
+        // No per-tag tool is published, so no per-process RSS note.
+        assert!(!block.contains("is per process"), "{block}");
     }
 
     #[test]
