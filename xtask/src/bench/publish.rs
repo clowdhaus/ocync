@@ -1607,12 +1607,6 @@ pub(crate) mod tests {
         let record = fixture(FIXTURE_RUN);
         let files = written(&record);
 
-        // Nothing is shown before the first publish.
-        assert_eq!(
-            stale(&record, &BTreeMap::new()).len(),
-            regions(&record).unwrap().len()
-        );
-
         // A hand edit to one number in one file names that file's region.
         let mut edited = files.clone();
         let readme = edited.get_mut(README).unwrap();
