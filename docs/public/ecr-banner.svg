@@ -63,14 +63,12 @@
   <rect x="430" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="500" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#06b6d4" letter-spacing="2">SPEED</text>
   <text x="500" y="140" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="52" font-weight="800" fill="url(#cyan-grad)"><!-- BENCH-SPEED:START -->4x<!-- BENCH-SPEED:END --></text>
-  <text x="500" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">faster than</text>
-  <text x="500" y="192" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">regsync</text>
+  <text x="500" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">faster</text>
 
   <rect x="590" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="660" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#a855f7" letter-spacing="2">EFFICIENCY</text>
   <text x="660" y="140" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="52" font-weight="800" fill="url(#purple-grad)"><!-- BENCH-REQUESTS:START -->30%<!-- BENCH-REQUESTS:END --></text>
   <text x="660" y="175" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">fewer requests</text>
-  <text x="660" y="192" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" fill="#8b92b0">than regsync</text>
 
   <rect x="750" y="35" width="140" height="180" rx="12" fill="url(#stat-bg)" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
   <text x="820" y="70" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#F736F6" letter-spacing="2">RELIABILITY</text>
