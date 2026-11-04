@@ -48,7 +48,9 @@ use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferState
 use crate::error::ManifestRefusal;
 pub use crate::plan::{RegistryAlias, TargetId};
 use crate::progress::RunProgress;
-use crate::retry::{RetryConfig, count_retries, retries_made, with_retry, with_retry_until};
+use crate::retry::{
+    Retried, RetryConfig, count_retries, retries_made, with_retry, with_retry_unless_cancelled,
+};
 use crate::shared::{
     Claim, ClaimGuard, CopyKey, PerRun, Referrers, claim, copy_key, run_once, source_key,
     target_key,
@@ -2630,8 +2632,11 @@ async fn transfer_claimed_blob(
 
     let transfer_result: Result<PushOutcome, crate::Error> = match staging {
         StagingClaim::Pull(guard) => {
-            if let Err(e) =
-                with_retry_until(io.retry, "blob pull (to stage)", io.cancel, || async {
+            let staged = with_retry_unless_cancelled(
+                io.retry,
+                "blob pull (to stage)",
+                Some(io.cancel),
+                || async {
                     let mut writer = io.staging.begin_write(digest).map_err(|e| {
                         ocync_distribution::Error::Io {
                             context: "staging create",
@@ -2654,17 +2659,19 @@ async fn transfer_claimed_blob(
                         source: e.into(),
                     })?;
                     Ok::<(), ocync_distribution::Error>(())
-                })
-                .await
-            {
-                if io.cancel.is_triggered() {
-                    return io.abandon_claim(digest);
+                },
+            )
+            .await;
+            match staged {
+                Retried::Done(Ok(())) => {}
+                Retried::Done(Err(e)) => {
+                    let err = crate::Error::BlobTransfer {
+                        digest: digest.clone(),
+                        source: e,
+                    };
+                    return BlobResult::Failed(io.fail_copy(digest, err));
                 }
-                let err = crate::Error::BlobTransfer {
-                    digest: digest.clone(),
-                    source: e,
-                };
-                return BlobResult::Failed(io.fail_copy(digest, err));
+                Retried::Cancelled => return io.abandon_claim(digest),
             }
             // Staged: waiters read it from disk while this task pushes.
             drop(guard);
@@ -2717,7 +2724,7 @@ where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<ocync_distribution::Error> + Send,
 {
-    let pushed = with_retry_until(io.retry, operation, io.cancel, || async {
+    let pushed = with_retry_unless_cancelled(io.retry, operation, Some(io.cancel), || async {
         let slot = tokio::select! {
             biased;
             () = io.cancel.notified() => return Ok(PushOutcome::Cancelled),
@@ -2733,8 +2740,8 @@ where
     })
     .await;
     match pushed {
-        Err(_) if io.cancel.is_triggered() => Ok(PushOutcome::Cancelled),
-        pushed => pushed.map_err(|e| crate::Error::BlobTransfer {
+        Retried::Cancelled => Ok(PushOutcome::Cancelled),
+        Retried::Done(pushed) => pushed.map_err(|e| crate::Error::BlobTransfer {
             digest: digest.clone(),
             source: e,
         }),

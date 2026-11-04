@@ -414,7 +414,10 @@ impl Error {
                 status,
                 retry_after,
                 ..
-            } => retry_after.is_none() && crate::retry::is_transient_status(*status),
+            } => {
+                !retry_after.is_some_and(crate::retry::RetryAfter::names_a_wait)
+                    && crate::retry::is_transient_status(*status)
+            }
             Self::Transport { call, source } => {
                 let final_failure = match call {
                     Call::AwsRegion => source.is_connect() || source.is_timeout(),

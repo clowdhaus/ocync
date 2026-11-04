@@ -306,15 +306,16 @@ fn classifies_answers() {
     assert!(!undecodable.is_transient());
 }
 
-/// A credential call's 429 or 503 that names a `Retry-After` is not sent
-/// again, as its caller may hold a request permit; one without the header
-/// still is. Breaks if the header is not read from the answer, or a
-/// throttle that names a wait is retried.
+/// A credential call's 429 that names a wait is not sent again, as its
+/// caller may hold a request permit; one without the header, or with
+/// `Retry-After: 0`, still is. Breaks if the header is not read from the
+/// answer, a throttle that names a wait is retried, or one that asks for no
+/// wait fails the credential load.
 #[tokio::test]
 async fn a_throttle_that_names_a_wait_is_final() {
     for (status, header, transient) in [
         (429, Some("30"), false),
-        (503, Some("30"), false),
+        (429, Some("0"), true),
         (429, None, true),
     ] {
         let mut answer = http::Response::builder().status(status);

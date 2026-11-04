@@ -621,21 +621,6 @@ fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) ->
     }
 }
 
-/// `work`'s output, or `None` when `shutdown` fires first.
-async fn unless_shutdown<F: Future>(
-    shutdown: Option<&ShutdownSignal>,
-    work: F,
-) -> Option<F::Output> {
-    match shutdown {
-        Some(shutdown) => tokio::select! {
-            biased;
-            () = shutdown.notified() => None,
-            output = work => Some(output),
-        },
-        None => Some(work.await),
-    }
-}
-
 /// Run the sync command: load config, resolve mappings, and execute.
 ///
 /// The `shutdown` signal is forwarded to the engine for graceful drain.
@@ -647,6 +632,7 @@ pub(crate) async fn run(
     verbose: bool,
     mut watch_log: Option<&mut WatchLogState>,
 ) -> Result<ExitCode, CliError> {
+    let run_start = std::time::Instant::now();
     let config = load_config(&args.config)?;
 
     let min_tags = if args.dry_run {
@@ -678,8 +664,11 @@ pub(crate) async fn run(
     });
     // Signing in and listing tags can wait out a registry's `Retry-After`,
     // longer than a pod's shutdown grace period, so shutdown ends it.
-    let Some(resolution) = unless_shutdown(shutdown, prepare).await else {
+    let Some(resolution) = ocync_sync::shutdown::unless_triggered(shutdown, prepare).await else {
         tracing::warn!("shutdown before the sync started; nothing was synced");
+        // The `--json` document is still written, so a consumer reads an
+        // empty run rather than nothing.
+        write_output(&SyncReport::empty(run_start.elapsed()), &[], &[], args.json)?;
         return Ok(ExitCode::Failure);
     };
     let Resolution {
@@ -1891,26 +1880,51 @@ fn write_output(
 mod tests {
     use super::*;
 
-    /// Shutdown ends the prepare phase's wait, and without a signal the
-    /// work runs to the end. Breaks if a SIGTERM during a `Retry-After`
-    /// wait in sign-in or tag listing is ignored until the wait ends.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn shutdown_ends_the_prepare_phase() {
-        let shutdown = ShutdownSignal::new();
-        let slow = async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            "prepared"
+    /// A shutdown while the clients sign in ends the run at once, as a
+    /// failure, instead of after the registry answers. Breaks if the prepare
+    /// phase ignores shutdown until a slow sign-in, or a `Retry-After` wait in
+    /// it, ends.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_during_sign_in_ends_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v2/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("ocync.yaml");
+        let repos = repo_names(1);
+        let yaml = config_yaml(&server, &repos, "      glob: [\"*\"]\n");
+        std::fs::write(&config, yaml).unwrap();
+        let args = SyncArgs {
+            config,
+            dry_run: false,
+            json: true,
         };
-        let started = tokio::time::Instant::now();
-        let (prepared, ()) = tokio::join!(unless_shutdown(Some(&shutdown), slow), async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            shutdown.trigger();
-        });
-        assert_eq!(prepared, None);
-        assert_eq!(started.elapsed(), Duration::from_secs(5));
-        assert_eq!(
-            unless_shutdown(None, async { "prepared" }).await,
-            Some("prepared")
+        let shutdown = ShutdownSignal::new();
+
+        let started = std::time::Instant::now();
+        let (code, ()) = tokio::join!(
+            run(
+                &args,
+                &ocync_sync::progress::NullProgress,
+                Some(&shutdown),
+                None,
+                false,
+                None,
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                shutdown.trigger();
+            },
+        );
+
+        assert!(matches!(code, Ok(ExitCode::Failure)), "{code:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
         );
     }
 

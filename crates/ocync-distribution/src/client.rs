@@ -642,23 +642,15 @@ pub(crate) fn auth_headers(token: Option<&Token>) -> Result<HeaderMap, Error> {
 
 /// Report the AIMD permit outcome:
 /// [`throttled`](crate::aimd::AimdPermit::throttled) on 429,
-/// [`success`](crate::aimd::AimdPermit::success) otherwise, and pause the
-/// window for any `Retry-After` the answer named. The permit's drop treats a
-/// transport error as success.
+/// [`success`](crate::aimd::AimdPermit::success) otherwise. The permit's drop
+/// treats a transport error as success.
 pub(crate) fn report_permit(
-    mut permit: crate::aimd::AimdPermit<'_>,
+    permit: crate::aimd::AimdPermit<'_>,
     result: &Result<reqwest::Response, Error>,
 ) {
-    let Ok(resp) = result else {
-        return permit.success();
-    };
-    if let Some(wait) = crate::retry::retry_after(resp).and_then(crate::retry::RetryAfter::wait) {
-        permit.pause_for(wait);
-    }
-    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-        permit.throttled();
-    } else {
-        permit.success();
+    match result {
+        Ok(resp) if resp.status() == StatusCode::TOO_MANY_REQUESTS => permit.throttled(),
+        _ => permit.success(),
     }
 }
 
@@ -734,41 +726,6 @@ mod tests {
 
     fn test_base_url() -> Url {
         Url::parse("https://registry-1.docker.io").unwrap()
-    }
-
-    /// A 429 or 503 that names a `Retry-After` holds the window's next
-    /// request back that long, so requests that would run into the same
-    /// limit wait with the one that was told to. Breaks if the header is
-    /// ignored, a 503's is, or a wait too long to sit out pauses the window.
-    #[tokio::test(start_paused = true, flavor = "current_thread")]
-    async fn a_retry_after_holds_back_the_windows_next_request() {
-        // (status, Retry-After, seconds the next request is held)
-        let cases = [
-            (429, Some("30"), 30),
-            (503, Some("30"), 30),
-            (429, None, 0),
-            (429, Some("3600"), 0),
-        ];
-        for (status, header, held) in cases {
-            let ctrl = AimdController::new("registry.example.com", NonZeroUsize::new(8).unwrap());
-            let mut answer = http::Response::builder().status(status);
-            if let Some(value) = header {
-                answer = answer.header(http::header::RETRY_AFTER, value);
-            }
-            let answer = reqwest::Response::from(answer.body(Vec::<u8>::new()).unwrap());
-            report_permit(
-                ctrl.acquire(RegistryAction::ManifestRead).await,
-                &Ok(answer),
-            );
-
-            let started = tokio::time::Instant::now();
-            drop(ctrl.acquire(RegistryAction::ManifestRead).await);
-            assert_eq!(
-                started.elapsed().as_secs(),
-                held,
-                "{status} with Retry-After {header:?}"
-            );
-        }
     }
 
     /// Minimal auth provider for tests that always returns a fixed token.

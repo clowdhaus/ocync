@@ -90,9 +90,9 @@ pub struct RetryAfter(Asked);
 enum Asked {
     /// At most [`MAX_HONORED_RETRY_AFTER`].
     Wait(Duration),
-    /// More than [`MAX_HONORED_RETRY_AFTER`], including a number too large
-    /// to hold.
-    TooLong,
+    /// More than [`MAX_HONORED_RETRY_AFTER`], as asked, or [`Duration::MAX`]
+    /// for a number too large to hold.
+    TooLong(Duration),
 }
 
 impl RetryAfter {
@@ -104,34 +104,47 @@ impl RetryAfter {
     pub fn parse(value: &str, now: SystemTime) -> Option<Self> {
         let value = value.trim();
         let asked = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-            value.parse().ok().map(Duration::from_secs)
+            value.parse().map_or(Duration::MAX, Duration::from_secs)
         } else {
             let date = crate::aws::calendar::parse_imf_fixdate(value)?;
-            Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+            date.duration_since(now).unwrap_or(Duration::ZERO)
         };
-        Some(Self(match asked {
-            Some(wait) if wait <= MAX_HONORED_RETRY_AFTER => Asked::Wait(wait),
-            _ => Asked::TooLong,
+        Some(Self(if asked <= MAX_HONORED_RETRY_AFTER {
+            Asked::Wait(asked)
+        } else {
+            Asked::TooLong(asked)
         }))
     }
 
     /// The wait, or `None` when it is longer than a sync waits out.
-    pub fn wait(self) -> Option<Duration> {
+    pub(crate) fn wait(self) -> Option<Duration> {
         match self.0 {
             Asked::Wait(wait) => Some(wait),
-            Asked::TooLong => None,
+            Asked::TooLong(_) => None,
         }
+    }
+
+    /// The wait as the registry named it, for a log line.
+    fn asked_secs(self) -> u64 {
+        match self.0 {
+            Asked::Wait(asked) | Asked::TooLong(asked) => asked.as_secs(),
+        }
+    }
+
+    /// Whether the registry named a wait longer than none at all. A
+    /// `Retry-After: 0`, or a date already past, asks for nothing.
+    pub(crate) fn names_a_wait(self) -> bool {
+        self.wait() != Some(Duration::ZERO)
     }
 }
 
-/// The `Retry-After` of a 429 or 503 `response`, the two answers RFC 9110
-/// gives it meaning on. A date is measured against the response's `Date`,
-/// when it has one, so local clock skew does not change the wait.
+/// The `Retry-After` of a 429 `response`. Only a throttle's is read: a 503
+/// keeps the usual backoff, as one asking for longer than a sync waits out
+/// would otherwise fail where retrying gets through. A date is measured
+/// against the response's `Date`, when it has one, so local clock skew does
+/// not change the wait.
 pub(crate) fn retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
-    let status = response.status();
-    if status != http::StatusCode::TOO_MANY_REQUESTS
-        && status != http::StatusCode::SERVICE_UNAVAILABLE
-    {
+    if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
     let header = |name| response.headers().get(name)?.to_str().ok();
@@ -145,8 +158,8 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
 /// retry loop would use: `backoff`, plus the registry's `Retry-After` when
 /// it named one. `honored` is the `Retry-After` time this operation has
 /// already waited out, and grows by this one. `None`, with a WARN naming
-/// `error`, when the sum would pass 120 s and the error
-/// should surface. The single definition every registry retry loop shares.
+/// `error`, when this wait is too long or the sum would pass 120 s, and the
+/// error should surface. The single definition every registry retry loop shares.
 pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> Option<Duration> {
     let asked = match error {
         Error::RegistryError { retry_after, .. } => *retry_after,
@@ -156,7 +169,7 @@ pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> 
     if delay.is_none() {
         tracing::warn!(
             error = %error,
-            retry_after_s = asked.and_then(RetryAfter::wait).map(|w| w.as_secs()),
+            retry_after_s = asked.map(RetryAfter::asked_secs),
             already_waited_s = honored.as_secs(),
             max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
             "registry asked for a longer wait than a sync waits out; not retrying"
@@ -345,10 +358,11 @@ pub(crate) async fn send_retrying(
         // Callers hold a request permit, and for a push an upload slot, while
         // they sign in, so sitting out a registry's wait here would starve
         // every other request to it. The throttle surfaces instead.
-        if let Some(asked) = outcome.as_ref().ok().and_then(retry_after) {
+        let asked = outcome.as_ref().ok().and_then(retry_after);
+        if let Some(asked) = asked.filter(|asked| asked.names_a_wait()) {
             tracing::warn!(
                 what,
-                retry_after_s = asked.wait().map(|w| w.as_secs()),
+                retry_after_s = asked.asked_secs(),
                 "registry asked a sign-in request to wait; not retrying while holding a request slot"
             );
             return Ok(outcome?);
@@ -518,23 +532,28 @@ mod tests {
     /// Both forms are read, a date against the registry's clock, and a wait
     /// over the cap is told apart from no header. Breaks if a sign or garbage
     /// is taken as a wait, if a number or a date is ignored, or if a wait over
-    /// the cap, or a number too large to hold, is held as a wait.
+    /// the cap, or a number too large to hold, is held as a wait or loses the
+    /// seconds the registry asked for.
     #[test]
     fn retry_after_reads_seconds_and_dates() {
         let now = crate::aws::calendar::parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT")
             .expect("a valid date");
         let wait = |secs| Some(RetryAfter(Asked::Wait(Duration::from_secs(secs))));
-        let too_long = Some(RetryAfter(Asked::TooLong));
+        let too_long = |asked| Some(RetryAfter(Asked::TooLong(asked)));
         let cases = [
             ("7", wait(7)),
             (" 60 ", wait(60)),
             ("0", wait(0)),
             ("120", wait(120)),
-            ("121", too_long),
-            ("99999999999999999999", too_long),
+            ("121", too_long(Duration::from_secs(121))),
+            ("3600", too_long(Duration::from_secs(3600))),
+            ("99999999999999999999", too_long(Duration::MAX)),
             ("Wed, 21 Oct 2015 07:28:30 GMT", wait(30)),
             ("Wed, 21 Oct 2015 07:27:00 GMT", wait(0)),
-            ("Wed, 21 Oct 2015 08:28:00 GMT", too_long),
+            (
+                "Wed, 21 Oct 2015 08:28:00 GMT",
+                too_long(Duration::from_secs(3600)),
+            ),
             ("+5", None),
             ("-5", None),
             ("soon", None),
@@ -543,12 +562,17 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(RetryAfter::parse(value, now), expected, "{value:?}");
         }
+        // The warning names the wait the registry asked for, not the cap.
+        assert_eq!(
+            RetryAfter::parse("3600", now).map(RetryAfter::asked_secs),
+            Some(3600)
+        );
     }
 
     /// A date is measured from the answer's `Date`, not the local clock, and
-    /// only a 429's or a 503's header counts. Breaks if the local clock is
-    /// used (a 2015 date reads as zero), if a 503's header is ignored, or if
-    /// another answer's is taken.
+    /// only a 429's header counts. Breaks if the local clock is used (a 2015
+    /// date reads as zero), or a 503's header is taken, which would fail a
+    /// short outage that asks for a long wait instead of retrying it.
     #[test]
     fn retry_after_measures_a_date_from_the_answer() {
         let answer = |status: u16| {
@@ -563,8 +587,7 @@ mod tests {
         };
         let thirty = Some(RetryAfter(Asked::Wait(Duration::from_secs(30))));
         assert_eq!(retry_after(&answer(429)), thirty);
-        assert_eq!(retry_after(&answer(503)), thirty);
-        assert_eq!(retry_after(&answer(500)), None);
+        assert_eq!(retry_after(&answer(503)), None);
     }
 
     /// Breaks if the wait drops the backoff on top of a `Retry-After` (every
@@ -580,7 +603,7 @@ mod tests {
             (0, None, Some(Duration::from_millis(250)), 0),
             (0, wait(0), Some(Duration::from_millis(250)), 0),
             (0, wait(120), Some(Duration::from_millis(120_250)), 120),
-            (0, Some(RetryAfter(Asked::TooLong)), None, 0),
+            (0, Some(RetryAfter(Asked::TooLong(secs(121)))), None, 0),
             (60, wait(60), Some(Duration::from_millis(60_250)), 120),
             (60, wait(61), None, 60),
         ];
@@ -651,23 +674,30 @@ mod tests {
     async fn send_retrying_surfaces_a_throttle_that_names_a_wait() {
         // Catches: a sign-in request (ping, token endpoint, ACR OAuth)
         // sleeping out a registry's wait while its caller holds a request
-        // permit, or re-sending into the throttle.
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(429).insert_header("Retry-After", "1"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        // permit, or re-sending into the throttle; and a `Retry-After: 0`,
+        // which asks for no wait, failing the sign-in instead of retrying.
+        // (Retry-After, requests sent, final status)
+        for (asked, requests, status) in [("1", 1, 429), ("0", 2, 200)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(429).insert_header("Retry-After", asked),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
 
-        let response = send_retrying(crate::test_http_client().get(server.uri()), "test")
-            .await
-            .unwrap();
+            let response = send_retrying(crate::test_http_client().get(server.uri()), "test")
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(response.status().as_u16(), status, "Retry-After {asked}");
+            let sent = server.received_requests().await.unwrap().len();
+            assert_eq!(sent, requests, "Retry-After {asked}");
+        }
     }
 }

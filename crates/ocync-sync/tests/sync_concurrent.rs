@@ -795,6 +795,52 @@ async fn sync_blob_failure_cancels_remaining_blobs() {
     assert_eq!(report.stats.images_failed, 1);
 }
 
+/// A blob sitting out a target's `Retry-After` stops when another blob of its
+/// image fails, instead of finishing the wait. Every upload is throttled with
+/// `Retry-After: 60`, and one layer cannot be pulled: the image fails within
+/// seconds. Breaks if the wait between attempts ignores the image's cancel.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_blob_failure_ends_a_retry_after_wait() {
+    let source_server = MockServer::start().await;
+    let target_server = MockServer::start().await;
+    let parts = ManifestBuilder::new(b"retry-after-cancel-config")
+        .layer(b"retry-after-cancel-throttled")
+        .layer(b"retry-after-cancel-unpullable")
+        .build();
+    parts.mount_source(&source_server, "repo", "v1").await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v2/repo/blobs/{}",
+            parts.layer_descs[1].digest
+        )))
+        .respond_with(ResponseTemplate::new(404).set_delay(Duration::from_secs(1)))
+        .with_priority(1)
+        .mount(&source_server)
+        .await;
+    mount_manifest_head_not_found(&target_server, "repo", "v1").await;
+    parts.mount_target_blob_misses(&target_server, "repo").await;
+    Mock::given(method("POST"))
+        .and(path("/v2/repo/blobs/uploads/"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+        .mount(&target_server)
+        .await;
+
+    let mapping = mapping_from_servers(
+        &source_server,
+        &target_server,
+        "repo",
+        vec![TagPair::same("v1")],
+    );
+    let report = tokio::time::timeout(
+        Duration::from_secs(20),
+        run_sync_with_concurrency(vec![mapping], 4, BlobStage::disabled()),
+    )
+    .await
+    .expect("the throttled uploads stop at the cancel, not after 60 s");
+
+    assert_status!(report, 0, ImageStatus::Failed { .. });
+}
+
 /// Two images sharing a blob sync concurrently with staging enabled, to
 /// different targets. Concurrent staging writes to the same digest must not
 /// panic or produce ENOENT errors (unique tmp paths prevent collision).

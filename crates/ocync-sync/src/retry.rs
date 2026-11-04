@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 
-use crate::shutdown::ShutdownSignal;
+use crate::shutdown::{ShutdownSignal, unless_triggered};
 
 /// Retry configuration with exponential backoff.
 #[derive(Debug, Clone)]
@@ -184,33 +184,29 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ocync_distribution::Error>>,
 {
-    retry_loop(config, operation, None, f).await
+    match with_retry_unless_cancelled(config, operation, None, f).await {
+        Retried::Done(result) => result,
+        Retried::Cancelled => unreachable!("only a cancel signal ends a retry as cancelled"),
+    }
+}
+
+/// How a retry that a cancel can cut short ended.
+pub(crate) enum Retried<T> {
+    /// The last attempt's result, a failure after a cancel included.
+    Done(Result<T, ocync_distribution::Error>),
+    /// The cancel fired during a wait between attempts.
+    Cancelled,
 }
 
 /// [`with_retry`], whose wait between attempts ends early when `cancel`
-/// fires: the last error is returned at once, so a cancelled image does not
-/// sit out a registry's `Retry-After` before it can stop. The caller tells a
-/// cancel from a failure by `cancel`.
-pub(crate) async fn with_retry_until<T, F, Fut>(
-    config: &RetryConfig,
-    operation: &str,
-    cancel: &ShutdownSignal,
-    f: F,
-) -> Result<T, ocync_distribution::Error>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
-{
-    retry_loop(config, operation, Some(cancel), f).await
-}
-
-/// The loop behind [`with_retry`] and [`with_retry_until`].
-async fn retry_loop<T, F, Fut>(
+/// fires, so a cancelled image does not sit out a registry's `Retry-After`
+/// before it can stop.
+pub(crate) async fn with_retry_unless_cancelled<T, F, Fut>(
     config: &RetryConfig,
     operation: &str,
     cancel: Option<&ShutdownSignal>,
     f: F,
-) -> Result<T, ocync_distribution::Error>
+) -> Retried<T>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ocync_distribution::Error>>,
@@ -220,7 +216,7 @@ where
     let mut honored = Duration::ZERO;
     loop {
         match f().await {
-            Ok(val) => return Ok(val),
+            Ok(val) => return Retried::Done(Ok(val)),
             Err(ocync_distribution::Error::UploadTokenRefused { message })
                 if refusal == TokenRetry::Available =>
             {
@@ -256,20 +252,17 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying"
                     );
-                    let sleep = tokio::time::sleep(delay);
-                    match cancel {
-                        Some(cancel) => tokio::select! {
-                            biased;
-                            () = cancel.notified() => return Err(e),
-                            () = sleep => {}
-                        },
-                        None => sleep.await,
+                    if unless_triggered(cancel, tokio::time::sleep(delay))
+                        .await
+                        .is_none()
+                    {
+                        return Retried::Cancelled;
                     }
                     attempt += 1;
                     record_retry();
                     continue;
                 }
-                return Err(e);
+                return Retried::Done(Err(e));
             }
         }
     }
@@ -501,7 +494,7 @@ mod tests {
         let calls = Cell::new(0);
         let started = tokio::time::Instant::now();
         let (result, ()) = tokio::join!(
-            with_retry_until(&config, "blob transfer", &cancel, || {
+            with_retry_unless_cancelled(&config, "blob transfer", Some(&cancel), || {
                 calls.set(calls.get() + 1);
                 async {
                     Err::<(), _>(ocync_distribution::Error::RegistryError {
@@ -519,9 +512,30 @@ mod tests {
                 cancel.trigger();
             },
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Retried::Cancelled));
         assert_eq!(calls.get(), 1, "no attempt after the cancel");
         assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    /// A failure the last attempt returns is a failure even when the image
+    /// was cancelled meanwhile, so it is recorded and not retried by the next
+    /// image. Breaks if every error after a cancel counts as the cancel.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failure_after_a_cancel_is_still_a_failure() {
+        let config = RetryConfig::default();
+        let cancel = ShutdownSignal::new();
+        let result = with_retry_unless_cancelled(&config, "blob transfer", Some(&cancel), || {
+            cancel.trigger();
+            async {
+                Err::<(), _>(ocync_distribution::Error::RegistryError {
+                    status: StatusCode::NOT_FOUND,
+                    message: "registry/repo".into(),
+                    retry_after: None,
+                })
+            }
+        })
+        .await;
+        assert!(matches!(result, Retried::Done(Err(_))));
     }
 
     /// The engine's retry waits out a 429's `Retry-After` and surfaces one
