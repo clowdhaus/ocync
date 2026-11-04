@@ -14,7 +14,7 @@ use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::{PER_TAG_JOBS, Tool};
-use crate::bench::stats::{self, Overhead, Pair, Ratio, Timed, Verdict};
+use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
 /// The docs performance page, relative to the repository root.
@@ -1172,7 +1172,7 @@ fn render_metric_table(
     }
 }
 
-/// The ratio `other / ocync` of a row's metric in each round, `None` unless
+/// The ratio `other / ocync` of a row's metric in each round, ocync the base, `None` unless
 /// both tools have a value in every round.
 fn round_ratio(rounds: &[&ScenarioResult], other: Tool, row: &MetricRow) -> Option<Ratio> {
     let pairs: Vec<Pair> = rounds
@@ -1183,7 +1183,7 @@ fn round_ratio(rounds: &[&ScenarioResult], other: Tool, row: &MetricRow) -> Opti
                 (row.rank)(run).map(|v| v as f64)
             };
             Some(Pair {
-                ocync: value(Tool::Ocync)?,
+                base: value(Tool::Ocync)?,
                 other: value(other)?,
             })
         })
@@ -1230,8 +1230,8 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
             if verdicts {
                 let [lower, higher] = row.verdict_words.expect("filtered above");
                 let (words, chance) = match verdict {
-                    Some(Verdict::OcyncLower) => (lower, format!("{identical:.2}%")),
-                    Some(Verdict::OcyncHigher) => (higher, format!("{identical:.2}%")),
+                    Some(Verdict::BaseLower) => (lower, format!("{identical:.2}%")),
+                    Some(Verdict::BaseHigher) => (higher, format!("{identical:.2}%")),
                     _ => ("no measured difference", "--".to_owned()),
                 };
                 table.push_str(&format!(" {words} | {chance} |"));
@@ -1267,48 +1267,49 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
 
 /// Renders what the proxy cost each tool, from the rounds that paired a proxied
 /// run with a direct one: the median and range of the per-round ratio of the
-/// two wall clocks, the run-to-run noise of the direct times, and whether the
-/// median is within it. Nothing for a scenario that measured none.
+/// proxied to the direct wall clock, and from [`stats::VERDICT_ROUNDS`] rounds
+/// whether every round agrees the proxy changed it. Nothing for a scenario
+/// that measured none.
 fn render_proxy_overhead(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut String) {
     let mut table = String::new();
     for (tool, runs) in rounds_by_tool(rounds) {
-        let timed: Option<Vec<Timed>> = runs
+        let pairs: Option<Vec<Pair>> = runs
             .iter()
             .map(|run| {
-                Some(Timed {
-                    proxied: run.wall_clock_secs,
-                    direct: run.direct_wall_clock_secs?,
+                Some(Pair {
+                    base: run.direct_wall_clock_secs?,
+                    other: run.wall_clock_secs,
                 })
             })
             .collect();
-        let Some(Overhead {
-            ratio,
-            noise,
-            within_noise,
-        }) = timed.as_deref().and_then(stats::overhead)
-        else {
+        let Some(Ratio { spread, verdict }) = pairs.as_deref().and_then(stats::ratio) else {
             continue;
         };
+        let measured = match verdict {
+            Some(Verdict::BaseLower) => "yes, slower",
+            Some(Verdict::BaseHigher) => "yes, faster",
+            Some(Verdict::NoMeasuredDifference) => "no",
+            None => "too few rounds",
+        };
         table.push_str(&format!(
-            "| {} | {:.2} | {:.2}..{:.2} | {:.0}% | {} |\n",
+            "| {} | {:.2} | {:.2}..{:.2} | {measured} |\n",
             report.label(tool),
-            ratio.median,
-            ratio.min,
-            ratio.max,
-            noise * 100.0,
-            if within_noise { "yes" } else { "no" },
+            spread.median,
+            spread.min,
+            spread.max,
         ));
     }
     if table.is_empty() {
         return;
     }
-    out.push_str(
+    out.push_str(&format!(
         "\nProxy overhead: the ratio of a tool's wall clock through the proxy to its wall \
-         clock without it, run back to back in each round. Noise is the highest to the \
-         lowest of the tool's wall clocks without the proxy over their median; the overhead \
-         is within the noise when the median ratio is no further from 1 than that.\n\n\
-         | Tool | Median ratio | Range | Noise | Within noise |\n|---|---:|---:|---:|---|\n",
-    );
+         clock without it, run back to back in each round. An overhead is measured only \
+         when every round is on the same side of 1, from {} rounds; identical routes would \
+         do that one time in sixteen.\n\n\
+         | Tool | Median ratio | Range | Measured overhead |\n|---|---:|---:|---|\n",
+        stats::VERDICT_ROUNDS,
+    ));
     out.push_str(&table);
 }
 
@@ -3485,22 +3486,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_summary_says_per_tool_whether_the_overhead_is_within_the_noise() {
-        // Catches: the verdict column dropped or inverted, the ratio taken the
-        // wrong way round, and the noise left out of the row. Direct times of
-        // 8, 12 and 10 give noise 40%.
-        let cases = [
-            (
-                [(10.0, 8.0), (15.0, 12.0), (12.5, 10.0)],
-                "| ocync | 1.25 | 1.25..1.25 | 40% | yes |",
-            ),
-            (
-                [(12.0, 8.0), (18.0, 12.0), (15.0, 10.0)],
-                "| ocync | 1.50 | 1.50..1.50 | 40% | no |",
-            ),
+    fn the_summary_says_per_tool_whether_every_round_shows_an_overhead() {
+        // Catches: the ratio taken direct over proxied (the 1.25 rounds would
+        // read 0.80 and "faster"), a verdict given below five rounds, and rounds
+        // on both sides of 1 claimed as an overhead.
+        let slower = [(10.0, 8.0); 5];
+        let mixed = [
+            (9.0, 10.0),
+            (11.0, 10.0),
+            (10.0, 8.0),
+            (8.0, 10.0),
+            (12.0, 10.0),
+        ];
+        let few = [(10.0, 8.0); 3];
+        let cases: [(&[(f64, f64)], &str); 3] = [
+            (&slower, "| ocync | 1.25 | 1.25..1.25 | yes, slower |"),
+            (&mixed, "| ocync | 1.10 | 0.80..1.25 | no |"),
+            (&few, "| ocync | 1.25 | 1.25..1.25 | too few rounds |"),
         ];
         for (rounds, row) in cases {
-            let md = summary_markdown(&paired_report(&rounds));
+            let md = summary_markdown(&paired_report(rounds));
             assert!(md.contains(row), "{row}\n{md}");
         }
     }

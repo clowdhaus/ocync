@@ -36,30 +36,32 @@ pub(crate) fn spread(values: &[f64]) -> Option<Spread> {
 }
 
 /// What the rounds agree on, for a metric where lower is better. A ratio above
-/// 1 favors ocync.
+/// 1 favors the base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// ocync's value was lower than the other tool's in every round.
-    OcyncLower,
-    /// ocync's value was higher than the other tool's in every round.
-    OcyncHigher,
+    /// The base's value was lower than the other's in every round.
+    BaseLower,
+    /// The base's value was higher than the other's in every round.
+    BaseHigher,
     /// Some rounds on each side of 1, or a round at exactly 1.
     NoMeasuredDifference,
 }
 
-/// One round's value of a metric for ocync and for another tool.
+/// One round's value of a metric for the base it is measured against (ocync,
+/// or a tool's direct run) and for the other side (another tool, or the same
+/// run through the proxy).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Pair {
-    /// ocync's value.
-    pub(crate) ocync: f64,
-    /// The other tool's value.
+    /// The base's value.
+    pub(crate) base: f64,
+    /// The other side's value.
     pub(crate) other: f64,
 }
 
-/// The per-round ratios between ocync and one other tool.
+/// The per-round ratios between a base and the other side.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Ratio {
-    /// Median and range of `other / ocync` over the rounds.
+    /// Median and range of `other / base` over the rounds.
     pub(crate) spread: Spread,
     /// What the rounds agree on; `None` below [`VERDICT_ROUNDS`], where a
     /// one-sided run is too likely between identical builds to be claimed.
@@ -79,79 +81,25 @@ pub(crate) fn confidence(rounds: u32) -> f64 {
     1.0 - 2.0 * 0.5_f64.powi(i32::try_from(rounds).expect("a run has fewer than 2^31 rounds"))
 }
 
-/// The ratio `other / ocync` of each round, summarized. `None` when there are
-/// no rounds, a value is not finite, or ocync's is not above zero (a ratio of
-/// nothing says nothing).
+/// The ratio `other / base` of each round, summarized. `None` when there are
+/// no rounds, a value is not finite, or the base's is not above zero (a ratio
+/// of nothing says nothing).
 pub(crate) fn ratio(rounds: &[Pair]) -> Option<Ratio> {
     let ratios: Vec<f64> = rounds
         .iter()
-        .map(|pair| (pair.ocync.is_finite() && pair.ocync > 0.0).then(|| pair.other / pair.ocync))
+        .map(|pair| (pair.base.is_finite() && pair.base > 0.0).then(|| pair.other / pair.base))
         .collect::<Option<_>>()?;
     let spread = spread(&ratios)?;
     let verdict = (rounds.len() >= VERDICT_ROUNDS).then_some({
         if spread.min > 1.0 {
-            Verdict::OcyncLower
+            Verdict::BaseLower
         } else if spread.max < 1.0 {
-            Verdict::OcyncHigher
+            Verdict::BaseHigher
         } else {
             Verdict::NoMeasuredDifference
         }
     });
     Some(Ratio { spread, verdict })
-}
-
-/// One round's wall clock of a tool through the proxy and directly.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Timed {
-    /// Seconds with the proxy.
-    pub(crate) proxied: f64,
-    /// Seconds without it.
-    pub(crate) direct: f64,
-}
-
-/// What the proxy costs one tool.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Overhead {
-    /// Median and range of `proxied / direct` over the rounds.
-    pub(crate) ratio: Spread,
-    /// The run-to-run noise of the tool's direct times, see [`noise`].
-    pub(crate) noise: f64,
-    /// Whether the median ratio is within that noise, see [`within_noise`].
-    pub(crate) within_noise: bool,
-}
-
-/// Run-to-run noise: the highest direct time less the lowest, as a fraction of
-/// their median. `None` when there are no times, one is not finite, or the
-/// median is not above zero.
-pub(crate) fn noise(direct: &[f64]) -> Option<f64> {
-    let Spread { median, min, max } = spread(direct)?;
-    (median > 0.0).then(|| (max - min) / median)
-}
-
-/// Whether a median `proxied / direct` ratio is within `noise` of 1, in either
-/// direction: an overhead no larger than the spread the tool shows without the
-/// proxy cannot be told from it.
-pub(crate) fn within_noise(median_ratio: f64, noise: f64) -> bool {
-    (median_ratio - 1.0).abs() <= noise
-}
-
-/// The proxy's overhead from each round's pair of times. `None` when there are
-/// no rounds, a time is not finite, or a direct time is not above zero.
-pub(crate) fn overhead(rounds: &[Timed]) -> Option<Overhead> {
-    let ratios: Vec<f64> = rounds
-        .iter()
-        .map(|round| {
-            (round.direct.is_finite() && round.direct > 0.0).then(|| round.proxied / round.direct)
-        })
-        .collect::<Option<_>>()?;
-    let ratio = spread(&ratios)?;
-    let direct: Vec<f64> = rounds.iter().map(|round| round.direct).collect();
-    let noise = noise(&direct)?;
-    Some(Overhead {
-        ratio,
-        noise,
-        within_noise: within_noise(ratio.median, noise),
-    })
 }
 
 #[cfg(test)]
@@ -191,13 +139,13 @@ mod tests {
     fn pairs(rounds: &[(f64, f64)]) -> Vec<Pair> {
         rounds
             .iter()
-            .map(|&(ocync, other)| Pair { ocync, other })
+            .map(|&(base, other)| Pair { base, other })
             .collect()
     }
 
     #[test]
     fn the_verdict_needs_every_round_on_one_side_of_one() {
-        // (name, (ocync, other) per round, verdict, median, min, max)
+        // (name, (base, other) per round, verdict, median, min, max)
         type Case = (&'static str, &'static [(f64, f64)], Verdict, f64, f64, f64);
         let cases: [Case; 4] = [
             (
@@ -209,7 +157,7 @@ mod tests {
                     (10.0, 25.0),
                     (10.0, 20.0),
                 ],
-                Verdict::OcyncLower,
+                Verdict::BaseLower,
                 2.0,
                 1.5,
                 3.0,
@@ -223,7 +171,7 @@ mod tests {
                     (10.0, 6.0),
                     (10.0, 8.0),
                 ],
-                Verdict::OcyncHigher,
+                Verdict::BaseHigher,
                 0.8,
                 0.5,
                 0.9,
@@ -275,7 +223,7 @@ mod tests {
             assert_eq!(got.spread.median, 2.0, "{rounds} rounds");
         }
         let five = ratio(&pairs(&[(10.0, 20.0); 5])).unwrap();
-        assert_eq!(five.verdict, Some(Verdict::OcyncLower));
+        assert_eq!(five.verdict, Some(Verdict::BaseLower));
     }
 
     #[test]
@@ -289,79 +237,5 @@ mod tests {
         );
         assert_eq!(ratio(&pairs(&[(f64::NAN, 20.0)])), None);
         assert_eq!(ratio(&pairs(&[(10.0, f64::INFINITY)])), None);
-    }
-
-    fn timed(pairs: &[(f64, f64)]) -> Vec<Timed> {
-        pairs
-            .iter()
-            .map(|&(proxied, direct)| Timed { proxied, direct })
-            .collect()
-    }
-
-    #[test]
-    fn noise_is_the_direct_range_over_its_median() {
-        // Catches: a range taken over the proxied times, a median left out of
-        // the divisor, and a zero median giving infinity instead of `None`.
-        assert_eq!(noise(&[8.0, 12.0, 10.0]), Some(0.4));
-        assert_eq!(noise(&[5.0, 5.0, 5.0]), Some(0.0));
-        assert_eq!(noise(&[0.0, 0.0, 0.0]), None);
-        assert_eq!(noise(&[]), None);
-    }
-
-    #[test]
-    fn within_noise_is_inclusive_and_either_direction() {
-        // Catches: `<` for `<=` (the 0.375 case sits on the edge), a missing
-        // `abs` (the 0.5 ratio), and the noise compared with the ratio itself
-        // instead of its distance from 1.
-        assert!(within_noise(1.375, 0.375));
-        assert!(!within_noise(1.5, 0.375));
-        assert!(within_noise(0.75, 0.375));
-        assert!(!within_noise(0.5, 0.375));
-        assert!(within_noise(1.0, 0.0));
-    }
-
-    #[test]
-    fn overhead_within_noise() {
-        // Catches: the ratio inverted (direct over proxied would give 0.8),
-        // a mean for the median, and the range taken over the wrong series.
-        // Direct 8, 12, 10 give noise 0.4; every round took 1.125 times as long.
-        let got = overhead(&timed(&[(9.0, 8.0), (13.5, 12.0), (11.25, 10.0)])).unwrap();
-        assert_eq!(
-            got,
-            Overhead {
-                ratio: Spread {
-                    median: 1.125,
-                    min: 1.125,
-                    max: 1.125
-                },
-                noise: 0.4,
-                within_noise: true,
-            }
-        );
-    }
-
-    #[test]
-    fn overhead_outside_noise() {
-        // Catches: a verdict that is always within noise. Direct times of 8
-        // each have no noise, so a 1.5 ratio in two of three rounds is outside.
-        let got = overhead(&timed(&[(12.0, 8.0), (8.0, 8.0), (12.0, 8.0)])).unwrap();
-        assert_eq!(
-            got,
-            Overhead {
-                ratio: Spread {
-                    median: 1.5,
-                    min: 1.0,
-                    max: 1.5
-                },
-                noise: 0.0,
-                within_noise: false,
-            }
-        );
-    }
-
-    #[test]
-    fn overhead_needs_a_positive_direct_time_in_every_round() {
-        assert_eq!(overhead(&timed(&[(1.0, 2.0), (1.0, 0.0)])), None);
-        assert_eq!(overhead(&[]), None);
     }
 }

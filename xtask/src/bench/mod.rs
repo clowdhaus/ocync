@@ -339,14 +339,11 @@ fn sync_legs(args: &BenchArgs, round: usize) -> Vec<Route> {
 }
 
 /// Refuses a proxy overhead measurement for a scenario with no sync scenario
-/// round to pair in. Called by `bench` and `bench-remote`, like
-/// [`ToolSelection::ensure_baseline_applies`].
-pub(crate) fn ensure_proxy_overhead_applies(
-    measure: bool,
-    scenario: Scenario,
-) -> Result<(), String> {
+/// round to pair in. Called by `bench` and `bench-remote` when the option is
+/// given, like [`ToolSelection::ensure_baseline_applies`].
+pub(crate) fn ensure_proxy_overhead_applies(scenario: Scenario) -> Result<(), String> {
     match scenario {
-        Scenario::Partial | Scenario::Scale | Scenario::Prepare if measure => Err(format!(
+        Scenario::Partial | Scenario::Scale | Scenario::Prepare => Err(format!(
             "--measure-proxy-overhead applies to the sync scenario, not {}",
             value_name(&scenario)
         )),
@@ -615,7 +612,9 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
-    ensure_proxy_overhead_applies(args.measure_proxy_overhead, args.scenario)?;
+    if args.measure_proxy_overhead {
+        ensure_proxy_overhead_applies(args.scenario)?;
+    }
     let corpus_id = args.paths.corpus_id()?;
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
@@ -3917,11 +3916,10 @@ images:
             (Scenario::Prepare, false),
         ] {
             assert_eq!(
-                ensure_proxy_overhead_applies(true, scenario).is_ok(),
+                ensure_proxy_overhead_applies(scenario).is_ok(),
                 ok,
                 "{scenario:?}"
             );
-            assert!(ensure_proxy_overhead_applies(false, scenario).is_ok());
         }
         assert!(parse_bench(&["--measure-proxy-overhead", "--no-proxy", "sync"]).is_err());
     }
