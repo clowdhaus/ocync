@@ -116,7 +116,7 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
 /// retry loop would use: `backoff`, plus the registry's `Retry-After` when
 /// it named one. `honored` is the `Retry-After` time this operation has
 /// already waited out, and grows by this one. `None`, with a WARN naming
-/// `error`, when the sum would pass [`MAX_HONORED_RETRY_AFTER`] and the error
+/// `error`, when the sum would pass 120 s and the error
 /// should surface. The single definition every registry retry loop shares.
 pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> Option<Duration> {
     let asked = match error {
