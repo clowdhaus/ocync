@@ -2874,7 +2874,7 @@ mod tests {
 
         assert!(is_published(&report, full, publish::Publication::Publish));
         // Catches: a run that qualifies in every way but was not started with
-        // `--publish` writing the surfaces, as every such run once did.
+        // `--publish` writing a surface: only a published run may.
         assert!(!is_published(&report, full, publish::Publication::Archive));
         // Catches: a published run that lost a round, or is tied to a commit by
         // a short hash, being published anyway.

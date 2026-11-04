@@ -1345,7 +1345,7 @@ pub(crate) mod tests {
         let archive = archive_dir();
 
         // Catches: a run that qualifies in every way but was not started with
-        // `--publish` rewriting the page, as every such run did before.
+        // `--publish` writing a surface: only a published run may.
         let mut qualifying = fixture(FIXTURE_RUN);
         qualifying.publication = Publication::Archive;
         Deferred::new("ecr", Some(qualifying))
@@ -1424,7 +1424,7 @@ pub(crate) mod tests {
             stale(record, &BTreeMap::new()),
             Vec::<String>::new(),
             "a surface differs from, or does not cite, the published run {}; \
-             `cargo xtask bench-remote --fetch` rewrites them",
+             rewrite them from that record",
             record.timestamp
         );
     }

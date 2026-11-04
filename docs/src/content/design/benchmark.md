@@ -153,7 +153,7 @@ The archive shows what happens without this rule. The cold-sync figures publishe
 
 ### What a run must be to be published
 
-A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below, and `bench-remote` also refuses a commit that is not on `origin/main`, before it pushes. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
+A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below, and `bench-remote`, which owns the build, also refuses a commit that is not on `origin/main`, before it pushes. A direct `bench --publish` run checks the recorded hash's form and nothing more, so the place of its commit is on the operator. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
 - **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. The page keeps a column for each of the seven, so a tool with no run reads `--` there and never leaves the table. Today a tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.

@@ -1171,8 +1171,7 @@ fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::
 }
 
 /// Fails unless `commit` is on `origin/main`, as of a fetch now: a published
-/// run is built from a commit anyone can check out later, and most commits
-/// behind the April 2026 runs are gone from the history.
+/// run is built from a commit anyone can check out later.
 fn ensure_on_main(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::error::Error>> {
     git(repo, &["fetch", "--prune", "origin"])?;
     git(
