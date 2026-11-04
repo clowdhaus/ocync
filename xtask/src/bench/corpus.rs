@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use crate::bench::source::Source;
+
 /// The main corpus file. Its records carry no corpus name.
-const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
+pub(crate) const DEFAULT_CORPUS: &str = "bench/corpus.yaml";
 
 /// The main corpus file in the workspace this binary was built from, so a path
 /// reaches it from any current directory.
@@ -166,6 +168,9 @@ pub(crate) struct Corpus {
     /// Docker Hub auth credentials (populated at runtime, not from YAML).
     #[serde(skip)]
     pub(crate) dockerhub_auth: Option<DockerHubAuth>,
+    /// Where the tools read each image from (set at runtime, not from YAML).
+    #[serde(skip)]
+    pub(crate) source: Source,
 }
 
 /// Corpus-level settings (target registry, prefix).
@@ -200,6 +205,7 @@ impl Corpus {
             settings: self.settings.clone(),
             images: self.images.iter().take(n).cloned().collect(),
             dockerhub_auth: self.dockerhub_auth.clone(),
+            source: self.source.clone(),
         }
     }
 
@@ -238,6 +244,7 @@ impl Corpus {
                 .cloned()
                 .collect(),
             dockerhub_auth: self.dockerhub_auth.clone(),
+            source: self.source.clone(),
         }
     }
 

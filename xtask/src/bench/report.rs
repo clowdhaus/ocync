@@ -15,6 +15,7 @@ use crate::bench::proxy::ProxyMetrics;
 use crate::bench::publish::{self, Publication};
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::{PER_TAG_JOBS, Tool};
+use crate::bench::source;
 use crate::bench::stats::{self, Pair, Ratio, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
@@ -64,6 +65,16 @@ pub(crate) struct RunRecord {
     /// Absent: the tools synced source tags, or the run had no lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) sync_from: Option<SyncFrom>,
+    /// The registry the tools read the corpus from. Runs from different
+    /// sources are different series; absent for the public registries, and
+    /// from records written before the controlled source existed.
+    #[serde(default, skip_serializing_if = "source::Kind::is_public")]
+    pub(crate) source: source::Kind,
+    /// The region of the controlled source, which the record names instead of
+    /// its host, since the host holds the account id. Absent for the public
+    /// registries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_region: Option<String>,
     /// Machine and cloud provider metadata.
     pub(crate) machine: MachineInfo,
     /// Versions of binaries the benchmarked tools relay their transfers
@@ -142,6 +153,8 @@ impl RunRecord {
             git_ref,
             publication: Publication::Archive,
             sync_from: SyncFrom::of(corpus_locked_at.as_ref()),
+            source: source::Kind::Public,
+            source_region: None,
             corpus_locked_at,
             machine: MachineInfo {
                 provider: report.instance.provider(),
@@ -198,6 +211,8 @@ impl RunRecord {
 pub(crate) enum Prewarm {
     /// Skipped with `--skip-prewarm`.
     Skipped,
+    /// Not applicable: the controlled source has no CDN to warm.
+    NotApplicable,
     /// Ran.
     Done {
         /// For each registry with a blob that failed or was not finished by
@@ -227,6 +242,9 @@ impl Prewarm {
     pub(crate) fn note(&self) -> Option<String> {
         match self {
             Self::Skipped => Some("Pre-warm: skipped (--skip-prewarm)".to_owned()),
+            Self::NotApplicable => {
+                Some("Pre-warm: not applicable (the controlled source has no CDN)".to_owned())
+            }
             Self::Done { unwarmed, no_cache } => {
                 let mut parts = Vec::new();
                 if !unwarmed.is_empty() {
@@ -1994,6 +2012,10 @@ pub(crate) mod tests {
                 None,
             ),
             (Prewarm::Skipped, Some("Pre-warm: skipped (--skip-prewarm)")),
+            (
+                Prewarm::NotApplicable,
+                Some("Pre-warm: not applicable (the controlled source has no CDN)"),
+            ),
             (unwarmed, Some("Pre-warm: not warmed for quay.io (3 blobs)")),
             (no_cache, Some("Pre-warm: no blob cache at cgr.dev")),
         ];
@@ -2087,6 +2109,29 @@ pub(crate) mod tests {
 
     fn sample_record() -> RunRecord {
         RunRecord::of(&sample_report(), "abc1234".into(), None)
+    }
+
+    #[test]
+    fn a_record_names_the_controlled_source_by_region_and_a_public_one_by_nothing() {
+        // Catches: the source dropped from the record, so runs from different
+        // registries read as one series; the account id in the registry host
+        // reaching a file tracked in git; and records written before the
+        // source existed failing to read.
+        let public = serde_json::to_value(sample_record()).unwrap();
+        assert!(public.get("source").is_none() && public.get("source_region").is_none());
+        let old: RunRecord = serde_json::from_value(public).unwrap();
+        assert_eq!(old.source, source::Kind::Public);
+
+        let mut controlled = sample_record();
+        controlled.source = source::Kind::Controlled;
+        controlled.source_region = Some(source::REGION.to_owned());
+        let text = serde_json::to_string(&controlled).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(written["source"], "controlled");
+        assert_eq!(written["source_region"], source::REGION);
+        assert!(!text.contains("amazonaws.com"), "{text}");
+        let read: RunRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.source, source::Kind::Controlled);
     }
 
     #[test]

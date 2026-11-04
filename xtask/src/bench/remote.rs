@@ -21,6 +21,7 @@ use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::publish;
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred};
 use super::runner::join_tools;
+use super::source;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{
     Provider, RunTimestamp, Scenario, ToolSelection, captured, ensure_proxy_overhead_applies,
@@ -60,6 +61,25 @@ const REMOTE_CREDENTIALS: &str = ".bench-gar-credentials.json";
 /// relative to the bench user's home.
 const REMOTE_AZURE_TOKEN: &str = ".bench-azure-token";
 
+/// The options that shape a benchmark run, which `--fetch` and `--seed` each
+/// refuse beside them since neither starts one.
+const RUN_SHAPING: [&str; 14] = [
+    "target",
+    "source",
+    "corpus",
+    "tools",
+    "baseline_ref",
+    "rounds",
+    "max_concurrent_transfers",
+    "scenario",
+    "limit",
+    "skip_registries",
+    "skip_prewarm",
+    "no_proxy",
+    "measure_proxy_overhead",
+    "publish",
+];
+
 /// Arguments for the `bench-remote` subcommand.
 #[derive(Args)]
 pub(crate) struct BenchRemoteArgs {
@@ -77,6 +97,14 @@ pub(crate) struct BenchRemoteArgs {
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: Kind,
 
+    /// Where the tools read the corpus from: `public` is the registries the
+    /// corpus names, where rate-limit behavior is measured; `controlled` is
+    /// the ECR registry in another region of the target's account that
+    /// `--seed` fills, where speed is measured. Needs the ECR target, and
+    /// `--publish` needs `controlled`.
+    #[arg(long, value_enum, default_value = "public")]
+    pub(crate) source: source::Kind,
+
     /// Corpus YAML the instance syncs, passed through to `cargo xtask bench`
     /// when given; the instance's own default otherwise. The file and its
     /// `.lock.json` beside it must be committed in the commit that runs.
@@ -87,31 +115,20 @@ pub(crate) struct BenchRemoteArgs {
     /// They are a live run's partial results only once its benchmark has
     /// started; before that they are the previous run's. Conflicts with every
     /// option that shapes a run.
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "force",
-            "git_ref",
-            "target",
-            "corpus",
-            "tools",
-            "baseline_ref",
-            "rounds",
-            "max_concurrent_transfers",
-            "scenario",
-            "limit",
-            "skip_registries",
-            "skip_prewarm",
-            "no_proxy",
-            "measure_proxy_overhead",
-            "publish",
-        ]
-    )]
+    #[arg(long, conflicts_with_all = RUN_SHAPING)]
     pub(crate) fetch: bool,
+
+    /// Copy every digest of the corpus lock from its public source into the
+    /// controlled source instead of starting a run: runs `cargo xtask
+    /// bench-seed` on the instance, which creates the repositories it needs in
+    /// the target's account. Repeating it copies nothing new. Conflicts with
+    /// every option that shapes a run.
+    #[arg(long, conflicts_with_all = RUN_SHAPING, conflicts_with = "fetch")]
+    pub(crate) seed: bool,
 
     /// Kill a benchmark still running on the instance and start fresh.
     /// Without it, a live run is left alone and this command fails.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fetch")]
     pub(crate) force: bool,
 
     /// Git ref to checkout on the instance (default: current branch). A ref
@@ -119,7 +136,7 @@ pub(crate) struct BenchRemoteArgs {
     /// the instance's `bench` would not know the option, and one older than
     /// `--max-concurrent-transfers` cannot take that option for the same reason.
     /// An Artifact Registry or ACR run needs a ref with `--target`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "fetch")]
     pub(crate) git_ref: Option<String>,
 
     #[command(flatten)]
@@ -154,8 +171,9 @@ pub(crate) struct BenchRemoteArgs {
 
     /// Make this the published run, the one every public number comes from
     /// (passed through to `cargo xtask bench`). Refused unless the run is the
-    /// whole main corpus on ECR with all seven tools at their defaults for 5
-    /// rounds, and unless the commit it builds is on `origin/main`.
+    /// whole main corpus on ECR from the controlled source with all seven tools
+    /// at their defaults for 5 rounds, and unless the commit it builds is on
+    /// `origin/main`.
     #[arg(long)]
     pub(crate) publish: bool,
 
@@ -222,6 +240,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
         ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
+    args.source.ensure_applies(args.target)?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }
@@ -231,6 +250,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
             &publish::Shape {
                 scenario: args.scenario,
                 target: args.target,
+                source: args.source,
                 corpus: match &args.corpus {
                     Some(path) => corpus::id_of(path)?,
                     None => corpus::Id::Main,
@@ -343,13 +363,20 @@ fn run_on_instance(
         return (RunEnd::Settled, Err(e));
     }
 
-    let bench_args = bench_args(args, timestamp);
+    let argv = if args.seed {
+        vec![SEED_COMMAND.to_owned()]
+    } else {
+        [BENCH_COMMAND.to_owned()]
+            .into_iter()
+            .chain(bench_args(args, timestamp))
+            .collect()
+    };
 
     let target = provisioned.map_or(Target::Ecr, Provisioned::target);
     let script = remote_script(
         git_ref,
         git_sha,
-        &bench_args,
+        &argv,
         &target,
         ExistingRun::from_force(args.force),
     );
@@ -378,6 +405,15 @@ fn run_on_instance(
         }
         RemoteOutcome::Ran(code) => code,
     };
+
+    // A seed writes no results: its outcome is its exit code.
+    if args.seed {
+        let result = match exit_code {
+            0 => Ok(()),
+            code => Err(format!("{SEED_COMMAND} exited with code {code}").into()),
+        };
+        return (end, result);
+    }
 
     if exit_code != 0 {
         eprintln!("bench-remote: fetching partial results...");
@@ -449,6 +485,10 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     // `--git-ref` whose `bench` has no such option.
     if args.target != Kind::Ecr {
         bench_args.extend(["--target".to_string(), value_name(&args.target)]);
+    }
+    // Only for the controlled source, for the same reason.
+    if args.source == source::Kind::Controlled {
+        bench_args.extend(["--source".to_string(), value_name(&args.source)]);
     }
     // Only when given, for the same reason.
     if let Some(corpus) = &args.corpus {
@@ -983,10 +1023,16 @@ echo "$$" > "$PGID_FILE""#
 /// `$EXIT_FILE`. The exit status is captured with `if` because `set -e` would
 /// otherwise end the script before recording it.
 const BENCH_RUNNER: &str = r#"set -euo pipefail
-if cargo xtask bench "$@" 2>&1; then BENCH_EXIT=0; else BENCH_EXIT=$?; fi
+if cargo xtask "$@" 2>&1; then BENCH_EXIT=0; else BENCH_EXIT=$?; fi
 echo "$BENCH_EXIT" > "$EXIT_FILE"
 echo "[bench-remote] exit code: $BENCH_EXIT"
 exit "$BENCH_EXIT""#;
+
+/// The `cargo xtask` subcommand that runs a benchmark on the instance.
+const BENCH_COMMAND: &str = "bench";
+
+/// The `cargo xtask` subcommand that seeds the controlled source on the instance.
+const SEED_COMMAND: &str = "bench-seed";
 
 /// Removes untracked files left by previous builds, keeping the build cache,
 /// results, the baseline checkouts and the run's own files. The run-file pattern is quoted so the
@@ -1587,6 +1633,8 @@ mod tests {
             &["--no-proxy"][..],
             &["--measure-proxy-overhead"][..],
             &["--publish"][..],
+            &["--source", "controlled"][..],
+            &["--seed"][..],
         ] {
             let argv = ["xtask", "--provider", "aws", "--fetch"]
                 .into_iter()
@@ -1883,6 +1931,7 @@ mod tests {
             "main",
             &CommitSha::parse(SHA).unwrap(),
             &[
+                "bench".to_string(),
                 "--tools".to_string(),
                 "ocync".to_string(),
                 "all".to_string(),
@@ -2111,6 +2160,87 @@ mod tests {
         let argv: Vec<&str> = published.iter().map(String::as_str).collect();
         assert!(crate::bench::parse_bench(&argv).unwrap().publish);
         assert!(!passed(&[]).iter().any(|a| a == "--publish"));
+    }
+
+    #[test]
+    fn the_source_reaches_the_benchmark_on_the_instance_only_when_controlled() {
+        // Catches: `--source controlled` accepted and dropped, so the run reads
+        // the public registries it was meant to leave alone; and an option sent
+        // when it was not asked for, which an older `--git-ref` cannot parse.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            bench_args(&Cli::try_parse_from(argv).unwrap().args, &timestamp)
+        };
+
+        let controlled = passed(&["--source", "controlled"]);
+        let argv: Vec<&str> = controlled.iter().map(String::as_str).collect();
+        assert_eq!(
+            crate::bench::parse_bench(&argv).unwrap().source,
+            source::Kind::Controlled
+        );
+        assert!(!passed(&[]).iter().any(|a| a == "--source"));
+        assert!(
+            !passed(&["--source", "public"])
+                .iter()
+                .any(|a| a == "--source")
+        );
+    }
+
+    #[test]
+    fn a_seed_runs_bench_seed_on_the_instance_and_refuses_any_run_option() {
+        // Catches: a seed that starts a benchmark instead, and one that accepts
+        // the options of a run it does not make.
+        use clap::Parser;
+        let args = Cli::try_parse_from(["xtask", "--provider", "aws", "--seed"])
+            .unwrap()
+            .args;
+        assert!(args.seed);
+        for extra in [
+            &["--target", "ecr"][..],
+            &["--source", "controlled"][..],
+            &["--tools", "ocync"][..],
+            &["--publish"][..],
+            &["--scenario", "sync"][..],
+            &["--fetch"][..],
+        ] {
+            let argv = ["xtask", "--provider", "aws", "--seed"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let err = Cli::try_parse_from(argv).err().unwrap();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{extra:?}"
+            );
+        }
+        // The seed may choose the commit and replace a live run, as a run may.
+        assert!(
+            Cli::try_parse_from([
+                "xtask",
+                "--provider",
+                "aws",
+                "--seed",
+                "--force",
+                "--git-ref",
+                "main"
+            ])
+            .is_ok()
+        );
+        let script = remote_script(
+            "main",
+            &CommitSha::parse(SHA).unwrap(),
+            &[SEED_COMMAND.to_owned()],
+            &Target::Ecr,
+            ExistingRun::Refuse,
+        );
+        assert!(
+            script.contains(r#"bash "$RUNNER_FILE" 'bench-seed' >>"#),
+            "{script}"
+        );
     }
 
     #[test]
@@ -2615,7 +2745,7 @@ cp -r "$STUB_FIXTURE" "${@: -1}/$(basename "${src#*:}")""#,
             ),
         )
         .unwrap();
-        let bench_args = ["--tools", "oc ync", "it's", "cold"].map(String::from);
+        let bench_args = ["bench", "--tools", "oc ync", "it's", "cold"].map(String::from);
 
         // The launch line is the one the remote script runs.
         let status = Command::new("bash")

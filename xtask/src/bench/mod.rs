@@ -17,7 +17,9 @@ pub(crate) mod regression;
 pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
+pub(crate) mod seed;
 pub(crate) mod skopeo_shim;
+pub(crate) mod source;
 pub(crate) mod stats;
 pub(crate) mod target;
 
@@ -228,6 +230,13 @@ pub(crate) struct BenchArgs {
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: target::Kind,
 
+    /// Where the tools read the corpus from: `public` is the registries the
+    /// corpus names, where rate-limit behavior is measured; `controlled` is the
+    /// ECR registry `bench-seed` fills, where speed is measured. The controlled
+    /// source has no CDN, so the pre-warm does not apply.
+    #[arg(long, value_enum, default_value = "public")]
+    pub(crate) source: source::Kind,
+
     /// Path to the prepare-scenario corpus YAML.
     ///
     /// Separate from `--corpus` because the two measure opposite things: the
@@ -306,9 +315,9 @@ pub(crate) struct BenchArgs {
     pub(crate) measure_proxy_overhead: bool,
 
     /// Make this the published run: the one every public number comes from.
-    /// Refused unless the run is the whole main corpus on ECR with all seven
-    /// tools at their defaults for 5 rounds, and a record that finishes short
-    /// of that is archived as an experiment. A published run rewrites the
+    /// Refused unless the run is the whole main corpus on ECR from the
+    /// controlled source with all seven tools at their defaults for 5 rounds,
+    /// and a record that finishes short of that is archived as an experiment. A published run rewrites the
     /// performance page, the README, the homepage and the banners.
     #[arg(long, conflicts_with = "regression")]
     pub(crate) publish: bool,
@@ -652,6 +661,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if args.measure_proxy_overhead {
         ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
+    args.source.ensure_applies(args.target)?;
     let corpus_id = args.paths.corpus_id()?;
     if args.publication() == publish::Publication::Publish {
         publish::ensure_publishable(
@@ -659,6 +669,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             &publish::Shape {
                 scenario: args.scenario,
                 target: args.target,
+                source: args.source,
                 corpus: corpus_id.clone(),
                 limit: args.limit,
                 skips_registries: !args.skip_registries.is_empty(),
@@ -715,7 +726,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
     let coverage = report::Coverage::of(whole_images, &corpus_info);
 
-    corpus.dockerhub_auth = docker_hub_auth();
+    // The controlled source is read with the account's ECR sign-in, and no
+    // generated config names Docker Hub then.
+    corpus.source = source::Source::resolve(args.source, &corpus.settings.target_registry)?;
+    corpus.dockerhub_auth = match corpus.source {
+        source::Source::Public => docker_hub_auth(),
+        source::Source::Controlled(_) => None,
+    };
 
     // The lock is read only when a scenario syncs from it: prepare reads its own
     // wildcard corpus and transfers nothing, so it needs no lock.
@@ -745,7 +762,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a digest the source no
         // longer serves costs seconds rather than a wasted run.
-        lock::ensure_served(&http, lock, &refs, auth).await?;
+        lock::ensure_served(&http, lock, &refs, auth, &corpus.source).await?;
     }
 
     let tools = args.tool_selection.run_tools();
@@ -844,7 +861,10 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    let prewarm = if args.skip_prewarm {
+    let prewarm = if corpus.source.kind() == source::Kind::Controlled {
+        eprintln!("bench: skipping CDN pre-warm (the controlled source has no CDN)");
+        (!transfers.is_empty()).then_some(Prewarm::NotApplicable)
+    } else if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
         (!transfers.is_empty()).then_some(Prewarm::Skipped)
     } else if let Some(lock) = &lock {
@@ -931,7 +951,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     Ok(finished) => Ok(finished),
                     Err(error) => {
                         let refs = scenario_refs(transfer, &corpus);
-                        let recheck = lock::ensure_served(&http, lock, &refs, auth).await;
+                        let recheck =
+                            lock::ensure_served(&http, lock, &refs, auth, &corpus.source).await;
                         Err(lock::explain(error.to_string(), recheck))
                     }
                 }
@@ -973,6 +994,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &report,
         git_ref(args.publication()),
         corpus_locked_at.clone(),
+        &corpus.source,
         args.publication(),
     );
     match args.archive {
@@ -1023,9 +1045,12 @@ fn deferred_output(
     report: &BenchReport,
     git_ref: String,
     corpus_locked_at: Option<lock::LockedAt>,
+    source: &source::Source,
     publication: publish::Publication,
 ) -> report::Deferred {
     let mut record = report::RunRecord::of(report, git_ref, corpus_locked_at);
+    record.source = source.kind();
+    record.source_region = source.region().map(str::to_owned);
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
@@ -2798,6 +2823,7 @@ mod tests {
                 &report,
                 "abc1234".into(),
                 None,
+                &source::Source::Public,
                 publish::Publication::Publish,
             );
             let text = serde_json::to_string(&deferred).unwrap();
@@ -2860,21 +2886,70 @@ mod tests {
     }
 
     #[test]
+    fn a_run_reads_the_public_registries_unless_it_asks_for_the_controlled_source() {
+        // Catches: the default changing, which moves every existing command to
+        // a registry that may not be seeded; and `--publish` with the default
+        // source being accepted, when only the controlled source may publish.
+        let source = |argv: &[&str]| parse_bench(argv).unwrap().source;
+        assert_eq!(source(&["sync"]), source::Kind::Public);
+        assert_eq!(
+            source(&["--source", "controlled", "sync"]),
+            source::Kind::Controlled
+        );
+        assert!(parse_bench(&["--source", "private", "sync"]).is_err());
+
+        let args = parse_bench(&["--publish", "sync"]).unwrap();
+        let shape = publish::Shape {
+            scenario: args.scenario,
+            target: args.target,
+            source: args.source,
+            corpus: corpus::Id::Main,
+            limit: None,
+            skips_registries: false,
+            skips_prewarm: false,
+            disables_proxy: false,
+            measures_proxy_overhead: false,
+            checks_regression: false,
+        };
+        let selection = ToolSelection {
+            tools: publish::PUBLISHED_TOOLS.to_vec(),
+            ..args.tool_selection
+        };
+        let refusal = publish::ensure_publishable(&selection, &shape).unwrap_err();
+        assert!(refusal.contains("--source must be controlled"), "{refusal}");
+        let controlled = publish::Shape {
+            source: source::Kind::Controlled,
+            ..shape
+        };
+        assert_eq!(publish::ensure_publishable(&selection, &controlled), Ok(()));
+    }
+
+    #[test]
     fn only_a_run_that_asked_to_be_published_and_qualifies_is_recorded_as_published() {
         use crate::bench::publish::tests::{fixture_report, published};
         let host = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
         let full = "0123456789abcdef0123456789abcdef01234567";
+        let controlled = source::Source::resolve(
+            source::Kind::Controlled,
+            "111111111111.dkr.ecr.us-east-2.amazonaws.com",
+        )
+        .unwrap();
+        let is_published_from =
+            |source: &source::Source, report: &BenchReport, git_ref: &str, publication| {
+                let deferred = deferred_output(
+                    &Target::Ecr,
+                    host,
+                    report,
+                    git_ref.into(),
+                    None,
+                    source,
+                    publication,
+                );
+                let json = serde_json::to_value(&deferred).unwrap();
+                json["record"]["published"] == serde_json::json!(true)
+            };
         let is_published = |report: &BenchReport, git_ref: &str, publication| {
-            let deferred = deferred_output(
-                &Target::Ecr,
-                host,
-                report,
-                git_ref.into(),
-                None,
-                publication,
-            );
-            let json = serde_json::to_value(&deferred).unwrap();
-            json["record"]["published"] == serde_json::json!(true)
+            is_published_from(&controlled, report, git_ref, publication)
         };
         let report = fixture_report("2026-11-02-120000", [200.0; 5]);
         assert_eq!(published(&report).git_ref, full);
@@ -2895,6 +2970,14 @@ mod tests {
         assert!(!is_published(
             &report,
             "0123456",
+            publish::Publication::Publish
+        ));
+        // Catches: a run from the public registries recorded as the published
+        // one because the report alone looked right.
+        assert!(!is_published_from(
+            &source::Source::Public,
+            &report,
+            full,
             publish::Publication::Publish
         ));
     }
