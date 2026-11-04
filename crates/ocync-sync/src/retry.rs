@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use http::StatusCode;
 
+use crate::shutdown::ShutdownSignal;
+
 /// Retry configuration with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -182,6 +184,37 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ocync_distribution::Error>>,
 {
+    retry_loop(config, operation, None, f).await
+}
+
+/// [`with_retry`], whose wait between attempts ends early when `cancel`
+/// fires: the last error is returned at once, so a cancelled image does not
+/// sit out a registry's `Retry-After` before it can stop. The caller tells a
+/// cancel from a failure by `cancel`.
+pub(crate) async fn with_retry_until<T, F, Fut>(
+    config: &RetryConfig,
+    operation: &str,
+    cancel: &ShutdownSignal,
+    f: F,
+) -> Result<T, ocync_distribution::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
+{
+    retry_loop(config, operation, Some(cancel), f).await
+}
+
+/// The loop behind [`with_retry`] and [`with_retry_until`].
+async fn retry_loop<T, F, Fut>(
+    config: &RetryConfig,
+    operation: &str,
+    cancel: Option<&ShutdownSignal>,
+    f: F,
+) -> Result<T, ocync_distribution::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, ocync_distribution::Error>>,
+{
     let mut attempt = 0;
     let mut refusal = TokenRetry::Available;
     let mut honored = Duration::ZERO;
@@ -223,7 +256,15 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying"
                     );
-                    tokio::time::sleep(delay).await;
+                    let sleep = tokio::time::sleep(delay);
+                    match cancel {
+                        Some(cancel) => tokio::select! {
+                            biased;
+                            () = cancel.notified() => return Err(e),
+                            () = sleep => {}
+                        },
+                        None => sleep.await,
+                    }
                     attempt += 1;
                     record_retry();
                     continue;
@@ -450,6 +491,39 @@ mod tests {
         }
     }
 
+    /// A cancel ends the wait between attempts at once. Breaks if a
+    /// cancelled image sits out a 60 s `Retry-After` before it can stop, or
+    /// sends again after the cancel.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cancel_ends_the_wait_between_attempts() {
+        let config = RetryConfig::default();
+        let cancel = ShutdownSignal::new();
+        let calls = Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(
+            with_retry_until(&config, "blob transfer", &cancel, || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err::<(), _>(ocync_distribution::Error::RegistryError {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        message: "registry/repo".into(),
+                        retry_after: ocync_distribution::retry::RetryAfter::parse(
+                            "60",
+                            std::time::SystemTime::now(),
+                        ),
+                    })
+                }
+            }),
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                cancel.trigger();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "no attempt after the cancel");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
     /// The engine's retry waits out a 429's `Retry-After` and surfaces one
     /// longer than a sync waits. Breaks if the header is ignored (the
     /// retry comes after about a second) or the cap is dropped (the 3600 s
@@ -457,15 +531,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_retry_after_is_waited_out_unless_too_long() {
         let config = RetryConfig::default();
-        // (Retry-After, throttled answers before success, calls made,
-        // succeeds, time waited). Two 70 s waits pass the 120 s an operation
+        /// How the operation ends.
+        #[derive(Debug, PartialEq)]
+        enum Ends {
+            Succeeds,
+            Surfaces,
+        }
+        // (Retry-After, throttled answers before success, calls made, how it
+        // ends, time waited). Two 70 s waits pass the 120 s an operation
         // waits out in all, so the second throttle surfaces.
         let cases = [
-            (30u64, 1, 2, true, 30),
-            (70, 2, 2, false, 70),
-            (3600, 1, 1, false, 0),
+            (30u64, 1, 2, Ends::Succeeds, 30),
+            (70, 2, 2, Ends::Surfaces, 70),
+            (3600, 1, 1, Ends::Surfaces, 0),
         ];
-        for (asked, throttles, expected_calls, succeeds, waited) in cases {
+        for (asked, throttles, expected_calls, ends, waited) in cases {
             let calls = Cell::new(0);
             let started = tokio::time::Instant::now();
             let result = with_retry(&config, "blob transfer", || {
@@ -476,7 +556,10 @@ mod tests {
                         Err(ocync_distribution::Error::RegistryError {
                             status: StatusCode::TOO_MANY_REQUESTS,
                             message: "registry/repo".into(),
-                            retry_after: Some(Duration::from_secs(asked)),
+                            retry_after: ocync_distribution::retry::RetryAfter::parse(
+                                &asked.to_string(),
+                                std::time::SystemTime::now(),
+                            ),
                         })
                     } else {
                         Ok(())
@@ -484,7 +567,12 @@ mod tests {
                 }
             })
             .await;
-            assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}");
+            let ended = if result.is_ok() {
+                Ends::Succeeds
+            } else {
+                Ends::Surfaces
+            };
+            assert_eq!(ended, ends, "Retry-After {asked}");
             assert_eq!(calls.get(), expected_calls, "Retry-After {asked}");
             let elapsed = started.elapsed();
             assert!(

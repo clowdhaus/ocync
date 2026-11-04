@@ -621,6 +621,21 @@ fn open_staging(dir: PathBuf, limit: Option<StagingLimit>, need: StagingNeed) ->
     }
 }
 
+/// `work`'s output, or `None` when `shutdown` fires first.
+async fn unless_shutdown<F: Future>(
+    shutdown: Option<&ShutdownSignal>,
+    work: F,
+) -> Option<F::Output> {
+    match shutdown {
+        Some(shutdown) => tokio::select! {
+            biased;
+            () = shutdown.notified() => None,
+            output = work => Some(output),
+        },
+        None => Some(work.await),
+    }
+}
+
 /// Run the sync command: load config, resolve mappings, and execute.
 ///
 /// The `shutdown` signal is forwarded to the engine for graceful drain.
@@ -643,7 +658,7 @@ pub(crate) async fn run(
     // One ticker spans client construction, batch-checker setup and mapping
     // resolution, so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
-    let resolution = with_prepare_progress(&tracker, "sync", async {
+    let prepare = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
         // One run's clients share credentials; the next watch cycle reloads them.
         let credentials = RunCredentials::default();
@@ -660,14 +675,19 @@ pub(crate) async fn run(
             PREPARE_MAPPING_CONCURRENCY,
         )
         .await
-    })
-    .await?;
+    });
+    // Signing in and listing tags can wait out a registry's `Retry-After`,
+    // longer than a pod's shutdown grace period, so shutdown ends it.
+    let Some(resolution) = unless_shutdown(shutdown, prepare).await else {
+        tracing::warn!("shutdown before the sync started; nothing was synced");
+        return Ok(ExitCode::Failure);
+    };
     let Resolution {
         resolved: mappings,
         unresolved,
         dropped_targets,
         no_match,
-    } = resolution;
+    } = resolution?;
 
     if let Some(state) = watch_log.as_mut() {
         for resolved in &mappings {
@@ -1870,6 +1890,29 @@ fn write_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shutdown ends the prepare phase's wait, and without a signal the
+    /// work runs to the end. Breaks if a SIGTERM during a `Retry-After`
+    /// wait in sign-in or tag listing is ignored until the wait ends.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_ends_the_prepare_phase() {
+        let shutdown = ShutdownSignal::new();
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            "prepared"
+        };
+        let started = tokio::time::Instant::now();
+        let (prepared, ()) = tokio::join!(unless_shutdown(Some(&shutdown), slow), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            shutdown.trigger();
+        });
+        assert_eq!(prepared, None);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(
+            unless_shutdown(None, async { "prepared" }).await,
+            Some("prepared")
+        );
+    }
 
     /// A filter's semver range as written, for comparing against a literal.
     fn semver_text(filter: &FilterConfig) -> Option<String> {

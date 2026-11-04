@@ -498,6 +498,10 @@ struct WindowState {
     /// Token buckets for hard TPS ceilings, all drawn from per request
     /// (empty = AIMD only).
     buckets: Buckets,
+    /// The end of the last `Retry-After` the registry named for this
+    /// window. No request is admitted before it, so one throttled request's
+    /// wait holds back the others it would have run into the same limit.
+    paused_until: Option<tokio::time::Instant>,
 }
 
 impl WindowState {
@@ -517,6 +521,7 @@ impl WindowState {
             semaphore: Arc::new(Semaphore::new(limit)),
             owed: 0,
             buckets,
+            paused_until: None,
         }
     }
 
@@ -602,17 +607,32 @@ impl AimdController {
         self.provider
     }
 
-    /// Take a token from each of the window's rate buckets, in order, then
-    /// its window and aggregate permits.
+    /// Wait out the window's `Retry-After` pause, then take a token from
+    /// each of its rate buckets, in order, then its window and aggregate
+    /// permits.
     pub async fn acquire(&self, op: RegistryAction) -> AimdPermit<'_> {
         let key = window_key_for_provider(self.provider, op);
 
-        let (action_semaphore, buckets) = {
-            let mut map = self.windows.lock().expect("aimd lock poisoned");
-            let state = map.entry(key).or_insert_with(|| {
-                WindowState::new_for(key, self.max_concurrent, self.shared.get(&key))
-            });
-            (Arc::clone(&state.semaphore), Arc::clone(&state.buckets))
+        let (action_semaphore, buckets) = loop {
+            let (action_semaphore, buckets, paused_until) = {
+                let mut map = self.windows.lock().expect("aimd lock poisoned");
+                let state = map.entry(key).or_insert_with(|| {
+                    WindowState::new_for(key, self.max_concurrent, self.shared.get(&key))
+                });
+                (
+                    Arc::clone(&state.semaphore),
+                    Arc::clone(&state.buckets),
+                    state.paused_until,
+                )
+            };
+            // Re-read after the wait: a throttle that lands during it may
+            // have pushed the pause further out.
+            match paused_until {
+                Some(until) if until > tokio::time::Instant::now() => {
+                    tokio::time::sleep_until(until).await;
+                }
+                _ => break (action_semaphore, buckets),
+            }
         };
 
         // Paced before any permit, so a paced action holds no slot another
@@ -638,6 +658,7 @@ impl AimdController {
             aggregate_permit,
             action_permit: Some(action_permit),
             outcome: Outcome::Success,
+            pause: None,
             host: self.host.clone(),
             action: op,
         }
@@ -670,6 +691,8 @@ pub struct AimdPermit<'a> {
     /// `Option` so `drop` can hand the permit to [`WindowState::settle`].
     action_permit: Option<OwnedSemaphorePermit>,
     outcome: Outcome,
+    /// A `Retry-After` the answer named, which pauses the window on drop.
+    pause: Option<Duration>,
     /// Registry hostname for diagnostic logging on a halving.
     host: String,
     /// The operation type for diagnostic logging on a halving.
@@ -694,6 +717,12 @@ impl AimdPermit<'_> {
     pub fn throttled(mut self) {
         self.outcome = Outcome::Throttled;
     }
+
+    /// Hold the window's next requests back for `wait`, a `Retry-After` the
+    /// answer named.
+    pub(crate) fn pause_for(&mut self, wait: Duration) {
+        self.pause = Some(wait);
+    }
 }
 
 impl Drop for AimdPermit<'_> {
@@ -711,6 +740,10 @@ impl Drop for AimdPermit<'_> {
             return;
         };
         let (old_window, new_window) = state.settle(self.outcome, permit);
+        if let Some(wait) = self.pause {
+            let until = tokio::time::Instant::now() + wait;
+            state.paused_until = Some(state.paused_until.map_or(until, |u| u.max(until)));
+        }
         if new_window < old_window {
             tracing::warn!(
                 registry = %self.host,
