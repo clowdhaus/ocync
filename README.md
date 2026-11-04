@@ -4,7 +4,8 @@ Sync OCI container images across registries - efficiently.
 
 <p align="center">
   <!-- BENCH-BANNER:START -->
-  <img src="docs/public/ecr-banner.png" alt="ocync - 4x faster sync, 30% fewer API requests, adaptive rate control" width="900">
+  <!-- run 2026-11-04-171727 -->
+  <img src="docs/public/ecr-banner.png" alt="ocync - 4.1x faster than regsync, 27% fewer API requests than regsync, adaptive rate control" width="900">
   <!-- BENCH-BANNER:END -->
 </p>
 
@@ -13,7 +14,7 @@ Sync OCI container images across registries - efficiently.
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.94.0.html)
 [![ECR Public](https://img.shields.io/badge/ECR_Public-clowdhaus%2Focync-ff9900.svg?logo=amazonecs)](https://gallery.ecr.aws/clowdhaus/ocync)
 
-ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. <!-- BENCH-README:START -->In 4 rounds of a cold sync of a 55 GB corpus to ECR, it finished 2.87 to 2.90 times faster than regsync, made about 27% fewer requests and moved about 10 GB (15%) less, and no tool drew a 429.<!-- BENCH-README:END --> See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
+ocync copies container images between OCI registries with blob deduplication, cross-repo mounting, and streaming transfers. <!-- BENCH-README:START -->In a cold sync of 40 images to ECR (the median of 5 rounds, run 2026-11-04-171727), it finished 4.1 times faster than regsync, made 27% fewer requests and moved 10.0 GB less.<!-- BENCH-README:END --> See [Performance](https://clowdhaus.github.io/ocync/performance) for the conditions and the full comparison.
 
 ocync is purpose-built for one job: efficiently mirroring images from upstream registries (Docker Hub, GHCR, GAR, Chainguard) to a private registry (ECR, GAR, ACR). It is not a build tool, a registry, or a content rewriter - it copies bytes verbatim and lets the registry do its job. Multi-architecture indexes, manifests, blobs, and OCI 1.1 referrers (signatures, SBOMs, attestations) all flow through bit-for-bit.
 

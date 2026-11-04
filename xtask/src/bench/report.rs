@@ -747,8 +747,13 @@ impl BenchReport {
 
 /// Formats a [`Duration`] as a human-readable string.
 ///
-/// Examples: `"47s"`, `"3m 12s"`, `"2m"` (exact minutes omit the seconds component).
+/// Examples: `"0.6s"`, `"47s"`, `"3m 12s"`, `"2m"` (exact minutes omit the
+/// seconds component). Under ten seconds a tenth is kept, so a sub-second run
+/// does not read as no time at all.
 fn format_duration(d: Duration) -> String {
+    if d < Duration::from_secs(10) {
+        return format!("{:.1}s", d.as_secs_f64());
+    }
     let total_secs = d.as_secs();
     let mins = total_secs / 60;
     let secs = total_secs % 60;
@@ -1638,9 +1643,16 @@ pub(crate) mod tests {
 
     #[test]
     fn format_duration_shows_minutes_only_when_there_are_some() {
-        for (secs, expected) in [(0, "0s"), (47, "47s"), (192, "3m 12s"), (120, "2m")] {
+        for (secs, expected) in [
+            (0, "0.0s"),
+            (580, "0.6s"),
+            (5_700, "5.7s"),
+            (47_000, "47s"),
+            (192_000, "3m 12s"),
+            (120_000, "2m"),
+        ] {
             assert_eq!(
-                format_duration(Duration::from_secs(secs)),
+                format_duration(Duration::from_millis(secs)),
                 expected,
                 "{secs}s"
             );
