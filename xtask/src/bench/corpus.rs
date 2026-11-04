@@ -111,7 +111,7 @@ pub(crate) fn lock_path(corpus: &Path) -> PathBuf {
 
 /// The corpus file at `corpus`: the main corpus when it is the workspace's
 /// `bench/corpus.yaml`.
-fn id_of(corpus: &str) -> Result<Id, String> {
+pub(crate) fn id_of(corpus: &str) -> Result<Id, String> {
     let path = Path::new(corpus);
     let file = path
         .canonicalize()

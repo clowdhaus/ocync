@@ -11,6 +11,7 @@ pub(crate) mod gcloud;
 pub(crate) mod lock;
 pub(crate) mod provision;
 pub(crate) mod proxy;
+pub(crate) mod publish;
 pub(crate) mod registry;
 pub(crate) mod regression;
 pub(crate) mod remote;
@@ -303,9 +304,22 @@ pub(crate) struct BenchArgs {
     /// the registries, so it is refused beside `--regression`.
     #[arg(long, conflicts_with_all = ["no_proxy", "regression"])]
     pub(crate) measure_proxy_overhead: bool,
+
+    /// Make this the published run: the one every public number comes from.
+    /// Refused unless the run is the whole main corpus on ECR with all seven
+    /// tools at their defaults for 5 rounds, and a record that finishes short
+    /// of that is archived as an experiment. A published run rewrites the
+    /// performance page, the README, the homepage and the banners.
+    #[arg(long)]
+    pub(crate) publish: bool,
 }
 
 impl BenchArgs {
+    /// Whether the run asks to be the published one.
+    fn publication(&self) -> publish::Publication {
+        self.publish.into()
+    }
+
     /// How an unpaired run sends its traffic.
     fn route(&self) -> Route {
         if self.no_proxy {
@@ -629,6 +643,21 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
     let corpus_id = args.paths.corpus_id()?;
+    if args.publication() == publish::Publication::Publish {
+        publish::ensure_publishable(
+            &args.tool_selection,
+            &publish::Shape {
+                scenario: args.scenario,
+                target: args.target,
+                corpus: corpus_id.clone(),
+                limit: args.limit,
+                skips_registries: !args.skip_registries.is_empty(),
+                skips_prewarm: args.skip_prewarm,
+                disables_proxy: args.no_proxy,
+                measures_proxy_overhead: args.measure_proxy_overhead,
+            },
+        )?;
+    }
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
         args.target,
