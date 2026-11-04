@@ -58,12 +58,25 @@ A baseline build of ocync, from a commit given with `--baseline-ref`, takes part
 
 ### Proxy overhead measured before it is trusted
 
-> **Status: Planned.** Today wall clock is taken with the proxy, in the same pass as the counts, and its overhead is not yet resolved.
+Every request goes through `bench-proxy` unless the run passes `--no-proxy`, which records times but no traffic counts. The proxy terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: `--measure-proxy-overhead` runs each tool's sync twice in every round, through the proxy and directly, back to back, and reports the per-tool overhead.
 
-Every request goes through `bench-proxy` unless the run passes `--no-proxy`, which records times but no traffic counts. The proxy terminates and re-encrypts TLS so it can count requests, bytes, mounts and 429s per tool. That work could slow tools by different amounts. The harness therefore measures it: each tool runs several times with and without the proxy, interleaved, and the per-tool overhead is published.
+```bash
+cargo xtask bench-remote --provider aws --scenario sync --tools ocync,regsync --measure-proxy-overhead
+```
 
-- If every tool's overhead is within the run-to-run noise, wall clock is taken with the proxy in the same pass as the counts.
+- It applies to the sync scenario, whose cold sync and warm re-sync are each run both ways, and is refused for the others and beside `--no-proxy`. Each leg starts from an emptied target with its own config, so the second leg does not run against the first's cache. That needs ECR: Artifact Registry and ACR keep a round's blobs until the round ends, so the option is refused for them.
+- Each proxied run meets twice the usual load on the registries, so a paired run writes nothing to the performance page and is refused beside `--regression`. Its record still goes to the archive, where `direct_wall_clock_secs` marks it.
+- The proxied leg is first in odd rounds and the direct leg in even ones, so drift across a round is charged to neither route.
+- The direct leg records time only. Every count in the summary and the run record comes from the proxied legs, and the record stores the direct leg's wall clock beside the proxied run it was paired with (`direct_wall_clock_secs`), so the overhead can be recomputed from it.
+- The summary gives, per tool and per scenario, the median and range of the per-round ratio of the proxied to the direct wall clock, and whether the overhead is measured: every round on the same side of 1. This is the rule a speed comparison between tools uses, and it needs 5 rounds, where identical routes would put every round on one side one time in sixteen. Below 5 rounds the summary says too few rounds. A small overhead seen in every round counts as measured, and the median shows how large it is.
+- It doubles the run time of the sync scenario, and takes the usual rounds (at least 3, 5 by default).
+
+The rule that follows from the result:
+
+- If no tool shows a measured overhead, wall clock is taken with the proxy in the same pass as the counts.
 - If not, wall clock is taken in a pass without the proxy, and counts in a separate pass with it.
+
+> **Status: Planned.** The harness reports whether each tool shows a measured overhead, but a run does not yet apply the rule: today wall clock is always taken with the proxy, in the same pass as the counts, and the result of a paired run is read by a person.
 
 A first check by hand, on 2026-11-03, could not resolve the overhead. It ran ocync (built from `main`, reporting 0.8.2) and regsync v0.11.7 into ECR on the c6in.4xlarge bench instance, over the first 5 corpus images, all from quay.io (corpus locked 2026-11-01, sources pre-warmed). Four passes alternated with and without the proxy, each 3 rounds of a cold then a warm sync, so 6 rounds per tool each way. The first pass, with the proxy, ran at 11bae49 and the rest at f7d0cf2, which changes only how the harness records regsync's version. The passes are run records `2026-11-03-203607`, `-205529`, `-211254` and `-212951` in `bench/results/ecr.json`.
 

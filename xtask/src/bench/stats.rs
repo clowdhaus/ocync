@@ -36,30 +36,32 @@ pub(crate) fn spread(values: &[f64]) -> Option<Spread> {
 }
 
 /// What the rounds agree on, for a metric where lower is better. A ratio above
-/// 1 favors ocync.
+/// 1 favors the base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// ocync's value was lower than the other tool's in every round.
-    OcyncLower,
-    /// ocync's value was higher than the other tool's in every round.
-    OcyncHigher,
+    /// The base's value was lower than the other's in every round.
+    BaseLower,
+    /// The base's value was higher than the other's in every round.
+    BaseHigher,
     /// Some rounds on each side of 1, or a round at exactly 1.
     NoMeasuredDifference,
 }
 
-/// One round's value of a metric for ocync and for another tool.
+/// One round's value of a metric for the base it is measured against (ocync,
+/// or a tool's direct run) and for the other side (another tool, or the same
+/// run through the proxy).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Pair {
-    /// ocync's value.
-    pub(crate) ocync: f64,
-    /// The other tool's value.
+    /// The base's value.
+    pub(crate) base: f64,
+    /// The other side's value.
     pub(crate) other: f64,
 }
 
-/// The per-round ratios between ocync and one other tool.
+/// The per-round ratios between a base and the other side.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Ratio {
-    /// Median and range of `other / ocync` over the rounds.
+    /// Median and range of `other / base` over the rounds.
     pub(crate) spread: Spread,
     /// What the rounds agree on; `None` below [`VERDICT_ROUNDS`], where a
     /// one-sided run is too likely between identical builds to be claimed.
@@ -79,20 +81,20 @@ pub(crate) fn confidence(rounds: u32) -> f64 {
     1.0 - 2.0 * 0.5_f64.powi(i32::try_from(rounds).expect("a run has fewer than 2^31 rounds"))
 }
 
-/// The ratio `other / ocync` of each round, summarized. `None` when there are
-/// no rounds, a value is not finite, or ocync's is not above zero (a ratio of
-/// nothing says nothing).
+/// The ratio `other / base` of each round, summarized. `None` when there are
+/// no rounds, a value is not finite, or the base's is not above zero (a ratio
+/// of nothing says nothing).
 pub(crate) fn ratio(rounds: &[Pair]) -> Option<Ratio> {
     let ratios: Vec<f64> = rounds
         .iter()
-        .map(|pair| (pair.ocync.is_finite() && pair.ocync > 0.0).then(|| pair.other / pair.ocync))
+        .map(|pair| (pair.base.is_finite() && pair.base > 0.0).then(|| pair.other / pair.base))
         .collect::<Option<_>>()?;
     let spread = spread(&ratios)?;
     let verdict = (rounds.len() >= VERDICT_ROUNDS).then_some({
         if spread.min > 1.0 {
-            Verdict::OcyncLower
+            Verdict::BaseLower
         } else if spread.max < 1.0 {
-            Verdict::OcyncHigher
+            Verdict::BaseHigher
         } else {
             Verdict::NoMeasuredDifference
         }
@@ -137,13 +139,13 @@ mod tests {
     fn pairs(rounds: &[(f64, f64)]) -> Vec<Pair> {
         rounds
             .iter()
-            .map(|&(ocync, other)| Pair { ocync, other })
+            .map(|&(base, other)| Pair { base, other })
             .collect()
     }
 
     #[test]
     fn the_verdict_needs_every_round_on_one_side_of_one() {
-        // (name, (ocync, other) per round, verdict, median, min, max)
+        // (name, (base, other) per round, verdict, median, min, max)
         type Case = (&'static str, &'static [(f64, f64)], Verdict, f64, f64, f64);
         let cases: [Case; 4] = [
             (
@@ -155,7 +157,7 @@ mod tests {
                     (10.0, 25.0),
                     (10.0, 20.0),
                 ],
-                Verdict::OcyncLower,
+                Verdict::BaseLower,
                 2.0,
                 1.5,
                 3.0,
@@ -169,7 +171,7 @@ mod tests {
                     (10.0, 6.0),
                     (10.0, 8.0),
                 ],
-                Verdict::OcyncHigher,
+                Verdict::BaseHigher,
                 0.8,
                 0.5,
                 0.9,
@@ -221,7 +223,7 @@ mod tests {
             assert_eq!(got.spread.median, 2.0, "{rounds} rounds");
         }
         let five = ratio(&pairs(&[(10.0, 20.0); 5])).unwrap();
-        assert_eq!(five.verdict, Some(Verdict::OcyncLower));
+        assert_eq!(five.verdict, Some(Verdict::BaseLower));
     }
 
     #[test]

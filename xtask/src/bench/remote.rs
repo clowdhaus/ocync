@@ -21,7 +21,10 @@ use super::provision::{Outputs, Provisioned, RunEnd, lock_local_run};
 use super::report::{ARCHIVE_DIR, ArchiveMode, Deferred, PERFORMANCE_PAGE};
 use super::runner::join_tools;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
-use super::{Provider, RunTimestamp, Scenario, ToolSelection, captured, finish_pass, value_name};
+use super::{
+    Provider, RunTimestamp, Scenario, ToolSelection, captured, ensure_proxy_overhead_applies,
+    finish_pass, value_name,
+};
 
 /// Common SSH options for all remote connections.
 ///
@@ -99,6 +102,7 @@ pub(crate) struct BenchRemoteArgs {
             "skip_registries",
             "skip_prewarm",
             "no_proxy",
+            "measure_proxy_overhead",
         ]
     )]
     pub(crate) fetch: bool,
@@ -139,6 +143,12 @@ pub(crate) struct BenchRemoteArgs {
     /// Disable bench-proxy on the remote instance.
     #[arg(long)]
     pub(crate) no_proxy: bool,
+
+    /// Run each tool's sync twice per round, through bench-proxy and directly,
+    /// and report the proxy's overhead (passed through to `cargo xtask bench`).
+    /// The sync scenario only; doubles its run time.
+    #[arg(long, conflicts_with = "no_proxy")]
+    pub(crate) measure_proxy_overhead: bool,
 
     /// Local directory to save fetched results.
     #[arg(long, default_value = ARCHIVE_DIR)]
@@ -199,6 +209,9 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    if args.measure_proxy_overhead {
+        ensure_proxy_overhead_applies(args.scenario, args.target)?;
+    }
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
@@ -426,6 +439,9 @@ fn bench_args(args: &BenchRemoteArgs, timestamp: &RunTimestamp) -> Vec<String> {
     }
     if args.no_proxy {
         bench_args.push("--no-proxy".to_string());
+    }
+    if args.measure_proxy_overhead {
+        bench_args.push("--measure-proxy-overhead".to_string());
     }
     bench_args.push(value_name(&args.scenario));
     bench_args
@@ -1417,6 +1433,7 @@ mod tests {
             &["--skip-registries", "docker.io"][..],
             &["--skip-prewarm"][..],
             &["--no-proxy"][..],
+            &["--measure-proxy-overhead"][..],
         ] {
             let argv = ["xtask", "--provider", "aws", "--fetch"]
                 .into_iter()
@@ -1604,6 +1621,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "bench-remote: warning: refreshing the Azure token failed, keeping the last one\n"
+        );
+    }
+
+    #[test]
+    fn the_overhead_measurement_reaches_the_benchmark_only_when_asked_for() {
+        // Catches: the option accepted and dropped before the instance, and
+        // sent when it was not asked for, which an older `--git-ref` cannot parse.
+        use clap::Parser;
+        let timestamp = RunTimestamp::parse("2026-10-30-120000").unwrap();
+        let passed = |extra: &[&str]| {
+            let argv = ["xtask", "--provider", "aws", "--scenario", "sync"]
+                .into_iter()
+                .chain(extra.iter().copied());
+            let args = Cli::try_parse_from(argv).unwrap().args;
+            bench_args(&args, &timestamp).contains(&"--measure-proxy-overhead".to_owned())
+        };
+        assert!(passed(&["--measure-proxy-overhead"]));
+        assert!(!passed(&[]));
+        assert!(
+            Cli::try_parse_from([
+                "xtask",
+                "--provider",
+                "aws",
+                "--measure-proxy-overhead",
+                "--no-proxy"
+            ])
+            .is_err()
         );
     }
 

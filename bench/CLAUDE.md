@@ -31,6 +31,10 @@ cargo xtask bench-remote --provider aws --scenario sync \
 # the commit must be on a branch of origin, and a verdict needs 5 or more rounds)
 cargo xtask bench-remote --provider aws --scenario sync --baseline-ref <commit>
 
+# Measure what bench-proxy costs each tool: each sync runs through the proxy and directly,
+# back to back in every round (sync scenario only; the direct legs are timed, not counted)
+cargo xtask bench-remote --provider aws --scenario sync --tools ocync,regsync --measure-proxy-overhead
+
 # All scenarios (cold+warm + partial + scale)
 cargo xtask bench-remote --provider aws --scenario all
 
