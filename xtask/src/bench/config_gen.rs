@@ -13,6 +13,7 @@ use crate::bench::corpus::{Corpus, DockerHubAuth, ImageEntry};
 use crate::bench::lock::Lock;
 use crate::bench::runner::Copier;
 use crate::bench::skopeo_shim::PRESERVE_DIGESTS;
+use crate::bench::source::{Controlled, Source};
 use crate::bench::target::Kind;
 
 /// What a generated config syncs.
@@ -86,7 +87,7 @@ fn source_registry(source: &str) -> &str {
 ///
 /// `cgr.dev/chainguard/static` → `chainguard/static`
 /// `docker.io/library/alpine` → `library/alpine`
-fn source_path(source: &str) -> &str {
+pub(crate) fn source_path(source: &str) -> &str {
     match source.find('/') {
         Some(i) => &source[i + 1..],
         None => source,
@@ -105,6 +106,38 @@ fn registry_key(hostname: &str) -> String {
     }
 }
 
+/// The YAML key of the registry `host` a source is read from. The controlled
+/// source is ECR like the target, so it keeps its whole host and the two are
+/// two registries; a public source is keyed as it always was.
+fn source_key(source: &Source, host: &str) -> String {
+    match source {
+        Source::Public => registry_key(host),
+        Source::Controlled(_) => host.replace('.', "-"),
+    }
+}
+
+/// The credential helper regsync and the Docker config name for an ECR registry.
+const ECR_CRED_HELPER: &str = "docker-credential-ecr-login";
+
+/// Whether the tools sign in to their source as they do to the target, which
+/// the controlled source, an ECR registry, needs. The registries a public
+/// corpus names are read anonymously, or with Docker Hub credentials.
+fn signs_in_as_target(source: &Source) -> bool {
+    matches!(source, Source::Controlled(_))
+}
+
+/// The registries the tools read `images` from: their hostnames, sorted, once
+/// each.
+fn source_registries(images: &[ImageEntry], source: &Source) -> Vec<String> {
+    let mut registries: Vec<String> = images
+        .iter()
+        .map(|img| source_registry(&source.locate(&img.source)).to_owned())
+        .collect();
+    registries.sort_unstable();
+    registries.dedup();
+    registries
+}
+
 /// Generate an ocync YAML config from a corpus.
 ///
 /// Produces a `registries:` section with unique source registries (anonymous auth)
@@ -121,30 +154,116 @@ pub(crate) fn ocync_config(
     max_concurrent_transfers: Option<NonZeroUsize>,
     mode: Mode<'_>,
 ) -> String {
+    ocync_yaml(
+        &OcyncCopy {
+            images: &corpus.images,
+            source: &corpus.source,
+            dockerhub_auth: corpus.dockerhub_auth.as_ref(),
+            target_registry: &corpus.settings.target_registry,
+            target,
+            max_concurrent_transfers,
+            repos: TargetRepos::Prefixed(corpus),
+        },
+        mode,
+    )
+}
+
+/// What `bench-seed` copies: `images` from their public sources into
+/// `controlled`.
+pub(crate) struct Seed<'a> {
+    /// The controlled source the images are copied into.
+    pub(crate) controlled: &'a Controlled,
+    /// Each source with the locked tags to copy.
+    pub(crate) images: &'a [ImageEntry],
+    /// Docker Hub credentials for the public sources, if any.
+    pub(crate) dockerhub_auth: Option<&'a DockerHubAuth>,
+}
+
+/// The ocync config `bench-seed` runs: every tag of `seed` pinned to its digest
+/// in `lock`, copied from its public source to its repository in the
+/// controlled source, which ocync signs in to as ECR.
+pub(crate) fn seed_config(seed: &Seed<'_>, lock: &Lock) -> String {
+    ocync_yaml(
+        &OcyncCopy {
+            images: seed.images,
+            source: &Source::Public,
+            dockerhub_auth: seed.dockerhub_auth,
+            target_registry: seed.controlled.host(),
+            target: Kind::Ecr,
+            max_concurrent_transfers: None,
+            repos: TargetRepos::Mirrored(seed.controlled),
+        },
+        Mode::Sync(lock),
+    )
+}
+
+/// The repositories an ocync config writes to.
+#[derive(Clone, Copy)]
+enum TargetRepos<'a> {
+    /// `{prefix}/{flattened source}` in the corpus's target registry.
+    Prefixed(&'a Corpus),
+    /// `bench-source/{path of the source}` in the controlled source.
+    Mirrored(&'a Controlled),
+}
+
+impl TargetRepos<'_> {
+    /// The repository the image from `source` is written to.
+    fn of(&self, source: &str) -> String {
+        match self {
+            Self::Prefixed(corpus) => corpus.target_repo(source),
+            Self::Mirrored(controlled) => controlled.repo(source),
+        }
+    }
+}
+
+/// What an ocync config copies, from where and to where.
+struct OcyncCopy<'a> {
+    /// Each source with the tags to copy.
+    images: &'a [ImageEntry],
+    /// Where the sources are read.
+    source: &'a Source,
+    /// Docker Hub credentials, if any.
+    dockerhub_auth: Option<&'a DockerHubAuth>,
+    /// The target registry's hostname.
+    target_registry: &'a str,
+    /// How the target is signed in to.
+    target: Kind,
+    /// The cap written to a leading `global:` block, when given.
+    max_concurrent_transfers: Option<NonZeroUsize>,
+    /// The repositories written to.
+    repos: TargetRepos<'a>,
+}
+
+/// The ocync config for `copy`, syncing as `mode` says.
+fn ocync_yaml(copy: &OcyncCopy<'_>, mode: Mode<'_>) -> String {
+    let OcyncCopy {
+        images,
+        source,
+        dockerhub_auth,
+        target_registry,
+        target,
+        max_concurrent_transfers,
+        repos,
+    } = copy;
     let mut out = String::new();
 
     if let Some(cap) = max_concurrent_transfers {
         out.push_str(&format!("global:\n  max_concurrent_transfers: {cap}\n\n"));
     }
 
-    let mut source_registries: Vec<&str> = corpus
-        .images
-        .iter()
-        .map(|img| source_registry(&img.source))
-        .collect();
-    source_registries.sort_unstable();
-    source_registries.dedup();
-
-    let target_key = registry_key(&corpus.settings.target_registry);
+    let target_key = registry_key(target_registry);
 
     out.push_str("registries:\n");
-    for reg in &source_registries {
-        let key = registry_key(reg);
+    for reg in source_registries(images, source) {
+        let key = source_key(source, &reg);
         out.push_str(&format!("  {key}:\n"));
         out.push_str(&format!("    url: {reg}\n"));
+        if signs_in_as_target(source) {
+            out.push_str(&format!("    auth_type: {}\n", Kind::Ecr.auth_type()));
+        }
         // Docker Hub: inject basic auth to avoid 10 pulls/hr anonymous limit.
-        if *reg == "docker.io" {
-            if let Some(auth) = &corpus.dockerhub_auth {
+        if reg == "docker.io" {
+            if let Some(auth) = dockerhub_auth {
                 out.push_str("    auth_type: basic\n");
                 out.push_str("    credentials:\n");
                 out.push_str(&format!("      username: {}\n", auth.username));
@@ -153,15 +272,16 @@ pub(crate) fn ocync_config(
         }
     }
     out.push_str(&format!("  {target_key}:\n"));
-    out.push_str(&format!("    url: {}\n", corpus.settings.target_registry));
+    out.push_str(&format!("    url: {target_registry}\n"));
     out.push_str(&format!("    auth_type: {}\n", target.auth_type()));
 
     out.push('\n');
     out.push_str("mappings:\n");
-    for img in &corpus.images {
-        let src_key = registry_key(source_registry(&img.source));
-        let path = source_path(&img.source);
-        let target_repo = corpus.target_repo(&img.source);
+    for img in *images {
+        let read_from = source.locate(&img.source);
+        let src_key = source_key(source, source_registry(&read_from));
+        let path = source_path(&read_from);
+        let target_repo = repos.of(&img.source);
         out.push_str(&format!("  - from: \"{path}\"\n"));
         out.push_str(&format!("    to: \"{target_repo}\"\n"));
         out.push_str(&format!("    source: {src_key}\n"));
@@ -199,11 +319,13 @@ pub(crate) fn ocync_config(
 /// (via `GetAuthorizationToken`) instead of falling through to skopeo's Docker credential
 /// resolution. 12h matches the ECR token lifetime to minimize refresh overhead.
 pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> String {
-    // Group images by source registry. BTreeMap gives deterministic iteration order.
-    let mut by_registry: BTreeMap<&str, Vec<&ImageEntry>> = BTreeMap::new();
+    // Group images by the registry they are read from. BTreeMap gives
+    // deterministic iteration order.
+    let mut by_registry: BTreeMap<String, Vec<(&ImageEntry, String)>> = BTreeMap::new();
     for img in &corpus.images {
-        let reg = source_registry(&img.source);
-        by_registry.entry(reg).or_default().push(img);
+        let read_from = corpus.source.locate(&img.source).into_owned();
+        let reg = source_registry(&read_from).to_owned();
+        by_registry.entry(reg).or_default().push((img, read_from));
     }
 
     let mut out = String::new();
@@ -218,8 +340,12 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> Stri
         out.push_str(&format!("  - name: {task_name}\n"));
         out.push_str("    source:\n");
         out.push_str(&format!("      registry: {registry}\n"));
+        // The controlled source is ECR: signed in to as the target is.
+        if signs_in_as_target(&corpus.source) {
+            out.push_str("      auth-refresh: 12h\n");
+        }
         // Docker Hub: inject base64-encoded auth to avoid 10 pulls/hr anonymous limit.
-        if *registry == "docker.io" {
+        if registry == "docker.io" {
             if let Some(auth) = &corpus.dockerhub_auth {
                 let encoded = docker_hub_basic_auth(auth);
                 out.push_str(&format!("      auth: {encoded}\n"));
@@ -233,8 +359,8 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> Stri
         // ECR: use dregsy's built-in AWS SDK auth refresher (12h matches token lifetime).
         out.push_str("      auth-refresh: 12h\n");
         out.push_str("    mappings:\n");
-        for img in images {
-            let from = source_path(&img.source);
+        for (img, read_from) in images {
+            let from = source_path(read_from);
             let to = corpus.target_repo(&img.source);
             out.push_str(&format!("      - from: \"{from}\"\n"));
             out.push_str(&format!("        to: \"{to}\"\n"));
@@ -263,25 +389,22 @@ pub(crate) fn dregsy_config(corpus: &Corpus, lock: &Lock, skopeo: &Path) -> Stri
 /// locked digest from `lock` to the corpus tag, so a moved source tag cannot change what is
 /// copied.
 pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
-    let mut source_registries: Vec<&str> = corpus
-        .images
-        .iter()
-        .map(|img| source_registry(&img.source))
-        .collect();
-    source_registries.sort_unstable();
-    source_registries.dedup();
-
     let mut out = String::new();
     out.push_str("version: 1\n");
     out.push('\n');
     out.push_str("creds:\n");
-    for reg in &source_registries {
+    for reg in source_registries(&corpus.images, &corpus.source) {
         out.push_str(&format!("  - registry: {reg}\n"));
+        if signs_in_as_target(&corpus.source) {
+            // The controlled source is ECR: signed in to as the target is.
+            out.push_str(&format!("    credHelper: {ECR_CRED_HELPER}\n"));
+            continue;
+        }
         // Per-repo auth: required for registries that issue per-scope tokens and
         // reject multi-scope requests (cgr.dev, gcr.io, nvcr.io).
         out.push_str("    repoAuth: true\n");
         // Docker Hub: inject user/pass to avoid 10 pulls/hr anonymous limit.
-        if *reg == "docker.io" {
+        if reg == "docker.io" {
             if let Some(auth) = &corpus.dockerhub_auth {
                 out.push_str(&format!("    user: {}\n", auth.username));
                 out.push_str(&format!("    pass: {}\n", auth.token));
@@ -292,7 +415,7 @@ pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
         "  - registry: {}\n",
         corpus.settings.target_registry
     ));
-    out.push_str("    credHelper: docker-credential-ecr-login\n");
+    out.push_str(&format!("    credHelper: {ECR_CRED_HELPER}\n"));
 
     out.push('\n');
     out.push_str("sync:\n");
@@ -309,7 +432,7 @@ pub(crate) fn regsync_config(corpus: &Corpus, lock: &Lock) -> String {
     for img in &corpus.images {
         for tag in &img.tags {
             let digest = locked_digest(lock, &img.source, tag);
-            let source_ref = format!("{}@{digest}", img.source);
+            let source_ref = format!("{}@{digest}", corpus.source.locate(&img.source));
             let target_ref = format!("{}:{}", corpus.target_ref(&img.source), tag);
             out.push_str(&format!("  - source: \"{source_ref}\"\n"));
             out.push_str(&format!("    target: \"{target_ref}\"\n"));
@@ -335,8 +458,8 @@ const DOCKER_HUB_AUTH_KEY: &str = "https://index.docker.io/v1/";
 
 /// The Docker-format config the per-tag tools sign in with: Docker Hub
 /// credentials when the corpus has them, and the ECR credential helper for the
-/// target registry. Credentials go here, never on a command line, since the
-/// stderr of a failed run is printed.
+/// target registry and for the controlled source. Credentials go here, never on
+/// a command line, since the stderr of a failed run is printed.
 pub(crate) fn docker_config(corpus: &Corpus) -> String {
     let mut config = serde_json::Map::new();
     if let Some(auth) = &corpus.dockerhub_auth {
@@ -346,10 +469,14 @@ pub(crate) fn docker_config(corpus: &Corpus) -> String {
             serde_json::json!({ DOCKER_HUB_AUTH_KEY: { "auth": encoded } }),
         );
     }
-    config.insert(
-        "credHelpers".to_owned(),
-        serde_json::json!({ &corpus.settings.target_registry: "ecr-login" }),
-    );
+    let mut helpers = serde_json::Map::new();
+    if signs_in_as_target(&corpus.source) {
+        for registry in source_registries(&corpus.images, &corpus.source) {
+            helpers.insert(registry, "ecr-login".into());
+        }
+    }
+    helpers.insert(corpus.settings.target_registry.clone(), "ecr-login".into());
+    config.insert("credHelpers".to_owned(), helpers.into());
     serde_json::Value::Object(config).to_string()
 }
 
@@ -372,7 +499,11 @@ pub(crate) fn per_tag_copies(
     for img in &corpus.images {
         let target_ref = corpus.target_ref(&img.source);
         for tag in &img.tags {
-            let source = format!("{}@{}", img.source, locked_digest(lock, &img.source, tag));
+            let source = format!(
+                "{}@{}",
+                corpus.source.locate(&img.source),
+                locked_digest(lock, &img.source, tag)
+            );
             let target = format!("{target_ref}:{tag}");
             let args = match copier {
                 Copier::Skopeo => vec![
@@ -876,6 +1007,130 @@ sync:
                 "{copier:?}"
             );
         }
+    }
+
+    /// The test corpus read from the controlled source, for a target in
+    /// us-east-2: the source is the same account's us-east-1 registry.
+    fn controlled_corpus() -> Corpus {
+        use crate::bench::source::{Kind as SourceKind, Region};
+
+        let mut corpus = test_corpus();
+        corpus.settings.target_registry = "111111111111.dkr.ecr.us-east-2.amazonaws.com".into();
+        corpus.source = Source::resolve(
+            SourceKind::Controlled,
+            &corpus.settings.target_registry,
+            &Region::default(),
+        )
+        .unwrap();
+        corpus
+    }
+
+    const CONTROLLED_HOST: &str = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
+
+    #[test]
+    fn the_controlled_source_is_every_tools_only_source_and_no_public_host_is_left() {
+        // Catches: a tool still reading a public registry beside the controlled
+        // one, which would spend its rate limit and make that tool's rounds
+        // differ from the others'; and the source and the target, both ECR,
+        // sharing one registry key so one overwrites the other.
+        let (corpus, lock) = (controlled_corpus(), test_lock());
+        let dir = Path::new("/run/config");
+        let mut configs = vec![
+            (
+                "ocync",
+                ocync_config(&corpus, Kind::Ecr, None, Mode::Sync(&lock)),
+            ),
+            ("dregsy", dregsy_config(&corpus, &lock, Path::new("skopeo"))),
+            ("regsync", regsync_config(&corpus, &lock)),
+            ("docker config", docker_config(&corpus)),
+        ];
+        for copier in [Copier::Skopeo, Copier::Crane, Copier::Regctl, Copier::Oras] {
+            configs.push((
+                "per-tag",
+                per_tag_copies(copier, &corpus, &lock, dir)
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ));
+        }
+        for (tool, config) in &configs {
+            assert!(config.contains(CONTROLLED_HOST), "{tool}: {config}");
+            for public in ["docker.io", "cgr.dev", "docker-io", "cgr-dev", "ecr.aws"] {
+                assert!(!config.contains(public), "{tool} names {public}: {config}");
+            }
+        }
+
+        let ocync = &configs[0].1;
+        assert_eq!(
+            ocync.matches("    auth_type: ecr\n").count(),
+            2,
+            "source and target both sign in as ECR: {ocync}"
+        );
+        assert!(ocync.contains("  111111111111-dkr-ecr-us-east-1-amazonaws-com:\n"));
+        assert!(ocync.contains("  ecr:\n    url: 111111111111.dkr.ecr.us-east-2.amazonaws.com"));
+        assert!(ocync.contains(
+            "  - from: \"bench-source/library/alpine\"\n    to: \"bench/library-alpine\"\n    \
+             source: 111111111111-dkr-ecr-us-east-1-amazonaws-com\n    targets: [ecr]"
+        ));
+        // The digests are the lock's, found by the corpus source and not the copy's.
+        for entry in lock.images.values() {
+            assert!(ocync.contains(&entry.digest.to_string()), "{ocync}");
+        }
+
+        // The source signs in the way the target does, for each tool.
+        assert!(configs[1].1.contains(&format!(
+            "registry: {CONTROLLED_HOST}\n      auth-refresh: 12h"
+        )));
+        assert!(configs[2].1.contains(&format!(
+            "- registry: {CONTROLLED_HOST}\n    credHelper: docker-credential-ecr-login"
+        )));
+        assert!(!configs[2].1.contains("repoAuth"));
+        let docker: serde_json::Value = serde_json::from_str(&configs[3].1).unwrap();
+        assert_eq!(docker["credHelpers"][CONTROLLED_HOST], "ecr-login");
+        assert_eq!(
+            docker["credHelpers"]["111111111111.dkr.ecr.us-east-2.amazonaws.com"],
+            "ecr-login"
+        );
+        assert!(docker.get("auths").is_none());
+    }
+
+    #[test]
+    fn the_public_source_still_reads_the_registries_the_corpus_names() {
+        // Catches: the controlled source leaking into a default run.
+        let (corpus, lock) = (test_corpus(), test_lock());
+        for config in [
+            ocync_config(&corpus, Kind::Ecr, None, Mode::Sync(&lock)),
+            dregsy_config(&corpus, &lock, Path::new("skopeo")),
+            regsync_config(&corpus, &lock),
+        ] {
+            assert!(
+                config.contains("cgr.dev") && config.contains("docker.io"),
+                "{config}"
+            );
+            assert!(!config.contains("bench-source"), "{config}");
+        }
+    }
+
+    #[test]
+    fn a_public_corpus_reads_a_private_ecr_source_anonymously_as_before() {
+        // Catches: signing in to a source because its host looks like ECR,
+        // which changes what a public run does. Only the controlled source
+        // is signed in to; the target is the one ECR sign-in left.
+        let mut corpus = test_corpus();
+        let private = "222222222222.dkr.ecr.us-west-2.amazonaws.com/team/app";
+        corpus.images[0].source = private.into();
+        let lock = lock_of(&[
+            (&format!("{private}:latest"), entry('1', &[])),
+            ("docker.io/library/alpine:3.20", entry('2', &[])),
+            ("docker.io/library/alpine:latest", entry('3', &[])),
+        ]);
+        let ocync = ocync_config(&corpus, Kind::Ecr, None, Mode::Sync(&lock));
+        assert!(ocync.contains("url: 222222222222.dkr.ecr.us-west-2.amazonaws.com"));
+        assert_eq!(ocync.matches("    auth_type: ecr\n").count(), 1, "{ocync}");
+        let regsync = regsync_config(&corpus, &lock);
+        assert_eq!(regsync.matches("docker-credential-ecr-login").count(), 1);
+        assert!(!docker_config(&corpus).contains("222222222222"));
     }
 
     #[test]

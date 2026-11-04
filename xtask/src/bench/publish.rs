@@ -16,7 +16,7 @@ use crate::bench::report::{
     self, Coverage, Detail, Prewarm, RoundCount, RunRecord, ScenarioKind, ScenarioResult, ToolRun,
 };
 use crate::bench::runner::Tool;
-use crate::bench::{Scenario, ToolSelection, corpus, target, value_name};
+use crate::bench::{Scenario, ToolSelection, corpus, source, target, value_name};
 
 /// The rounds a published run is asked for and finishes.
 pub(crate) const PUBLISHED_ROUNDS: usize = 5;
@@ -77,6 +77,8 @@ pub(crate) struct Shape {
     pub(crate) scenario: Scenario,
     /// The registry the run syncs into.
     pub(crate) target: target::Kind,
+    /// The registry the tools read the corpus from.
+    pub(crate) source: source::Kind,
     /// The corpus the run syncs.
     pub(crate) corpus: corpus::Id,
     /// `--limit`, when given.
@@ -147,9 +149,16 @@ pub(crate) fn ensure_publishable(selection: &ToolSelection, shape: &Shape) -> Re
             shape.target.name()
         ));
     }
-    if !matches!(shape.scenario, Scenario::Sync | Scenario::All) {
+    if shape.source != source::Kind::Controlled {
         problems.push(format!(
-            "the scenario must include the cold and warm sync (sync or all), not {}",
+            "--source must be controlled, not {}: public registries rate-limit the repeated \
+             rounds",
+            value_name(&shape.source)
+        ));
+    }
+    if !matches!(shape.scenario, Scenario::Sync) {
+        problems.push(format!(
+            "the scenario must be sync, the cold and warm sync the page shows, not {}",
             value_name(&shape.scenario)
         ));
     }
@@ -452,6 +461,17 @@ fn short(commit: &str) -> &str {
     &commit[..commit.len().min(7)]
 }
 
+/// The source kind the page names, with the region of the controlled source.
+fn source_phrase(record: &RunRecord) -> String {
+    match (record.source, record.source_region.as_deref()) {
+        (source::Kind::Controlled, Some(region)) => {
+            format!("the controlled source (ECR {region})")
+        }
+        (source::Kind::Controlled, None) => "the controlled source".to_owned(),
+        (source::Kind::Public, _) => "the public registries".to_owned(),
+    }
+}
+
 /// The page block for one scenario of the run: a line naming the run, the
 /// medians of its rounds as a table, and the footnotes.
 fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Result<String, String> {
@@ -465,8 +485,8 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
         format!(
         "Measured {date} (run {run}, commit {commit}) on {instance} ({arch}, {vcpus} vCPUs, \
          {memory:.0} GiB, {network}). Full corpus: {images} images, {tags} tags. {description} \
-         to ECR {region}. Median of {count} rounds. {settings}All traffic routed through \
-         bench-proxy for byte-accurate measurement.\n\n",
+         from {source} to ECR {region}. Median of {count} rounds. {settings}All traffic \
+         routed through bench-proxy for byte-accurate measurement.\n\n",
         date = record.timestamp.get(..10).unwrap_or(&record.timestamp),
         run = record.timestamp,
         commit = short(&record.git_ref),
@@ -477,6 +497,7 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
         network = machine.network,
         images = record.corpus.images,
         tags = record.corpus.tags,
+        source = source_phrase(record),
         region = machine.region,
         count = rounds.len(),
         settings = record.max_concurrent_transfers.map_or_else(String::new, |cap| {
@@ -921,6 +942,25 @@ pub(crate) fn verify(record: &RunRecord) -> Result<(), String> {
     regions(record).map(|_| ())
 }
 
+/// The pre-warm requirement of [`verify`]: done with no blob left unwarmed, or
+/// not applicable, which only a run from the controlled source can be, since
+/// a public registry has a CDN to warm.
+fn check_prewarm(record: &RunRecord) -> Result<(), String> {
+    match &record.prewarm {
+        Some(Prewarm::Done { unwarmed, .. }) if unwarmed.is_empty() => Ok(()),
+        Some(Prewarm::Done { unwarmed, .. }) => Err(format!(
+            "the CDN pre-warm left blobs: {}",
+            report::not_warmed(unwarmed)
+        )),
+        Some(Prewarm::NotApplicable) if record.source == source::Kind::Controlled => Ok(()),
+        Some(Prewarm::NotApplicable) => {
+            Err("the CDN pre-warm is not applicable to a source with a CDN, and was not run".into())
+        }
+        Some(Prewarm::Skipped) => Err("the CDN pre-warm was skipped".into()),
+        None => Err("no CDN pre-warm ran".into()),
+    }
+}
+
 /// The requirements of [`verify`] that the record's own fields state.
 fn check(record: &RunRecord) -> Result<(), String> {
     if record.machine.provider.is_none() {
@@ -938,17 +978,10 @@ fn check(record: &RunRecord) -> Result<(), String> {
     if record.baseline_max_concurrent_transfers.is_some() {
         return Err("the run carried a baseline build".into());
     }
-    match &record.prewarm {
-        Some(Prewarm::Done { unwarmed, .. }) if unwarmed.is_empty() => {}
-        Some(Prewarm::Done { unwarmed, .. }) => {
-            return Err(format!(
-                "the CDN pre-warm left blobs: {}",
-                report::not_warmed(unwarmed)
-            ));
-        }
-        Some(Prewarm::Skipped) => return Err("the CDN pre-warm was skipped".into()),
-        None => return Err("no CDN pre-warm ran".into()),
+    if record.source != source::Kind::Controlled {
+        return Err("the tools did not read the controlled source".into());
     }
+    check_prewarm(record)?;
     let wanted = u32::try_from(PUBLISHED_ROUNDS).expect("a published run has few rounds");
     if record.rounds
         != Some(RoundCount {
@@ -962,7 +995,18 @@ fn check(record: &RunRecord) -> Result<(), String> {
         return Err("the commit is not recorded by its full hash".into());
     }
     let tools: BTreeSet<Tool> = PUBLISHED_TOOLS.into_iter().collect();
-    for kind in [ScenarioKind::Cold, ScenarioKind::Warm] {
+    let published_kinds = [ScenarioKind::Cold, ScenarioKind::Warm];
+    if let Some(other) = record.scenarios.iter().find(|scenario| {
+        !published_kinds
+            .iter()
+            .any(|kind| kind.label() == scenario.name)
+    }) {
+        return Err(format!(
+            "the run held the {} scenario, and a published run is the sync scenario alone",
+            other.name
+        ));
+    }
+    for kind in published_kinds {
         let rounds = rounds_in(record, kind)?;
         if rounds.len() != PUBLISHED_ROUNDS {
             return Err(format!(
@@ -1011,6 +1055,7 @@ pub(crate) mod tests {
         Shape {
             scenario: Scenario::Sync,
             target: target::Kind::Ecr,
+            source: source::Kind::Controlled,
             corpus: corpus::Id::Main,
             limit: None,
             skips_registries: false,
@@ -1022,16 +1067,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_published_shape_is_accepted_in_any_tool_order_and_for_sync_or_all() {
+    fn the_published_shape_is_accepted_in_any_tool_order() {
         assert_eq!(ensure_publishable(&selection(), &shape()), Ok(()));
         let mut reversed = selection();
         reversed.tools.reverse();
         assert_eq!(ensure_publishable(&reversed, &shape()), Ok(()));
-        let all = Shape {
-            scenario: Scenario::All,
-            ..shape()
-        };
-        assert_eq!(ensure_publishable(&selection(), &all), Ok(()));
     }
 
     #[test]
@@ -1122,14 +1162,32 @@ pub(crate) mod tests {
             },
             "must be ECR, not ACR",
         );
-        for scenario in [Scenario::Partial, Scenario::Scale, Scenario::Prepare] {
+        // Catches: the published run synced from the public registries, whose
+        // rate limits the repeated rounds would hit.
+        refused(
+            selection(),
+            Shape {
+                source: source::Kind::Public,
+                ..shape()
+            },
+            "--source must be controlled, not public",
+        );
+        // Catches: a run that also runs the partial, scale or prepare scenario
+        // (`all` included) being published; prepare reads the public
+        // registries whatever the source.
+        for scenario in [
+            Scenario::Partial,
+            Scenario::Scale,
+            Scenario::Prepare,
+            Scenario::All,
+        ] {
             refused(
                 selection(),
                 Shape {
                     scenario,
                     ..shape()
                 },
-                "cold and warm sync",
+                "the scenario must be sync",
             );
         }
     }
@@ -1218,10 +1276,7 @@ pub(crate) mod tests {
                 images: 25,
                 tags: 39,
             },
-            prewarm: Some(Prewarm::Done {
-                unwarmed: BTreeMap::new(),
-                no_cache: BTreeSet::from(["quay.io".to_owned()]),
-            }),
+            prewarm: Some(Prewarm::NotApplicable),
             tool_versions: PUBLISHED_TOOLS.iter().map(|&t| (t, "1.0".into())).collect(),
             scenarios: (0..5)
                 .flat_map(|n| [round(ScenarioKind::Cold, n), round(ScenarioKind::Warm, n)])
@@ -1234,6 +1289,8 @@ pub(crate) mod tests {
     pub(crate) fn published(report: &BenchReport) -> RunRecord {
         let mut record = RunRecord::of(report, FIXTURE_COMMIT.into(), None);
         record.publication = Publication::Publish;
+        record.source = source::Kind::Controlled;
+        record.source_region = Some(source::REGION.to_owned());
         record
     }
 
@@ -1324,12 +1381,52 @@ pub(crate) mod tests {
         let mut missing_tool = base();
         missing_tool.scenarios[3].runs.pop();
         refused(missing_tool, "every published tool");
+        // Catches: a record of an `all` run, whose partial scenario the page
+        // does not show, being published.
+        let mut with_partial = published(&base());
+        with_partial.scenarios.push(report::ScenarioRecord {
+            name: ScenarioKind::Partial.label(),
+            round: None,
+            shuffle_seed: 0,
+            tool_order: Vec::new(),
+            tools: Vec::new(),
+        });
+        assert!(
+            verify(&with_partial)
+                .unwrap_err()
+                .contains("sync scenario alone")
+        );
         let mut paired = base();
         paired.scenarios[0].runs[0].direct_wall_clock_secs = Some(1.0);
         refused(paired, "direct");
+        // Catches: a run from the public registries, the one a rate limit can
+        // spoil, being published whatever its arguments said.
+        let mut public = published(&base());
+        public.source = source::Kind::Public;
+        public.source_region = None;
+        assert!(
+            verify(&public)
+                .unwrap_err()
+                .contains("did not read the controlled source")
+        );
         let mut short_hash = published(&base());
         short_hash.git_ref = "0123456".into();
         assert!(verify(&short_hash).unwrap_err().contains("full hash"));
+    }
+
+    #[test]
+    fn a_prewarm_that_does_not_apply_is_accepted_only_for_the_controlled_source() {
+        // Catches: a public-source run, which has a CDN to warm, passing for
+        // having nothing to warm; and a controlled run refused for it.
+        let mut record = fixture(FIXTURE_RUN);
+        record.prewarm = Some(Prewarm::NotApplicable);
+        assert_eq!(check_prewarm(&record), Ok(()));
+        record.source = source::Kind::Public;
+        assert!(
+            check_prewarm(&record)
+                .unwrap_err()
+                .contains("not applicable to a source with a CDN")
+        );
     }
 
     #[test]
@@ -1399,7 +1496,7 @@ pub(crate) mod tests {
             "{block}"
         );
         assert!(
-            block.contains("Cold sync to ECR us-east-1. Median of 5 rounds."),
+            block.contains("Cold sync from the controlled source (ECR us-east-1) to ECR us-east-1. Median of 5 rounds."),
             "{block}"
         );
         assert!(
@@ -1438,8 +1535,23 @@ pub(crate) mod tests {
     fn the_warm_block_is_the_warm_scenario() {
         let record = fixture(FIXTURE_RUN);
         let block = page_block(&record, ScenarioKind::Warm, "Warm sync (no changes)").unwrap();
-        assert!(block.contains("Warm sync (no changes) to ECR"), "{block}");
+        assert!(
+            block.contains(
+                "Warm sync (no changes) from the controlled source (ECR us-east-1) to ECR"
+            ),
+            "{block}"
+        );
         assert!(!block.contains("Cold sync"), "{block}");
+        // Catches: every page naming the controlled source, whatever the
+        // record says it read.
+        let mut public = fixture(FIXTURE_RUN);
+        public.source = source::Kind::Public;
+        public.source_region = None;
+        let block = page_block(&public, ScenarioKind::Warm, "Warm sync (no changes)").unwrap();
+        assert!(
+            block.contains("from the public registries to ECR"),
+            "{block}"
+        );
     }
 
     #[test]

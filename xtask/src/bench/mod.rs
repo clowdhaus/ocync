@@ -17,7 +17,9 @@ pub(crate) mod regression;
 pub(crate) mod remote;
 pub(crate) mod report;
 pub(crate) mod runner;
+pub(crate) mod seed;
 pub(crate) mod skopeo_shim;
+pub(crate) mod source;
 pub(crate) mod stats;
 pub(crate) mod target;
 
@@ -228,6 +230,18 @@ pub(crate) struct BenchArgs {
     #[arg(long, value_enum, default_value = "ecr")]
     pub(crate) target: target::Kind,
 
+    /// Where the tools read the corpus from: `public` is the registries the
+    /// corpus names, where rate-limit behavior is measured; `controlled` is the
+    /// ECR registry `bench-seed` fills, where speed is measured. The controlled
+    /// source has no CDN, so the pre-warm does not apply.
+    #[arg(long, value_enum, default_value = "public")]
+    pub(crate) source: source::Kind,
+
+    /// The AWS region of the controlled source, which must not be the target's.
+    /// Read only with `--source controlled`.
+    #[arg(long, default_value = source::REGION)]
+    pub(crate) source_region: source::Region,
+
     /// Path to the prepare-scenario corpus YAML.
     ///
     /// Separate from `--corpus` because the two measure opposite things: the
@@ -306,10 +320,11 @@ pub(crate) struct BenchArgs {
     pub(crate) measure_proxy_overhead: bool,
 
     /// Make this the published run: the one every public number comes from.
-    /// Refused unless the run is the whole main corpus on ECR with all seven
-    /// tools at their defaults for 5 rounds, and a record that finishes short
-    /// of that is archived as an experiment. A published run rewrites the
-    /// performance page, the README, the homepage and the banners.
+    /// Refused unless the run is the whole main corpus on ECR from the
+    /// controlled source with all seven tools at their defaults for 5 rounds,
+    /// and a record that finishes short of that is archived as an experiment.
+    /// A published run rewrites the performance page, the README, the homepage
+    /// and the banners.
     #[arg(long, conflicts_with = "regression")]
     pub(crate) publish: bool,
 }
@@ -652,6 +667,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if args.measure_proxy_overhead {
         ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
+    args.source.ensure_applies(args.target)?;
     let corpus_id = args.paths.corpus_id()?;
     if args.publication() == publish::Publication::Publish {
         publish::ensure_publishable(
@@ -659,6 +675,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
             &publish::Shape {
                 scenario: args.scenario,
                 target: args.target,
+                source: args.source,
                 corpus: corpus_id.clone(),
                 limit: args.limit,
                 skips_registries: !args.skip_registries.is_empty(),
@@ -673,6 +690,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         remote::ensure_head_publishable(Path::new("."))?;
     }
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
+    ensure_source_reads_scenario(args.source, args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
         args.target,
         &|name| std::env::var(name).ok(),
@@ -715,7 +733,17 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     };
     let coverage = report::Coverage::of(whole_images, &corpus_info);
 
-    corpus.dockerhub_auth = docker_hub_auth();
+    // The controlled source is read with the account's ECR sign-in, and no
+    // generated config names Docker Hub then.
+    corpus.source = source::Source::resolve(
+        args.source,
+        &corpus.settings.target_registry,
+        &args.source_region,
+    )?;
+    corpus.dockerhub_auth = match corpus.source {
+        source::Source::Public => docker_hub_auth(),
+        source::Source::Controlled(_) => None,
+    };
 
     // The lock is read only when a scenario syncs from it: prepare reads its own
     // wildcard corpus and transfers nothing, so it needs no lock.
@@ -734,10 +762,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &transfers,
         &corpus_info,
         corpus_locked_at.as_ref(),
-        &baseline_path(&corpus_info.id),
+        &baseline_path(Path::new(report::ARCHIVE_DIR), &corpus_info.id, args.source),
     )?;
     let http = registry::http_client()?;
     let auth = corpus.dockerhub_auth.as_ref();
+    let source_check =
+        lock::SourceCheck::new(&http, auth, &corpus.source, args.paths.corpus()).await?;
     let refs: BTreeSet<_> = transfers
         .iter()
         .flat_map(|transfer| scenario_refs(transfer, &corpus))
@@ -745,7 +775,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     if let Some(lock) = &lock {
         // Before the build and the CDN pre-warm, so a digest the source no
         // longer serves costs seconds rather than a wasted run.
-        lock::ensure_served(&http, lock, &refs, auth).await?;
+        source_check.ensure_served(lock, &refs).await?;
     }
 
     let tools = args.tool_selection.run_tools();
@@ -844,7 +874,10 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     // and reads a different corpus than the one warmed here, so warming for it
     // is hundreds of pointless requests against registries that rate-limit.
     // A mixed run still warms, because the scenarios beside it do transfer.
-    let prewarm = if args.skip_prewarm {
+    let prewarm = if corpus.source.kind() == source::Kind::Controlled {
+        eprintln!("bench: skipping CDN pre-warm (the controlled source has no CDN)");
+        (!transfers.is_empty()).then_some(Prewarm::NotApplicable)
+    } else if args.skip_prewarm {
         eprintln!("bench: skipping CDN pre-warm (--skip-prewarm)");
         (!transfers.is_empty()).then_some(Prewarm::Skipped)
     } else if let Some(lock) = &lock {
@@ -931,7 +964,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                     Ok(finished) => Ok(finished),
                     Err(error) => {
                         let refs = scenario_refs(transfer, &corpus);
-                        let recheck = lock::ensure_served(&http, lock, &refs, auth).await;
+                        let recheck = source_check.ensure_served(lock, &refs).await;
                         Err(lock::explain(error.to_string(), recheck))
                     }
                 }
@@ -973,6 +1006,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         &report,
         git_ref(args.publication()),
         corpus_locked_at.clone(),
+        &corpus.source,
         args.publication(),
     );
     match args.archive {
@@ -1003,7 +1037,13 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     if args.regression {
-        check_regression(&report, args.threshold_pct, corpus_locked_at.as_ref())?;
+        check_regression(
+            &report,
+            args.threshold_pct,
+            corpus_locked_at.as_ref(),
+            Path::new(report::ARCHIVE_DIR),
+            args.source,
+        )?;
     }
 
     Ok(())
@@ -1023,9 +1063,12 @@ fn deferred_output(
     report: &BenchReport,
     git_ref: String,
     corpus_locked_at: Option<lock::LockedAt>,
+    source: &source::Source,
     publication: publish::Publication,
 ) -> report::Deferred {
     let mut record = report::RunRecord::of(report, git_ref, corpus_locked_at);
+    record.source = source.kind();
+    record.source_region = source.region().map(str::to_owned);
     // The archive is tracked in git and read as a history of comparable runs.
     // A run whose machine could not be identified is not comparable to one on
     // a known instance, and the harness already says so with a WARNING per
@@ -1256,6 +1299,27 @@ fn runs_prepare(requested: Scenario, corpus: &corpus::Id) -> Result<bool, String
     }
 }
 
+/// Refuses `--source controlled` for a run that executes the prepare scenario,
+/// which reads `bench/corpus-prepare.yaml` and lists its wildcard tags on the
+/// public registries. A lock of digests cannot pin a wildcard, so the
+/// controlled source holds nothing for it, and running it anyway would put a
+/// public registry's reads in a record that says the source was controlled.
+pub(crate) fn ensure_source_reads_scenario(
+    source: source::Kind,
+    requested: Scenario,
+    corpus: &corpus::Id,
+) -> Result<(), String> {
+    if source == source::Kind::Controlled && runs_prepare(requested, corpus)? {
+        return Err(format!(
+            "--source controlled cannot run the {} scenario: it lists the wildcard tags of \
+             bench/corpus-prepare.yaml, which cannot be pinned to digests and so are not in the \
+             controlled source; run it with --source public",
+            value_name(&requested)
+        ));
+    }
+    Ok(())
+}
+
 /// Every (source, tag) a scenario syncs.
 fn scenario_refs(transfer: &Transfer, corpus: &Corpus) -> BTreeSet<lock::ImageRef> {
     let mut refs = lock::refs_of(&corpus.images);
@@ -1369,25 +1433,34 @@ fn ensure_baseline_comparable(
     regression::ensure_baseline_comparable(baseline_path, &key)
 }
 
-/// Where the stored baseline of `--regression` lives: one per corpus, so a run
-/// of a named corpus is never compared with the main corpus's.
-fn baseline_path(corpus: &corpus::Id) -> PathBuf {
-    let dir = Path::new(report::ARCHIVE_DIR);
-    match corpus {
-        corpus::Id::Main => dir.join("baseline.json"),
-        corpus::Id::Named(name) => dir.join(format!("baseline-{name}.json")),
-    }
+/// Where the stored baseline of `--regression` lives in `dir`: one per corpus
+/// and per kind of source, so a run of a named corpus is never compared with
+/// the main corpus's, nor one from the controlled source with one from the
+/// public registries. The public baseline keeps the name it always had.
+fn baseline_path(dir: &Path, corpus: &corpus::Id, source: source::Kind) -> PathBuf {
+    let corpus = match corpus {
+        corpus::Id::Main => String::new(),
+        corpus::Id::Named(name) => format!("-{name}"),
+    };
+    let source = match source {
+        source::Kind::Public => "",
+        source::Kind::Controlled => "-controlled",
+    };
+    dir.join(format!("baseline{corpus}{source}.json"))
 }
 
-/// Compare the current ocync run against a stored baseline.
+/// Compare the current ocync run against the baseline stored in `dir` for its
+/// corpus and kind of source.
 ///
 /// Returns an error if regression is detected.
 fn check_regression(
     report: &BenchReport,
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
+    dir: &Path,
+    source: source::Kind,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let baseline_path = baseline_path(&report.corpus.id);
+    let baseline_path = baseline_path(dir, &report.corpus.id, source);
 
     if let Some(current) = cold_ocync_median(
         &report.scenarios,
@@ -2798,6 +2871,7 @@ mod tests {
                 &report,
                 "abc1234".into(),
                 None,
+                &source::Source::Public,
                 publish::Publication::Publish,
             );
             let text = serde_json::to_string(&deferred).unwrap();
@@ -2860,21 +2934,105 @@ mod tests {
     }
 
     #[test]
+    fn a_run_reads_the_public_registries_unless_it_asks_for_the_controlled_source() {
+        // Catches: the default changing, which moves every existing command to
+        // a registry that may not be seeded; and `--publish` with the default
+        // source being accepted, when only the controlled source may publish.
+        let source = |argv: &[&str]| parse_bench(argv).unwrap().source;
+        assert_eq!(source(&["sync"]), source::Kind::Public);
+        assert_eq!(
+            source(&["--source", "controlled", "sync"]),
+            source::Kind::Controlled
+        );
+        assert!(parse_bench(&["--source", "private", "sync"]).is_err());
+
+        let args = parse_bench(&["--publish", "sync"]).unwrap();
+        let shape = publish::Shape {
+            scenario: args.scenario,
+            target: args.target,
+            source: args.source,
+            corpus: corpus::Id::Main,
+            limit: None,
+            skips_registries: false,
+            skips_prewarm: false,
+            disables_proxy: false,
+            measures_proxy_overhead: false,
+            checks_regression: false,
+        };
+        let selection = ToolSelection {
+            tools: publish::PUBLISHED_TOOLS.to_vec(),
+            ..args.tool_selection
+        };
+        let refusal = publish::ensure_publishable(&selection, &shape).unwrap_err();
+        assert!(refusal.contains("--source must be controlled"), "{refusal}");
+        let controlled = publish::Shape {
+            source: source::Kind::Controlled,
+            ..shape
+        };
+        assert_eq!(publish::ensure_publishable(&selection, &controlled), Ok(()));
+    }
+
+    #[test]
+    fn the_controlled_source_refuses_the_scenarios_that_run_prepare() {
+        // Catches: prepare, whose wildcard tags the lock cannot pin, running
+        // against the public registries inside a run recorded as controlled;
+        // and the refusal reaching a run that runs no prepare, or a run from
+        // the public registries.
+        let main = corpus::Id::Main;
+        for scenario in [Scenario::Prepare, Scenario::All] {
+            let refusal = ensure_source_reads_scenario(source::Kind::Controlled, scenario, &main)
+                .unwrap_err();
+            assert!(
+                refusal.contains("wildcard tags") && refusal.contains("--source public"),
+                "{refusal}"
+            );
+            assert_eq!(
+                ensure_source_reads_scenario(source::Kind::Public, scenario, &main),
+                Ok(())
+            );
+        }
+        for scenario in [Scenario::Sync, Scenario::Partial, Scenario::Scale] {
+            assert_eq!(
+                ensure_source_reads_scenario(source::Kind::Controlled, scenario, &main),
+                Ok(()),
+                "{scenario:?}"
+            );
+        }
+        // `all` on a named corpus skips prepare, so nothing reads it.
+        let small = corpus::Id::Named(CorpusName::new("small"));
+        assert_eq!(
+            ensure_source_reads_scenario(source::Kind::Controlled, Scenario::All, &small),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn only_a_run_that_asked_to_be_published_and_qualifies_is_recorded_as_published() {
         use crate::bench::publish::tests::{fixture_report, published};
         let host = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
         let full = "0123456789abcdef0123456789abcdef01234567";
+        let controlled = source::Source::resolve(
+            source::Kind::Controlled,
+            "111111111111.dkr.ecr.us-east-2.amazonaws.com",
+            &source::Region::default(),
+        )
+        .unwrap();
+        let is_published_from =
+            |source: &source::Source, report: &BenchReport, git_ref: &str, publication| {
+                let deferred = deferred_output(
+                    &Target::Ecr,
+                    host,
+                    report,
+                    git_ref.into(),
+                    None,
+                    source,
+                    publication,
+                );
+                let json = serde_json::to_value(&deferred).unwrap();
+                json["record"]["published"] == serde_json::json!(true)
+            };
         let is_published = |report: &BenchReport, git_ref: &str, publication| {
-            let deferred = deferred_output(
-                &Target::Ecr,
-                host,
-                report,
-                git_ref.into(),
-                None,
-                publication,
-            );
-            let json = serde_json::to_value(&deferred).unwrap();
-            json["record"]["published"] == serde_json::json!(true)
+            is_published_from(&controlled, report, git_ref, publication)
         };
         let report = fixture_report("2026-11-02-120000", [200.0; 5]);
         assert_eq!(published(&report).git_ref, full);
@@ -2895,6 +3053,14 @@ mod tests {
         assert!(!is_published(
             &report,
             "0123456",
+            publish::Publication::Publish
+        ));
+        // Catches: a run from the public registries recorded as the published
+        // one because the report alone looked right.
+        assert!(!is_published_from(
+            &source::Source::Public,
+            &report,
+            full,
             publish::Publication::Publish
         ));
     }
@@ -3913,18 +4079,88 @@ images:
     }
 
     #[test]
-    fn each_corpus_has_its_own_baseline_file() {
+    fn each_corpus_and_kind_of_source_has_its_own_baseline_file() {
         // Catches: a shape corpus compared with, or overwriting, the main
-        // corpus's baseline.
-        for (id, path) in [
-            (corpus::Id::Main, "bench/results/baseline.json"),
+        // corpus's baseline; a run from the controlled source sharing the
+        // public run's file; and the public file changing its name.
+        let dir = Path::new("bench/results");
+        for (id, source, path) in [
+            (
+                corpus::Id::Main,
+                source::Kind::Public,
+                "bench/results/baseline.json",
+            ),
+            (
+                corpus::Id::Main,
+                source::Kind::Controlled,
+                "bench/results/baseline-controlled.json",
+            ),
             (
                 corpus::Id::Named(CorpusName::new("corpus-small")),
+                source::Kind::Public,
                 "bench/results/baseline-corpus-small.json",
             ),
+            (
+                corpus::Id::Named(CorpusName::new("corpus-small")),
+                source::Kind::Controlled,
+                "bench/results/baseline-corpus-small-controlled.json",
+            ),
         ] {
-            assert_eq!(baseline_path(&id), PathBuf::from(path), "{id:?}");
+            assert_eq!(
+                baseline_path(dir, &id, source),
+                PathBuf::from(path),
+                "{id:?} {source:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_controlled_run_reads_and_writes_only_the_controlled_baseline() {
+        // Catches: a controlled run judged against, or overwriting, the public
+        // baseline, whose figures the same code does not reproduce.
+        use crate::bench::report::tests::sample_report;
+
+        let mut run = tool_run(Tool::Ocync, 10.0);
+        run.proxy_metrics = Some(proxy::ProxyMetrics {
+            requests: 100,
+            response_bytes: 100_000,
+            ..Default::default()
+        });
+        let mut report = sample_report();
+        report.scenarios = vec![ScenarioResult {
+            round: Some(1),
+            ..ScenarioResult::unshuffled(ScenarioKind::Cold, vec![run])
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let public = baseline_path(dir.path(), &report.corpus.id, source::Kind::Public);
+        let controlled = baseline_path(dir.path(), &report.corpus.id, source::Kind::Controlled);
+        // A public baseline far below this run, which would be a regression.
+        let tiny = Baseline {
+            wall_clock_secs: 0.001,
+            requests: 1,
+            total_bytes: 1,
+            ..cold_ocync_median(
+                &report.scenarios,
+                report.corpus.clone(),
+                report.ocync_transfer_cap(),
+                None,
+            )
+            .unwrap()
+        };
+        regression::save_baseline(&public, &tiny).unwrap();
+        let before = std::fs::read(&public).unwrap();
+
+        check_regression(&report, 20, None, dir.path(), source::Kind::Controlled).unwrap();
+        assert_eq!(std::fs::read(&public).unwrap(), before, "public baseline");
+        assert!(controlled.exists(), "controlled baseline saved");
+
+        // Now the controlled baseline is read, and this run matches it.
+        check_regression(&report, 20, None, dir.path(), source::Kind::Controlled).unwrap();
+        assert_eq!(std::fs::read(&public).unwrap(), before, "public baseline");
+        assert!(
+            check_regression(&report, 20, None, dir.path(), source::Kind::Public).is_err(),
+            "the public baseline is still what a public run is judged against"
+        );
     }
 
     #[test]

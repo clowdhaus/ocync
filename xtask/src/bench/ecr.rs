@@ -12,14 +12,66 @@ pub(crate) async fn client() -> Client {
     Client::new(&config)
 }
 
+/// Create an ECR client for `region`, whatever region the environment names.
+pub(crate) async fn client_in(region: &str) -> Client {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_owned()))
+        .load()
+        .await;
+    Client::new(&config)
+}
+
 /// Validate ECR credentials by calling `GetAuthorizationToken`.
 pub(crate) async fn validate_credentials(client: &Client) -> Result<(), String> {
-    client
+    registry_token(client).await.map(drop)
+}
+
+/// The token `GetAuthorizationToken` returns for the client's region: base64 of
+/// `AWS:<password>`, which the registry takes as Basic credentials.
+pub(crate) async fn registry_token(client: &Client) -> Result<String, String> {
+    let response = client
         .get_authorization_token()
         .send()
         .await
         .map_err(|e| format!("ECR credential validation failed: {e}"))?;
-    Ok(())
+    response
+        .authorization_data()
+        .first()
+        .and_then(|data| data.authorization_token())
+        .map(str::to_owned)
+        .ok_or_else(|| "ECR credential validation failed: no authorization token".to_owned())
+}
+
+/// Whether [`create_repo`] made the repository or found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepoState {
+    /// It did not exist and now does.
+    Created,
+    /// It existed already.
+    Existed,
+}
+
+/// Create the repository `name`, or find it already there.
+pub(crate) async fn create_repo(client: &Client, name: &str) -> Result<RepoState, String> {
+    use aws_sdk_ecr::operation::create_repository::CreateRepositoryError;
+
+    match client
+        .create_repository()
+        .repository_name(name)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(RepoState::Created),
+        Err(e) => {
+            if let Some(CreateRepositoryError::RepositoryAlreadyExistsException(_)) =
+                e.as_service_error()
+            {
+                Ok(RepoState::Existed)
+            } else {
+                Err(format!("failed to create repo {name}: {e}"))
+            }
+        }
+    }
 }
 
 /// Create all target repositories for the corpus.
@@ -27,26 +79,11 @@ pub(crate) async fn validate_credentials(client: &Client) -> Result<(), String> 
 /// Each source image maps to a `{prefix}/{name}` repository in ECR.
 /// Repositories that already exist are silently skipped.
 pub(crate) async fn create_repos(client: &Client, corpus: &Corpus) -> Result<(), String> {
-    use aws_sdk_ecr::operation::create_repository::CreateRepositoryError;
-
     for img in &corpus.images {
         let repo_name = corpus.target_repo(&img.source);
-        match client
-            .create_repository()
-            .repository_name(&repo_name)
-            .send()
-            .await
-        {
-            Ok(_) => eprintln!("  created repo: {repo_name}"),
-            Err(e) => {
-                if let Some(CreateRepositoryError::RepositoryAlreadyExistsException(_)) =
-                    e.as_service_error()
-                {
-                    eprintln!("  repo exists: {repo_name}");
-                } else {
-                    return Err(format!("failed to create repo {repo_name}: {e}"));
-                }
-            }
+        match create_repo(client, &repo_name).await? {
+            RepoState::Created => eprintln!("  created repo: {repo_name}"),
+            RepoState::Existed => eprintln!("  repo exists: {repo_name}"),
         }
     }
 

@@ -16,7 +16,9 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::corpus::{self, CorpusPaths, DockerHubAuth, ImageEntry};
-use crate::bench::registry::{self, Access, Repository};
+use crate::bench::ecr;
+use crate::bench::registry::{self, Access, BasicLogin, Repository};
+use crate::bench::source::Source;
 
 /// The digest of `bytes`.
 fn digest_of(bytes: &[u8]) -> Digest {
@@ -277,8 +279,12 @@ impl std::error::Error for NotServed {}
 /// Judge the refs that could not be served. A digest answered 404, 403, or 401
 /// after a new token is no longer served, as for a deleted repository; any other
 /// failure only leaves the check incomplete. `missing` are the lock's reasons
-/// for the refs it lacks.
-fn judge_served(missing: Vec<String>, failed: &[(ImageRef, FetchError)]) -> Result<(), NotServed> {
+/// for the refs it lacks, and `remedy` is what to do about a digest not served.
+fn judge_served(
+    missing: Vec<String>,
+    failed: &[(ImageRef, FetchError)],
+    remedy: &str,
+) -> Result<(), NotServed> {
     let (gone, unreachable): (Vec<_>, Vec<_>) = failed.iter().cloned().partition(|(_, e)| {
         matches!(
             e.status,
@@ -303,9 +309,7 @@ fn judge_served(missing: Vec<String>, failed: &[(ImageRef, FetchError)]) -> Resu
         return incomplete.map_or(Ok(()), |text| Err(NotServed::Incomplete(text)));
     }
     let mut text = format!(
-        "{} source ref(s) cannot be copied from the lock:\n{}\nRun `cargo xtask bench-lock` to \
-         lock the current content. A new lock starts a new comparison series: do not read its \
-         runs against runs under the old one.",
+        "{} source ref(s) cannot be copied from the lock:\n{}\n{remedy}",
         lines.len(),
         lines.join("\n")
     );
@@ -329,30 +333,90 @@ pub(crate) fn explain(error: String, recheck: Result<(), NotServed>) -> String {
     }
 }
 
-/// Check that the source still serves the locked manifest digest of every ref
-/// in `refs`, each by a HEAD of that digest and never of its tag. A tag that
-/// has moved is not a difference: the run copies the locked digest.
-pub(crate) async fn ensure_served(
-    client: &reqwest::Client,
-    lock: &Lock,
-    refs: &BTreeSet<ImageRef>,
-    auth: Option<&DockerHubAuth>,
-) -> Result<(), NotServed> {
-    let access = Access::new(client, auth);
-    check_served(&access, lock, refs, async |repo, digest| {
-        access.head_digest(repo, digest).await
-    })
-    .await
+/// What a run checks its source with: the HTTP client, the Docker Hub
+/// credentials, the source and, for the controlled source, the ECR sign-in made
+/// once for the run.
+pub(crate) struct SourceCheck<'a> {
+    /// Client for every request.
+    client: &'a reqwest::Client,
+    /// Docker Hub credentials, if any.
+    auth: Option<&'a DockerHubAuth>,
+    /// The source the tools read.
+    source: &'a Source,
+    /// The sign-in to the controlled source.
+    login: Option<BasicLogin>,
+    /// The corpus file the run reads, which the remedy names.
+    corpus: &'a str,
 }
 
-/// [`ensure_served`] with the request `head` makes for one locked digest. A ref
-/// the lock lacks is refused before any request goes out. Otherwise one request
-/// goes out per distinct repository and digest, and a failure is reported for
-/// every tag that names it.
+impl<'a> SourceCheck<'a> {
+    /// A check of `source` for a run of `corpus`. The controlled source is read
+    /// with the account's ECR sign-in, made here once for every check.
+    pub(crate) async fn new(
+        client: &'a reqwest::Client,
+        auth: Option<&'a DockerHubAuth>,
+        source: &'a Source,
+        corpus: &'a str,
+    ) -> Result<Self, NotServed> {
+        let login = match source {
+            Source::Public => None,
+            Source::Controlled(controlled) => {
+                let token =
+                    ecr::registry_token(&ecr::client_in(controlled.region().as_str()).await)
+                        .await
+                        .map_err(|e| {
+                            NotServed::Incomplete(format!(
+                                "cannot sign in to the controlled source in {}: {e}",
+                                controlled.region()
+                            ))
+                        })?;
+                Some(BasicLogin::new(controlled.host(), token))
+            }
+        };
+        Ok(Self {
+            client,
+            auth,
+            source,
+            login,
+            corpus,
+        })
+    }
+
+    /// Check that the source still serves the locked manifest digest of every
+    /// ref in `refs`, each by a HEAD of that digest and never of its tag. A tag
+    /// that has moved is not a difference: the run copies the locked digest.
+    pub(crate) async fn ensure_served(
+        &self,
+        lock: &Lock,
+        refs: &BTreeSet<ImageRef>,
+    ) -> Result<(), NotServed> {
+        let access = Access::new(self.client, self.auth);
+        let access = match &self.login {
+            Some(login) => access.signed_in_to(login),
+            None => access,
+        };
+        check_served(
+            &access,
+            lock,
+            refs,
+            self.source,
+            self.corpus,
+            async |repo, digest| access.head_digest(repo, digest).await,
+        )
+        .await
+    }
+}
+
+/// [`SourceCheck::ensure_served`] with the request `head` makes for one locked
+/// digest. A ref the lock lacks is refused before any request goes out.
+/// Otherwise one request goes out per distinct repository and digest, and a
+/// failure is reported for every tag that names it.
 async fn check_served(
     access: &Access<'_>,
     lock: &Lock,
     refs: &BTreeSet<ImageRef>,
+    source: &Source,
+    corpus: &str,
     head: impl AsyncFn(&Repository<'_>, &Digest) -> Result<(), FetchError>,
 ) -> Result<(), NotServed> {
     let mut missing = Vec::new();
@@ -367,7 +431,7 @@ async fn check_served(
         }
     }
     if !missing.is_empty() {
-        return judge_served(missing, &[]);
+        return judge_served(missing, &[], &source.remedy(corpus));
     }
     let probes: BTreeSet<ImageRef> = sharing.values().map(|tags| tags[0].clone()).collect();
     eprintln!(
@@ -375,7 +439,7 @@ async fn check_served(
         probes.len()
     );
     let (_, failed) = access
-        .resolve(&probes, async |_, repo, image| {
+        .resolve(&probes, source, async |_, repo, image| {
             let digest = &lock.images[image].digest;
             head(repo, digest).await.map_err(|e| FetchError {
                 reason: format!("digest {digest}: {}", e.reason),
@@ -391,7 +455,7 @@ async fn check_served(
                 .map(move |image| ((*image).clone(), e.clone()))
         })
         .collect();
-    judge_served(Vec::new(), &failed)
+    judge_served(Vec::new(), &failed, &source.remedy(corpus))
 }
 
 /// The digest of a manifest body. A registry that also reports a digest must
@@ -519,17 +583,20 @@ impl Access<'_> {
         }
     }
 
-    /// Resolve every ref with `fetch`. Returns what resolved and each ref that
-    /// did not, so the caller decides what an incomplete answer means.
+    /// Resolve every ref with `fetch`, in the repository `source` holds it in.
+    /// Returns what resolved and each ref that did not, so the caller decides
+    /// what an incomplete answer means.
     async fn resolve<T>(
         &self,
         refs: &BTreeSet<ImageRef>,
+        source: &Source,
         fetch: impl AsyncFn(&Self, &Repository<'_>, &ImageRef) -> Result<T, FetchError>,
     ) -> (BTreeMap<ImageRef, T>, Vec<(ImageRef, FetchError)>) {
         let mut resolved = BTreeMap::new();
         let mut failed = Vec::new();
         for image in refs {
-            let outcome = match registry::split_source(&image.source) {
+            let located = source.locate(&image.source);
+            let outcome = match registry::split_source(&located) {
                 Some(repo) => fetch(self, &repo, image).await,
                 None => Err("source names no registry".to_owned().into()),
             };
@@ -656,7 +723,7 @@ pub(crate) async fn run(args: LockArgs) -> Result<(), Box<dyn std::error::Error>
     let client = registry::http_client()?;
     let access = Access::new(&client, auth.as_ref());
     let (images, failed) = access
-        .resolve(&refs, async |access, repo, image| {
+        .resolve(&refs, &Source::Public, async |access, repo, image| {
             access.fetch_entry(repo, &image.tag).await
         })
         .await;
@@ -734,6 +801,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::{digest as d, entry, lock_of, locked_at};
     use super::*;
+    use crate::bench::source::{Kind, Region};
 
     fn image(raw: &str) -> ImageRef {
         ImageRef::parse(raw).unwrap()
@@ -931,6 +999,17 @@ mod tests {
         served: &[char],
         status: StatusCode,
     ) -> (Result<(), NotServed>, Vec<String>) {
+        check_in(lock, refs, served, status, &Source::Public)
+    }
+
+    /// [`check`] with the repositories read from `source`.
+    fn check_in(
+        lock: &Lock,
+        refs: &[&str],
+        served: &[char],
+        status: StatusCode,
+        source: &Source,
+    ) -> (Result<(), NotServed>, Vec<String>) {
         let served: Vec<Digest> = served.iter().map(|c| d(*c)).collect();
         let asked = std::cell::RefCell::new(Vec::new());
         let client = registry::http_client().unwrap();
@@ -940,6 +1019,8 @@ mod tests {
             &access,
             lock,
             &refs,
+            source,
+            "bench/corpus.yaml",
             async |repo, digest| {
                 asked.borrow_mut().push(format!("{repo}@{digest}"));
                 if served.contains(digest) {
@@ -987,6 +1068,49 @@ mod tests {
         assert!(!text.contains("s/a:1"), "{text}");
         assert!(text.contains("1 source ref(s) cannot be copied from the lock"));
         assert!(text.contains("cargo xtask bench-lock") && text.contains("new comparison series"));
+    }
+
+    #[test]
+    fn the_controlled_source_is_asked_for_the_locked_digest_in_its_own_repository() {
+        // Catches: the check still HEADing the public registry while the tools
+        // read the controlled one, and a digest the seed never copied being
+        // reported with the lock's advice (re-lock) rather than the seed's.
+        let lock = lock_of(&[("docker.io/library/a:1", entry('1', &[]))]);
+        let source = Source::resolve(
+            Kind::Controlled,
+            "111.dkr.ecr.us-east-2.amazonaws.com",
+            &Region::default(),
+        )
+        .unwrap();
+        let refs = ["docker.io/library/a:1"];
+        let (verdict, asked) = check_in(&lock, &refs, &['1'], StatusCode::NOT_FOUND, &source);
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(
+            asked,
+            [format!(
+                "111.dkr.ecr.us-east-1.amazonaws.com/bench-source/library/a@{}",
+                d('1')
+            )]
+        );
+        assert!(!asked[0].contains("registry-1.docker.io"), "{asked:?}");
+
+        let (verdict, asked) = check_in(&lock, &refs, &[], StatusCode::NOT_FOUND, &source);
+        let Err(NotServed::Gone(text)) = verdict else {
+            panic!("a digest the seed never copied must stop the run");
+        };
+        assert!(
+            text.contains(&format!(
+                "docker.io/library/a:1: digest {}: manifest request returned 404",
+                d('1')
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("bench-remote --provider aws --seed"),
+            "{text}"
+        );
+        assert!(!text.contains("bench-lock"), "{text}");
+        assert_eq!(asked.len(), 1);
     }
 
     #[test]

@@ -188,23 +188,53 @@ enum Grant {
     /// The registry answered `/v2/` without a challenge: it asks for no
     /// credential, so none is sent and a 401 is a refusal, not an expiry.
     Anonymous,
+    /// A fixed Basic credential, as ECR takes one: nothing to exchange, and a
+    /// 401 is a refusal.
+    Basic(String),
 }
 
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bearer(_) => f.write_str("Bearer([REDACTED])"),
+            Self::Basic(_) => f.write_str("Basic([REDACTED])"),
             Self::Anonymous => f.write_str("Anonymous"),
         }
     }
 }
 
 /// `request`, authorized with `grant`: a bearer token for [`Grant::Bearer`],
-/// no `Authorization` header for [`Grant::Anonymous`].
+/// the credential for [`Grant::Basic`], no `Authorization` header for
+/// [`Grant::Anonymous`].
 fn authorize(request: reqwest::RequestBuilder, grant: &Grant) -> reqwest::RequestBuilder {
     match grant {
         Grant::Bearer(token) => request.bearer_auth(token),
+        Grant::Basic(credential) => request.header(
+            reqwest::header::AUTHORIZATION,
+            format!("Basic {credential}"),
+        ),
         Grant::Anonymous => request,
+    }
+}
+
+/// A Basic credential held for one registry, which answers `/v2/` with a Basic
+/// challenge and so has no token to exchange.
+#[derive(Clone)]
+pub(crate) struct BasicLogin {
+    /// The registry's hostname.
+    host: String,
+    /// The base64 `user:password` it takes.
+    credential: String,
+}
+
+impl BasicLogin {
+    /// The login for the registry `host`, with the base64 `user:password`
+    /// `credential` it takes, which ECR's `GetAuthorizationToken` returns.
+    pub(crate) fn new(host: &str, credential: String) -> Self {
+        Self {
+            host: host.to_owned(),
+            credential,
+        }
     }
 }
 
@@ -219,6 +249,8 @@ pub(crate) struct Access<'a> {
     client: &'a reqwest::Client,
     /// Docker Hub credentials for the token exchange, if any.
     auth: Option<&'a DockerHubAuth>,
+    /// The Basic credential of the one registry that needs it, if any.
+    basic: Option<BasicLogin>,
     /// Latest exchange for each repository; a failure is kept so it is
     /// reported for every tag and not retried at once.
     grants: Grants,
@@ -234,8 +266,15 @@ impl<'a> Access<'a> {
         Self {
             client,
             auth,
+            basic: None,
             grants: RefCell::default(),
         }
+    }
+
+    /// Access that signs in to one registry with `login`.
+    pub(crate) fn signed_in_to(mut self, login: &BasicLogin) -> Self {
+        self.basic = Some(login.clone());
+        self
     }
 
     /// The grant for `repo`, exchanged for the first time it is asked, or when
@@ -246,7 +285,7 @@ impl<'a> Access<'a> {
         rejected: Option<&Grant>,
     ) -> Result<Grant, String> {
         cached_grant(&self.grants, RepoKey::from(repo), rejected, async || {
-            oci_grant(self.client, repo, self.auth).await
+            oci_grant(self.client, repo, self.auth, self.basic.as_ref()).await
         })
         .await
     }
@@ -297,7 +336,7 @@ async fn cached_grant(
 /// Send with the current grant. A 401 under a bearer token means it expired, so
 /// exchange for another once and send again; whatever that answers is returned,
 /// so a registry that still refuses is reported, not asked again. A 401 under
-/// [`Grant::Anonymous`] has nothing to renew and is returned as it is.
+/// any other grant has nothing to renew and is returned as it is.
 async fn send_renewing<E>(
     grant: impl AsyncFn() -> Result<Grant, E>,
     renew: impl AsyncFn(&Grant) -> Result<Grant, E>,
@@ -305,7 +344,7 @@ async fn send_renewing<E>(
 ) -> Result<reqwest::Response, E> {
     let used = grant().await?;
     let response = send(&used).await?;
-    if response.status() != StatusCode::UNAUTHORIZED || used == Grant::Anonymous {
+    if response.status() != StatusCode::UNAUTHORIZED || !matches!(used, Grant::Bearer(_)) {
         return Ok(response);
     }
     send(&renew(&used).await?).await
@@ -351,18 +390,30 @@ fn read_challenge<'a>(
     }
 }
 
+/// The grant for `registry` when `basic` holds its credential.
+fn basic_grant(basic: Option<&BasicLogin>, registry: &str) -> Option<Grant> {
+    basic
+        .filter(|login| login.host == registry)
+        .map(|login| Grant::Basic(login.credential.clone()))
+}
+
 /// OCI token exchange for a single repository scope.
 ///
 /// Follows the standard flow: challenge /v2/, parse `WWW-Authenticate`,
 /// request a bearer token from the auth realm. A registry that answers `/v2/` with success and no
 /// challenge is [`Grant::Anonymous`]. For Docker Hub, includes basic auth
-/// credentials if given. The error says which step failed.
+/// credentials if given. The registry `basic` names is not challenged: its
+/// credential is the grant. The error says which step failed.
 async fn oci_grant(
     client: &reqwest::Client,
     repo: &Repository<'_>,
     dockerhub_auth: Option<&DockerHubAuth>,
+    basic: Option<&BasicLogin>,
 ) -> Result<Grant, String> {
     let registry = repo.host.api_host();
+    if let Some(grant) = basic_grant(basic, registry) {
+        return Ok(grant);
+    }
 
     // Step 1: challenge the registry to get the auth parameters.
     let challenge_url = format!("https://{registry}/v2/");
@@ -599,6 +650,12 @@ mod tests {
         assert_eq!(renewing_under(old(), &[401, 401, 200]), (401, 2, 1));
         // Catches: an exchange attempted against a registry with no token service.
         assert_eq!(renewing_under(Grant::Anonymous, &[401, 200]), (401, 1, 0));
+        // Catches: an exchange attempted for ECR's fixed credential, which has
+        // no token service to ask.
+        assert_eq!(
+            renewing_under(Grant::Basic("c".to_owned()), &[401, 200]),
+            (401, 1, 0)
+        );
     }
 
     #[test]
@@ -624,6 +681,28 @@ mod tests {
             header(&Grant::Bearer("t0k".into())).as_deref(),
             Some("Bearer t0k")
         );
+        assert_eq!(
+            header(&Grant::Basic("QVdTOnB3".into())).as_deref(),
+            Some("Basic QVdTOnB3")
+        );
+        assert_eq!(
+            format!("{:?}", Grant::Basic("QVdTOnB3".into())),
+            "Basic([REDACTED])"
+        );
+    }
+
+    #[test]
+    fn only_the_registry_signed_in_to_is_given_the_basic_credential() {
+        // Catches: the ECR credential sent to a public registry that is not
+        // ECR, and the ECR registry sent through a token exchange it does not
+        // have.
+        let login = BasicLogin::new("r.example", "QVdTOnB3".to_owned());
+        assert_eq!(
+            basic_grant(Some(&login), "r.example"),
+            Some(Grant::Basic("QVdTOnB3".to_owned()))
+        );
+        assert_eq!(basic_grant(Some(&login), "registry-1.docker.io"), None);
+        assert_eq!(basic_grant(None, "r.example"), None);
     }
 
     #[test]
