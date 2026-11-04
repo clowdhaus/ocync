@@ -53,14 +53,7 @@ async fn expect_status(
     if status == expected {
         Ok(resp)
     } else {
-        let registry = base_url.host_str().unwrap_or("unknown");
-        let body = crate::json::error_body(resp).await;
-        let message = if body.is_empty() {
-            format!("{registry}/{repository}")
-        } else {
-            format!("{registry}/{repository}: {body}")
-        };
-        Err(Error::RegistryError { status, message })
+        Err(Error::from_response(resp, Some((base_url, repository))).await)
     }
 }
 
@@ -148,6 +141,7 @@ impl UploadSlot<'_> {
             Err(Error::RegistryError {
                 status: StatusCode::UNAUTHORIZED,
                 message,
+                ..
             }) => {
                 client.refuse_auth(sent).await;
                 Err(Error::UploadTokenRefused { message })
@@ -424,16 +418,7 @@ async fn classify_mount_response(
     match status {
         StatusCode::CREATED => Ok(MountResult::Mounted),
         StatusCode::ACCEPTED => Ok(MountResult::NotMounted),
-        _ => {
-            let registry = base_url.host_str().unwrap_or("unknown");
-            let body = crate::json::error_body(resp).await;
-            let message = if body.is_empty() {
-                format!("{registry}/{repository}")
-            } else {
-                format!("{registry}/{repository}: {body}")
-            };
-            Err(Error::RegistryError { status, message })
-        }
+        _ => Err(Error::from_response(resp, Some((base_url, repository))).await),
     }
 }
 

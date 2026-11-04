@@ -136,7 +136,10 @@ impl Error {
     /// the reason. Throttling, access and server errors are `None`.
     pub(crate) fn manifest_refusal(&self) -> Option<ManifestRefusal> {
         let Self::Manifest {
-            source: ocync_distribution::Error::RegistryError { status, message },
+            source:
+                ocync_distribution::Error::RegistryError {
+                    status, message, ..
+                },
             ..
         } = self
         else {
@@ -181,6 +184,7 @@ mod tests {
             source: ocync_distribution::Error::RegistryError {
                 status,
                 message: message.into(),
+                retry_after: None,
             },
         }
     }
@@ -252,6 +256,7 @@ mod tests {
             source: ocync_distribution::Error::RegistryError {
                 status: http::StatusCode::BAD_REQUEST,
                 message: ECR_IMMUTABLE_TAG_CODE.into(),
+                retry_after: None,
             },
         };
         assert_eq!(err.manifest_refusal(), None);
@@ -268,6 +273,7 @@ mod tests {
         let registry_404 = ocync_distribution::Error::RegistryError {
             status: http::StatusCode::NOT_FOUND,
             message: "not found".into(),
+            retry_after: None,
         };
         let permission_denied = ocync_distribution::Error::Io {
             context: "staging read",
@@ -373,6 +379,7 @@ mod tests {
                     source: ocync_distribution::Error::RegistryError {
                         status: http::StatusCode::TOO_MANY_REQUESTS,
                         message: "rate limited".into(),
+                        retry_after: None,
                     },
                 },
                 Some(http::StatusCode::TOO_MANY_REQUESTS),
@@ -398,6 +405,7 @@ mod tests {
             source: ocync_distribution::Error::RegistryError {
                 status: http::StatusCode::BAD_REQUEST,
                 message: "denied".into(),
+                retry_after: None,
             },
         }));
         assert_eq!(err.status_code(), Some(http::StatusCode::BAD_REQUEST));

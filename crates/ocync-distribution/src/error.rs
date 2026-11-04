@@ -162,6 +162,9 @@ pub enum Error {
         status: http::StatusCode,
         /// Human-readable context (typically registry/repository and response body).
         message: String,
+        /// How long a 429's `Retry-After` header asked the caller to wait;
+        /// `None` for any other answer or an unreadable header.
+        retry_after: Option<std::time::Duration>,
     },
 
     /// The registry answered a streamed blob upload with 401 Unauthorized.
@@ -406,6 +409,37 @@ impl Error {
             registry: registry.to_owned(),
             reason: reason.to_string(),
             failure,
+        }
+    }
+
+    /// The [`RegistryError`](Self::RegistryError) for a registry's failing
+    /// `response`, with its `Retry-After` and body. `place` is the registry
+    /// and repository the message names, when the caller has them. With no
+    /// `place` the message is the body alone, which the sync engine reads as
+    /// OCI error JSON (a manifest refusal, `BLOB_UPLOAD_UNKNOWN`). The only
+    /// production constructor, so no failing answer drops its `Retry-After`.
+    pub(crate) async fn from_response(
+        response: reqwest::Response,
+        place: Option<(&url::Url, &str)>,
+    ) -> Self {
+        let status = response.status();
+        let retry_after = crate::retry::retry_after(&response);
+        let body = crate::json::error_body(response).await;
+        let message = match place {
+            None => body,
+            Some((base_url, repository)) => {
+                let registry = base_url.host_str().unwrap_or("unknown");
+                if body.is_empty() {
+                    format!("{registry}/{repository}")
+                } else {
+                    format!("{registry}/{repository}: {body}")
+                }
+            }
+        };
+        Self::RegistryError {
+            status,
+            message,
+            retry_after,
         }
     }
 
@@ -700,6 +734,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::TOO_MANY_REQUESTS,
             message: "rate limited".into(),
+            retry_after: None,
         };
         assert_eq!(err.status_code(), Some(http::StatusCode::TOO_MANY_REQUESTS));
     }
@@ -792,6 +827,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::NOT_FOUND,
             message: "missing".into(),
+            retry_after: None,
         };
         assert!(err.is_not_found());
     }
@@ -801,6 +837,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::UNAUTHORIZED,
             message: "denied".into(),
+            retry_after: None,
         };
         assert!(!err.is_not_found());
     }
@@ -880,6 +917,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::UNAUTHORIZED,
             message: "denied".into(),
+            retry_after: None,
         };
         assert!(err.is_auth_error());
     }
@@ -900,6 +938,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::FORBIDDEN,
             message: "no access".into(),
+            retry_after: None,
         };
         assert!(err.is_auth_error());
     }
@@ -909,6 +948,7 @@ mod tests {
         let err = Error::RegistryError {
             status: http::StatusCode::INTERNAL_SERVER_ERROR,
             message: "broke".into(),
+            retry_after: None,
         };
         assert!(!err.is_auth_error());
     }

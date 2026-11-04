@@ -6,7 +6,7 @@
 //! here, with no AWS SDK crate, and the credential chain in
 //! `credentials`.
 
-mod calendar;
+pub(crate) mod calendar;
 mod config;
 mod credentials;
 mod endpoint;

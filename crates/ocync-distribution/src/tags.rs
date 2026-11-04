@@ -1,13 +1,11 @@
 //! Tag listing with pagination for OCI repositories.
 
-use std::cell::Cell;
-
 use serde::Deserialize;
 
 use crate::aimd::RegistryAction;
 use crate::client::RegistryClient;
 use crate::error::Error;
-use crate::retry::{Budgeted, MAX_LISTING_RETRIES, retrying};
+use crate::retry::{Budgeted, MAX_LISTING_RETRIES, RetryBudget, retrying};
 use crate::spec::RepositoryName;
 
 /// Maximum number of tag list pages to follow before treating the pagination
@@ -84,7 +82,7 @@ impl RegistryClient {
         let mut path = "tags/list".to_owned();
         let mut page_count: usize = 0;
         // One budget for the whole walk; see MAX_LISTING_RETRIES.
-        let retry_budget = Cell::new(MAX_LISTING_RETRIES);
+        let retry_budget = RetryBudget::new(MAX_LISTING_RETRIES);
 
         loop {
             page_count += 1;
@@ -292,5 +290,64 @@ mod tests {
             matches!(err, Error::UnreadableAnswer { .. }),
             "unexpected error: {err}"
         );
+    }
+
+    /// A registry's 429 reaches the prepare-phase retry with its
+    /// `Retry-After`: the page is not re-sent before it, and one longer than
+    /// `MAX_HONORED_RETRY_AFTER` is not re-sent at all. Breaks if the header
+    /// is dropped between the response and the retry (the retry comes after
+    /// about 250 ms) or the cap is dropped (the second request is made).
+    #[tokio::test]
+    async fn a_tag_listing_waits_out_retry_after_unless_too_long() {
+        // (Retry-After, requests the registry should see, tag listing succeeds)
+        let cases = [(1u64, 2u64, true), (3600, 1, false)];
+        for (asked, requests, succeeds) in cases {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v2/repo/tags/list"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(429)
+                        .append_header("retry-after", asked.to_string().as_str()),
+                )
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/v2/repo/tags/list"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"name": "repo", "tags": ["t"]})),
+                )
+                .expect(requests - 1)
+                .mount(&server)
+                .await;
+
+            let base_url = url::Url::parse(&server.uri()).unwrap();
+            let client = crate::client::RegistryClientBuilder::new(base_url)
+                .build()
+                .unwrap();
+            let repo = RepositoryName::new("repo").unwrap();
+
+            let started = std::time::Instant::now();
+            // Bounded so a dropped cap fails here instead of sleeping the hour out.
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(10), client.list_tags(&repo))
+                    .await
+                    .expect("the listing returned within 10 s");
+            assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}: {result:?}");
+            if succeeds {
+                assert!(
+                    started.elapsed() >= std::time::Duration::from_secs(asked),
+                    "re-sent after {:?}",
+                    started.elapsed()
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err().status_code(),
+                    Some(http::StatusCode::TOO_MANY_REQUESTS)
+                );
+            }
+        }
     }
 }

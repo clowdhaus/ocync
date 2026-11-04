@@ -69,7 +69,10 @@ pub fn should_retry(status: StatusCode, current_attempt: u32, max_retries: u32) 
 /// removes this race in the common case. Retrying on it stays as the
 /// fallback for a wait that times out and for targets without a batch checker.
 pub fn is_blob_upload_unknown(error: &ocync_distribution::Error) -> bool {
-    let ocync_distribution::Error::RegistryError { status, message } = error else {
+    let ocync_distribution::Error::RegistryError {
+        status, message, ..
+    } = error
+    else {
         return false;
     };
     if *status != StatusCode::NOT_FOUND {
@@ -181,6 +184,7 @@ where
 {
     let mut attempt = 0;
     let mut refusal = TokenRetry::Available;
+    let mut honored = Duration::ZERO;
     loop {
         match f().await {
             Ok(val) => return Ok(val),
@@ -199,16 +203,27 @@ where
                     attempt < config.max_retries && should_retry_transport(&e)
                 };
 
-                if retryable {
-                    let backoff = config.backoff_for(attempt);
+                // A 429's Retry-After lengthens the wait, or surfaces the
+                // error when it is longer than a sync waits out.
+                let wait = retryable
+                    .then(|| {
+                        ocync_distribution::retry::retry_delay(
+                            &e,
+                            config.backoff_for(attempt),
+                            &mut honored,
+                        )
+                    })
+                    .flatten();
+
+                if let Some(delay) = wait {
                     tracing::warn!(
                         operation,
                         attempt,
                         error = %e,
-                        backoff_ms = backoff.as_millis(),
+                        delay_ms = delay.as_millis(),
                         "retrying"
                     );
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                     record_retry();
                     continue;
@@ -305,6 +320,7 @@ mod tests {
         let registry = |status, message: &str| ocync_distribution::Error::RegistryError {
             status,
             message: message.into(),
+            retry_after: None,
         };
         let digest = |c: char| -> ocync_distribution::Digest {
             format!("sha256:{}", c.to_string().repeat(64))
@@ -373,6 +389,7 @@ mod tests {
                 ocync_distribution::Error::RegistryError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     message: "broke".into(),
+                    retry_after: None,
                 },
             ),
             (
@@ -421,6 +438,7 @@ mod tests {
                     Unavailable => ocync_distribution::Error::RegistryError {
                         status: StatusCode::SERVICE_UNAVAILABLE,
                         message: "registry/repo".into(),
+                        retry_after: None,
                     },
                 });
                 async move { failure.map_or(Ok(()), Err) }
@@ -429,6 +447,51 @@ mod tests {
             assert_eq!(result.is_ok(), succeeds, "{failures:?}");
             assert_eq!(calls.get(), expected_calls, "{failures:?}");
             assert_eq!(started.elapsed() > Duration::ZERO, waits, "{failures:?}");
+        }
+    }
+
+    /// The engine's retry waits out a 429's `Retry-After` and surfaces one
+    /// longer than a sync waits. Breaks if the header is ignored (the
+    /// retry comes after about a second) or the cap is dropped (the 3600 s
+    /// case is retried).
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_is_waited_out_unless_too_long() {
+        let config = RetryConfig::default();
+        // (Retry-After, throttled answers before success, calls made,
+        // succeeds, time waited). Two 70 s waits pass the 120 s an operation
+        // waits out in all, so the second throttle surfaces.
+        let cases = [
+            (30u64, 1, 2, true, 30),
+            (70, 2, 2, false, 70),
+            (3600, 1, 1, false, 0),
+        ];
+        for (asked, throttles, expected_calls, succeeds, waited) in cases {
+            let calls = Cell::new(0);
+            let started = tokio::time::Instant::now();
+            let result = with_retry(&config, "blob transfer", || {
+                calls.set(calls.get() + 1);
+                let throttled = calls.get() <= throttles;
+                async move {
+                    if throttled {
+                        Err(ocync_distribution::Error::RegistryError {
+                            status: StatusCode::TOO_MANY_REQUESTS,
+                            message: "registry/repo".into(),
+                            retry_after: Some(Duration::from_secs(asked)),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}");
+            assert_eq!(calls.get(), expected_calls, "Retry-After {asked}");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(waited)
+                    && elapsed < Duration::from_secs(waited) + Duration::from_secs(2),
+                "Retry-After {asked}: waited {elapsed:?}"
+            );
         }
     }
 
@@ -492,6 +555,7 @@ mod tests {
                     Err(ocync_distribution::Error::RegistryError {
                         status: StatusCode::SERVICE_UNAVAILABLE,
                         message: "busy".into(),
+                        retry_after: None,
                     })
                 } else {
                     Ok(())

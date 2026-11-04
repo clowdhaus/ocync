@@ -460,8 +460,7 @@ impl RegistryClient {
         if status.is_success() || status == StatusCode::UNAUTHORIZED {
             Ok(())
         } else {
-            let message = crate::json::error_body(resp).await;
-            Err(Error::RegistryError { status, message })
+            Err(Error::from_response(resp, None).await)
         }
     }
 
@@ -689,15 +688,7 @@ async fn classify_response(
         return Ok(resp);
     }
 
-    let registry = base_url.host_str().unwrap_or("unknown");
-    let body = crate::json::error_body(resp).await;
-    let message = if body.is_empty() {
-        format!("{registry}/{repository}")
-    } else {
-        format!("{registry}/{repository}: {body}")
-    };
-
-    Err(Error::RegistryError { status, message })
+    Err(Error::from_response(resp, Some((base_url, repository))).await)
 }
 
 /// Construct a URL for the `/v2/` endpoint.
