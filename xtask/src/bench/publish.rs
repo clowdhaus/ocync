@@ -156,9 +156,9 @@ pub(crate) fn ensure_publishable(selection: &ToolSelection, shape: &Shape) -> Re
             value_name(&shape.source)
         ));
     }
-    if !matches!(shape.scenario, Scenario::Sync | Scenario::All) {
+    if !matches!(shape.scenario, Scenario::Sync) {
         problems.push(format!(
-            "the scenario must include the cold and warm sync (sync or all), not {}",
+            "the scenario must be sync, the cold and warm sync the page shows, not {}",
             value_name(&shape.scenario)
         ));
     }
@@ -996,7 +996,18 @@ fn check(record: &RunRecord) -> Result<(), String> {
         return Err("the commit is not recorded by its full hash".into());
     }
     let tools: BTreeSet<Tool> = PUBLISHED_TOOLS.into_iter().collect();
-    for kind in [ScenarioKind::Cold, ScenarioKind::Warm] {
+    let published_kinds = [ScenarioKind::Cold, ScenarioKind::Warm];
+    if let Some(other) = record.scenarios.iter().find(|scenario| {
+        !published_kinds
+            .iter()
+            .any(|kind| kind.label() == scenario.name)
+    }) {
+        return Err(format!(
+            "the run held the {} scenario, and a published run is the sync scenario alone",
+            other.name
+        ));
+    }
+    for kind in published_kinds {
         let rounds = rounds_in(record, kind)?;
         if rounds.len() != PUBLISHED_ROUNDS {
             return Err(format!(
@@ -1057,16 +1068,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_published_shape_is_accepted_in_any_tool_order_and_for_sync_or_all() {
+    fn the_published_shape_is_accepted_in_any_tool_order() {
         assert_eq!(ensure_publishable(&selection(), &shape()), Ok(()));
         let mut reversed = selection();
         reversed.tools.reverse();
         assert_eq!(ensure_publishable(&reversed, &shape()), Ok(()));
-        let all = Shape {
-            scenario: Scenario::All,
-            ..shape()
-        };
-        assert_eq!(ensure_publishable(&selection(), &all), Ok(()));
     }
 
     #[test]
@@ -1167,14 +1173,22 @@ pub(crate) mod tests {
             },
             "--source must be controlled, not public",
         );
-        for scenario in [Scenario::Partial, Scenario::Scale, Scenario::Prepare] {
+        // Catches: a run that also runs the partial, scale or prepare scenario
+        // (`all` included) being published; prepare reads the public
+        // registries whatever the source.
+        for scenario in [
+            Scenario::Partial,
+            Scenario::Scale,
+            Scenario::Prepare,
+            Scenario::All,
+        ] {
             refused(
                 selection(),
                 Shape {
                     scenario,
                     ..shape()
                 },
-                "cold and warm sync",
+                "the scenario must be sync",
             );
         }
     }
@@ -1368,6 +1382,21 @@ pub(crate) mod tests {
         let mut missing_tool = base();
         missing_tool.scenarios[3].runs.pop();
         refused(missing_tool, "every published tool");
+        // Catches: a record of an `all` run, whose partial scenario the page
+        // does not show, being published.
+        let mut with_partial = published(&base());
+        with_partial.scenarios.push(report::ScenarioRecord {
+            name: ScenarioKind::Partial.label(),
+            round: None,
+            shuffle_seed: 0,
+            tool_order: Vec::new(),
+            tools: Vec::new(),
+        });
+        assert!(
+            verify(&with_partial)
+                .unwrap_err()
+                .contains("sync scenario alone")
+        );
         let mut paired = base();
         paired.scenarios[0].runs[0].direct_wall_clock_secs = Some(1.0);
         refused(paired, "direct");

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::report::CorpusInfo;
+use crate::bench::source;
 
 /// Stored performance baseline for a benchmark run.
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,6 +49,12 @@ pub(crate) struct Baseline {
     /// rounds, which were a single run.
     #[serde(default = "one_round")]
     pub(crate) rounds: u32,
+    /// The registry the tools read the corpus from. A controlled source and the
+    /// public registries give different figures for the same code, so a run is
+    /// compared only with a baseline from its own kind. Absent from baselines
+    /// saved before the controlled source existed, all of which are public.
+    #[serde(default, skip_serializing_if = "source::Kind::is_public")]
+    pub(crate) source: source::Kind,
 }
 
 /// The rounds of a baseline saved before rounds were recorded.
@@ -69,7 +76,7 @@ pub(crate) struct RegressionResult {
 
 /// Refuses when `current` and `baseline` were recorded for different corpora,
 /// under different corpus locks, the baseline under none, from different sources (a tag or its locked
-/// digest), or over a different number of images or
+/// digest), from different kinds of source (the controlled source or the public registries), or over a different number of images or
 /// tags: they synced different content, so a delta is not a regression. Refuses
 /// a different cap on concurrent transfers or number of rounds too.
 /// `baseline_path` names the file to replace. The figures are not read, so a
@@ -121,6 +128,17 @@ pub(crate) fn ensure_comparable(
             baseline_path,
             &format!("with {}", show(baseline.max_concurrent_transfers)),
             &format!("with {}", show(current.max_concurrent_transfers)),
+        ));
+    }
+    if current.source != baseline.source {
+        let show = |kind: source::Kind| match kind {
+            source::Kind::Public => "from the public registries",
+            source::Kind::Controlled => "from the controlled source",
+        };
+        return Err(refusal(
+            baseline_path,
+            show(baseline.source),
+            show(current.source),
         ));
     }
     if current.rounds != baseline.rounds {
@@ -288,6 +306,7 @@ mod tests {
             },
             max_concurrent_transfers: None,
             rounds: 5,
+            source: source::Kind::Public,
         }
     }
 
@@ -413,6 +432,7 @@ mod tests {
             },
             max_concurrent_transfers: NonZeroUsize::new(20),
             rounds: 5,
+            source: source::Kind::Controlled,
         };
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
         save_baseline(tmpfile.path(), &baseline).unwrap();
@@ -422,10 +442,53 @@ mod tests {
         assert_eq!(loaded.total_bytes, 2_100_000_000);
         assert_eq!(loaded.max_concurrent_transfers, NonZeroUsize::new(20));
         assert_eq!(loaded.sync_from, Some(SyncFrom::Digest));
+        assert_eq!(loaded.source, source::Kind::Controlled);
         assert_eq!(
             loaded.corpus_locked_at,
             Some(locked_at("2026-10-30-214340"))
         );
+    }
+
+    #[test]
+    fn a_baseline_from_the_other_kind_of_source_is_not_compared() {
+        // Catches: a run from the controlled source judged against a baseline
+        // from the public registries, or the reverse, where the same code
+        // gives other figures; and a baseline saved before the controlled
+        // source existed, which has no `source`, being read as anything but
+        // public.
+        let path = Path::new("bench/results/baseline.json");
+        let from = |kind| Baseline {
+            source: kind,
+            ..baseline(1.0, 1, 1)
+        };
+        let public = || from(source::Kind::Public);
+        let controlled = || from(source::Kind::Controlled);
+
+        assert_eq!(ensure_comparable(&public(), &public(), path), Ok(()));
+        assert_eq!(
+            ensure_comparable(&controlled(), &controlled(), path),
+            Ok(())
+        );
+        let into_public = ensure_comparable(&public(), &controlled(), path).unwrap_err();
+        assert!(
+            into_public.contains("recorded from the controlled source, this run from the public"),
+            "{into_public}"
+        );
+        let into_controlled = ensure_comparable(&controlled(), &public(), path).unwrap_err();
+        assert!(
+            into_controlled
+                .contains("recorded from the public registries, this run from the controlled"),
+            "{into_controlled}"
+        );
+
+        let old: Baseline = serde_json::from_value(serde_json::json!({
+            "wall_clock_secs": 1.0, "requests": 1, "total_bytes": 1,
+        }))
+        .unwrap();
+        assert_eq!(old.source, source::Kind::Public);
+        assert!(ensure_comparable(&controlled(), &old, path).is_err());
+        let written = serde_json::to_value(public()).unwrap();
+        assert!(written.get("source").is_none(), "{written}");
     }
 
     #[test]

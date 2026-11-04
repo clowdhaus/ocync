@@ -25,7 +25,7 @@ use super::source;
 use super::target::{ENV_REGISTRY, Kind, Target, ensure_target_applies};
 use super::{
     Provider, RunTimestamp, Scenario, ToolSelection, captured, ensure_proxy_overhead_applies,
-    finish_pass, value_name,
+    ensure_source_reads_scenario, finish_pass, value_name,
 };
 
 /// Common SSH options for all remote connections.
@@ -241,6 +241,14 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     }
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     args.source.ensure_applies(args.target)?;
+    ensure_source_reads_scenario(
+        args.source,
+        args.scenario,
+        &match &args.corpus {
+            Some(path) => corpus::id_of(path)?,
+            None => corpus::Id::Main,
+        },
+    )?;
     if let Some(commit) = &args.tool_selection.baseline_ref {
         ensure_on_origin(Path::new("."), commit)?;
     }

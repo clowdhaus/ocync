@@ -684,6 +684,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
         remote::ensure_head_publishable(Path::new("."))?;
     }
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
+    ensure_source_reads_scenario(args.source, args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
         args.target,
         &|name| std::env::var(name).ok(),
@@ -1025,7 +1026,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     if args.regression {
-        check_regression(&report, args.threshold_pct, corpus_locked_at.as_ref())?;
+        check_regression(
+            &report,
+            args.threshold_pct,
+            corpus_locked_at.as_ref(),
+            args.source,
+        )?;
     }
 
     Ok(())
@@ -1281,6 +1287,27 @@ fn runs_prepare(requested: Scenario, corpus: &corpus::Id) -> Result<bool, String
     }
 }
 
+/// Refuses `--source controlled` for a run that executes the prepare scenario,
+/// which reads `bench/corpus-prepare.yaml` and lists its wildcard tags on the
+/// public registries. A lock of digests cannot pin a wildcard, so the
+/// controlled source holds nothing for it, and running it anyway would put a
+/// public registry's reads in a record that says the source was controlled.
+pub(crate) fn ensure_source_reads_scenario(
+    source: source::Kind,
+    requested: Scenario,
+    corpus: &corpus::Id,
+) -> Result<(), String> {
+    if source == source::Kind::Controlled && runs_prepare(requested, corpus)? {
+        return Err(format!(
+            "--source controlled cannot run the {} scenario: it lists the wildcard tags of \
+             bench/corpus-prepare.yaml, which cannot be pinned to digests and so are not in the \
+             controlled source; run it with --source public",
+            value_name(&requested)
+        ));
+    }
+    Ok(())
+}
+
 /// Every (source, tag) a scenario syncs.
 fn scenario_refs(transfer: &Transfer, corpus: &Corpus) -> BTreeSet<lock::ImageRef> {
     let mut refs = lock::refs_of(&corpus.images);
@@ -1333,6 +1360,7 @@ fn cold_ocync_median(
     corpus: report::CorpusInfo,
     max_concurrent_transfers: Option<NonZeroUsize>,
     corpus_locked_at: Option<&lock::LockedAt>,
+    source: source::Kind,
 ) -> Option<Baseline> {
     let runs = cold_ocync_runs(scenarios);
     if runs.is_empty() {
@@ -1354,6 +1382,7 @@ fn cold_ocync_median(
         corpus,
         max_concurrent_transfers,
         rounds: u32::try_from(runs.len()).expect("a run has fewer than 2^32 rounds"),
+        source,
     })
 }
 
@@ -1390,6 +1419,7 @@ fn ensure_baseline_comparable(
             args.tool_selection.max_concurrent_transfers,
         )),
         rounds: u32::try_from(cold_rounds).expect("a run has fewer than 2^32 rounds"),
+        source: args.source,
     };
     regression::ensure_baseline_comparable(baseline_path, &key)
 }
@@ -1411,6 +1441,7 @@ fn check_regression(
     report: &BenchReport,
     threshold: u32,
     corpus_locked_at: Option<&lock::LockedAt>,
+    source: source::Kind,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_path = baseline_path(&report.corpus.id);
 
@@ -1419,6 +1450,7 @@ fn check_regression(
         report.corpus.clone(),
         report.ocync_transfer_cap(),
         corpus_locked_at,
+        source,
     ) {
         if baseline_path.exists() {
             let baseline = regression::load_baseline(&baseline_path)?;
@@ -2925,6 +2957,40 @@ mod tests {
     }
 
     #[test]
+    fn the_controlled_source_refuses_the_scenarios_that_run_prepare() {
+        // Catches: prepare, whose wildcard tags the lock cannot pin, running
+        // against the public registries inside a run recorded as controlled;
+        // and the refusal reaching a run that runs no prepare, or a run from
+        // the public registries.
+        let main = corpus::Id::Main;
+        for scenario in [Scenario::Prepare, Scenario::All] {
+            let refusal = ensure_source_reads_scenario(source::Kind::Controlled, scenario, &main)
+                .unwrap_err();
+            assert!(
+                refusal.contains("wildcard tags") && refusal.contains("--source public"),
+                "{refusal}"
+            );
+            assert_eq!(
+                ensure_source_reads_scenario(source::Kind::Public, scenario, &main),
+                Ok(())
+            );
+        }
+        for scenario in [Scenario::Sync, Scenario::Partial, Scenario::Scale] {
+            assert_eq!(
+                ensure_source_reads_scenario(source::Kind::Controlled, scenario, &main),
+                Ok(()),
+                "{scenario:?}"
+            );
+        }
+        // `all` on a named corpus skips prepare, so nothing reads it.
+        let small = corpus::Id::Named(CorpusName::new("small"));
+        assert_eq!(
+            ensure_source_reads_scenario(source::Kind::Controlled, Scenario::All, &small),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn only_a_run_that_asked_to_be_published_and_qualifies_is_recorded_as_published() {
         use crate::bench::publish::tests::{fixture_report, published};
         let host = "111111111111.dkr.ecr.us-east-1.amazonaws.com";
@@ -3325,6 +3391,7 @@ mod tests {
             corpus: corpus.clone(),
             max_concurrent_transfers: NonZeroUsize::new(20),
             rounds: 3,
+            source: source::Kind::Public,
         };
         regression::save_baseline(&path, &saved).unwrap();
         let shown = path.display();
@@ -3412,6 +3479,7 @@ mod tests {
             corpus: corpus.clone(),
             max_concurrent_transfers: Some(report::effective_transfer_cap(None)),
             rounds: 5,
+            source: source::Kind::Public,
         };
         let check = || ensure_baseline_comparable(&args, &cold, &corpus, Some(&at), &path);
 
@@ -3426,6 +3494,36 @@ mod tests {
         );
         regression::save_baseline(&path, &saved(Some(lock::SyncFrom::Digest))).unwrap();
         assert_eq!(check(), Ok(()));
+
+        // Catches: a run compared with a baseline from the other kind of
+        // source, in either direction, after the rounds had been paid for.
+        let controlled_args =
+            parse_bench(&["--regression", "--source", "controlled", "sync"]).unwrap();
+        let into_controlled =
+            ensure_baseline_comparable(&controlled_args, &cold, &corpus, Some(&at), &path);
+        assert_eq!(
+            into_controlled,
+            Err(format!(
+                "{shown} was recorded from the public registries, this run from the \
+                 controlled source; record a new baseline by deleting {shown} and rerunning"
+            ))
+        );
+        let controlled_baseline = Baseline {
+            source: source::Kind::Controlled,
+            ..saved(Some(lock::SyncFrom::Digest))
+        };
+        regression::save_baseline(&path, &controlled_baseline).unwrap();
+        assert_eq!(
+            ensure_baseline_comparable(&controlled_args, &cold, &corpus, Some(&at), &path),
+            Ok(())
+        );
+        assert_eq!(
+            check(),
+            Err(format!(
+                "{shown} was recorded from the controlled source, this run from the public \
+                 registries; record a new baseline by deleting {shown} and rerunning"
+            ))
+        );
     }
 
     #[test]
@@ -3515,7 +3613,14 @@ mod tests {
             tags: 2,
         };
 
-        let median = cold_ocync_median(&scenarios, corpus(), NonZeroUsize::new(20), None).unwrap();
+        let median = cold_ocync_median(
+            &scenarios,
+            corpus(),
+            NonZeroUsize::new(20),
+            None,
+            source::Kind::Public,
+        )
+        .unwrap();
 
         assert_eq!(median.wall_clock_secs, 20.0);
         assert_eq!(median.requests, 300);
@@ -3526,9 +3631,20 @@ mod tests {
         // Catches: a baseline saved from a locked run that a baseline of source
         // tags cannot be told from.
         let at = lock::fixtures::locked_at("2026-10-30-120000");
-        let locked = cold_ocync_median(&scenarios, corpus(), None, Some(&at)).unwrap();
+        let locked = cold_ocync_median(
+            &scenarios,
+            corpus(),
+            None,
+            Some(&at),
+            source::Kind::Controlled,
+        )
+        .unwrap();
         assert_eq!(locked.sync_from, Some(lock::SyncFrom::Digest));
-        assert!(cold_ocync_median(&[], corpus(), None, None).is_none());
+        // Catches: a baseline saved from a controlled run that a public one
+        // cannot be told from.
+        assert_eq!(locked.source, source::Kind::Controlled);
+        assert_eq!(median.source, source::Kind::Public);
+        assert!(cold_ocync_median(&[], corpus(), None, None, source::Kind::Public).is_none());
     }
 
     #[test]
@@ -3545,7 +3661,7 @@ mod tests {
             tags: 2,
         };
 
-        assert!(cold_ocync_median(&[scenario], corpus, None, None).is_none());
+        assert!(cold_ocync_median(&[scenario], corpus, None, None, source::Kind::Public).is_none());
     }
 
     /// What a fake pass returns for one run of `tool`.

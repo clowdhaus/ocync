@@ -96,7 +96,7 @@ ocync's cold median came out faster with the proxy, which the proxy cannot cause
 
 Each published number names the source kind it came from: the run record stores `source: controlled` and the region of the source, and the performance page's context line names the source.
 
-> **Status: Planned.** The prepare scenario still lists tags on the public registries under `--source controlled`: its corpus uses wildcard tags, which a lock of digests does not cover.
+The prepare scenario reads `bench/corpus-prepare.yaml`, whose wildcard tags a lock of digests cannot pin, so the controlled source holds nothing for it. `--source controlled` therefore refuses any run that executes it (`prepare`, and `all` on the main corpus) and says to run it with `--source public`. Nothing is skipped silently.
 
 ### Competitors at their best
 
@@ -161,7 +161,7 @@ A run is published only through `--publish`, on `cargo xtask bench-remote`, or o
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
 - **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on. The controlled source has no CDN, so its pre-warm is recorded as not applicable and a record from a source with one cannot claim that. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
 - **Build:** a commit on `main`, recorded by its full hash, from a checkout with no modified tracked file.
-- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region from the controlled source in the same account and another region. The scenario is `sync` or `all`, so the cold and the warm sync both run.
+- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region from the controlled source in the same account and another region. The scenario is `sync` alone: the page shows its cold and warm runs, and prepare (in `all`) reads the public registries whatever the source.
 - **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published. `--limit` and `--skip-registries` are refused with it.
 
 > **Status: Planned.** A tool that fails the content check, or fails to finish, stays in the page as a column that names the failure, and the run goes on to the rest. Today the first failure stops the run, so no such column exists yet.
