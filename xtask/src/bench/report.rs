@@ -1173,7 +1173,7 @@ fn is_bold(row: &MetricRow, cell: &Cell, cells: &[Option<Cell>], detail: Detail)
 /// Columns are tool names, rows are metrics. The best value per row is bolded
 /// when more than one tool has data for that metric, see [`is_bold`]. The Peak
 /// RSS row bolds nothing when a per-tag tool ran, as [`per_process_rss_footnote`]
-/// explains. A column whose tool has no run reads `--` in every row.
+/// explains. A cell with no value reads `--`.
 pub(crate) fn render_metric_table(
     baseline: Option<&CommitSha>,
     columns: &[Tool],
@@ -1454,12 +1454,15 @@ impl Deferred {
     /// Appends the record to the archive in `archive_dir` and, for a published
     /// run, writes the surfaces under the repository at `root`; the one step a
     /// local run and a fetched run share. Safe to repeat, see
-    /// [`append_record`]. A record that cannot be appended is an error. The
-    /// surfaces are all computed and checked before the record is appended or
-    /// any file written, so a surface that cannot be updated (a missing
-    /// marker, say) is an error that leaves everything as it was. A published
-    /// run that an archived published run is newer than writes no surface, so
-    /// fetching an old run cannot turn the surfaces back.
+    /// [`append_record`]. A record that cannot be appended is an error.
+    ///
+    /// The record is appended first, since a local run has no other copy of
+    /// it. The surfaces are then all computed and checked before any file is
+    /// written, so a surface that cannot be updated (a missing marker, say) is
+    /// an error that names `cargo xtask bench-publish-surfaces` to finish once
+    /// it is fixed. A published run that an archived published run is newer
+    /// than writes no surface, so fetching an old run cannot turn the surfaces
+    /// back.
     pub(crate) fn apply(
         self,
         archive_dir: &Path,
@@ -1469,10 +1472,7 @@ impl Deferred {
         let Some(record) = self.record else {
             return Ok(());
         };
-        let planned = match record.publication {
-            Publication::Publish => Some(publish::plan(root, &record)?),
-            Publication::Archive => None,
-        };
+        let published = record.publication == Publication::Publish;
         let timestamp = record.timestamp.clone();
         append_record(archive_dir, &self.archive_key, record)?;
         eprintln!(
@@ -1481,54 +1481,32 @@ impl Deferred {
                 .join(format!("{}.json", self.archive_key))
                 .display()
         );
-        let Some(planned) = planned else {
+        if !published {
             return Ok(());
-        };
-        let newest = newest_published(archive_dir, &self.archive_key)?;
-        if newest.as_deref() != Some(timestamp.as_str()) {
+        }
+        let newest = publish::newest_published(archive_dir, &self.archive_key)?
+            .filter(|newest| newest.timestamp == timestamp);
+        let Some(newest) = newest else {
             eprintln!(
                 "WARNING: the archive holds a newer published run than {timestamp}, so it \
                  writes no surface"
             );
             return Ok(());
-        }
+        };
+        let planned = publish::plan(root, &newest).map_err(|e| {
+            format!(
+                "{e}; the run record is in the archive, so fix the cause and run \
+                 `cargo xtask bench-publish-surfaces` to write the surfaces"
+            )
+        })?;
         planned.write(root, banners)
     }
 }
 
-/// The part of an archived record the duplicate check and the published run's
-/// lookup read.
+/// The part of an archived record the duplicate check reads.
 #[derive(Deserialize)]
 struct Stamped {
     timestamp: String,
-    #[serde(default, rename = "published")]
-    publication: Publication,
-}
-
-/// The timestamp of the newest published record in the archive
-/// `{registry_key}.json` of `results_dir`; `None` without one or without the
-/// archive.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "reads a record file the bench wrote"
-)]
-pub(crate) fn newest_published(
-    results_dir: &Path,
-    registry_key: &str,
-) -> Result<Option<String>, String> {
-    let path = results_dir.join(format!("{registry_key}.json"));
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let archived: Vec<Stamped> =
-        serde_json::from_str(&contents).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    Ok(archived
-        .into_iter()
-        .filter(|record| record.publication == Publication::Publish)
-        .map(|record| record.timestamp)
-        .max())
 }
 
 /// Appends a compact run record to the per-registry JSON archive.

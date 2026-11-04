@@ -310,7 +310,7 @@ pub(crate) struct BenchArgs {
     /// tools at their defaults for 5 rounds, and a record that finishes short
     /// of that is archived as an experiment. A published run rewrites the
     /// performance page, the README, the homepage and the banners.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "regression")]
     pub(crate) publish: bool,
 }
 
@@ -665,8 +665,12 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                 skips_prewarm: args.skip_prewarm,
                 disables_proxy: args.no_proxy,
                 measures_proxy_overhead: args.measure_proxy_overhead,
+                checks_regression: args.regression,
             },
         )?;
+        // The run is of a commit anyone can check out later, and of nothing
+        // that is not in it.
+        remote::ensure_head_publishable(Path::new("."))?;
     }
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
@@ -2850,6 +2854,9 @@ mod tests {
             publish::Publication::Publish
         );
         assert_eq!(publication(&["sync"]), publish::Publication::Archive);
+        // Catches: a published run that then reports a regression, after it
+        // has already rewritten the surfaces.
+        assert!(parse_bench(&["--publish", "--regression", "sync"]).is_err());
     }
 
     #[test]

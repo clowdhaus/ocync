@@ -39,13 +39,13 @@ Per-round ratio of the other tool to ocync (above 1: ocync lower). The range is 
 > **Artifact sync (OCI 1.1 referrers).** ocync issues `GET /v2/<repo>/referrers/...` to discover attestations (SBOM, SLSA) and transfers any referenced artifacts. Comparable tools do not implement this. The Source blob GETs and Source blob bytes columns above include this artifact content for ocync.
 >
 > Referrers calls -- ocync: 37, ocync@7634416: 39, regsync: 0.
-<!-- BENCH:END -->
 
 `ocync` is the build that raised the default to 20 images at once ([#238](https://github.com/clowdhaus/ocync/pull/238)); `ocync@7634416` is ocync as of April 2026. cgr.dev is skipped, so the corpus is 25 images and 39 tags. Uploaded to ECR per round, summed from the proxy logs' blob upload PUT request bytes: ocync 53,292,924,413 to 53,292,924,415 B in the four rounds where 1 or 2 of 268 mounts fell back to uploads and 53,293,057,239 B in the one where 6 did, the April build 57,018,027,869 to 57,812,918,335 B, regsync 62,883,218,811 B.
 
 The two ocync builds differ in six months of code. One difference is the cap on images synced at once: 50 in April, 20 today. The April build finishes in the same time but uploads 3.7 to 4.5 GB more per round and sends about 10% more requests. Raising today's cap from 10 to 20 made a cold sync about 13% faster on both ECR and Artifact Registry ([#129](https://github.com/clowdhaus/ocync/issues/129)).
 
 dregsy is left out because its run did not pass the content check, which requires every image to arrive at the digest the corpus lock names. Earlier dregsy figures predate that check. The comparison between tools is on ECR; Artifact Registry has been measured with ocync alone.
+<!-- BENCH:END -->
 
 ## How tools compare
 

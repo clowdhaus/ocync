@@ -89,6 +89,9 @@ pub(crate) struct Shape {
     pub(crate) disables_proxy: bool,
     /// Whether `--measure-proxy-overhead` is given.
     pub(crate) measures_proxy_overhead: bool,
+    /// Whether `--regression` is given: a run that reports a regression
+    /// must not have rewritten the surfaces.
+    pub(crate) checks_regression: bool,
 }
 
 /// Refuses a `--publish` run that is not the shape of a published one, naming
@@ -125,6 +128,7 @@ pub(crate) fn ensure_publishable(selection: &ToolSelection, shape: &Shape) -> Re
         ("--skip-prewarm", shape.skips_prewarm),
         ("--no-proxy", shape.disables_proxy),
         ("--measure-proxy-overhead", shape.measures_proxy_overhead),
+        ("--regression", shape.checks_regression),
     ];
     for (option, set) in refused {
         if set {
@@ -457,11 +461,12 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
     }
     let rounds: Vec<&ScenarioResult> = results.iter().collect();
     let machine = &record.machine;
-    let mut out = format!(
+    let mut out =
+        format!(
         "Measured {date} (run {run}, commit {commit}) on {instance} ({arch}, {vcpus} vCPUs, \
          {memory:.0} GiB, {network}). Full corpus: {images} images, {tags} tags. {description} \
-         to ECR {region}. Median of {count} rounds. All traffic routed through bench-proxy for \
-         byte-accurate measurement.\n\n",
+         to ECR {region}. Median of {count} rounds. {settings}All traffic routed through \
+         bench-proxy for byte-accurate measurement.\n\n",
         date = record.timestamp.get(..10).unwrap_or(&record.timestamp),
         run = record.timestamp,
         commit = short(&record.git_ref),
@@ -474,6 +479,12 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
         tags = record.corpus.tags,
         region = machine.region,
         count = rounds.len(),
+        settings = record.max_concurrent_transfers.map_or_else(String::new, |cap| {
+            format!(
+                "ocync ran at its default of {cap} images at once and every other tool at its \
+                 own defaults. "
+            )
+        }),
     );
     report::render_metric_table(
         None,
@@ -711,6 +722,9 @@ fn plan_with(
     record: &RunRecord,
     read: impl Fn(&str) -> Result<String, String>,
 ) -> Result<Planned, String> {
+    // The surfaces show a published run, so a record that is not one, with
+    // every tool in every round, is never written.
+    check(record)?;
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     for region in regions(record)? {
         let at = files
@@ -736,11 +750,39 @@ fn read(path: &Path) -> Result<String, String> {
 impl Planned {
     /// Writes every surface under `root`, then renders the banner PNGs when
     /// `banners` says so.
+    ///
+    /// Every file is first written whole beside its target, and only when all
+    /// of those are written is each renamed over its target. A file that
+    /// cannot be written therefore leaves every surface as it was. The renames
+    /// are separate steps, so one that fails after others succeeded leaves
+    /// those surfaces updated, and the error says so.
     pub(crate) fn write(self, root: &Path, banners: Banners) -> Result<(), String> {
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
         for (path, content) in &self.files {
-            let path = root.join(path);
-            std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
-            eprintln!("bench: updated {}", path.display());
+            let target = root.join(path);
+            let temp = staging_path(&target);
+            if let Err(e) = stage(&target, &temp, content) {
+                for (temp, _) in &staged {
+                    let _ = std::fs::remove_file(temp);
+                }
+                let _ = std::fs::remove_file(&temp);
+                return Err(format!("{e}; no surface was changed"));
+            }
+            staged.push((temp, target));
+        }
+        for (done, (temp, target)) in staged.iter().enumerate() {
+            if let Err(e) = std::fs::rename(temp, target) {
+                for (temp, _) in &staged[done..] {
+                    let _ = std::fs::remove_file(temp);
+                }
+                return Err(format!(
+                    "rename onto {}: {e}; {done} of {} surfaces were already updated, so run \
+                     `cargo xtask bench-publish-surfaces` to finish",
+                    target.display(),
+                    staged.len()
+                ));
+            }
+            eprintln!("bench: updated {}", target.display());
         }
         match banners {
             Banners::Render => render_banners(root),
@@ -748,6 +790,22 @@ impl Planned {
             Banners::Skip => Ok(()),
         }
     }
+}
+
+/// The file a surface is written to before it replaces `target`.
+fn staging_path(target: &Path) -> PathBuf {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    target.with_file_name(format!(".{name}.bench-new"))
+}
+
+/// Writes `content` to `temp` with the permissions `target` has.
+fn stage(target: &Path, temp: &Path, content: &str) -> Result<(), String> {
+    std::fs::write(temp, content).map_err(|e| format!("write {}: {e}", temp.display()))?;
+    let permissions = std::fs::metadata(target)
+        .map_err(|e| format!("read {}: {e}", target.display()))?
+        .permissions();
+    std::fs::set_permissions(temp, permissions)
+        .map_err(|e| format!("set permissions of {}: {e}", temp.display()))
 }
 
 /// Rasterizes the banner SVGs to PNGs with the docs site's `sharp`.
@@ -790,6 +848,19 @@ fn newest_published_record(archive: &str) -> Result<Option<RunRecord>, String> {
         .max_by(|a, b| a.timestamp.cmp(&b.timestamp)))
 }
 
+/// The newest published record in the archive `{registry_key}.json` of
+/// `archive_dir`; `None` without one or without the archive.
+pub(crate) fn newest_published(
+    archive_dir: &Path,
+    registry_key: &str,
+) -> Result<Option<RunRecord>, String> {
+    let path = archive_dir.join(format!("{registry_key}.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    newest_published_record(&read(&path)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Rewrites every surface under `root` from the newest published run in the
 /// ECR archive of `archive_dir`, by the plan and write a publish uses, so the
 /// surfaces show that run again after a change to how they are worded. An error
@@ -799,16 +870,14 @@ pub(crate) fn rewrite_surfaces(
     root: &Path,
     banners: Banners,
 ) -> Result<(), String> {
-    let path = archive_dir.join(format!("{}.json", super::RegistryKind::Ecr.archive_stem()));
-    let record = newest_published_record(&read(&path)?)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .ok_or_else(|| {
-            format!(
-                "{} holds no published run, so there is nothing to write; publish one with \
-                 `cargo xtask bench-remote --publish`",
-                path.display()
-            )
-        })?;
+    let key = super::RegistryKind::Ecr.archive_stem();
+    let record = newest_published(archive_dir, key)?.ok_or_else(|| {
+        format!(
+            "{} holds no published run, so there is nothing to write; publish one with \
+             `cargo xtask bench-remote --publish`",
+            archive_dir.join(format!("{key}.json")).display()
+        )
+    })?;
     eprintln!(
         "bench: writing the surfaces of the published run {}",
         record.timestamp
@@ -848,6 +917,12 @@ fn stale_regions(record: &RunRecord, read: impl Fn(&str) -> String) -> Result<Ve
 /// which requirement it misses, and the record is then archived as an
 /// experiment.
 pub(crate) fn verify(record: &RunRecord) -> Result<(), String> {
+    check(record)?;
+    regions(record).map(|_| ())
+}
+
+/// The requirements of [`verify`] that the record's own fields state.
+fn check(record: &RunRecord) -> Result<(), String> {
     if record.machine.provider.is_none() {
         return Err("the instance could not be identified".into());
     }
@@ -863,8 +938,16 @@ pub(crate) fn verify(record: &RunRecord) -> Result<(), String> {
     if record.baseline_max_concurrent_transfers.is_some() {
         return Err("the run carried a baseline build".into());
     }
-    if record.prewarm == Some(Prewarm::Skipped) {
-        return Err("the CDN pre-warm was skipped".into());
+    match &record.prewarm {
+        Some(Prewarm::Done { unwarmed, .. }) if unwarmed.is_empty() => {}
+        Some(Prewarm::Done { unwarmed, .. }) => {
+            return Err(format!(
+                "the CDN pre-warm left blobs: {}",
+                report::not_warmed(unwarmed)
+            ));
+        }
+        Some(Prewarm::Skipped) => return Err("the CDN pre-warm was skipped".into()),
+        None => return Err("no CDN pre-warm ran".into()),
     }
     let wanted = u32::try_from(PUBLISHED_ROUNDS).expect("a published run has few rounds");
     if record.rounds
@@ -902,7 +985,7 @@ pub(crate) fn verify(record: &RunRecord) -> Result<(), String> {
             }
         }
     }
-    regions(record).map(|_| ())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -934,6 +1017,7 @@ pub(crate) mod tests {
             skips_prewarm: false,
             disables_proxy: false,
             measures_proxy_overhead: false,
+            checks_regression: false,
         }
     }
 
@@ -1013,6 +1097,14 @@ pub(crate) mod tests {
                 ..shape()
             },
             "--measure-proxy-overhead",
+        );
+        refused(
+            selection(),
+            Shape {
+                checks_regression: true,
+                ..shape()
+            },
+            "--regression",
         );
         refused(
             selection(),
@@ -1126,6 +1218,10 @@ pub(crate) mod tests {
                 images: 25,
                 tags: 39,
             },
+            prewarm: Some(Prewarm::Done {
+                unwarmed: BTreeMap::new(),
+                no_cache: BTreeSet::from(["quay.io".to_owned()]),
+            }),
             tool_versions: PUBLISHED_TOOLS.iter().map(|&t| (t, "1.0".into())).collect(),
             scenarios: (0..5)
                 .flat_map(|n| [round(ScenarioKind::Cold, n), round(ScenarioKind::Warm, n)])
@@ -1215,7 +1311,16 @@ pub(crate) mod tests {
         refused(with_baseline, "baseline");
         let mut cold_start = base();
         cold_start.prewarm = Some(Prewarm::Skipped);
-        refused(cold_start, "pre-warm");
+        refused(cold_start, "pre-warm was skipped");
+        let mut no_prewarm = base();
+        no_prewarm.prewarm = None;
+        refused(no_prewarm, "no CDN pre-warm");
+        let mut unwarmed = base();
+        unwarmed.prewarm = Some(Prewarm::Done {
+            unwarmed: BTreeMap::from([("docker.io".to_owned(), 3)]),
+            no_cache: BTreeSet::new(),
+        });
+        refused(unwarmed, "docker.io (3 blobs)");
         let mut missing_tool = base();
         missing_tool.scenarios[3].runs.pop();
         refused(missing_tool, "every published tool");
@@ -1298,6 +1403,10 @@ pub(crate) mod tests {
             "{block}"
         );
         assert!(
+            block.contains("ocync ran at its default of 20 images at once"),
+            "{block}"
+        );
+        assert!(
             block.contains(
                 "| Metric | ocync | dregsy | regsync | skopeo | crane | regctl | oras |\n"
             ),
@@ -1331,21 +1440,6 @@ pub(crate) mod tests {
         let block = page_block(&record, ScenarioKind::Warm, "Warm sync (no changes)").unwrap();
         assert!(block.contains("Warm sync (no changes) to ECR"), "{block}");
         assert!(!block.contains("Cold sync"), "{block}");
-    }
-
-    #[test]
-    fn a_tool_with_no_run_keeps_its_column() {
-        // Catches: a tool that did not finish vanishing from the table.
-        let mut report = fixture_report(FIXTURE_RUN, [200.0; 5]);
-        for scenario in &mut report.scenarios {
-            scenario.runs.retain(|run| run.tool != Tool::Dregsy);
-        }
-        let block = page_block(&published(&report), ScenarioKind::Cold, "Cold sync").unwrap();
-        assert!(block.contains("| ocync | dregsy | regsync |"), "{block}");
-        assert!(
-            block.contains("| Wall clock | **3m 20s** | -- | 9m 40s |"),
-            "{block}"
-        );
     }
 
     #[test]
@@ -1486,6 +1580,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_published_record_that_is_not_the_published_shape_is_never_written() {
+        // Catches: surfaces written from a record with a tool missing from a
+        // round, which `apply` would otherwise take on trust.
+        let mut report = fixture_report(FIXTURE_RUN, [200.0; 5]);
+        report.scenarios[0]
+            .runs
+            .retain(|run| run.tool != Tool::Dregsy);
+        let err = plan_with(&published(&report), |_| panic!("no file is read")).unwrap_err();
+        assert!(err.contains("every published tool"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_every_surface_as_it_was() {
+        // Catches: the first surfaces rewritten before a later one fails, so
+        // the page and the banners show different runs.
+        let root = repository();
+        let planned = plan(root.path(), &fixture(FIXTURE_RUN)).unwrap();
+        std::fs::remove_dir_all(root.path().join("docs/public")).unwrap();
+
+        let err = planned.write(root.path(), Banners::Skip).unwrap_err();
+
+        assert!(err.contains("no surface was changed"), "{err}");
+        for path in [PERFORMANCE_PAGE, README, HOMEPAGE] {
+            assert_eq!(surface_of(root.path(), path), tracked(path), "{path}");
+        }
+        // No staging file is left beside a surface.
+        let leftovers = std::fs::read_dir(root.path().join("docs/src/pages"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("bench-new")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn the_page_prose_outside_the_generated_blocks_names_no_run() {
+        // Catches: hand-written text about the current run (a build such as
+        // `ocync@7634416`, a tool left out of it) that a publish would leave
+        // standing beside the next run's numbers.
+        let page = tracked(PERFORMANCE_PAGE);
+        let mut outside = page.to_owned();
+        for name in ["BENCH", "BENCH-WARM"] {
+            let region = Region {
+                path: PERFORMANCE_PAGE,
+                fence: Fence::Html,
+                name,
+                layout: Layout::Lines,
+                text: String::new(),
+            };
+            outside = region.applied(&outside).unwrap();
+        }
+        for stale in ["ocync@", "is left out", "The two ocync builds"] {
+            assert!(!outside.contains(stale), "{stale} outside the blocks");
+        }
+    }
+
+    #[test]
     fn markers_are_found_once_and_in_order() {
         let region = Region {
             path: "f",
@@ -1597,7 +1754,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_surface_that_cannot_take_the_run_stops_everything_before_it_is_written() {
+    fn a_surface_that_cannot_take_the_run_keeps_the_record_and_changes_no_file() {
         use crate::bench::report::Deferred;
         let root = repository();
         let archive = archive_dir();
@@ -1608,11 +1765,14 @@ pub(crate) mod tests {
             .apply(archive.path(), root.path(), Banners::Skip)
             .unwrap_err();
 
-        // Catches: some surfaces updated and not others, or a record kept
-        // that the surfaces do not show.
+        // Catches: some surfaces updated and not others, or a finished run's
+        // record lost because a marker was missing (a local run has no other
+        // copy of it), or an error that does not say how to finish.
         assert!(err.contains("BENCH-STATS"), "{err}");
+        assert!(err.contains("cargo xtask bench-publish-surfaces"), "{err}");
         assert_eq!(surface_of(root.path(), README), tracked(README));
-        assert!(!archive.path().join("ecr.json").exists());
+        assert!(archive.path().join("ecr.json").exists());
+        assert!(newest_published(archive.path(), "ecr").unwrap().is_some());
     }
 
     #[test]

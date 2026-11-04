@@ -153,17 +153,17 @@ The archive shows what happens without this rule. The cold-sync figures publishe
 
 ### What a run must be to be published
 
-A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below, and `bench-remote`, which owns the build, also refuses a commit that is not on `origin/main`, before it pushes. A direct `bench --publish` run checks the recorded hash's form and nothing more, so the place of its commit is on the operator. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
+A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below. `bench --publish` also refuses a checkout whose HEAD is not on `origin/main` or whose tracked files are modified, and `bench-remote` makes the same main check before it pushes, so a bad commit costs no instance boot. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
-- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. The page keeps a column for each of the seven, so a tool with no run reads `--` there and never leaves the table. Today a tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.
+- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
-- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the pre-warm run and the proxy on. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy` and `--measure-proxy-overhead` are refused.
-- **Build:** a commit on `main`, recorded by its full hash.
+- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on and the pre-warm run with no blob left unwarmed (a registry with no blob cache is fine). `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
+- **Build:** a commit on `main`, recorded by its full hash, from a checkout with no modified tracked file.
 - **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region. The scenario is `sync` or `all`, so the cold and the warm sync both run.
 - **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published. `--limit` and `--skip-registries` are refused with it.
 
-> **Status: Planned.** A tool that fails the content check, or fails to finish, stays in the page as a column that names the failure, and the run goes on to the rest. Today the first failure stops the run.
+> **Status: Planned.** A tool that fails the content check, or fails to finish, stays in the page as a column that names the failure, and the run goes on to the rest. Today the first failure stops the run, so no such column exists yet.
 
 ### What it writes
 

@@ -240,6 +240,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
                 skips_prewarm: args.skip_prewarm,
                 disables_proxy: args.no_proxy,
                 measures_proxy_overhead: args.measure_proxy_overhead,
+                checks_regression: false,
             },
         )?;
     }
@@ -1173,7 +1174,7 @@ fn ensure_on_origin(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::
 /// Fails unless `commit` is on `origin/main`, as of a fetch now: a published
 /// run is built from a commit anyone can check out later.
 fn ensure_on_main(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::error::Error>> {
-    git(repo, &["fetch", "--prune", "origin"])?;
+    git(repo, &["fetch", "origin", "main"])?;
     git(
         repo,
         &[
@@ -1189,6 +1190,21 @@ fn ensure_on_main(repo: &Path, commit: &CommitSha) -> Result<(), Box<dyn std::er
              first"
         )
     })?;
+    Ok(())
+}
+
+/// Fails unless HEAD of `repo` is on `origin/main` and none of its tracked
+/// files is modified, so a published run is of a commit and of nothing that
+/// commit does not hold. `bench --publish` calls it on the machine that runs.
+pub(crate) fn ensure_head_publishable(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_on_main(repo, &resolve_commit(repo, "HEAD")?)?;
+    let modified = git(repo, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !modified.is_empty() {
+        return Err(format!(
+            "--publish needs a clean checkout, and these tracked files are modified:\n{modified}"
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1494,6 +1510,41 @@ mod tests {
         git_in(work.path(), &["merge", "-q", "--ff-only", "topic"]);
         git_in(work.path(), &["push", "-q", "origin", "main"]);
         assert!(ensure_on_main(work.path(), &topic).is_ok());
+    }
+
+    #[test]
+    fn a_published_run_needs_a_head_on_main_and_a_clean_checkout() {
+        let origin = tempfile::tempdir().unwrap();
+        git_in(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        let work = tempfile::tempdir().unwrap();
+        git_in(work.path(), &["init", "-q", "-b", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        std::fs::write(work.path().join("tracked.txt"), "one\n").unwrap();
+        git_in(work.path(), &["add", "tracked.txt"]);
+        git_in(work.path(), &["commit", "-q", "-m", "merged"]);
+        git_in(work.path(), &["push", "-q", "origin", "main"]);
+        assert!(ensure_head_publishable(work.path()).is_ok());
+
+        // An untracked file is not part of the commit and does not matter.
+        std::fs::write(work.path().join("untracked.txt"), "x\n").unwrap();
+        assert!(ensure_head_publishable(work.path()).is_ok());
+
+        // Catches: a run of a working tree that is not the commit it records.
+        std::fs::write(work.path().join("tracked.txt"), "two\n").unwrap();
+        let err = ensure_head_publishable(work.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tracked.txt"), "{err}");
+        git_in(work.path(), &["commit", "-q", "-a", "-m", "local only"]);
+
+        // Catches: a run of a commit that is not on origin/main.
+        let err = ensure_head_publishable(work.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("origin/main"), "{err}");
     }
 
     #[test]
