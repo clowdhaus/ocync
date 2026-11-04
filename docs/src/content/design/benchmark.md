@@ -172,9 +172,9 @@ From the one run record, `--publish` writes:
 - **Performance page tables:** one per scenario, cold and warm, between the existing markers. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line under the table gives the run timestamp, the commit, the instance, the corpus size and the round count. Ranges, per-round ratios and confidence stay in the run record and in this document. They are not on the page.
 - **Page description:** the `description` front matter of `docs/src/content/performance.md`.
 - **README:** the summary sentence in `README.md`, between a new pair of markers.
-- **Banner:** the banner carries no numbers. Its image and alt text name what ocync does, and the numbers live only in text the publish step writes.
+- **Homepage and banners:** the speed and request figures in `docs/src/pages/index.astro`, in `docs/public/ecr-banner.svg` and `docs/public/og-image.svg`, and in the README banner's alt text. The PNG copies are rendered from the SVGs with `sharp`, which the docs site already installs.
 
-Every surface states its numbers the same way: the median ratio against regsync and the request and byte savings against it, rounded the same way, with the run timestamp beside them. A run without `--publish` writes none of these surfaces.
+Every surface states its numbers the same way: the median ratio against regsync and the request and byte savings against it, rounded the same way. The page and the README name the run timestamp beside them. A run without `--publish` writes none of these surfaces.
 
 ### Telling a published record from an experiment
 
@@ -182,7 +182,7 @@ The archive keeps every run, experiments included. `--publish` sets `published: 
 
 ### The check that keeps them in line
 
-A test reads the newest published record from `bench/results/ecr.json`, computes the published numbers from it, and fails when the page tables, the page description or the README sentence differ from them or cite another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others.
+A test reads the newest published record from `bench/results/ecr.json`, computes the published numbers from it, and fails when any surface above, other than the PNG copies, differs from them or cites another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others. Until the first published run, the archive holds no published record and the surfaces keep the text they have.
 
 ## What we do not do
 
