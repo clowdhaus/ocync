@@ -23,7 +23,7 @@ use http::header::{
     TRANSFER_ENCODING, UPGRADE,
 };
 use http::uri::Authority;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyDataStream, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
@@ -145,12 +145,18 @@ pub(crate) async fn serve(
     // feature bleeds into this binary; without this pin, reqwest would
     // negotiate H2 with origins like cgr.dev (Google Frontend), which
     // returns 502 on H2 connections.
-    let upstream = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .http1_only()
-        .pool_max_idle_per_host(32)
-        .build()
-        .map_err(|e| format!("reqwest client: {e}"))?;
+    let client = |max_idle| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .http1_only()
+            .pool_max_idle_per_host(max_idle)
+            .build()
+            .map_err(|e| format!("reqwest client: {e}"))
+    };
+    let upstream = Upstream {
+        pooled: client(32)?,
+        fresh: client(0)?,
+    };
 
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(%listen, "bench-proxy listening");
@@ -208,7 +214,7 @@ async fn handle_connection(
     stream: TcpStream,
     ca: Arc<CaSigner>,
     log: Arc<LogWriter>,
-    upstream: reqwest::Client,
+    upstream: Upstream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read the HTTP/1.1 request line + headers ourselves. hyper's server
     // doesn't expose CONNECT handling on the inbound connection so we
@@ -322,12 +328,83 @@ impl ResolvesServerCert for DynamicResolver {
     }
 }
 
+/// The clients the proxy forwards through.
+#[derive(Clone)]
+struct Upstream {
+    /// Keeps idle connections, so a tool's requests reuse them as they would
+    /// without the proxy.
+    pooled: reqwest::Client,
+    /// Keeps none, so a request sent again cannot meet a second pooled
+    /// connection the origin has closed.
+    fresh: reqwest::Client,
+}
+
+/// Whether the proxy may send a request again after its first send fails
+/// before any response arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replay {
+    /// A GET or HEAD without a body. Its first send can die on a pooled
+    /// connection the origin had already closed, which is the proxy's
+    /// failure and not the tool's, and sending it again repeats no side
+    /// effect. Any send error qualifies, since none of them returned a
+    /// response for the tool to see.
+    Once,
+    /// Anything else, which the proxy forwards exactly once.
+    Never,
+}
+
+impl Replay {
+    /// The replay rule for a request with this method and these headers. A
+    /// body is absent only when no `Transfer-Encoding` is sent and any
+    /// `Content-Length` is exactly `0`; a length that does not parse counts
+    /// as a body.
+    fn of(method: &Method, headers: &http::HeaderMap) -> Self {
+        let bodiless = !headers.contains_key(TRANSFER_ENCODING)
+            && headers
+                .get(CONTENT_LENGTH)
+                .is_none_or(|len| len.as_bytes() == b"0");
+        if bodiless && (method == Method::GET || method == Method::HEAD) {
+            Self::Once
+        } else {
+            Self::Never
+        }
+    }
+}
+
+/// Sends `first`, and `again` when there is one and `first` fails before a
+/// response. The tool sent one request, so the failed attempt is a warning
+/// and never a logged request of its own.
+async fn send(
+    first: reqwest::RequestBuilder,
+    again: Option<reqwest::RequestBuilder>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    match (first.send().await, again) {
+        (Err(e), Some(again)) => {
+            warn!(error = %error_chain(&e.without_url()), "upstream send failed; sending once more");
+            again.send().await
+        }
+        (result, _) => result,
+    }
+}
+
+/// `error` and every cause beneath it, joined by `: `.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        chain.push_str(": ");
+        chain.push_str(&next.to_string());
+        cause = next.source();
+    }
+    chain
+}
+
 /// Process one HTTP/1.1 request arriving on a MITM'd connection:
 /// forward it to the origin, stream the response back, and log.
 async fn handle_request(
     req: Request<Incoming>,
     target: Arc<Authority>,
-    upstream: reqwest::Client,
+    upstream: Upstream,
     log: Arc<LogWriter>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let start = Instant::now();
@@ -351,6 +428,7 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
 
+    let replay = Replay::of(&method, req.headers());
     let mut headers = forward_request_headers(req.headers(), &host);
 
     // Strip Content-Length from forwarded headers. We set it explicitly
@@ -363,26 +441,32 @@ async fn handle_request(
     // AtomicU64 counter instead of buffering the entire body in memory.
     // A monolithic PUT of a multi-GB blob would OOM the proxy otherwise.
     let request_counter = Arc::new(AtomicU64::new(0));
-    let counter_for_req = request_counter.clone();
+    let request = |client: &reqwest::Client| {
+        let builder = client
+            .request(method.clone(), &url)
+            .headers(headers.clone());
+        match content_length {
+            Some(len) => builder.header(CONTENT_LENGTH, len),
+            None => builder,
+        }
+    };
+    let sent = match replay {
+        Replay::Once => send(request(&upstream.pooled), Some(request(&upstream.fresh))).await,
+        Replay::Never => {
+            let counter_for_req = request_counter.clone();
+            let body_stream = BodyDataStream::new(req.into_body()).map(move |chunk| {
+                chunk
+                    .inspect(|b| {
+                        counter_for_req.fetch_add(b.len() as u64, Ordering::Relaxed);
+                    })
+                    .map_err(|e| e.to_string())
+            });
+            let builder = request(&upstream.pooled).body(reqwest::Body::wrap_stream(body_stream));
+            send(builder, None).await
+        }
+    };
 
-    let body_stream = BodyDataStream::new(req.into_body()).map(move |chunk| {
-        chunk
-            .inspect(|b| {
-                counter_for_req.fetch_add(b.len() as u64, Ordering::Relaxed);
-            })
-            .map_err(|e| e.to_string())
-    });
-
-    let mut upstream_req = upstream
-        .request(method.clone(), &url)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body_stream));
-
-    if let Some(len) = content_length {
-        upstream_req = upstream_req.header(CONTENT_LENGTH, len);
-    }
-
-    let upstream_resp = match upstream_req.send().await {
+    let upstream_resp = match sent {
         Ok(r) => r,
         Err(e) => {
             // Log the failed hop too so benchmark analytics see the miss.
@@ -401,7 +485,10 @@ async fn handle_request(
             log.write_entry(&entry).await;
             return Ok(error_response(
                 502,
-                format!("upstream request to {url}: {e}"),
+                format!(
+                    "upstream request to {url}: {}",
+                    error_chain(&e.without_url())
+                ),
             ));
         }
     };
@@ -729,6 +816,106 @@ mod tests {
         let out = forward_request_headers(&incoming, "registry.example.com");
         assert_eq!(out.get(HOST).unwrap(), "registry.example.com");
         assert!(out.contains_key("accept"));
+    }
+
+    /// A local origin whose first connection is closed as soon as a request
+    /// arrives, as an origin closing an idle pooled connection does, and
+    /// whose later connections answer 200. Returns its URL and a count of
+    /// the connections it accepted.
+    async fn origin_dropping_first_connection() -> (String, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v2/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let nth = counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                if nth > 0 {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                }
+            }
+        });
+        (url, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_bodiless_get_is_sent_again_after_a_dropped_connection() {
+        let (url, accepted) = origin_dropping_first_connection().await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        let response = send(client.get(&url), Some(client.get(&url)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_replay_that_fails_too_returns_its_error_after_two_sends() {
+        // Catches: a replay that loops, or that hides the second failure.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v2/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+            }
+        });
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        let err = send(client.head(&url), Some(client.head(&url)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        assert!(
+            !error_chain(&err.without_url()).contains("http://"),
+            "the chain names no URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_may_not_be_replayed_is_sent_once() {
+        // Catches: an upload replayed after a failure, which would repeat
+        // its side effect at the registry.
+        let (url, accepted) = origin_dropping_first_connection().await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+
+        assert!(send(client.post(&url), None).await.is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_a_bodiless_get_or_head_may_be_replayed() {
+        let none = http::HeaderMap::new();
+        let mut chunked = http::HeaderMap::new();
+        chunked.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+
+        let length = |value: &'static str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static(value));
+            headers
+        };
+
+        assert_eq!(Replay::of(&Method::GET, &none), Replay::Once);
+        assert_eq!(Replay::of(&Method::HEAD, &length("0")), Replay::Once);
+        assert_eq!(Replay::of(&Method::GET, &length("5")), Replay::Never);
+        // Catches: a length that does not parse read as no body, which would
+        // drop the body the tool sent.
+        assert_eq!(Replay::of(&Method::GET, &length("five")), Replay::Never);
+        assert_eq!(Replay::of(&Method::GET, &chunked), Replay::Never);
+        assert_eq!(Replay::of(&Method::PUT, &none), Replay::Never);
+        assert_eq!(Replay::of(&Method::POST, &none), Replay::Never);
     }
 
     #[tokio::test]
