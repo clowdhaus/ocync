@@ -178,8 +178,8 @@ pub(crate) struct BenchRemoteArgs {
 
     /// Make this the published run, the one every public number comes from
     /// (passed through to `cargo xtask bench`). Refused unless the run is the
-    /// whole main corpus on ECR from the controlled source with ocync, dregsy and regsync
-    /// at their defaults for 5 rounds, and unless the commit it builds is on
+    /// whole main corpus on ECR from the controlled source with the published
+    /// tools at their defaults for 5 rounds, and unless the commit it builds is on
     /// `origin/main`.
     #[arg(long)]
     pub(crate) publish: bool,

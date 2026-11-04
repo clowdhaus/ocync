@@ -321,8 +321,8 @@ pub(crate) struct BenchArgs {
 
     /// Make this the published run: the one every public number comes from.
     /// Refused unless the run is the whole main corpus on ECR from the
-    /// controlled source with ocync, dregsy and regsync at their defaults for 5 rounds,
-    /// and a record that finishes short of that is archived as an experiment.
+    /// controlled source with the published tools at their defaults for 5
+    /// rounds, and a record that finishes short of that is archived as an experiment.
     /// A published run rewrites the performance page, the README, the homepage
     /// and the banners.
     #[arg(long, conflicts_with = "regression")]

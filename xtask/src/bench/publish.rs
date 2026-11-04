@@ -1073,8 +1073,10 @@ pub(crate) mod tests {
         // each departure being a way the page's numbers stop being comparable.
         let mut one_tool = selection();
         one_tool.tools = vec![Tool::Ocync];
-        let mut six_tools = selection();
-        six_tools.tools.pop();
+        let mut missing_tool = selection();
+        missing_tool.tools.pop();
+        let mut extra_tool = selection();
+        extra_tool.tools.push(Tool::Skopeo);
         let mut three_rounds = selection();
         three_rounds.rounds = "3".parse().unwrap();
         let mut baseline = selection();
@@ -1087,7 +1089,8 @@ pub(crate) mod tests {
             assert!(err.contains(needle), "{needle}: {err}");
         };
         refused(one_tool, shape(), "--tools");
-        refused(six_tools, shape(), "--tools");
+        refused(missing_tool, shape(), "--tools");
+        refused(extra_tool, shape(), "--tools");
         refused(three_rounds, shape(), "--rounds must be 5, not 3");
         refused(baseline, shape(), "--baseline-ref");
         refused(capped, shape(), "--max-concurrent-transfers");
@@ -1374,6 +1377,12 @@ pub(crate) mod tests {
         let mut missing_tool = base();
         missing_tool.scenarios[3].runs.pop();
         refused(missing_tool, "every published tool");
+        // Catches: a record holding a per-tag tool reaching the page's table.
+        let mut extra_tool = base();
+        extra_tool.scenarios[3]
+            .runs
+            .push(tool_run(Tool::Skopeo, 600.0, 8000, 60_000_000_000));
+        refused(extra_tool, "every published tool");
         // Catches: a record of an `all` run, whose partial scenario the page
         // does not show, being published.
         let mut with_partial = published(&base());

@@ -132,7 +132,7 @@ Published runs are taken only from a commit on `main`, recorded by its full hash
 
 ## Per-tag tools
 
-skopeo, crane, regctl and oras are compared too. Each copies one tag per process, driven by the harness, because `skopeo sync` cannot copy `source@digest` to `target:tag`. Every copy keeps the source digest:
+skopeo, crane, regctl and oras can be benchmarked too, outside the published run. Each copies one tag per process, driven by the harness, because `skopeo sync` cannot copy `source@digest` to `target:tag`. Every copy keeps the source digest:
 
 - **skopeo** runs `copy --preserve-digests --multi-arch all`: without the first flag it recompresses an uncompressed layer on push and the digest changes, and with it a copy that cannot keep the digest fails instead.
 - **crane** `copy` pushes the manifest and blobs as fetched, every platform of an index.
@@ -157,7 +157,7 @@ A run is published only through `--publish`, on `cargo xtask bench-remote`, or o
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
 - **Source:** the controlled source, seeded from that lock. A run from the public registries is refused, since their rate limits reach the repeated rounds.
-- **Tools:** ocync, regsync and dregsy, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published. skopeo, crane, regctl and oras join the published set once each has finished a full benchmark run; none has yet.
+- **Tools:** ocync, regsync and dregsy, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published. Another tool joins this list once it has finished a full benchmark run.
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
 - **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on. The controlled source has no CDN, so its pre-warm is recorded as not applicable and a record from a source with one cannot claim that. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
 - **Build:** a commit on `main`, recorded by its full hash, from a checkout with no modified tracked file.
