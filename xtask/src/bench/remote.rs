@@ -210,7 +210,7 @@ pub(crate) fn run(args: BenchRemoteArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
     if args.measure_proxy_overhead {
-        ensure_proxy_overhead_applies(args.scenario)?;
+        ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
     ensure_target_applies(args.target, args.scenario, &args.tool_selection.run_tools())?;
     if let Some(commit) = &args.tool_selection.baseline_ref {

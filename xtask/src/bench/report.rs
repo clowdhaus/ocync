@@ -1172,7 +1172,7 @@ fn render_metric_table(
     }
 }
 
-/// The ratio `other / ocync` of a row's metric in each round, ocync the base, `None` unless
+/// The ratio `other / ocync` of a row's metric in each round, `None` unless
 /// both tools have a value in every round.
 fn round_ratio(rounds: &[&ScenarioResult], other: Tool, row: &MetricRow) -> Option<Ratio> {
     let pairs: Vec<Pair> = rounds
@@ -1302,13 +1302,15 @@ fn render_proxy_overhead(report: &BenchReport, rounds: &[&ScenarioResult], out: 
     if table.is_empty() {
         return;
     }
+    let fewest = u32::try_from(stats::VERDICT_ROUNDS).expect("a verdict needs few rounds");
     out.push_str(&format!(
         "\nProxy overhead: the ratio of a tool's wall clock through the proxy to its wall \
          clock without it, run back to back in each round. An overhead is measured only \
          when every round is on the same side of 1, from {} rounds; identical routes would \
-         do that one time in sixteen.\n\n\
+         do that {:.2}% of the time.\n\n\
          | Tool | Median ratio | Range | Measured overhead |\n|---|---:|---:|---|\n",
         stats::VERDICT_ROUNDS,
+        (1.0 - stats::confidence(fewest)) * 100.0,
     ));
     out.push_str(&table);
 }
@@ -1460,11 +1462,17 @@ impl PageBlocks {
     /// The blocks `report` produces. A run whose transfer cap is not ocync's
     /// default produces none: the page shows ocync as it runs out of the box.
     /// Nor does a run without ocync, a run of a named corpus (the page is the
-    /// main corpus's), or a run of part of the corpus.
+    /// main corpus's), a run of part of the corpus, or a run that paired each
+    /// proxied run with a direct one, which doubled the load every run met.
     pub(crate) fn of(report: &BenchReport) -> Self {
         if !report.corpus.id.is_main()
             || report.coverage != Coverage::Whole
             || report.ocync_transfer_cap() != Some(DEFAULT_MAX_CONCURRENT_TRANSFERS)
+            || report
+                .scenarios
+                .iter()
+                .flat_map(|scenario| &scenario.runs)
+                .any(|run| run.direct_wall_clock_secs.is_some())
         {
             return Self::default();
         }
@@ -3508,6 +3516,18 @@ pub(crate) mod tests {
             let md = summary_markdown(&paired_report(rounds));
             assert!(md.contains(row), "{row}\n{md}");
         }
+    }
+
+    #[test]
+    fn a_paired_run_writes_no_page_blocks() {
+        // Catches: times taken while a direct run doubled the load on the
+        // registries replacing the performance page's numbers.
+        let mut report = paired_report(&[(10.0, 8.0); 5]);
+        assert_eq!(PageBlocks::of(&report), PageBlocks::default());
+        for scenario in &mut report.scenarios {
+            scenario.runs[0].direct_wall_clock_secs = None;
+        }
+        assert_ne!(PageBlocks::of(&report), PageBlocks::default());
     }
 
     #[test]

@@ -299,8 +299,9 @@ pub(crate) struct BenchArgs {
     /// Run each tool's cold and warm sync of the sync scenario twice per round,
     /// through the proxy and directly, back to back, and report the proxy's
     /// overhead per tool. The direct legs record time only; counts come from
-    /// the proxied legs. Doubles the sync scenario's run time.
-    #[arg(long, conflicts_with = "no_proxy")]
+    /// the proxied legs. Doubles the sync scenario's run time, and the load on
+    /// the registries, so it is refused beside `--regression`.
+    #[arg(long, conflicts_with_all = ["no_proxy", "regression"])]
     pub(crate) measure_proxy_overhead: bool,
 }
 
@@ -339,9 +340,21 @@ fn sync_legs(args: &BenchArgs, round: usize) -> Vec<Route> {
 }
 
 /// Refuses a proxy overhead measurement for a scenario with no sync scenario
-/// round to pair in. Called by `bench` and `bench-remote` when the option is
+/// round to pair in, or a target other than ECR: Artifact Registry and ACR
+/// keep a round's blobs until the round ends, so the second run of a pair
+/// would not be cold. Called by `bench` and `bench-remote` when the option is
 /// given, like [`ToolSelection::ensure_baseline_applies`].
-pub(crate) fn ensure_proxy_overhead_applies(scenario: Scenario) -> Result<(), String> {
+pub(crate) fn ensure_proxy_overhead_applies(
+    scenario: Scenario,
+    target: target::Kind,
+) -> Result<(), String> {
+    if target != target::Kind::Ecr {
+        return Err(format!(
+            "--measure-proxy-overhead needs a target emptied between runs, which {} is not \
+             within a round; use ECR",
+            target.name()
+        ));
+    }
     match scenario {
         Scenario::Partial | Scenario::Scale | Scenario::Prepare => Err(format!(
             "--measure-proxy-overhead applies to the sync scenario, not {}",
@@ -613,7 +626,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
     if args.measure_proxy_overhead {
-        ensure_proxy_overhead_applies(args.scenario)?;
+        ensure_proxy_overhead_applies(args.scenario, args.target)?;
     }
     let corpus_id = args.paths.corpus_id()?;
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
@@ -1474,7 +1487,7 @@ async fn run_single_tool(
         let url = handle.proxy_url();
         (Some(handle), Some(url))
     } else {
-        eprintln!("bench: proxy disabled -- no traffic metrics");
+        eprintln!("bench: {tool} {pass} sent directly -- no traffic metrics");
         (None, None)
     };
 
@@ -3905,9 +3918,11 @@ images:
     }
 
     #[test]
-    fn proxy_overhead_is_refused_without_a_sync_round_and_with_no_proxy() {
+    fn proxy_overhead_is_refused_without_a_sync_round_a_cold_target_or_beside_another_mode() {
         // Catches: the option silently doing nothing for a scenario with no
-        // cold sync, and being allowed beside `--no-proxy`.
+        // cold sync, pairing a cold run with a warm one on a target that keeps
+        // a round's blobs, being allowed beside `--no-proxy`, and a regression
+        // check judging times taken under doubled load.
         for (scenario, ok) in [
             (Scenario::Sync, true),
             (Scenario::All, true),
@@ -3916,12 +3931,19 @@ images:
             (Scenario::Prepare, false),
         ] {
             assert_eq!(
-                ensure_proxy_overhead_applies(scenario).is_ok(),
+                ensure_proxy_overhead_applies(scenario, target::Kind::Ecr).is_ok(),
                 ok,
                 "{scenario:?}"
             );
         }
+        for kept in [target::Kind::ArtifactRegistry, target::Kind::Acr] {
+            assert!(
+                ensure_proxy_overhead_applies(Scenario::Sync, kept).is_err(),
+                "{kept:?}"
+            );
+        }
         assert!(parse_bench(&["--measure-proxy-overhead", "--no-proxy", "sync"]).is_err());
+        assert!(parse_bench(&["--measure-proxy-overhead", "--regression", "sync"]).is_err());
     }
 
     #[test]
