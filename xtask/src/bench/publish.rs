@@ -486,6 +486,95 @@ fn page_block(record: &RunRecord, kind: ScenarioKind, description: &str) -> Resu
     Ok(out)
 }
 
+/// The tool every published figure is measured against, as a banner's labels
+/// name it.
+const COMPARED_WITH: &str = "regsync";
+
+/// Which way a label's text is anchored to its `x`.
+#[derive(Clone, Copy)]
+enum Anchor {
+    /// Starts at `x`.
+    Start,
+    /// Centered on `x`.
+    Middle,
+}
+
+/// Where and how a banner SVG sets the two lines of the label beside a figure.
+struct StatLabel {
+    x: u32,
+    /// The baseline of each of the two lines.
+    ys: [u32; 2],
+    size: u32,
+    fill: &'static str,
+    anchor: Anchor,
+}
+
+impl StatLabel {
+    /// The `<text>` elements of the two `lines`, one per line, each on a line
+    /// of the SVG.
+    fn text(&self, lines: [&str; 2]) -> String {
+        let anchor = match self.anchor {
+            Anchor::Start => "",
+            Anchor::Middle => " text-anchor=\"middle\"",
+        };
+        lines
+            .iter()
+            .zip(self.ys)
+            .map(|(line, y)| {
+                format!(
+                    "  <text x=\"{x}\" y=\"{y}\"{anchor} font-family=\"system-ui, -apple-system, \
+                     'Segoe UI', sans-serif\" font-size=\"{size}\" fill=\"{fill}\">{line}</text>\n",
+                    x = self.x,
+                    size = self.size,
+                    fill = self.fill,
+                )
+            })
+            .collect()
+    }
+}
+
+/// The labels beside the speed and the request figures of a banner SVG.
+struct SvgLabels {
+    speed: StatLabel,
+    requests: StatLabel,
+}
+
+/// The README banner's labels, centered under each figure.
+const ECR_BANNER_LABELS: SvgLabels = SvgLabels {
+    speed: StatLabel {
+        x: 500,
+        ys: [175, 192],
+        size: 13,
+        fill: "#8b92b0",
+        anchor: Anchor::Middle,
+    },
+    requests: StatLabel {
+        x: 660,
+        ys: [175, 192],
+        size: 13,
+        fill: "#8b92b0",
+        anchor: Anchor::Middle,
+    },
+};
+
+/// The social card's labels, to the right of each figure.
+const OG_IMAGE_LABELS: SvgLabels = SvgLabels {
+    speed: StatLabel {
+        x: 810,
+        ys: [155, 180],
+        size: 22,
+        fill: "#bcc6ec",
+        anchor: Anchor::Start,
+    },
+    requests: StatLabel {
+        x: 845,
+        ys: [315, 340],
+        size: 22,
+        fill: "#bcc6ec",
+        anchor: Anchor::Start,
+    },
+};
+
 /// Every region the published run `record` writes, which is all the text any
 /// surface shows that comes from a benchmark.
 fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
@@ -504,7 +593,7 @@ fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
     let inline = Layout::Inline;
     let rounds = rounds_in(record, ScenarioKind::Cold)?.len();
     let images = record.corpus.images;
-    let svg = |path| {
+    let svg = |path, labels: &SvgLabels| {
         [
             region(
                 path,
@@ -515,6 +604,22 @@ fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
             ),
             region(path, Fence::Html, "BENCH-SPEED", inline, speed.clone()),
             region(path, Fence::Html, "BENCH-REQUESTS", inline, percent.clone()),
+            region(
+                path,
+                Fence::Html,
+                "BENCH-SPEED-LABEL",
+                lines,
+                labels.speed.text(["faster than", COMPARED_WITH]),
+            ),
+            region(
+                path,
+                Fence::Html,
+                "BENCH-REQUESTS-LABEL",
+                lines,
+                labels
+                    .requests
+                    .text(["fewer requests", &format!("than {COMPARED_WITH}")]),
+            ),
         ]
     };
     let mut regions = vec![
@@ -584,8 +689,8 @@ fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
             ),
         ),
     ];
-    regions.extend(svg(ECR_BANNER));
-    regions.extend(svg(OG_IMAGE));
+    regions.extend(svg(ECR_BANNER, &ECR_BANNER_LABELS));
+    regions.extend(svg(OG_IMAGE, &OG_IMAGE_LABELS));
     Ok(regions)
 }
 
@@ -1256,6 +1361,14 @@ pub(crate) mod tests {
             assert_ne!(content, tracked(path), "{path}");
             assert!(content.contains(FIXTURE_RUN), "{path}");
         }
+        // Every label beside a banner figure names what the figure is measured
+        // against, in both images, on two lines in the README banner.
+        for svg in [ECR_BANNER, OG_IMAGE] {
+            assert!(files[svg].contains(">faster than</text>"), "{svg}");
+            assert!(files[svg].contains(">regsync</text>"), "{svg}");
+            assert!(files[svg].contains(">than regsync</text>"), "{svg}");
+            assert!(!files[svg].contains("alternatives"), "{svg}");
+        }
         assert!(files[README].contains("2.9 times faster than regsync"));
         assert!(
             files[README].contains("2.9x faster than regsync, 25% fewer API requests than regsync")
@@ -1330,6 +1443,46 @@ pub(crate) mod tests {
         // Different figures from the same run time.
         let faster = published(&fixture_report(FIXTURE_RUN, [100.0; 5]));
         assert!(!stale(&faster, &files).is_empty());
+    }
+
+    #[test]
+    fn a_banner_label_that_does_not_name_regsync_is_stale() {
+        // Catches: a figure measured against regsync left beside a label
+        // that names something else, as "alternatives" did.
+        let record = fixture(FIXTURE_RUN);
+        let files = written(&record);
+        for (svg, was, now, region) in [
+            (
+                OG_IMAGE,
+                ">regsync</text>",
+                ">alternatives</text>",
+                "BENCH-SPEED-LABEL",
+            ),
+            (
+                OG_IMAGE,
+                ">than regsync</text>",
+                ">requests</text>",
+                "BENCH-REQUESTS-LABEL",
+            ),
+            (
+                ECR_BANNER,
+                ">regsync</text>",
+                ">faster</text>",
+                "BENCH-SPEED-LABEL",
+            ),
+            (
+                ECR_BANNER,
+                ">than regsync</text>",
+                ">fewer</text>",
+                "BENCH-REQUESTS-LABEL",
+            ),
+        ] {
+            let mut edited = files.clone();
+            let file = edited.get_mut(svg).unwrap();
+            assert!(file.contains(was), "{svg}");
+            *file = file.replace(was, now);
+            assert_eq!(stale(&record, &edited), vec![format!("{svg} {region}")]);
+        }
     }
 
     #[test]
@@ -1471,6 +1624,18 @@ pub(crate) mod tests {
         };
 
         assert_eq!(verify(&record), Ok(()), "{}", record.timestamp);
+        // Every banner label names what its figure is measured against.
+        for region in regions(&record).unwrap() {
+            if region.name.ends_with("-LABEL") {
+                let shown = &tracked(region.path)[region.span(tracked(region.path)).unwrap()];
+                assert!(
+                    shown.contains(COMPARED_WITH),
+                    "{} {}",
+                    region.path,
+                    region.name
+                );
+            }
+        }
         assert_eq!(
             stale(&record, &BTreeMap::new()),
             Vec::<String>::new(),
