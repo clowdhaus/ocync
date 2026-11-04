@@ -60,7 +60,7 @@ The `ocync version` command reports whether the binary is a FIPS build, the link
 
 ```
 $ ocync version
-ocync 0.8.2
+ocync 0.9.0
 FIPS 140-3: enabled
   module: AWS-LC-FIPS 4
   release: AWS-LC 4.2.0

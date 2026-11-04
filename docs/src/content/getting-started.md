@@ -56,7 +56,7 @@ cosign verify-attestation --type cyclonedx \
 ### Helm
 
 ```bash
-helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.8.2
+helm install ocync oci://public.ecr.aws/clowdhaus/ocync --version 0.9.0
 ```
 
 See the [Helm chart guide](/helm) for deployment modes and configuration.
