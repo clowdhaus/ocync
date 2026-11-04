@@ -78,7 +78,7 @@ const MONTHS: [&str; 12] = [
 /// Read an IMF-fixdate, `Sun, 06 Nov 1994 08:49:37 GMT`, the `Date` form
 /// RFC 9110 requires of senders. Fractional seconds, which the SDK also
 /// accepts, are dropped. Any other text is `None`.
-pub(super) fn parse_imf_fixdate(text: &str) -> Option<SystemTime> {
+pub(crate) fn parse_imf_fixdate(text: &str) -> Option<SystemTime> {
     let (weekday, rest) = text.split_once(", ")?;
     let mut fields = rest.split(' ');
     let (day, month, year, time, zone) = (

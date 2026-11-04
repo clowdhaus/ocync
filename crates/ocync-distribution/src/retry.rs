@@ -33,7 +33,7 @@ pub const MAX_LISTING_RETRIES: u32 = 32;
 /// A longer one is a quota that will not recover within a sync (Docker Hub's
 /// pull limit answers with hours), so the 429 surfaces at once instead of
 /// holding the run open.
-pub(crate) const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
+const MAX_HONORED_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Delay before the first retry.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
@@ -79,16 +79,18 @@ pub(crate) fn is_transient(error: &Error) -> bool {
 }
 
 /// The wait a `Retry-After` value names, in either of its forms (RFC 9110
-/// section 10.2.3): delta seconds, or an HTTP date, which a past date makes
-/// zero. A number too large to hold is [`Duration::MAX`], so the cap refuses
-/// it. Anything else is `None`, and the caller backs off as it would without
-/// the header.
+/// section 10.2.3): delta seconds, or an HTTP date in the IMF-fixdate form
+/// senders must use, which a past date makes zero. A number too large to
+/// hold counts as one second over [`MAX_HONORED_RETRY_AFTER`], so the cap
+/// refuses it. Anything else is `None`, and the caller backs off as it
+/// would without the header.
 fn retry_after_value(value: &str) -> Option<Duration> {
     let value = value.trim();
     if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-        return Some(value.parse().map_or(Duration::MAX, Duration::from_secs));
+        let beyond_cap = MAX_HONORED_RETRY_AFTER + Duration::from_secs(1);
+        return Some(value.parse().map_or(beyond_cap, Duration::from_secs));
     }
-    let date = httpdate::parse_http_date(value).ok()?;
+    let date = crate::aws::calendar::parse_imf_fixdate(value)?;
     Some(
         date.duration_since(std::time::SystemTime::now())
             .unwrap_or(Duration::ZERO),
@@ -111,34 +113,43 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
 }
 
 /// The wait before re-sending after `error`, given the jittered `backoff` a
-/// retry loop would use, or `None` when the error should surface. See
-/// [`capped_delay`]. The single definition every registry retry loop shares.
+/// retry loop would use: `backoff`, plus the registry's `Retry-After` when
+/// it named one. `None`, with a WARN naming `error`, when that `Retry-After`
+/// is longer than a sync waits out and the error should surface. The single
+/// definition every registry retry loop shares.
 pub fn retry_delay(error: &Error, backoff: Duration) -> Option<Duration> {
     let asked = match error {
         Error::RegistryError { retry_after, .. } => *retry_after,
         _ => None,
     };
-    capped_delay(asked, backoff)
+    let delay = delay_unless_over_cap(asked, backoff);
+    if delay.is_none() {
+        warn_beyond_cap(asked, &error.to_string());
+    }
+    delay
+}
+
+/// Report that a registry asked `subject` to wait longer than
+/// [`MAX_HONORED_RETRY_AFTER`], so it surfaces instead of retrying.
+fn warn_beyond_cap(asked: Option<Duration>, subject: &str) {
+    tracing::warn!(
+        subject,
+        retry_after_s = asked.unwrap_or_default().as_secs(),
+        max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
+        "registry asked for a longer wait than a sync waits out; not retrying"
+    );
 }
 
 /// `backoff` when the registry `asked` for no wait, and `asked` plus
 /// `backoff` when it did. The registry counts `Retry-After` down to the end
 /// of its quota window, so the jittered `backoff` on top keeps every request
-/// it throttled from re-sending at the same instant. `None`, with a WARN,
-/// when `asked` is over [`MAX_HONORED_RETRY_AFTER`].
-fn capped_delay(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
+/// it throttled from re-sending at the same instant. `None` when `asked` is
+/// over [`MAX_HONORED_RETRY_AFTER`]: the wait is refused, not shortened.
+fn delay_unless_over_cap(asked: Option<Duration>, backoff: Duration) -> Option<Duration> {
     let Some(asked) = asked else {
         return Some(backoff);
     };
-    if asked > MAX_HONORED_RETRY_AFTER {
-        tracing::warn!(
-            retry_after_s = asked.as_secs(),
-            max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
-            "registry asked for a longer wait than a sync waits out; not retrying"
-        );
-        return None;
-    }
-    Some(asked.saturating_add(backoff))
+    (asked <= MAX_HONORED_RETRY_AFTER).then(|| asked + backoff)
 }
 
 /// Exponential backoff for attempt `attempt` (0-indexed), jittered.
@@ -273,7 +284,8 @@ pub(crate) async fn send_retrying(
             return Ok(outcome?);
         }
         let asked = outcome.as_ref().ok().and_then(retry_after);
-        let Some(delay) = capped_delay(asked, backoff(attempt)) else {
+        let Some(delay) = delay_unless_over_cap(asked, backoff(attempt)) else {
+            warn_beyond_cap(asked, what);
             return Ok(outcome?);
         };
         tracing::debug!(
@@ -448,7 +460,7 @@ mod tests {
             ("7", Some(Duration::from_secs(7))),
             (" 60 ", Some(Duration::from_secs(60))),
             ("0", Some(Duration::ZERO)),
-            ("99999999999999999999", Some(Duration::MAX)),
+            ("99999999999999999999", Some(Duration::from_secs(121))),
             ("Wed, 21 Oct 2015 07:28:00 GMT", Some(Duration::ZERO)),
             ("+5", None),
             ("-5", None),
@@ -469,7 +481,7 @@ mod tests {
     /// throttled request would wake together), ignores the header, or moves
     /// the cap's edge.
     #[test]
-    fn capped_delay_adds_the_backoff_up_to_the_cap() {
+    fn delay_adds_the_backoff_up_to_the_cap() {
         let backoff = Duration::from_millis(250);
         let cases = [
             (None, Some(Duration::from_millis(250))),
@@ -483,10 +495,9 @@ mod tests {
                 Some(Duration::from_millis(120_250)),
             ),
             (Some(Duration::from_secs(121)), None),
-            (Some(Duration::MAX), None),
         ];
         for (asked, expected) in cases {
-            assert_eq!(capped_delay(asked, backoff), expected, "{asked:?}");
+            assert_eq!(delay_unless_over_cap(asked, backoff), expected, "{asked:?}");
         }
     }
 

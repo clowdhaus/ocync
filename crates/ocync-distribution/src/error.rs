@@ -414,7 +414,9 @@ impl Error {
 
     /// The [`RegistryError`](Self::RegistryError) for a registry's failing
     /// `response`, with its `Retry-After` and body. `place` is the registry
-    /// and repository the message names, when the caller has them. The only
+    /// and repository the message names, when the caller has them. With no
+    /// `place` the message is the body alone, which the sync engine reads as
+    /// OCI error JSON (a manifest refusal, `BLOB_UPLOAD_UNKNOWN`). The only
     /// production constructor, so no failing answer drops its `Retry-After`.
     pub(crate) async fn from_response(
         response: reqwest::Response,
