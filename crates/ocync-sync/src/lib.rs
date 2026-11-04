@@ -57,17 +57,6 @@ pub struct SyncReport {
 }
 
 impl SyncReport {
-    /// The report of a run that reached no image, as when shutdown stops it
-    /// before the engine starts.
-    pub fn empty(duration: Duration) -> Self {
-        Self {
-            run_id: Uuid::now_v7(),
-            images: Vec::new(),
-            stats: SyncStats::default(),
-            duration,
-        }
-    }
-
     /// Whether any image synced or was skipped.
     ///
     /// Public so a caller that tracks failures the report cannot see (a

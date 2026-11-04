@@ -80,20 +80,10 @@ pub(crate) fn is_transient(error: &Error) -> bool {
     }
 }
 
-/// A registry's `Retry-After`: a wait a sync sits out, or one longer than
-/// it does. Made only by [`parse`](Self::parse), so a wait it holds is never
-/// over the 120 s a sync waits out.
+/// A registry's `Retry-After`: the wait it asked for, or [`Duration::MAX`]
+/// for a number too large to hold. Made only by [`parse`](Self::parse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryAfter(Asked);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Asked {
-    /// At most [`MAX_HONORED_RETRY_AFTER`].
-    Wait(Duration),
-    /// More than [`MAX_HONORED_RETRY_AFTER`], as asked, or [`Duration::MAX`]
-    /// for a number too large to hold.
-    TooLong(Duration),
-}
+pub struct RetryAfter(Duration);
 
 impl RetryAfter {
     /// Read a `Retry-After` value in either of its forms (RFC 9110 section
@@ -109,32 +99,18 @@ impl RetryAfter {
             let date = crate::aws::calendar::parse_imf_fixdate(value)?;
             date.duration_since(now).unwrap_or(Duration::ZERO)
         };
-        Some(Self(if asked <= MAX_HONORED_RETRY_AFTER {
-            Asked::Wait(asked)
-        } else {
-            Asked::TooLong(asked)
-        }))
-    }
-
-    /// The wait, or `None` when it is longer than a sync waits out.
-    pub(crate) fn wait(self) -> Option<Duration> {
-        match self.0 {
-            Asked::Wait(wait) => Some(wait),
-            Asked::TooLong(_) => None,
-        }
+        Some(Self(asked))
     }
 
     /// The wait as the registry named it, for a log line.
     fn asked_secs(self) -> u64 {
-        match self.0 {
-            Asked::Wait(asked) | Asked::TooLong(asked) => asked.as_secs(),
-        }
+        self.0.as_secs()
     }
 
     /// Whether the registry named a wait longer than none at all. A
     /// `Retry-After: 0`, or a date already past, asks for nothing.
     pub(crate) fn names_a_wait(self) -> bool {
-        self.wait() != Some(Duration::ZERO)
+        !self.0.is_zero()
     }
 }
 
@@ -192,7 +168,7 @@ fn delay_unless_over_cap(
     let Some(asked) = asked else {
         return Some(backoff);
     };
-    let asked = asked.wait()?;
+    let asked = asked.0;
     let total = honored.saturating_add(asked);
     if total > MAX_HONORED_RETRY_AFTER {
         return None;
@@ -529,31 +505,25 @@ mod tests {
         assert!(logs.contains("empty host"), "{logs}");
     }
 
-    /// Both forms are read, a date against the registry's clock, and a wait
-    /// over the cap is told apart from no header. Breaks if a sign or garbage
-    /// is taken as a wait, if a number or a date is ignored, or if a wait over
-    /// the cap, or a number too large to hold, is held as a wait or loses the
-    /// seconds the registry asked for.
+    /// Both forms are read, a date against the registry's clock. Breaks if a
+    /// sign or garbage is taken as a wait, if a number or a date is ignored,
+    /// or if a number too large to hold is dropped instead of read as the
+    /// longest wait.
     #[test]
     fn retry_after_reads_seconds_and_dates() {
         let now = crate::aws::calendar::parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT")
             .expect("a valid date");
-        let wait = |secs| Some(RetryAfter(Asked::Wait(Duration::from_secs(secs))));
-        let too_long = |asked| Some(RetryAfter(Asked::TooLong(asked)));
+        let wait = |secs| Some(RetryAfter(Duration::from_secs(secs)));
         let cases = [
             ("7", wait(7)),
             (" 60 ", wait(60)),
             ("0", wait(0)),
             ("120", wait(120)),
-            ("121", too_long(Duration::from_secs(121))),
-            ("3600", too_long(Duration::from_secs(3600))),
-            ("99999999999999999999", too_long(Duration::MAX)),
+            ("121", wait(121)),
+            ("99999999999999999999", Some(RetryAfter(Duration::MAX))),
             ("Wed, 21 Oct 2015 07:28:30 GMT", wait(30)),
             ("Wed, 21 Oct 2015 07:27:00 GMT", wait(0)),
-            (
-                "Wed, 21 Oct 2015 08:28:00 GMT",
-                too_long(Duration::from_secs(3600)),
-            ),
+            ("Wed, 21 Oct 2015 08:28:00 GMT", wait(3600)),
             ("+5", None),
             ("-5", None),
             ("soon", None),
@@ -562,11 +532,6 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(RetryAfter::parse(value, now), expected, "{value:?}");
         }
-        // The warning names the wait the registry asked for, not the cap.
-        assert_eq!(
-            RetryAfter::parse("3600", now).map(RetryAfter::asked_secs),
-            Some(3600)
-        );
     }
 
     /// A date is measured from the answer's `Date`, not the local clock, and
@@ -585,25 +550,27 @@ mod tests {
                     .expect("a valid response"),
             )
         };
-        let thirty = Some(RetryAfter(Asked::Wait(Duration::from_secs(30))));
+        let thirty = Some(RetryAfter(Duration::from_secs(30)));
         assert_eq!(retry_after(&answer(429)), thirty);
         assert_eq!(retry_after(&answer(503)), None);
     }
 
     /// Breaks if the wait drops the backoff on top of a `Retry-After` (every
     /// throttled request would wake together), ignores the header, moves the
-    /// cap's edge, or caps each wait instead of an operation's sum.
+    /// cap's edge, caps each wait instead of an operation's sum, or overflows
+    /// on a number too large to hold.
     #[test]
     fn delay_adds_the_backoff_up_to_the_cap() {
         let backoff = Duration::from_millis(250);
         let secs = Duration::from_secs;
-        let wait = |s| Some(RetryAfter(Asked::Wait(secs(s))));
+        let wait = |s| Some(RetryAfter(secs(s)));
         // (already waited out, asked, delay, waited out after)
         let cases = [
             (0, None, Some(Duration::from_millis(250)), 0),
             (0, wait(0), Some(Duration::from_millis(250)), 0),
             (0, wait(120), Some(Duration::from_millis(120_250)), 120),
-            (0, Some(RetryAfter(Asked::TooLong(secs(121)))), None, 0),
+            (0, wait(121), None, 0),
+            (60, Some(RetryAfter(Duration::MAX)), None, 60),
             (60, wait(60), Some(Duration::from_millis(60_250)), 120),
             (60, wait(61), None, 60),
         ];
@@ -634,7 +601,7 @@ mod tests {
                             Err(Error::RegistryError {
                                 status: http::StatusCode::TOO_MANY_REQUESTS,
                                 message: "slow down".into(),
-                                retry_after: Some(RetryAfter(Asked::Wait(Duration::from_secs(70)))),
+                                retry_after: Some(RetryAfter(Duration::from_secs(70))),
                             })
                         } else {
                             Ok(())

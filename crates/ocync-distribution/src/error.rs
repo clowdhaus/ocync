@@ -162,8 +162,8 @@ pub enum Error {
         status: http::StatusCode,
         /// Human-readable context (typically registry/repository and response body).
         message: String,
-        /// The `Retry-After` of a 429 or 503; `None` for any other answer or
-        /// an unreadable header. Set only by `Error::from_response`.
+        /// The `Retry-After` of a 429; `None` for any other answer or an
+        /// unreadable header. Set only by `Error::from_response`.
         retry_after: Option<crate::retry::RetryAfter>,
     },
 

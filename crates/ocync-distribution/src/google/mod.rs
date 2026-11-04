@@ -294,7 +294,7 @@ pub(crate) enum Error {
         status: http::StatusCode,
         body: String,
         code: Option<OAuthCode>,
-        /// The answer's `Retry-After`, on a 429 or 503.
+        /// The answer's `Retry-After`, on a 429.
         retry_after: Option<crate::retry::RetryAfter>,
     },
     /// An endpoint's answer is not the JSON expected.

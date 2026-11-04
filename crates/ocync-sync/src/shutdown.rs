@@ -146,7 +146,7 @@ mod tests {
     }
 
     /// A signal ends the work's wait, and without one the work runs to the
-    /// end. Breaks if a SIGTERM during a `Retry-After` wait is ignored until
+    /// end. Breaks if a cancel during a `Retry-After` wait is ignored until
     /// the wait ends.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_signal_ends_the_work() {

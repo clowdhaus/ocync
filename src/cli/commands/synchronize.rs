@@ -632,7 +632,6 @@ pub(crate) async fn run(
     verbose: bool,
     mut watch_log: Option<&mut WatchLogState>,
 ) -> Result<ExitCode, CliError> {
-    let run_start = std::time::Instant::now();
     let config = load_config(&args.config)?;
 
     let min_tags = if args.dry_run {
@@ -644,7 +643,7 @@ pub(crate) async fn run(
     // One ticker spans client construction, batch-checker setup and mapping
     // resolution, so the run is never silent for longer than the interval.
     let tracker = PrepareTracker::default();
-    let prepare = with_prepare_progress(&tracker, "sync", async {
+    let resolution = with_prepare_progress(&tracker, "sync", async {
         let referenced = referenced_registries(&config);
         // One run's clients share credentials; the next watch cycle reloads them.
         let credentials = RunCredentials::default();
@@ -661,22 +660,14 @@ pub(crate) async fn run(
             PREPARE_MAPPING_CONCURRENCY,
         )
         .await
-    });
-    // Signing in and listing tags can wait out a registry's `Retry-After`,
-    // longer than a pod's shutdown grace period, so shutdown ends it.
-    let Some(resolution) = ocync_sync::shutdown::unless_triggered(shutdown, prepare).await else {
-        tracing::warn!("shutdown before the sync started; nothing was synced");
-        // The `--json` document is still written, so a consumer reads an
-        // empty run rather than nothing.
-        write_output(&SyncReport::empty(run_start.elapsed()), &[], &[], args.json)?;
-        return Ok(ExitCode::Failure);
-    };
+    })
+    .await?;
     let Resolution {
         resolved: mappings,
         unresolved,
         dropped_targets,
         no_match,
-    } = resolution?;
+    } = resolution;
 
     if let Some(state) = watch_log.as_mut() {
         for resolved in &mappings {
@@ -1879,54 +1870,6 @@ fn write_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A shutdown while the clients sign in ends the run at once, as a
-    /// failure, instead of after the registry answers. Breaks if the prepare
-    /// phase ignores shutdown until a slow sign-in, or a `Retry-After` wait in
-    /// it, ends.
-    #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_during_sign_in_ends_the_run() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/v2/"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("ocync.yaml");
-        let repos = repo_names(1);
-        let yaml = config_yaml(&server, &repos, "      glob: [\"*\"]\n");
-        std::fs::write(&config, yaml).unwrap();
-        let args = SyncArgs {
-            config,
-            dry_run: false,
-            json: true,
-        };
-        let shutdown = ShutdownSignal::new();
-
-        let started = std::time::Instant::now();
-        let (code, ()) = tokio::join!(
-            run(
-                &args,
-                &ocync_sync::progress::NullProgress,
-                Some(&shutdown),
-                None,
-                false,
-                None,
-            ),
-            async {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                shutdown.trigger();
-            },
-        );
-
-        assert!(matches!(code, Ok(ExitCode::Failure)), "{code:?}");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "{:?}",
-            started.elapsed()
-        );
-    }
 
     /// A filter's semver range as written, for comparing against a literal.
     fn semver_text(filter: &FilterConfig) -> Option<String> {
