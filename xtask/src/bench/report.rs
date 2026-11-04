@@ -14,7 +14,7 @@ use crate::bench::lock::{LockedAt, SyncFrom};
 use crate::bench::proxy::ProxyMetrics;
 use crate::bench::remote::CommitSha;
 use crate::bench::runner::{PER_TAG_JOBS, Tool};
-use crate::bench::stats::{self, Pair, Ratio, Verdict};
+use crate::bench::stats::{self, Overhead, Pair, Ratio, Timed, Verdict};
 use crate::bench::{Provider, Rounds, command_stdout};
 
 /// The docs performance page, relative to the repository root.
@@ -174,6 +174,7 @@ impl RunRecord {
                             peak_rss_kb: r.peak_rss_kb,
                             metrics: r.proxy_metrics.clone().unwrap_or_default(),
                             phase_timing_ms: r.phase_timing_ms.clone(),
+                            direct_wall_clock_secs: r.direct_wall_clock_secs,
                         })
                         .collect(),
                 })
@@ -330,6 +331,11 @@ pub(crate) struct ToolRecord {
     /// Phase timing from ocync's `OCYNC_TIMING_FILE` (milliseconds).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) phase_timing_ms: BTreeMap<String, u64>,
+    /// Wall-clock time in seconds of the direct run paired with this proxied
+    /// one in its round; absent unless the run measured the proxy's overhead
+    /// and in records written before it could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) direct_wall_clock_secs: Option<f64>,
 }
 
 /// Results for one tool in one scenario.
@@ -345,6 +351,10 @@ pub(crate) struct ToolRun {
     pub(crate) proxy_metrics: Option<ProxyMetrics>,
     /// Phase timing from ocync's `OCYNC_TIMING_FILE` (milliseconds).
     pub(crate) phase_timing_ms: BTreeMap<String, u64>,
+    /// Wall-clock time in seconds of the same run sent directly to the
+    /// registries, paired with this proxied run in its round and not counted.
+    /// `None` unless the run measured the proxy's overhead.
+    pub(crate) direct_wall_clock_secs: Option<f64>,
 }
 
 /// Which scenario a [`ScenarioResult`] measured. Code that selects a result
@@ -904,6 +914,7 @@ fn summary_markdown(report: &BenchReport) -> String {
             .collect();
         render_metric_table(report, &ran, &by_tool, &mut out);
         render_comparison(report, &rounds, &mut out);
+        render_proxy_overhead(report, &rounds, &mut out);
         out.push_str(&footnotes(report, &rounds));
         out.push('\n');
     }
@@ -1251,6 +1262,53 @@ fn render_comparison(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut
             stats::VERDICT_ROUNDS
         ));
     }
+    out.push_str(&table);
+}
+
+/// Renders what the proxy cost each tool, from the rounds that paired a proxied
+/// run with a direct one: the median and range of the per-round ratio of the
+/// two wall clocks, the run-to-run noise of the direct times, and whether the
+/// median is within it. Nothing for a scenario that measured none.
+fn render_proxy_overhead(report: &BenchReport, rounds: &[&ScenarioResult], out: &mut String) {
+    let mut table = String::new();
+    for (tool, runs) in rounds_by_tool(rounds) {
+        let timed: Option<Vec<Timed>> = runs
+            .iter()
+            .map(|run| {
+                Some(Timed {
+                    proxied: run.wall_clock_secs,
+                    direct: run.direct_wall_clock_secs?,
+                })
+            })
+            .collect();
+        let Some(Overhead {
+            ratio,
+            noise,
+            within_noise,
+        }) = timed.as_deref().and_then(stats::overhead)
+        else {
+            continue;
+        };
+        table.push_str(&format!(
+            "| {} | {:.2} | {:.2}..{:.2} | {:.0}% | {} |\n",
+            report.label(tool),
+            ratio.median,
+            ratio.min,
+            ratio.max,
+            noise * 100.0,
+            if within_noise { "yes" } else { "no" },
+        ));
+    }
+    if table.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\nProxy overhead: the ratio of a tool's wall clock through the proxy to its wall \
+         clock without it, run back to back in each round. Noise is the highest to the \
+         lowest of the tool's wall clocks without the proxy over their median; the overhead \
+         is within the noise when the median ratio is no further from 1 than that.\n\n\
+         | Tool | Median ratio | Range | Noise | Within noise |\n|---|---:|---:|---:|---|\n",
+    );
     out.push_str(&table);
 }
 
@@ -1638,6 +1696,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(65536),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
@@ -1645,6 +1704,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(131072),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                 ],
             )],
@@ -1786,6 +1846,7 @@ pub(crate) mod tests {
             peak_rss_kb: Some(65536),
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
+            direct_wall_clock_secs: None,
         };
         let mut report = sample_report();
         report.tool_versions = BTreeMap::from([
@@ -2001,6 +2062,7 @@ pub(crate) mod tests {
                 peak_rss_kb: Some(1),
                 proxy_metrics: None,
                 phase_timing_ms: BTreeMap::new(),
+                direct_wall_clock_secs: None,
             });
         }
         let record = RunRecord::of(&report, "abc1234".into(), None);
@@ -2295,6 +2357,7 @@ pub(crate) mod tests {
                     peak_rss_kb: Some(65536),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: None,
                 }],
             )],
             ..sample_report()
@@ -2346,6 +2409,7 @@ pub(crate) mod tests {
                     peak_rss_kb: Some(51200),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: None,
                 }],
             )],
             ..sample_report()
@@ -2444,6 +2508,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
@@ -2461,6 +2526,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                 ],
             )],
@@ -2544,6 +2610,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
@@ -2552,6 +2619,7 @@ pub(crate) mod tests {
                         // dregsy has no proxy metrics in this test.
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                 ],
             )],
@@ -2603,6 +2671,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
@@ -2613,6 +2682,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                 ],
             )],
@@ -2684,6 +2754,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(51200),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     }],
                 ),
                 ScenarioResult::unshuffled(
@@ -2694,6 +2765,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(40960),
                         proxy_metrics: None,
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     }],
                 ),
             ],
@@ -2745,6 +2817,7 @@ pub(crate) mod tests {
                     peak_rss_kb: Some(40960),
                     proxy_metrics: None,
                     phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: None,
                 }],
             )],
             ..sample_report()
@@ -2792,6 +2865,7 @@ pub(crate) mod tests {
                             ..Default::default()
                         }),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Dregsy,
@@ -2799,6 +2873,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(300_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                     ToolRun {
                         tool: Tool::Regsync,
@@ -2806,6 +2881,7 @@ pub(crate) mod tests {
                         peak_rss_kb: Some(280_000),
                         proxy_metrics: Some(ProxyMetrics::default()),
                         phase_timing_ms: BTreeMap::new(),
+                        direct_wall_clock_secs: None,
                     },
                 ],
             )],
@@ -2851,6 +2927,7 @@ pub(crate) mod tests {
                     peak_rss_kb: Some(300_000),
                     proxy_metrics: Some(ProxyMetrics::default()),
                     phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: None,
                 }],
             )],
             ..sample_report()
@@ -2893,6 +2970,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     }),
                     phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: None,
                 }],
             )],
             ..sample_report()
@@ -2953,6 +3031,7 @@ pub(crate) mod tests {
                                     ..Default::default()
                                 }),
                                 phase_timing_ms: BTreeMap::new(),
+                                direct_wall_clock_secs: None,
                             })
                             .collect(),
                     )
@@ -3162,6 +3241,7 @@ pub(crate) mod tests {
             peak_rss_kb: Some(peak_rss_kb),
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
+            direct_wall_clock_secs: None,
         };
         let report = sample_report();
         let rss_row = |tools: &[(Tool, u64)], idle: &[Tool]| {
@@ -3376,6 +3456,84 @@ pub(crate) mod tests {
         assert!(
             json.contains("\"rounds\":{\"requested\":5,\"finished\":5}"),
             "{json}"
+        );
+    }
+
+    /// A report of ocync's cold sync, one round per `(proxied, direct)` pair of
+    /// wall clocks.
+    fn paired_report(rounds: &[(f64, f64)]) -> BenchReport {
+        let mut report = sample_report();
+        report.scenarios = rounds
+            .iter()
+            .enumerate()
+            .map(|(i, &(proxied, direct))| ScenarioResult {
+                kind: ScenarioKind::Cold,
+                round: Some(i + 1),
+                runs: vec![ToolRun {
+                    tool: Tool::Ocync,
+                    wall_clock_secs: proxied,
+                    peak_rss_kb: None,
+                    proxy_metrics: None,
+                    phase_timing_ms: BTreeMap::new(),
+                    direct_wall_clock_secs: Some(direct),
+                }],
+                shuffle_seed: 0,
+                tool_order: Vec::new(),
+            })
+            .collect();
+        report
+    }
+
+    #[test]
+    fn the_summary_says_per_tool_whether_the_overhead_is_within_the_noise() {
+        // Catches: the verdict column dropped or inverted, the ratio taken the
+        // wrong way round, and the noise left out of the row. Direct times of
+        // 8, 12 and 10 give noise 40%.
+        let cases = [
+            (
+                [(10.0, 8.0), (15.0, 12.0), (12.5, 10.0)],
+                "| ocync | 1.25 | 1.25..1.25 | 40% | yes |",
+            ),
+            (
+                [(12.0, 8.0), (18.0, 12.0), (15.0, 10.0)],
+                "| ocync | 1.50 | 1.50..1.50 | 40% | no |",
+            ),
+        ];
+        for (rounds, row) in cases {
+            let md = summary_markdown(&paired_report(&rounds));
+            assert!(md.contains(row), "{row}\n{md}");
+        }
+    }
+
+    #[test]
+    fn a_run_that_paired_nothing_reports_no_overhead() {
+        // Catches: an empty overhead table, or one built from runs that have no
+        // direct partner.
+        let mut report = paired_report(&[(10.0, 8.0), (15.0, 12.0), (12.5, 10.0)]);
+        for scenario in &mut report.scenarios {
+            scenario.runs[0].direct_wall_clock_secs = None;
+        }
+        assert!(!summary_markdown(&report).contains("Proxy overhead"));
+        assert!(!summary_markdown(&sample_report()).contains("Proxy overhead"));
+    }
+
+    #[test]
+    fn a_record_keeps_the_direct_time_beside_the_proxied_run_and_old_ones_still_parse() {
+        // Catches: the direct time dropped from the archive, written for a run
+        // that has none (which would change every record already archived),
+        // and a record without the field no longer parsing.
+        let paired = RunRecord::of(&paired_report(&[(10.0, 8.0)]), "abc1234".into(), None);
+        let json = serde_json::to_string(&paired).unwrap();
+        assert!(json.contains("\"direct_wall_clock_secs\":8.0"), "{json}");
+        assert_eq!(paired.scenarios[0].tools[0].wall_clock_secs, 10.0);
+
+        let plain = serde_json::to_string(&sample_record()).unwrap();
+        assert!(!plain.contains("direct_wall_clock_secs"), "{plain}");
+        let parsed: RunRecord = serde_json::from_str(&plain).unwrap();
+        assert!(
+            parsed.scenarios[0].tools[0]
+                .direct_wall_clock_secs
+                .is_none()
         );
     }
 }

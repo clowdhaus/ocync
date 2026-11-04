@@ -295,6 +295,63 @@ pub(crate) struct BenchArgs {
     /// Disables traffic metrics, source error detection, and CDN stats.
     #[arg(long)]
     pub(crate) no_proxy: bool,
+
+    /// Run each tool's cold and warm sync of the sync scenario twice per round,
+    /// through the proxy and directly, back to back, and report the proxy's
+    /// overhead per tool. The direct legs record time only; counts come from
+    /// the proxied legs. Doubles the sync scenario's run time.
+    #[arg(long, conflicts_with = "no_proxy")]
+    pub(crate) measure_proxy_overhead: bool,
+}
+
+impl BenchArgs {
+    /// How an unpaired run sends its traffic.
+    fn route(&self) -> Route {
+        if self.no_proxy {
+            Route::Direct
+        } else {
+            Route::Proxied
+        }
+    }
+}
+
+/// Whether a tool's traffic goes through bench-proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// Through bench-proxy, which counts it.
+    Proxied,
+    /// Straight to the registries, timed and not counted.
+    Direct,
+}
+
+/// The routes one tool's sync runs in a round, in the order they run. A paired
+/// round runs both, the proxied one first in odd rounds from 1, so neither
+/// route is systematically first.
+fn sync_legs(args: &BenchArgs, round: usize) -> Vec<Route> {
+    if !args.measure_proxy_overhead {
+        return vec![args.route()];
+    }
+    if round % 2 == 1 {
+        vec![Route::Proxied, Route::Direct]
+    } else {
+        vec![Route::Direct, Route::Proxied]
+    }
+}
+
+/// Refuses a proxy overhead measurement for a scenario with no sync scenario
+/// round to pair in. Called by `bench` and `bench-remote`, like
+/// [`ToolSelection::ensure_baseline_applies`].
+pub(crate) fn ensure_proxy_overhead_applies(
+    measure: bool,
+    scenario: Scenario,
+) -> Result<(), String> {
+    match scenario {
+        Scenario::Partial | Scenario::Scale | Scenario::Prepare if measure => Err(format!(
+            "--measure-proxy-overhead applies to the sync scenario, not {}",
+            value_name(&scenario)
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Benchmark scenario to run.
@@ -558,6 +615,7 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
     args.tool_selection.ensure_baseline_applies(args.scenario)?;
     args.tool_selection.ensure_prepare_applies(args.scenario)?;
     args.tool_selection.ensure_cap_applies()?;
+    ensure_proxy_overhead_applies(args.measure_proxy_overhead, args.scenario)?;
     let corpus_id = args.paths.corpus_id()?;
     let prepare = runs_prepare(args.scenario, &corpus_id)?;
     let bench_target = Target::from_env(
@@ -789,7 +847,8 @@ pub(crate) async fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error
                             let logs = round_dir(&output_dir, *round);
                             let round_corpus = bench_target.round_corpus(&corpus, *round)?;
                             let (cold, warm) =
-                                run_sync(&args, &round_corpus, &target, order, &logs).await?;
+                                run_sync(&args, *round, &round_corpus, &target, order, &logs)
+                                    .await?;
                             vec![(ScenarioKind::Cold, cold), (ScenarioKind::Warm, warm)]
                         }
                         Transfer::Partial {
@@ -1146,14 +1205,14 @@ fn with_stop_reason(error: String, stopped: Option<&str>) -> String {
 
 /// Combine a pass's result with its cleanup's, keeping both messages: a repo
 /// left behind is named even when the pass had already failed.
-fn finish_pass(
-    pass: Result<(), Box<dyn std::error::Error>>,
+fn finish_pass<T>(
+    pass: Result<T, Box<dyn std::error::Error>>,
     cleanup: Result<(), String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<T, Box<dyn std::error::Error>> {
     match (pass, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
         (Err(error), Err(cleanup)) => Err(format!("{error}; also {cleanup}").into()),
     }
 }
@@ -1309,6 +1368,16 @@ impl std::fmt::Display for Pass {
     }
 }
 
+/// One run of a tool: the pass of a scenario it is, and the route its traffic
+/// takes.
+#[derive(Clone, Copy, Debug)]
+struct Leg {
+    /// Which run of a scenario this is.
+    pass: Pass,
+    /// Whether its traffic goes through the proxy.
+    route: Route,
+}
+
 /// Where a tool's proxy log for a pass goes. The directory is the round's, so
 /// no round truncates another's; the tool's name, never its binary's, so the
 /// baseline cannot truncate ocync's.
@@ -1347,9 +1416,10 @@ async fn run_single_tool(
     corpus: &Corpus,
     config_dir: &Path,
     output_dir: &Path,
-    pass: Pass,
+    leg: Leg,
     mode: config_gen::Mode<'_>,
 ) -> Result<ToolRun, Box<dyn std::error::Error>> {
+    let Leg { pass, route } = leg;
     // Mode 0600: regsync's and dregsy's configs hold the Docker Hub token.
     let config = |content: String| -> Result<Launch, String> {
         let path = config_dir.join(format!("{tool}.yaml"));
@@ -1392,7 +1462,7 @@ async fn run_single_tool(
     // API calls the tool issued.
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("create output dir {}: {e}", output_dir.display()))?;
-    let (proxy_handle, proxy_url) = if !args.no_proxy {
+    let (proxy_handle, proxy_url) = if route == Route::Proxied {
         let log_path = proxy_log(output_dir, tool, pass);
         let handle = proxy::start(
             &args.proxy_binary,
@@ -1495,6 +1565,7 @@ async fn run_single_tool(
         peak_rss_kb: result.peak_rss_kb,
         proxy_metrics,
         phase_timing_ms,
+        direct_wall_clock_secs: None,
     })
 }
 
@@ -1560,10 +1631,13 @@ fn check_source_errors(
 
 /// One round of the sync scenario: for each tool in order, a full sync
 /// (measured), then an immediate re-sync (measured) with the same config
-/// directory so that ocync's `TransferStateCache` persists between runs.
+/// directory so that ocync's `TransferStateCache` persists between runs. With
+/// `--measure-proxy-overhead` the tool does this twice, through the proxy and
+/// directly, and the proxied runs carry the direct ones' wall clock.
 /// Returns the cold and the warm runs.
 async fn run_sync(
     args: &BenchArgs,
+    round: usize,
     corpus: &Corpus,
     target: &Destination<'_>,
     tools: &[Tool],
@@ -1574,67 +1648,123 @@ async fn run_sync(
     let mut warm_runs = Vec::new();
 
     for &tool in tools {
-        let label = args.tool_selection.label(tool);
-        prepare_clean_slate();
-
-        target.reset(corpus).await?;
-
-        // Single config_dir for cold + warm. The cache file lives
-        // under this directory, so reusing it means the warm run
-        // sees a fully populated cache.
-        let config_dir = tempfile::tempdir()?;
-
-        progress(&format!("  cold: {label}"));
-        let run_result: Result<(), Box<dyn std::error::Error>> = async {
-            let cold = run_single_tool(
-                args,
-                tool,
-                corpus,
-                config_dir.path(),
-                output_dir,
-                Pass::Measured(ScenarioKind::Cold),
-                config_gen::Mode::Sync(target.lock),
-            )
-            .await?;
-            progress(&format!(
-                "  cold: {label} complete ({:.1}s)",
-                cold.wall_clock_secs
-            ));
-            cold_runs.push(cold);
-
-            target::verify_sync(target, corpus, &label, ScenarioKind::Cold).await?;
-
-            progress(&format!("  warm: {label}"));
-            let warm = run_single_tool(
-                args,
-                tool,
-                corpus,
-                config_dir.path(),
-                output_dir,
-                Pass::Measured(ScenarioKind::Warm),
-                config_gen::Mode::Sync(target.lock),
-            )
-            .await?;
-            progress(&format!(
-                "  warm: {label} complete ({:.1}s)",
-                warm.wall_clock_secs
-            ));
-            warm_runs.push(warm);
-
-            target::verify_sync(target, corpus, &label, ScenarioKind::Warm).await?;
-
-            Ok(())
+        let mut legs = Vec::new();
+        for route in sync_legs(args, round) {
+            let runs = sync_leg(args, tool, route, corpus, target, output_dir).await?;
+            legs.push((route, runs));
         }
-        .await;
-
-        // Always clean up, even if the tool run failed.
-        let cleanup = target.release(corpus).await;
-        finish_pass(run_result, cleanup)?;
-
-        cooldown().await;
+        let (cold, warm) = merge_legs(legs);
+        cold_runs.push(cold);
+        warm_runs.push(warm);
     }
 
     Ok((cold_runs, warm_runs))
+}
+
+/// A tool's cold run and the warm run after it.
+type SyncRuns = (ToolRun, ToolRun);
+
+/// One tool's cold sync into an emptied target and the warm re-sync after it,
+/// sent by `route`.
+async fn sync_leg(
+    args: &BenchArgs,
+    tool: Tool,
+    route: Route,
+    corpus: &Corpus,
+    target: &Destination<'_>,
+    output_dir: &Path,
+) -> Result<SyncRuns, Box<dyn std::error::Error>> {
+    let label = args.tool_selection.label(tool);
+    prepare_clean_slate();
+
+    target.reset(corpus).await?;
+
+    // Single config_dir for cold + warm. The cache file lives
+    // under this directory, so reusing it means the warm run
+    // sees a fully populated cache.
+    let config_dir = tempfile::tempdir()?;
+
+    progress(&format!("  cold: {label}"));
+    let run_result: Result<SyncRuns, Box<dyn std::error::Error>> = async {
+        let cold = run_single_tool(
+            args,
+            tool,
+            corpus,
+            config_dir.path(),
+            output_dir,
+            Leg {
+                pass: Pass::Measured(ScenarioKind::Cold),
+                route,
+            },
+            config_gen::Mode::Sync(target.lock),
+        )
+        .await?;
+        progress(&format!(
+            "  cold: {label} complete ({:.1}s)",
+            cold.wall_clock_secs
+        ));
+
+        target::verify_sync(target, corpus, &label, ScenarioKind::Cold).await?;
+
+        progress(&format!("  warm: {label}"));
+        let warm = run_single_tool(
+            args,
+            tool,
+            corpus,
+            config_dir.path(),
+            output_dir,
+            Leg {
+                pass: Pass::Measured(ScenarioKind::Warm),
+                route,
+            },
+            config_gen::Mode::Sync(target.lock),
+        )
+        .await?;
+        progress(&format!(
+            "  warm: {label} complete ({:.1}s)",
+            warm.wall_clock_secs
+        ));
+
+        target::verify_sync(target, corpus, &label, ScenarioKind::Warm).await?;
+
+        Ok((cold, warm))
+    }
+    .await;
+
+    // Always clean up, even if the tool run failed.
+    let cleanup = target.release(corpus).await;
+    let runs = finish_pass(run_result, cleanup)?;
+
+    cooldown().await;
+    Ok(runs)
+}
+
+/// One tool's runs from its legs of a round. A paired round's two legs become
+/// the proxied runs, carrying the direct runs' wall clock and nothing else of
+/// them, so a count is always a proxied leg's. A single leg is returned as it
+/// ran. The schedule gives a pair one leg of each route.
+fn merge_legs(legs: Vec<(Route, SyncRuns)>) -> SyncRuns {
+    let mut legs = legs.into_iter();
+    let (route, first) = legs.next().expect("a tool runs at least one leg");
+    let Some((_, second)) = legs.next() else {
+        return first;
+    };
+    let (proxied, direct) = match route {
+        Route::Proxied => (first, second),
+        Route::Direct => (second, first),
+    };
+    (
+        proxied_with_direct(proxied.0, &direct.0),
+        proxied_with_direct(proxied.1, &direct.1),
+    )
+}
+
+/// `proxied` with the wall clock of the direct run it was paired with.
+fn proxied_with_direct(proxied: ToolRun, direct: &ToolRun) -> ToolRun {
+    ToolRun {
+        direct_wall_clock_secs: Some(direct.wall_clock_secs),
+        ..proxied
+    }
 }
 
 /// One round of the partial scenario: for each tool in order, prime with the
@@ -1666,7 +1796,10 @@ async fn run_partial(
                 base_corpus,
                 config_dir.path(),
                 output_dir,
-                Pass::Prime,
+                Leg {
+                    pass: Pass::Prime,
+                    route: args.route(),
+                },
                 config_gen::Mode::Sync(target.lock),
             )
             .await?;
@@ -1678,7 +1811,10 @@ async fn run_partial(
                 partial_corpus,
                 config_dir.path(),
                 output_dir,
-                Pass::Measured(ScenarioKind::Partial),
+                Leg {
+                    pass: Pass::Measured(ScenarioKind::Partial),
+                    route: args.route(),
+                },
                 config_gen::Mode::Sync(target.lock),
             )
             .await?;
@@ -1736,7 +1872,10 @@ async fn run_scale(
                     &subset,
                     config_dir.path(),
                     output_dir,
-                    Pass::Measured(ScenarioKind::Scale { images: size }),
+                    Leg {
+                        pass: Pass::Measured(ScenarioKind::Scale { images: size }),
+                        route: args.route(),
+                    },
                     config_gen::Mode::Sync(target.lock),
                 )
                 .await?;
@@ -1796,7 +1935,10 @@ async fn run_prepare(
         &corpus,
         config_dir.path(),
         output_dir,
-        Pass::Measured(ScenarioKind::Prepare),
+        Leg {
+            pass: Pass::Measured(ScenarioKind::Prepare),
+            route: args.route(),
+        },
         config_gen::Mode::Prepare,
     )
     .await?;
@@ -3733,7 +3875,89 @@ images:
             peak_rss_kb: None,
             proxy_metrics: None,
             phase_timing_ms: BTreeMap::new(),
+            direct_wall_clock_secs: None,
         }
+    }
+
+    #[test]
+    fn a_paired_round_runs_both_routes_and_alternates_which_is_first() {
+        // Catches: a round with a missing or doubled leg, the proxied leg
+        // always first (drift would then be charged to the proxy), and the
+        // option off still pairing.
+        let paired = |round| {
+            let args = parse_bench(&["--measure-proxy-overhead", "sync"]).unwrap();
+            sync_legs(&args, round)
+        };
+        let proxied_first = vec![Route::Proxied, Route::Direct];
+        let direct_first = vec![Route::Direct, Route::Proxied];
+        for (round, legs) in [
+            (1, &proxied_first),
+            (2, &direct_first),
+            (3, &proxied_first),
+            (4, &direct_first),
+        ] {
+            assert_eq!(&paired(round), legs, "round {round}");
+        }
+
+        let plain = parse_bench(&["sync"]).unwrap();
+        let no_proxy = parse_bench(&["--no-proxy", "sync"]).unwrap();
+        assert_eq!(sync_legs(&plain, 2), [Route::Proxied]);
+        assert_eq!(sync_legs(&no_proxy, 2), [Route::Direct]);
+    }
+
+    #[test]
+    fn proxy_overhead_is_refused_without_a_sync_round_and_with_no_proxy() {
+        // Catches: the option silently doing nothing for a scenario with no
+        // cold sync, and being allowed beside `--no-proxy`.
+        for (scenario, ok) in [
+            (Scenario::Sync, true),
+            (Scenario::All, true),
+            (Scenario::Partial, false),
+            (Scenario::Scale, false),
+            (Scenario::Prepare, false),
+        ] {
+            assert_eq!(
+                ensure_proxy_overhead_applies(true, scenario).is_ok(),
+                ok,
+                "{scenario:?}"
+            );
+            assert!(ensure_proxy_overhead_applies(false, scenario).is_ok());
+        }
+        assert!(parse_bench(&["--measure-proxy-overhead", "--no-proxy", "sync"]).is_err());
+    }
+
+    #[test]
+    fn a_merged_pair_counts_only_the_proxied_legs() {
+        // Catches: the direct leg's counts or time replacing the proxied leg's,
+        // either order of the legs mixing them up, and a single leg being
+        // altered. The direct runs carry counts a real one never has, so any
+        // use of them shows.
+        let counted = |requests, wall_clock_secs| ToolRun {
+            proxy_metrics: Some(proxy::ProxyMetrics {
+                requests,
+                ..Default::default()
+            }),
+            ..tool_run(Tool::Ocync, wall_clock_secs)
+        };
+        let proxied = || (counted(7, 10.0), counted(3, 1.0));
+        let direct = || (counted(999, 8.0), counted(999, 0.5));
+        for legs in [
+            vec![(Route::Proxied, proxied()), (Route::Direct, direct())],
+            vec![(Route::Direct, direct()), (Route::Proxied, proxied())],
+        ] {
+            let (cold, warm) = merge_legs(legs);
+            assert_eq!(cold.proxy_metrics.unwrap().requests, 7);
+            assert_eq!(warm.proxy_metrics.unwrap().requests, 3);
+            assert_eq!(cold.wall_clock_secs, 10.0);
+            assert_eq!(warm.wall_clock_secs, 1.0);
+            assert_eq!(cold.direct_wall_clock_secs, Some(8.0));
+            assert_eq!(warm.direct_wall_clock_secs, Some(0.5));
+        }
+
+        let (cold, warm) = merge_legs(vec![(Route::Direct, direct())]);
+        assert_eq!(cold.wall_clock_secs, 8.0);
+        assert_eq!(cold.direct_wall_clock_secs, None);
+        assert_eq!(warm.direct_wall_clock_secs, None);
     }
 
     #[test]
