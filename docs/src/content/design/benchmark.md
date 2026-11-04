@@ -91,7 +91,7 @@ ocync's cold median came out faster with the proxy, which the proxy cannot cause
 
 ### Controlled and real-world sources
 
-- **Controlled.** `--source controlled`. The locked corpus is copied once into an ECR registry the bench owns, with `cargo xtask bench-seed`, and synced from there into the target. The public internet is out of the path, so speed ratios measure the tools, and five rounds of seven tools meet no public rate limit (Docker Hub allows 100 manifest pulls per 6 hours, authenticated). This is where speed claims come from. The source is in the target's account and another region (us-east-1 unless named, beside a us-east-2 target), so it is another registry host and no tool can mount a blob from a source repository into the target and skip the copy being measured. Every locked digest is copied bit for bit under `bench-source/<path of the public source>`, and a run checks the source holds each one before it builds. It has no CDN, so the pre-warm is recorded as not applicable.
+- **Controlled.** `--source controlled`. The locked corpus is copied once into an ECR registry the bench owns, with `cargo xtask bench-seed`, and synced from there into the target. The public internet is out of the path, so speed ratios measure the tools, and five rounds of every tool meet no public rate limit (Docker Hub allows 100 manifest pulls per 6 hours, authenticated). This is where speed claims come from. The source is in the target's account and another region (us-east-1 unless named, beside a us-east-2 target), so it is another registry host and no tool can mount a blob from a source repository into the target and skip the copy being measured. Every locked digest is copied bit for bit under `bench-source/<path of the public source>`, and a run checks the source holds each one before it builds. It has no CDN, so the pre-warm is recorded as not applicable.
 - **Real-world.** `--source public`, the default. The same corpus is pulled from its public sources. This is where rate-limit behavior, 429 counts and source request counts come from, since how a tool treats Docker Hub and the other public registries is part of what it claims.
 
 Each published number names the source kind it came from: the run record stores `source: controlled` and the region of the source, and the performance page's context line names the source.
@@ -132,7 +132,7 @@ Published runs are taken only from a commit on `main`, recorded by its full hash
 
 ## Per-tag tools
 
-skopeo, crane, regctl and oras are compared too. Each copies one tag per process, driven by the harness, because `skopeo sync` cannot copy `source@digest` to `target:tag`. Every copy keeps the source digest:
+skopeo, crane, regctl and oras can be benchmarked too, outside the published run. Each copies one tag per process, driven by the harness, because `skopeo sync` cannot copy `source@digest` to `target:tag`. Every copy keeps the source digest:
 
 - **skopeo** runs `copy --preserve-digests --multi-arch all`: without the first flag it recompresses an uncompressed layer on push and the digest changes, and with it a copy that cannot keep the digest fails instead.
 - **crane** `copy` pushes the manifest and blobs as fetched, every platform of an index.
@@ -157,7 +157,7 @@ A run is published only through `--publish`, on `cargo xtask bench-remote`, or o
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
 - **Source:** the controlled source, seeded from that lock. A run from the public registries is refused, since their rate limits reach the repeated rounds.
-- **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.
+- **Tools:** ocync, regsync and dregsy, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published. Another tool joins this list once it has finished a full benchmark run.
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
 - **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on. The controlled source has no CDN, so its pre-warm is recorded as not applicable and a record from a source with one cannot claim that. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
 - **Build:** a commit on `main`, recorded by its full hash, from a checkout with no modified tracked file.
@@ -170,7 +170,7 @@ A run is published only through `--publish`, on `cargo xtask bench-remote`, or o
 
 From the one run record, `--publish` writes:
 
-- **Performance page tables:** one per scenario, cold and warm, between the existing markers, with a column for each of the seven tools, ocync first. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line above the table gives the date, the run timestamp, the short commit, the instance, the corpus size, the source, the target and the round count. Ranges, per-round ratios and confidence are not on the page. They stay in the run record, and the run's `summary.md` carries them.
+- **Performance page tables:** one per scenario, cold and warm, between the existing markers, with a column for each published tool, ocync first. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line above the table gives the date, the run timestamp, the short commit, the instance, the corpus size, the source, the target and the round count. Ranges, per-round ratios and confidence are not on the page. They stay in the run record, and the run's `summary.md` carries them.
 - **Page description:** the `description` front matter of `docs/src/content/performance.md`.
 - **README:** the summary sentence in `README.md`, between a new pair of markers.
 - **Homepage and banners:** the speed and request figures in `docs/src/pages/index.astro`, in `docs/public/ecr-banner.svg` and `docs/public/og-image.svg`, and in the README banner's alt text. The PNG copies are rendered from the SVGs with `sharp`, which the docs site already installs.
