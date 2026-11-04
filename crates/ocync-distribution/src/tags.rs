@@ -299,9 +299,15 @@ mod tests {
     /// about 250 ms) or the cap is dropped (the second request is made).
     #[tokio::test]
     async fn a_tag_listing_waits_out_retry_after_unless_too_long() {
-        // (Retry-After, requests the registry should see, tag listing succeeds)
-        let cases = [(1u64, 2u64, true), (3600, 1, false)];
-        for (asked, requests, succeeds) in cases {
+        /// How the listing ends.
+        #[derive(Debug, PartialEq)]
+        enum Ends {
+            Listed,
+            Throttled,
+        }
+        // (Retry-After, requests the registry should see, how the listing ends)
+        let cases = [(1u64, 2u64, Ends::Listed), (3600, 1, Ends::Throttled)];
+        for (asked, requests, ends) in cases {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path("/v2/repo/tags/list"))
@@ -335,18 +341,19 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_secs(10), client.list_tags(&repo))
                     .await
                     .expect("the listing returned within 10 s");
-            assert_eq!(result.is_ok(), succeeds, "Retry-After {asked}: {result:?}");
-            if succeeds {
-                assert!(
-                    started.elapsed() >= std::time::Duration::from_secs(asked),
-                    "re-sent after {:?}",
-                    started.elapsed()
-                );
-            } else {
-                assert_eq!(
+            match ends {
+                Ends::Listed => {
+                    result.expect("the listing succeeds after the wait");
+                    assert!(
+                        started.elapsed() >= std::time::Duration::from_secs(asked),
+                        "re-sent after {:?}",
+                        started.elapsed()
+                    );
+                }
+                Ends::Throttled => assert_eq!(
                     result.unwrap_err().status_code(),
                     Some(http::StatusCode::TOO_MANY_REQUESTS)
-                );
+                ),
             }
         }
     }

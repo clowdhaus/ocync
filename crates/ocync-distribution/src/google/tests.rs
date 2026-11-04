@@ -285,6 +285,7 @@ fn classifies_answers() {
         status: http::StatusCode::from_u16(code).unwrap(),
         body: String::new(),
         code: None,
+        retry_after: None,
     };
     for (code, transient) in [
         (500, true),
@@ -303,6 +304,28 @@ fn classifies_answers() {
         source: crate::json::parse::<Value>("{").unwrap_err(),
     };
     assert!(!undecodable.is_transient());
+}
+
+/// A credential call's 429 that names a wait is not sent again, as its
+/// caller may hold a request permit; one without the header, or with
+/// `Retry-After: 0`, still is. Breaks if the header is not read from the
+/// answer, a throttle that names a wait is retried, or one that asks for no
+/// wait fails the credential load.
+#[tokio::test]
+async fn a_throttle_that_names_a_wait_is_final() {
+    for (status, header, transient) in [
+        (429, Some("30"), false),
+        (429, Some("0"), true),
+        (429, None, true),
+    ] {
+        let mut answer = http::Response::builder().status(status);
+        if let Some(value) = header {
+            answer = answer.header(http::header::RETRY_AFTER, value);
+        }
+        let answer = reqwest::Response::from(answer.body(Vec::<u8>::new()).unwrap());
+        let error = Error::status(Call::UserToken, answer).await;
+        assert_eq!(error.is_transient(), transient, "{status} {header:?}");
+    }
 }
 
 /// A request that does not connect is final for the EC2 instance metadata

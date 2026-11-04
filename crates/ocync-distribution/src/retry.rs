@@ -80,28 +80,46 @@ pub(crate) fn is_transient(error: &Error) -> bool {
     }
 }
 
-/// The wait a `Retry-After` value names, in either of its forms (RFC 9110
-/// section 10.2.3): delta seconds, or an HTTP date in the IMF-fixdate form
-/// senders must use, measured from the registry's own clock `now`, so a past
-/// date is zero. A number too large to
-/// hold counts as one second over [`MAX_HONORED_RETRY_AFTER`], so the cap
-/// refuses it. Anything else is `None`, and the caller backs off as it
-/// would without the header.
-fn retry_after_value(value: &str, now: SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-        let beyond_cap = MAX_HONORED_RETRY_AFTER + Duration::from_secs(1);
-        return Some(value.parse().map_or(beyond_cap, Duration::from_secs));
+/// A registry's `Retry-After`: the wait it asked for, or [`Duration::MAX`]
+/// for a number too large to hold. Made only by [`parse`](Self::parse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryAfter(Duration);
+
+impl RetryAfter {
+    /// Read a `Retry-After` value in either of its forms (RFC 9110 section
+    /// 10.2.3): delta seconds, or an HTTP date in the IMF-fixdate form
+    /// senders must use, measured from the registry's own clock `now`, so a
+    /// past date is no wait. Anything else is `None`, and the caller backs
+    /// off as it would without the header.
+    pub fn parse(value: &str, now: SystemTime) -> Option<Self> {
+        let value = value.trim();
+        let asked = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+            value.parse().map_or(Duration::MAX, Duration::from_secs)
+        } else {
+            let date = crate::aws::calendar::parse_imf_fixdate(value)?;
+            date.duration_since(now).unwrap_or(Duration::ZERO)
+        };
+        Some(Self(asked))
     }
-    let date = crate::aws::calendar::parse_imf_fixdate(value)?;
-    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+
+    /// The wait as the registry named it, for a log line.
+    fn asked_secs(self) -> u64 {
+        self.0.as_secs()
+    }
+
+    /// Whether the registry named a wait longer than none at all. A
+    /// `Retry-After: 0`, or a date already past, asks for nothing.
+    pub(crate) fn names_a_wait(self) -> bool {
+        !self.0.is_zero()
+    }
 }
 
-/// How long a 429 `response` asked to be left alone, from its `Retry-After`
-/// header. Only a throttle's header is read. A date is measured against the
-/// response's `Date`, when it has one, so local clock skew does not change
-/// the wait.
-pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+/// The `Retry-After` of a 429 `response`. Only a throttle's is read: a 503
+/// keeps the usual backoff, as one asking for longer than a sync waits out
+/// would otherwise fail where retrying gets through. A date is measured
+/// against the response's `Date`, when it has one, so local clock skew does
+/// not change the wait.
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<RetryAfter> {
     if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
@@ -109,15 +127,15 @@ pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     let now = header(http::header::DATE)
         .and_then(crate::aws::calendar::parse_imf_fixdate)
         .unwrap_or_else(SystemTime::now);
-    retry_after_value(header(http::header::RETRY_AFTER)?, now)
+    RetryAfter::parse(header(http::header::RETRY_AFTER)?, now)
 }
 
 /// The wait before re-sending after `error`, given the jittered `backoff` a
 /// retry loop would use: `backoff`, plus the registry's `Retry-After` when
 /// it named one. `honored` is the `Retry-After` time this operation has
 /// already waited out, and grows by this one. `None`, with a WARN naming
-/// `error`, when the sum would pass 120 s and the error
-/// should surface. The single definition every registry retry loop shares.
+/// `error`, when this wait is too long or the sum would pass 120 s, and the
+/// error should surface. The single definition every registry retry loop shares.
 pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> Option<Duration> {
     let asked = match error {
         Error::RegistryError { retry_after, .. } => *retry_after,
@@ -127,7 +145,7 @@ pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> 
     if delay.is_none() {
         tracing::warn!(
             error = %error,
-            retry_after_s = asked.unwrap_or_default().as_secs(),
+            retry_after_s = asked.map(RetryAfter::asked_secs),
             already_waited_s = honored.as_secs(),
             max_s = MAX_HONORED_RETRY_AFTER.as_secs(),
             "registry asked for a longer wait than a sync waits out; not retrying"
@@ -140,16 +158,17 @@ pub fn retry_delay(error: &Error, backoff: Duration, honored: &mut Duration) -> 
 /// `backoff` when it did, adding `asked` to `honored`. The registry counts
 /// `Retry-After` down to the end of its quota window, so the jittered
 /// `backoff` on top keeps every request it throttled from re-sending at the
-/// same instant. `None` when `honored` plus `asked` is over
-/// [`MAX_HONORED_RETRY_AFTER`]: the wait is refused, not shortened.
+/// same instant. `None` when `asked` is too long or `honored` plus `asked` is
+/// over [`MAX_HONORED_RETRY_AFTER`]: the wait is refused, not shortened.
 fn delay_unless_over_cap(
-    asked: Option<Duration>,
+    asked: Option<RetryAfter>,
     backoff: Duration,
     honored: &mut Duration,
 ) -> Option<Duration> {
     let Some(asked) = asked else {
         return Some(backoff);
     };
+    let asked = asked.0;
     let total = honored.saturating_add(asked);
     if total > MAX_HONORED_RETRY_AFTER {
         return None;
@@ -315,10 +334,11 @@ pub(crate) async fn send_retrying(
         // Callers hold a request permit, and for a push an upload slot, while
         // they sign in, so sitting out a registry's wait here would starve
         // every other request to it. The throttle surfaces instead.
-        if let Some(asked) = outcome.as_ref().ok().and_then(retry_after) {
+        let asked = outcome.as_ref().ok().and_then(retry_after);
+        if let Some(asked) = asked.filter(|asked| asked.names_a_wait()) {
             tracing::warn!(
                 what,
-                retry_after_s = asked.as_secs(),
+                retry_after_s = asked.asked_secs(),
                 "registry asked a sign-in request to wait; not retrying while holding a request slot"
             );
             return Ok(outcome?);
@@ -485,36 +505,39 @@ mod tests {
         assert!(logs.contains("empty host"), "{logs}");
     }
 
-    /// Both forms are read, a date against the registry's clock. Breaks if
-    /// a sign or garbage is taken as a wait, if a number or a date is
-    /// ignored, or if a number too large to hold slips under the cap.
+    /// Both forms are read, a date against the registry's clock. Breaks if a
+    /// sign or garbage is taken as a wait, if a number or a date is ignored,
+    /// or if a number too large to hold is dropped instead of read as the
+    /// longest wait.
     #[test]
     fn retry_after_reads_seconds_and_dates() {
         let now = crate::aws::calendar::parse_imf_fixdate("Wed, 21 Oct 2015 07:28:00 GMT")
             .expect("a valid date");
+        let wait = |secs| Some(RetryAfter(Duration::from_secs(secs)));
         let cases = [
-            ("7", Some(Duration::from_secs(7))),
-            (" 60 ", Some(Duration::from_secs(60))),
-            ("0", Some(Duration::ZERO)),
-            ("99999999999999999999", Some(Duration::from_secs(121))),
-            (
-                "Wed, 21 Oct 2015 07:28:30 GMT",
-                Some(Duration::from_secs(30)),
-            ),
-            ("Wed, 21 Oct 2015 07:27:00 GMT", Some(Duration::ZERO)),
+            ("7", wait(7)),
+            (" 60 ", wait(60)),
+            ("0", wait(0)),
+            ("120", wait(120)),
+            ("121", wait(121)),
+            ("99999999999999999999", Some(RetryAfter(Duration::MAX))),
+            ("Wed, 21 Oct 2015 07:28:30 GMT", wait(30)),
+            ("Wed, 21 Oct 2015 07:27:00 GMT", wait(0)),
+            ("Wed, 21 Oct 2015 08:28:00 GMT", wait(3600)),
             ("+5", None),
             ("-5", None),
             ("soon", None),
             ("", None),
         ];
         for (value, expected) in cases {
-            assert_eq!(retry_after_value(value, now), expected, "{value:?}");
+            assert_eq!(RetryAfter::parse(value, now), expected, "{value:?}");
         }
     }
 
-    /// A date is measured from the answer's `Date`, not the local clock,
-    /// and only a 429's header counts. Breaks if the local clock is used
-    /// (a 2015 date reads as zero) or a 503's header is taken.
+    /// A date is measured from the answer's `Date`, not the local clock, and
+    /// only a 429's header counts. Breaks if the local clock is used (a 2015
+    /// date reads as zero), or a 503's header is taken, which would fail a
+    /// short outage that asks for a long wait instead of retrying it.
     #[test]
     fn retry_after_measures_a_date_from_the_answer() {
         let answer = |status: u16| {
@@ -527,29 +550,33 @@ mod tests {
                     .expect("a valid response"),
             )
         };
-        assert_eq!(retry_after(&answer(429)), Some(Duration::from_secs(30)));
+        let thirty = Some(RetryAfter(Duration::from_secs(30)));
+        assert_eq!(retry_after(&answer(429)), thirty);
         assert_eq!(retry_after(&answer(503)), None);
     }
 
     /// Breaks if the wait drops the backoff on top of a `Retry-After` (every
     /// throttled request would wake together), ignores the header, moves the
-    /// cap's edge, or caps each wait instead of an operation's sum.
+    /// cap's edge, caps each wait instead of an operation's sum, or overflows
+    /// on a number too large to hold.
     #[test]
     fn delay_adds_the_backoff_up_to_the_cap() {
         let backoff = Duration::from_millis(250);
         let secs = Duration::from_secs;
+        let wait = |s| Some(RetryAfter(secs(s)));
         // (already waited out, asked, delay, waited out after)
         let cases = [
             (0, None, Some(Duration::from_millis(250)), 0),
-            (0, Some(0), Some(Duration::from_millis(250)), 0),
-            (0, Some(120), Some(Duration::from_millis(120_250)), 120),
-            (0, Some(121), None, 0),
-            (60, Some(60), Some(Duration::from_millis(60_250)), 120),
-            (60, Some(61), None, 60),
+            (0, wait(0), Some(Duration::from_millis(250)), 0),
+            (0, wait(120), Some(Duration::from_millis(120_250)), 120),
+            (0, wait(121), None, 0),
+            (60, Some(RetryAfter(Duration::MAX)), None, 60),
+            (60, wait(60), Some(Duration::from_millis(60_250)), 120),
+            (60, wait(61), None, 60),
         ];
         for (before, asked, expected, after) in cases {
             let mut honored = secs(before);
-            let delay = delay_unless_over_cap(asked.map(secs), backoff, &mut honored);
+            let delay = delay_unless_over_cap(asked, backoff, &mut honored);
             assert_eq!(delay, expected, "{before} s then {asked:?}");
             assert_eq!(honored, secs(after), "{before} s then {asked:?}");
         }
@@ -574,7 +601,7 @@ mod tests {
                             Err(Error::RegistryError {
                                 status: http::StatusCode::TOO_MANY_REQUESTS,
                                 message: "slow down".into(),
-                                retry_after: Some(Duration::from_secs(70)),
+                                retry_after: Some(RetryAfter(Duration::from_secs(70))),
                             })
                         } else {
                             Ok(())
@@ -614,23 +641,30 @@ mod tests {
     async fn send_retrying_surfaces_a_throttle_that_names_a_wait() {
         // Catches: a sign-in request (ping, token endpoint, ACR OAuth)
         // sleeping out a registry's wait while its caller holds a request
-        // permit, or re-sending into the throttle.
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(429).insert_header("Retry-After", "1"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        // permit, or re-sending into the throttle; and a `Retry-After: 0`,
+        // which asks for no wait, failing the sign-in instead of retrying.
+        // (Retry-After, requests sent, final status)
+        for (asked, requests, status) in [("1", 1, 429), ("0", 2, 200)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(429).insert_header("Retry-After", asked),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
 
-        let response = send_retrying(crate::test_http_client().get(server.uri()), "test")
-            .await
-            .unwrap();
+            let response = send_retrying(crate::test_http_client().get(server.uri()), "test")
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(response.status().as_u16(), status, "Retry-After {asked}");
+            let sent = server.received_requests().await.unwrap().len();
+            assert_eq!(sent, requests, "Retry-After {asked}");
+        }
     }
 }

@@ -48,7 +48,9 @@ use crate::cache::{PlatformFilterKey, SnapshotKey, SourceSnapshot, TransferState
 use crate::error::ManifestRefusal;
 pub use crate::plan::{RegistryAlias, TargetId};
 use crate::progress::RunProgress;
-use crate::retry::{RetryConfig, count_retries, retries_made, with_retry};
+use crate::retry::{
+    Retried, RetryConfig, count_retries, retries_made, with_retry, with_retry_unless_cancelled,
+};
 use crate::shared::{
     Claim, ClaimGuard, CopyKey, PerRun, Referrers, claim, copy_key, run_once, source_key,
     target_key,
@@ -2630,38 +2632,46 @@ async fn transfer_claimed_blob(
 
     let transfer_result: Result<PushOutcome, crate::Error> = match staging {
         StagingClaim::Pull(guard) => {
-            if let Err(e) = with_retry(io.retry, "blob pull (to stage)", || async {
-                let mut writer =
-                    io.staging
-                        .begin_write(digest)
-                        .map_err(|e| ocync_distribution::Error::Io {
+            let staged = with_retry_unless_cancelled(
+                io.retry,
+                "blob pull (to stage)",
+                Some(io.cancel),
+                || async {
+                    let mut writer = io.staging.begin_write(digest).map_err(|e| {
+                        ocync_distribution::Error::Io {
                             context: "staging create",
                             source: e.into(),
-                        })?;
-                let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
-                futures_util::pin_mut!(stream);
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    writer
-                        .write_chunk(&chunk)
-                        .map_err(|e| ocync_distribution::Error::Io {
-                            context: "staging write",
-                            source: e.into(),
-                        })?;
+                        }
+                    })?;
+                    let stream = io.source_client.blob_pull(io.source_repo, digest).await?;
+                    futures_util::pin_mut!(stream);
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk?;
+                        writer
+                            .write_chunk(&chunk)
+                            .map_err(|e| ocync_distribution::Error::Io {
+                                context: "staging write",
+                                source: e.into(),
+                            })?;
+                    }
+                    writer.finish().map_err(|e| ocync_distribution::Error::Io {
+                        context: "staging finalize",
+                        source: e.into(),
+                    })?;
+                    Ok::<(), ocync_distribution::Error>(())
+                },
+            )
+            .await;
+            match staged {
+                Retried::Done(Ok(())) => {}
+                Retried::Done(Err(e)) => {
+                    let err = crate::Error::BlobTransfer {
+                        digest: digest.clone(),
+                        source: e,
+                    };
+                    return BlobResult::Failed(io.fail_copy(digest, err));
                 }
-                writer.finish().map_err(|e| ocync_distribution::Error::Io {
-                    context: "staging finalize",
-                    source: e.into(),
-                })?;
-                Ok::<(), ocync_distribution::Error>(())
-            })
-            .await
-            {
-                let err = crate::Error::BlobTransfer {
-                    digest: digest.clone(),
-                    source: e,
-                };
-                return BlobResult::Failed(io.fail_copy(digest, err));
+                Retried::Cancelled => return io.abandon_claim(digest),
             }
             // Staged: waiters read it from disk while this task pushes.
             drop(guard);
@@ -2691,15 +2701,16 @@ async fn transfer_claimed_blob(
 /// How a copy ended when it did not fail.
 enum PushOutcome {
     Pushed,
-    /// The image was cancelled while the copy waited for an upload slot or
-    /// for the source to open.
+    /// The image was cancelled while the copy waited for an upload slot, for
+    /// the source to open, or between attempts.
     Cancelled,
 }
 
 /// Push one blob to the target, reserving a fresh upload slot for each attempt
 /// before `open` opens its source, so no source or file is open while a copy
 /// waits for a slot and no slot is held across a retry backoff. A cancel of
-/// the image ends either wait with [`PushOutcome::Cancelled`].
+/// the image ends any of those waits, or the wait between attempts, with
+/// [`PushOutcome::Cancelled`].
 async fn push_under_slot<S, E, Open, Fut>(
     io: &BlobIoContext<'_>,
     operation: &str,
@@ -2713,7 +2724,7 @@ where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<ocync_distribution::Error> + Send,
 {
-    with_retry(io.retry, operation, || async {
+    let pushed = with_retry_unless_cancelled(io.retry, operation, Some(io.cancel), || async {
         let slot = tokio::select! {
             biased;
             () = io.cancel.notified() => return Ok(PushOutcome::Cancelled),
@@ -2727,11 +2738,14 @@ where
         slot.push_stream(io.target_repo, digest, stream).await?;
         Ok(PushOutcome::Pushed)
     })
-    .await
-    .map_err(|e| crate::Error::BlobTransfer {
-        digest: digest.clone(),
-        source: e,
-    })
+    .await;
+    match pushed {
+        Retried::Cancelled => Ok(PushOutcome::Cancelled),
+        Retried::Done(pushed) => pushed.map_err(|e| crate::Error::BlobTransfer {
+            digest: digest.clone(),
+            source: e,
+        }),
+    }
 }
 
 /// Push a staged blob from disk to the target registry.

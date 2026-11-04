@@ -1,6 +1,7 @@
 //! Cooperative shutdown signal for the sync engine.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,6 +46,22 @@ impl ShutdownSignal {
             return;
         }
         future.await;
+    }
+}
+
+/// `work`'s output, or `None` when `signal` fires first. With no signal,
+/// `work` runs to the end.
+pub async fn unless_triggered<F: Future>(
+    signal: Option<&ShutdownSignal>,
+    work: F,
+) -> Option<F::Output> {
+    match signal {
+        Some(signal) => tokio::select! {
+            biased;
+            () = signal.notified() => None,
+            output = work => Some(output),
+        },
+        None => Some(work.await),
     }
 }
 
@@ -126,5 +143,25 @@ mod tests {
             .expect("timed out waiting for notified()")
             .expect("task panicked");
         assert!(result);
+    }
+
+    /// A signal ends the work's wait, and without one the work runs to the
+    /// end. Breaks if a cancel during a `Retry-After` wait is ignored until
+    /// the wait ends.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_signal_ends_the_work() {
+        let signal = ShutdownSignal::new();
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            "done"
+        };
+        let started = tokio::time::Instant::now();
+        let (done, ()) = tokio::join!(unless_triggered(Some(&signal), slow), async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            signal.trigger();
+        });
+        assert_eq!(done, None);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert_eq!(unless_triggered(None, async { "done" }).await, Some("done"));
     }
 }

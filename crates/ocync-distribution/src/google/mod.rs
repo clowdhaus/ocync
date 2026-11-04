@@ -294,6 +294,8 @@ pub(crate) enum Error {
         status: http::StatusCode,
         body: String,
         code: Option<OAuthCode>,
+        /// The answer's `Retry-After`, on a 429.
+        retry_after: Option<crate::retry::RetryAfter>,
     },
     /// An endpoint's answer is not the JSON expected.
     #[error("{call}: unreadable response")]
@@ -405,7 +407,17 @@ impl Error {
     /// host is, so one that does not connect or answer in time never will.
     pub(crate) fn is_transient(&self) -> bool {
         match self {
-            Self::Status { status, .. } => crate::retry::is_transient_status(*status),
+            // A credential request runs while its caller may hold a request
+            // permit, so a throttle that names a wait surfaces rather than
+            // sitting it out or re-sending into it.
+            Self::Status {
+                status,
+                retry_after,
+                ..
+            } => {
+                !retry_after.is_some_and(crate::retry::RetryAfter::names_a_wait)
+                    && crate::retry::is_transient_status(*status)
+            }
             Self::Transport { call, source } => {
                 let final_failure = match call {
                     Call::AwsRegion => source.is_connect() || source.is_timeout(),
@@ -456,12 +468,14 @@ impl Error {
     /// up to [`MAX_SMALL_ANSWER`] for its OAuth error code and quoted cut short.
     async fn status(call: Call, response: reqwest::Response) -> Self {
         let status = response.status();
+        let retry_after = crate::retry::retry_after(&response);
         let body = crate::json::error_body(response).await;
         Self::Status {
             call,
             status,
             body: truncate_quoted(&body).to_owned(),
             code: OAuthCode::read(body.as_bytes()),
+            retry_after,
         }
     }
 }
