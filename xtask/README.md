@@ -32,6 +32,8 @@ A run already in progress on the instance, including one still checking out or b
 |--------|------|---------|-------------|
 | `--provider` | string | (required) | Cloud provider; reads `bench/terraform/<provider>/bench.json` |
 | `--target` | `ecr`, `artifact-registry`, `acr` | `ecr` | Registry the instance syncs into. `artifact-registry` needs `bench/terraform/gcp` applied and `gcloud` signed in on this machine; `acr` needs `bench/terraform/azure` applied (and the AWS stack's token issuer) and `az` signed in on this machine. Both run the `sync` scenario with one ocync tool, and refuse `--regression`. Each round syncs into repositories of its own, which `bench-remote` deletes when the run ends: Artifact Registry's are made first with `gcloud`, ACR's are created by the first push, under `ocync-bench-run-<run timestamp>-r<round>/`, and deleted with `az`. The instance signs in to ACR as the Entra app through a token from `aws sts get-web-identity-token`, refreshed every 30 minutes |
+| `--source` | `public`, `controlled` | `public` | Where the tools read the corpus from: the registries it names, or the controlled source `--seed` fills (see [`bench-seed`](#cargo-xtask-bench-seed)). `controlled` needs the ECR target, skips the CDN pre-warm and is recorded as `source: controlled`; `--publish` needs it. Passed to `bench` only when `controlled`. Conflicts with `--fetch` and `--seed` |
+| `--seed` | flag | | Run `cargo xtask bench-seed` on the instance instead of a benchmark, which copies every digest of the corpus lock into the controlled source. Takes only `--git-ref` and `--force`, and the commit must hold `bench-seed` |
 | `--corpus` | path | the instance's default, `bench/corpus.yaml` | Image corpus YAML, passed to `bench` when given. The file and its lock must be committed in the commit that runs, which is checked before the push. Each corpus has its own lock, baseline and target prefix; only a published run of `bench/corpus.yaml` writes the surfaces. Conflicts with `--fetch` |
 | `--scenario` | string | `all` | Scenario to run (passed through to `bench`) |
 | `--tools` | string | `ocync` | Tools to benchmark: `ocync`, `dregsy`, `regsync`, `skopeo`, `crane`, `regctl`, `oras` |
@@ -64,6 +66,14 @@ cargo xtask bench-lock
 
 Re-running over unchanged sources leaves the file as it is. A new lock starts a new comparison series: run records carry its `locked_at` as `corpus_locked_at`. Records of runs that synced locked digests also carry `sync_from: digest`; `--regression` refuses a baseline recorded without it, so delete the baseline (`bench/results/baseline.json`, or `bench/results/baseline-<name>.json` for a corpus other than `corpus.yaml`) to record a new one.
 
+### `cargo xtask bench-seed`
+
+Copies every ref of the corpus lock, the partial scenario's tags included, from its public source into the controlled source: `<account>.dkr.ecr.us-east-1.amazonaws.com/bench-source/<path of the public source>`, in the account `BENCH_TARGET_REGISTRY` names. Run it on the instance through `bench-remote --seed`, once per lock. ocync does the copy from a config that pins each locked tag to its digest, so the content arrives bit for bit and a second run copies nothing. Each repository is created with the resource tag `ocync-bench-lock` set to the lock's `locked_at`; a repository tagged with another lock, or with none, is refused before anything is copied, and the fix is to delete the `bench-source/` repositories and seed again. It ends with the digest check a run makes, so a finished seed is one a run would start from. Writes to ECR in us-east-1 only; needs `target/release/ocync` built and, for Docker Hub sources, the credentials a run reads.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML whose lock, the `.lock.json` beside it, is seeded |
+
 ### `cargo xtask bench`
 
 Runs the benchmark suite directly on the current machine (intended for execution on the bench instance itself, not locally).
@@ -79,6 +89,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 | `--rounds` | integer, at least 3 | `5` | Rounds of the sync and partial scenarios, each running every tool once in a fresh random order |
 | `--baseline-ref` | hex commit id | | Also run the ocync built from this commit in every round, and compare it with the current one. Refused for `scale` and `prepare` |
 | `--max-concurrent-transfers` | integer, at least 1 | ocync default | Write `global.max_concurrent_transfers` to the ocync config, the baseline build's too. The run record and `summary.md` state the cap ocync ran with, its default's value when none is given; a capped run cannot be published. `--regression` refuses, before any round runs, a baseline taken under another cap. Refused when no ocync build runs |
+| `--source` | `public`, `controlled` | `public` | Where the tools read the corpus from. `controlled` reads each image from `<account>.dkr.ecr.us-east-1.amazonaws.com/bench-source/<path>` at its locked digest, after checking the source holds every locked digest the run needs (stopping, naming the digest, if not), skips the CDN pre-warm, and records `source: controlled` and `source_region`. Needs the ECR target and a target outside us-east-1. `--publish` needs it |
 | `--corpus` | path | `bench/corpus.yaml` | Image corpus YAML |
 | `--partial-overrides` | path | `bench/corpus-partial-overrides.yaml` | Partial sync tag overrides |
 | `--limit` | integer | all | Use first N corpus images only. A run that syncs fewer corpus images than it holds is never published; its record is still appended to the archive |
@@ -95,7 +106,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 
 ## Published runs
 
-Every public number (the performance page, its description, the README, the homepage and the banners) comes from the newest run recorded with `published: true`, and no other run writes any of them. `--publish` refuses to start unless the run is all seven tools, 5 rounds, scenario `sync` or `all`, the main corpus on ECR, with none of `--baseline-ref`, `--max-concurrent-transfers`, `--limit`, `--skip-registries`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression`. `bench --publish` also refuses a HEAD that is not on `origin/main` and a checkout with a modified tracked file. After the run the record is checked again, and a run that falls short is archived as an experiment with a warning saying why. `cargo xtask bench-publish-surfaces` rewrites every surface from the newest published record in `bench/results/ecr.json`, with no run, and fails with nothing written when the archive holds none. The design is in `docs/src/content/design/benchmark.md`.
+Every public number (the performance page, its description, the README, the homepage and the banners) comes from the newest run recorded with `published: true`, and no other run writes any of them. `--publish` refuses to start unless the run is all seven tools, 5 rounds, scenario `sync` or `all`, the main corpus on ECR from the controlled source (`--source controlled`), with none of `--baseline-ref`, `--max-concurrent-transfers`, `--limit`, `--skip-registries`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression`. `bench --publish` also refuses a HEAD that is not on `origin/main` and a checkout with a modified tracked file. After the run the record is checked again, and a run that falls short is archived as an experiment with a warning saying why. `cargo xtask bench-publish-surfaces` rewrites every surface from the newest published record in `bench/results/ecr.json`, with no run, and fails with nothing written when the archive holds none. The design is in `docs/src/content/design/benchmark.md`.
 
 ## Rounds and the baseline build
 
@@ -128,6 +139,10 @@ cargo xtask bench-remote --provider aws --tools ocync --limit 3 --rounds 3 --sce
 
 # Full 3-tool sync comparison (5 rounds)
 cargo xtask bench-remote --provider aws --tools ocync,dregsy,regsync --scenario sync
+
+# Fill the controlled source from the corpus lock, then sync from it
+cargo xtask bench-remote --provider aws --seed
+cargo xtask bench-remote --provider aws --tools ocync,regsync --scenario sync --source controlled
 
 # Has ocync regressed since a commit? Old and new ocync in the same rounds
 cargo xtask bench-remote --provider aws --baseline-ref <commit> --scenario sync

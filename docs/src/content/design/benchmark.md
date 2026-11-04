@@ -91,12 +91,12 @@ ocync's cold median came out faster with the proxy, which the proxy cannot cause
 
 ### Controlled and real-world sources
 
-> **Status: Planned.** Today every run pulls from the public registries.
+- **Controlled.** `--source controlled`. The locked corpus is copied once into an ECR registry the bench owns, with `cargo xtask bench-seed`, and synced from there into the target. The public internet is out of the path, so speed ratios measure the tools, and five rounds of seven tools meet no public rate limit (Docker Hub allows 100 manifest pulls per 6 hours, authenticated). This is where speed claims come from. The source is in the target's account and another region (us-east-1, beside a us-east-2 target), so it is another registry host and no tool can mount a blob from a source repository into the target and skip the copy being measured. Every locked digest is copied bit for bit under `bench-source/<path of the public source>`, and a run checks the source holds each one before it builds. It has no CDN, so the pre-warm is recorded as not applicable.
+- **Real-world.** `--source public`, the default. The same corpus is pulled from its public sources. This is where rate-limit behavior, 429 counts and source request counts come from, since how a tool treats Docker Hub and the other public registries is part of what it claims.
 
-- **Controlled.** The locked corpus is copied once into a registry the bench owns, in the instance's region, and synced from there into the target. The public internet is out of the path, so speed ratios measure the tools. This is where speed claims come from.
-- **Real-world.** The same corpus is pulled from its public sources. This is where rate-limit behavior, 429 counts and source request counts come from, since how a tool treats Docker Hub and the other public registries is part of what it claims.
+Each published number names the source kind it came from: the run record stores `source: controlled` and the region of the source, and the performance page's context line names the source.
 
-Each published number names the source kind it came from.
+> **Status: Planned.** The prepare scenario still lists tags on the public registries under `--source controlled`: its corpus uses wildcard tags, which a lock of digests does not cover.
 
 ### Competitors at their best
 
@@ -156,11 +156,12 @@ The archive shows what happens without this rule. The cold-sync figures publishe
 A run is published only through `--publish`, on `cargo xtask bench-remote`, or on `cargo xtask bench` for a run on the instance itself. The flag refuses to start unless the arguments fit the list below. `bench --publish` also refuses a checkout whose HEAD is not on `origin/main` or whose tracked files are modified, and `bench-remote` makes the same main check before it pushes, so a bad commit costs no instance boot. After the run, the record is checked against the list again. A run that fails the second check is archived as an experiment and writes no surface, and a warning says which requirement it missed.
 
 - **Corpus:** the whole main corpus at its current lock. A new lock starts a new series, and the next published run must use it.
+- **Source:** the controlled source, seeded from that lock. A run from the public registries is refused, since their rate limits reach the repeated rounds.
 - **Tools:** ocync, regsync, dregsy, skopeo, crane, regctl and oras, every one of them, each with a run in all 5 rounds of the cold and the warm sync. A tool that fails the content check stops the whole run, which then has fewer than 5 rounds and is not published.
 - **Rounds:** 5 requested and 5 finished. A run that loses a round is archived and not published.
-- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on and the pre-warm run with no blob left unwarmed (a registry with no blob cache is fine). `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
+- **Settings:** every tool at the defaults it ships with, or at the setting the competitor sweep chose. ocync runs at its own defaults, with the proxy on. The controlled source has no CDN, so its pre-warm is recorded as not applicable and a record from a source with one cannot claim that. `--max-concurrent-transfers`, `--skip-prewarm`, `--no-proxy`, `--measure-proxy-overhead` and `--regression` are refused.
 - **Build:** a commit on `main`, recorded by its full hash, from a checkout with no modified tracked file.
-- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region. The scenario is `sync` or `all`, so the cold and the warm sync both run.
+- **Place:** the standard instance in `bench/terraform/aws`, syncing into ECR in the same region from the controlled source in the same account and another region. The scenario is `sync` or `all`, so the cold and the warm sync both run.
 - **No baseline:** no baseline build. The regression check against an older ocync is its own run and is never published. `--limit` and `--skip-registries` are refused with it.
 
 > **Status: Planned.** A tool that fails the content check, or fails to finish, stays in the page as a column that names the failure, and the run goes on to the rest. Today the first failure stops the run, so no such column exists yet.
@@ -169,7 +170,7 @@ A run is published only through `--publish`, on `cargo xtask bench-remote`, or o
 
 From the one run record, `--publish` writes:
 
-- **Performance page tables:** one per scenario, cold and warm, between the existing markers, with a column for each of the seven tools, ocync first. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line above the table gives the date, the run timestamp, the short commit, the instance, the corpus size, the target and the round count. Ranges, per-round ratios and confidence are not on the page. They stay in the run record, and the run's `summary.md` carries them.
+- **Performance page tables:** one per scenario, cold and warm, between the existing markers, with a column for each of the seven tools, ocync first. Each cell is the median over the 5 rounds, the best value in each row is bold, and one line above the table gives the date, the run timestamp, the short commit, the instance, the corpus size, the source, the target and the round count. Ranges, per-round ratios and confidence are not on the page. They stay in the run record, and the run's `summary.md` carries them.
 - **Page description:** the `description` front matter of `docs/src/content/performance.md`.
 - **README:** the summary sentence in `README.md`, between a new pair of markers.
 - **Homepage and banners:** the speed and request figures in `docs/src/pages/index.astro`, in `docs/public/ecr-banner.svg` and `docs/public/og-image.svg`, and in the README banner's alt text. The PNG copies are rendered from the SVGs with `sharp`, which the docs site already installs.
