@@ -567,7 +567,8 @@ fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
             lines,
             format!(
                 "  <!-- run {run} -->\n  <img src=\"docs/public/ecr-banner.png\" alt=\"ocync - \
-                 {speed} faster sync, {percent} fewer API requests, adaptive rate control\" \
+                 {speed} faster than regsync, {percent} fewer API requests than regsync, adaptive \
+                 rate control\" \
                  width=\"900\">\n"
             ),
         ),
@@ -577,8 +578,8 @@ fn regions(record: &RunRecord) -> Result<Vec<Region>, String> {
             "BENCH-STATS",
             lines,
             format!(
-                "  // run {run}\n  {{ value: \"{speed}\", desc: \"faster cold syncs\", color: \
-                 \"stat-pink\" }},\n  {{ value: \"{percent}\", desc: \"fewer API requests\", \
+                "  // run {run}\n  {{ value: \"{speed}\", desc: \"faster cold syncs than regsync\", color: \
+                 \"stat-pink\" }},\n  {{ value: \"{percent}\", desc: \"fewer API requests than regsync\", \
                  color: \"stat-purple\" }},\n"
             ),
         ),
@@ -667,6 +668,57 @@ fn render_banners(root: &Path) -> Result<(), String> {
             docs.display()
         ))
     }
+}
+
+/// The newest published record in the archive text `archive`, `None` when it
+/// holds none.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "parses the archive the bench wrote"
+)]
+fn newest_published_record(archive: &str) -> Result<Option<RunRecord>, String> {
+    let records: Vec<RunRecord> =
+        serde_json::from_str(archive).map_err(|e| format!("parse the archive: {e}"))?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.publication == Publication::Publish)
+        .max_by(|a, b| a.timestamp.cmp(&b.timestamp)))
+}
+
+/// Rewrites every surface under `root` from the newest published run in the
+/// ECR archive of `archive_dir`, by the plan and write a publish uses, so the
+/// surfaces show that run again after a change to how they are worded. An error
+/// when the archive holds no published run, with nothing written.
+pub(crate) fn rewrite_surfaces(
+    archive_dir: &Path,
+    root: &Path,
+    banners: Banners,
+) -> Result<(), String> {
+    let path = archive_dir.join(format!("{}.json", super::RegistryKind::Ecr.archive_stem()));
+    let record = newest_published_record(&read(&path)?)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "{} holds no published run, so there is nothing to write; publish one with \
+                 `cargo xtask bench-remote --publish`",
+                path.display()
+            )
+        })?;
+    eprintln!(
+        "bench: writing the surfaces of the published run {}",
+        record.timestamp
+    );
+    plan(root, &record)?.write(root, banners)
+}
+
+/// The `bench-publish-surfaces` command: rewrites every surface of the
+/// repository in the current directory from its newest published run.
+pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(rewrite_surfaces(
+        Path::new(report::ARCHIVE_DIR),
+        Path::new("."),
+        Banners::Render,
+    )?)
 }
 
 /// The regions of the published run `record` that `read` returns different
@@ -1205,7 +1257,9 @@ pub(crate) mod tests {
             assert!(content.contains(FIXTURE_RUN), "{path}");
         }
         assert!(files[README].contains("2.9 times faster than regsync"));
-        assert!(files[README].contains("faster sync, 25% fewer API requests"));
+        assert!(
+            files[README].contains("2.9x faster than regsync, 25% fewer API requests than regsync")
+        );
         assert!(files[HOMEPAGE].contains(r#"{ value: "2.9x","#));
         assert!(files[PERFORMANCE_PAGE].contains("description: How ocync finishes"));
         assert!(
@@ -1411,21 +1465,56 @@ pub(crate) mod tests {
     #[test]
     fn the_surfaces_show_the_newest_published_run() {
         let archive = include_str!("../../../bench/results/ecr.json");
-        let records: Vec<RunRecord> = serde_json::from_str(archive).unwrap();
-        let newest = records
-            .iter()
-            .filter(|record| record.publication == Publication::Publish)
-            .max_by(|a, b| a.timestamp.cmp(&b.timestamp));
         // Until the first published run the surfaces keep the text they have.
-        let Some(record) = newest else { return };
+        let Some(record) = newest_published_record(archive).unwrap() else {
+            return;
+        };
 
-        assert_eq!(verify(record), Ok(()), "{}", record.timestamp);
+        assert_eq!(verify(&record), Ok(()), "{}", record.timestamp);
         assert_eq!(
-            stale(record, &BTreeMap::new()),
+            stale(&record, &BTreeMap::new()),
             Vec::<String>::new(),
             "a surface differs from, or does not cite, the published run {}; \
-             rewrite them from that record",
+             run `cargo xtask bench-publish-surfaces` to rewrite them from it",
             record.timestamp
         );
+    }
+
+    #[test]
+    fn the_surfaces_are_rewritten_from_the_archive_alone_and_only_from_a_published_run() {
+        use crate::bench::report::append_record;
+        let root = repository();
+        let files_of = |root: &Path| -> BTreeMap<String, String> {
+            [PERFORMANCE_PAGE, README, HOMEPAGE, ECR_BANNER, OG_IMAGE]
+                .into_iter()
+                .map(|path| (path.to_owned(), surface_of(root, path)))
+                .collect()
+        };
+
+        // Catches: a rewrite from an archive with only experiments in it
+        // changing a file, or succeeding.
+        let experiments = archive_dir();
+        let mut experiment = fixture(FIXTURE_RUN);
+        experiment.publication = Publication::Archive;
+        append_record(experiments.path(), "ecr", experiment).unwrap();
+        let err = rewrite_surfaces(experiments.path(), root.path(), Banners::Skip).unwrap_err();
+        assert!(err.contains("no published run"), "{err}");
+        let empty = archive_dir();
+        assert!(rewrite_surfaces(empty.path(), root.path(), Banners::Skip).is_err());
+        for (path, content) in files_of(root.path()) {
+            assert_eq!(content, tracked(&path), "{path}");
+        }
+
+        // The newest published run wins, and the surfaces show it.
+        let archive = archive_dir();
+        append_record(archive.path(), "ecr", fixture("2026-11-02-120000")).unwrap();
+        append_record(archive.path(), "ecr", fixture("2026-11-03-120000")).unwrap();
+        rewrite_surfaces(archive.path(), root.path(), Banners::Skip).unwrap();
+        let rewritten = files_of(root.path());
+        assert_eq!(
+            stale(&fixture("2026-11-03-120000"), &rewritten),
+            Vec::<String>::new()
+        );
+        assert!(!stale(&fixture("2026-11-02-120000"), &rewritten).is_empty());
     }
 }

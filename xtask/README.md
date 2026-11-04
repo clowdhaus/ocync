@@ -95,7 +95,7 @@ cargo xtask bench [OPTIONS] <SCENARIO>
 
 ## Published runs
 
-Every public number (the performance page, its description, the README, the homepage and the banners) comes from the newest run recorded with `published: true`, and no other run writes any of them. `--publish` refuses to start unless the run is all seven tools, 5 rounds, scenario `sync` or `all`, the main corpus on ECR, with none of `--baseline-ref`, `--max-concurrent-transfers`, `--limit`, `--skip-registries`, `--skip-prewarm`, `--no-proxy` and `--measure-proxy-overhead`. After the run the record is checked again, and a run that falls short is archived as an experiment with a warning saying why. The design is in `docs/src/content/design/benchmark.md`.
+Every public number (the performance page, its description, the README, the homepage and the banners) comes from the newest run recorded with `published: true`, and no other run writes any of them. `--publish` refuses to start unless the run is all seven tools, 5 rounds, scenario `sync` or `all`, the main corpus on ECR, with none of `--baseline-ref`, `--max-concurrent-transfers`, `--limit`, `--skip-registries`, `--skip-prewarm`, `--no-proxy` and `--measure-proxy-overhead`. After the run the record is checked again, and a run that falls short is archived as an experiment with a warning saying why. `cargo xtask bench-publish-surfaces` rewrites every surface from the newest published record in `bench/results/ecr.json`, with no run, and fails with nothing written when the archive holds none. The design is in `docs/src/content/design/benchmark.md`.
 
 ## Rounds and the baseline build
 

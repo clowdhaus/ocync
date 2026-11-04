@@ -184,7 +184,7 @@ The archive keeps every run, experiments included. `--publish` sets `published: 
 
 ### The check that keeps them in line
 
-A test reads the newest published record from `bench/results/ecr.json`, computes every generated region from it, and fails when any surface above, other than the PNG copies, differs from the result or cites another run. A hand edit to any of them fails CI. So does a publish that updates one surface and not the others. The PNG copies are the one thing it cannot check, so the publish step renders them and fails when it cannot. Until the first published run, the archive holds no published record and the surfaces keep the text they have. Other tests fit a stand-in run to every tracked file, so a deleted marker fails CI before the first publish does.
+A test reads the newest published record from `bench/results/ecr.json`, computes every generated region from it, and fails when any surface above, other than the PNG copies, differs from the result or cites another run. A hand edit to any of them fails CI, and `cargo xtask bench-publish-surfaces` rewrites them from the newest published record alone, without a run. So does a publish that updates one surface and not the others. The PNG copies are the one thing it cannot check, so the publish step renders them and fails when it cannot. Until the first published run, the archive holds no published record and the surfaces keep the text they have. Other tests fit a stand-in run to every tracked file, so a deleted marker fails CI before the first publish does.
 
 ## What we do not do
 

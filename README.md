@@ -4,7 +4,7 @@ Sync OCI container images across registries - efficiently.
 
 <p align="center">
   <!-- BENCH-BANNER:START -->
-  <img src="docs/public/ecr-banner.png" alt="ocync - 4x faster sync, 30% fewer API requests, adaptive rate control" width="900">
+  <img src="docs/public/ecr-banner.png" alt="ocync - 4x faster than regsync, 30% fewer API requests than regsync, adaptive rate control" width="900">
   <!-- BENCH-BANNER:END -->
 </p>
 
